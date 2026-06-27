@@ -40,14 +40,21 @@ this file is the at-a-glance view. Each item links to its tracking issue.
 
 ## 🔤 Catalog & UX
 
-- [ ] Amp/Drive/Cab real-world names (wiki-sourced) + UI toggle — [#3](https://github.com/sKuhLight/ForgeFX/issues/3)
+- [ ] Amp/Drive/Cab real-world names (wiki-sourced) — backend done — [#3](https://github.com/sKuhLight/ForgeFX/issues/3)
 - [ ] Parameter metadata completion (units/ranges/enums) — [#17](https://github.com/sKuhLight/ForgeFX/issues/17)
-- [ ] Axis editor screens (block editor, setup, FC, library, tuner) — [#19](https://github.com/sKuhLight/ForgeFX/issues/19)
 
 ## 🧩 Platform
 
 - [ ] Multi-device: FM9 / Axe-Fx III — [#18](https://github.com/sKuhLight/ForgeFX/issues/18)
 
+## 🖥 Frontend (Axis)
+
+The web UI lives in its own repo: **[sKuhLight/Axis](https://github.com/sKuhLight/Axis)** (it
+consumes this API). UI epics are tracked there:
+
+- [ ] Editor screens — block editor, setup, FC, library, tuner — [Axis#1](https://github.com/sKuhLight/Axis/issues/1)
+- [ ] Real-world names toggle — [Axis#2](https://github.com/sKuhLight/Axis/issues/2)
+
 ---
 
-Want something prioritized or have a request? Open an issue or comment on the relevant epic.
+Want something prioritized or have a request? Open an issue (backend → ForgeFX, UI → Axis).
