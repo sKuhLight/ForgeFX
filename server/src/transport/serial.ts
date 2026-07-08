@@ -263,8 +263,8 @@ export class FractalSerial implements Transport {
         }
         frames.push(frame);
         if (match?.(frames)) return finish();
-        // If a caller supplied a matcher, unrelated/stale frames must not quiet-complete this request:
-        // that was the 0x01/0x0d desync path where a late reply from request A ended request B early.
+        // A matched request has a concrete response owner. Do not let unrelated stale frames quiet-complete
+        // it; that releases the queue before the real reply arrives and poisons the next request.
         if (!match) armQuiet();
       };
       hardTimer = setTimeout(() => {
