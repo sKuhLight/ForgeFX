@@ -2,10 +2,11 @@ name: codec-bump
 
 # The codec → ForgeFX ripple (stage 1 → stage 2). When forgefx-midi publishes a release it
 # fires a `codec-released` repository_dispatch; this workflow opens a PR that bumps ForgeFX's
-# pinned codec ref (stack.lock.json → forgefx-midi.ref) to the released commit. CI then
-# validates the server against the new pin. Merging the PR adopts the pin; whether to also cut
-# a ForgeFX RELEASE is a human decision (see docs/RELEASING.md — wire/API-affecting or
-# catalog-affecting codec change → release; internal-only → the pin rides the next release).
+# pinned codec ref (stack.lock.json → forgefx-midi.ref) to the released commit. The PR is
+# labeled `bot/stack-sync` + `release:patch` and AUTO-MERGES once required checks are green,
+# which cuts a ForgeFX release by default. To adopt the pin WITHOUT releasing, add the
+# `release:none` label before it merges. Setting the repo Actions variable
+# RELEASE_AUTOMATION_ENABLED=false halts the auto-merge (the PR stays open for a manual merge).
 #
 # Can also be run manually (workflow_dispatch) with an explicit ref, or with an empty ref to
 # pin the codec's current default-branch HEAD.

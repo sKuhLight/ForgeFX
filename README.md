@@ -111,8 +111,8 @@ the gen-3 units share the virtual effect ids. Full detail in [docs/LAYOUTS.md](d
 
 | Path | What |
 |------|------|
-| `server/` | Node (Fastify) HTTP API + device client. `src/device.ts` is the serial-talking core; `src/index.ts` the routes. |
-| `vendor/` | the [`fractal-midi`](#credits--thanks) codec (SysEx framing, value codecs, gen-3 preset → grid decoder), vendored as a tarball. |
+| `server/` | Node (Fastify) HTTP API + device client. `src/index.ts` is the entry; `src/app.ts` defines the routes; per-device drivers live under `src/drivers/`. |
+| `../forgefx-midi` | the [`forgefx-midi`](#credits--thanks) codec (SysEx framing, value codecs, gen-3 preset → grid decoder) — a sibling checkout linked via `file:` and pinned in `stack.lock.json` for tag builds. |
 | `definitions/` | committed JSON data packs (block families → params, rosters, enum labels, cab IR names), loaded at runtime. |
 
 A web frontend, **[Axis](https://github.com/sKuhLight/Axis)**, lives in a separate repo and
