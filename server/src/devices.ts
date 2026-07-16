@@ -356,7 +356,7 @@ export const SLUG_FAMILY: Record<string, string> = {
 };
 
 type ParamDef = { paramId: number; name: string; displayLabel?: string; unit?: string };
-type RangeDef = { kind: string; displayMin: number; displayMax: number; typecode: number; scale?: number; step?: number };
+type RangeDef = { kind: string; displayMin: number; displayMax: number; typecode: number; scale?: number; step?: number; unit?: string };
 type ParamsByFamily = Record<string, ParamDef[]>;
 type Ranges = Record<string, Record<number, RangeDef>>;
 type RangeSections = Record<string, { stride: number; recordCount: number }>;

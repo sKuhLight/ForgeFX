@@ -1087,8 +1087,11 @@ class Gen3Driver implements DeviceDriver {
         const taperNib = (range.typecode >> 4) & 0xf;
         const log = (taperNib === 4 || taperNib === 5) && range.displayMin > 0;
         const v = wireToDisplay(raw, { displayMin: range.displayMin, displayMax: range.displayMax, displayScale: log ? 'log10' : 'linear' });
+        // Prefer the DEVICE-TRUE unit captured by the live-walk (RangeDef.unit, view 0x00)
+        // over the AM4-name-overlay catalog code; fall back to the overlay when absent
+        // (byte-source/.cache profiles carry no device-true unit).
         const unitCode = family ? this.#prof.params[family]?.find((x) => x.paramId === paramId)?.unit : undefined;
-        return { value: round3(v), norm, unit: (unitCode && UNIT_LABEL[unitCode]) || undefined, min: range.displayMin, max: range.displayMax, log: log || undefined };
+        return { value: round3(v), norm, unit: range.unit ?? ((unitCode && UNIT_LABEL[unitCode]) || undefined), min: range.displayMin, max: range.displayMax, log: log || undefined };
       } catch {
         /* fall through to 0..10 position */
       }

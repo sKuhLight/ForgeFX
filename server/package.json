@@ -1,6 +1,6 @@
 {
   "name": "forgefx-server",
-  "version": "0.6.28-beta",
+  "version": "0.6.29-beta",
   "private": true,
   "description": "ForgeFX — open HTTP API for Fractal devices. Node backend powered by fractal-midi.",
   "license": "MIT",
