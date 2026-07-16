@@ -85,8 +85,13 @@ const WALK_MAX_PARAM_ID = 127;
 function adaptRequest(transport: Transport, query: Uint8Array): Promise<Uint8Array | null> {
   const bytes = Array.from(query);
   const fn = bytes[5];
+  // Match the fn AND every echoed address byte: view f[6], block-lo f[8] + block-hi
+  // f[9] (effectId>=128), param-lo f[10] + param-hi f[11] (id>127). Matching only
+  // view+param-lo (the old code) can pair a high-block/high-param query with a stale
+  // reply for a different block/param — a desync that turns a slowdown into a wedge.
   const isEcho = (f: readonly number[]): boolean =>
-    isFractalHeaderFrame(f) && f[5] === fn && f[6] === bytes[6] && f[10] === bytes[10];
+    isFractalHeaderFrame(f) && f[5] === fn && f[6] === bytes[6]
+    && f[8] === bytes[8] && f[9] === bytes[9] && f[10] === bytes[10] && f[11] === bytes[11];
   return transport
     .request(bytes, { timeoutMs: 1000, quietMs: 20, match: (fs) => fs.some((f) => isEcho(f)) })
     .then((frames) => {
