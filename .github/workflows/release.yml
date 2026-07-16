@@ -193,6 +193,9 @@ jobs:
       contents: write
       packages: write
       issues: write
+    env:
+      # No checkout in this job — gh has no git context to infer the repo from.
+      GH_REPO: ${{ github.repository }}
     steps:
       # Emergency stop — leave the draft unpublished.
       - name: Emergency stop check

@@ -238,6 +238,7 @@ jobs:
         if: failure()
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}   # no git context if the failure preceded checkout
           NEXT: ${{ steps.ver.outputs.next }}
         shell: bash
         run: |
