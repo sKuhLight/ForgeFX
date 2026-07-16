@@ -1,0 +1,17 @@
+# Config for GitHub's auto-generated release notes (generate_release_notes: true in release.yml).
+# Categorizes merged PRs by their release:* label; bot pin-bumps and no-release PRs are excluded.
+changelog:
+  exclude:
+    labels:
+      - release:none
+      - bot/stack-sync
+  categories:
+    - title: Breaking
+      labels:
+        - release:major
+    - title: Features
+      labels:
+        - release:minor
+    - title: Fixes & changes
+      labels:
+        - "*"

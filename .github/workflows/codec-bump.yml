@@ -74,19 +74,24 @@ jobs:
             echo "changed=true" >> "$GITHUB_OUTPUT"
           fi
 
-      # A PAT (STACK_DISPATCH_TOKEN) makes the auto-PR's OWN CI run; with the fallback
-      # GITHUB_TOKEN the PR is still created, but its CI must be triggered manually
-      # (close/reopen the PR). Commits are authored as the maintainer, no AI attribution.
+      # A PAT (STACK_DISPATCH_TOKEN) makes the auto-PR's OWN CI run AND lets auto-merge fire the
+      # downstream release chain (a GITHUB_TOKEN merge would NOT trigger release-on-main's CI
+      # workflow_run). Stable branch per upstream (bump/forgefx-midi) → one living PR, no rivals.
+      # Commits are authored as the maintainer, no AI attribution.
       - name: Open pin-bump PR
+        id: cpr
         if: steps.pin.outputs.changed == 'true'
         uses: peter-evans/create-pull-request@v7
         with:
           token: ${{ secrets.STACK_DISPATCH_TOKEN || secrets.GITHUB_TOKEN }}
-          branch: bump/forgefx-midi-${{ steps.target.outputs.ref }}
+          branch: bump/forgefx-midi
           author: sKuhLight <sKuhLight@users.noreply.github.com>
           committer: sKuhLight <sKuhLight@users.noreply.github.com>
           commit-message: "stack: bump forgefx-midi pin to ${{ steps.target.outputs.ref }}"
           title: "stack: bump forgefx-midi pin to ${{ steps.target.outputs.ref }}"
+          labels: |
+            bot/stack-sync
+            release:patch
           body: |
             ## Codec pin bump
 
@@ -100,9 +105,34 @@ jobs:
             | sha | `${{ github.event.client_payload.sha || 'n/a' }}` |
             | pinned ref → | `${{ steps.target.outputs.ref }}` |
 
-            ### Decision (yours, on this PR)
-            - **Merge** = adopt the pin.
-            - **Cut a ForgeFX release too?**
-              - Wire/API surface or user-visible catalog change → **yes**, cut a ForgeFX
-                release (see `docs/RELEASING.md`).
-              - Internal-only codec change → **no**, let the pin ride along the next release.
+            Chain: ${{ github.event.client_payload.chain_id || '(none)' }}
+
+            ### Automation
+            - Auto-merges once required checks are green (this cuts a ForgeFX release by default).
+            - To **adopt the pin without releasing**, add the `release:none` label BEFORE it merges.
+            - To hold it, add `release:hold` (or set `RELEASE_AUTOMATION_ENABLED=false`).
+
+      # Enable auto-merge so the pin adopts + releases hands-off once checks pass. Must run under
+      # the PAT — a GITHUB_TOKEN merge would not trigger the downstream release-on-main chain.
+      # Soft-gated: no PAT → skip (the PR stays open for a manual merge).
+      - name: Enable auto-merge
+        if: steps.pin.outputs.changed == 'true' && steps.cpr.outputs.pull-request-number != ''
+        env:
+          GH_TOKEN: ${{ secrets.STACK_DISPATCH_TOKEN }}
+          PR: ${{ steps.cpr.outputs.pull-request-number }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ vars.RELEASE_AUTOMATION_ENABLED }}" = "false" ]; then
+            echo "::notice::RELEASE_AUTOMATION_ENABLED=false — auto-merge skipped; PR #$PR stays manual."
+            echo "Automation halted — auto-merge skipped; PR #$PR stays manual." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::notice::STACK_DISPATCH_TOKEN missing — leaving PR #$PR for a manual merge."
+            echo "PAT missing — auto-merge not enabled; PR #$PR stays manual." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          gh pr update-branch "$PR" || true      # refresh if the base moved; best-effort
+          gh pr merge "$PR" --auto --squash
+          echo "Auto-merge enabled on PR #$PR." >> "$GITHUB_STEP_SUMMARY"

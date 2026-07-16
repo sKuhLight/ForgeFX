@@ -1,10 +1,9 @@
 name: release-published
 
-# The ForgeFX → Axis release ripple (stage 2 → stage 3). Our releases are created as DRAFTS
-# by release.yml — PUBLISHING one is the deliberate "this is now real" step, so publishing
-# (not the draft) is what notifies Axis. Axis then opens its own stack-bump PR pinning this
-# server release AND the codec ref it shipped against (the two pins move together — Axis must
-# never pin a codec newer than the one ForgeFX shipped).
+# The ForgeFX → Axis release ripple (stage 2 → stage 3). Releases are created as DRAFTS by
+# release.yml and auto-published by its validate-and-publish job after the GHCR image is verified
+# multi-arch. Publishing is what notifies Axis: it opens its own stack-bump PR pinning THIS server
+# release AND the codec ref it shipped against (Axis must never pin a codec newer than ForgeFX's).
 on:
   release:
     types: [published]
@@ -19,20 +18,43 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.release.tag_name }}
-      - name: Gather release facts
+      - name: Gather release facts + build manifest
         id: facts
+        env:
+          TAG: ${{ github.event.release.tag_name }}
         shell: bash
         run: |
           set -euo pipefail
-          SERVER_VERSION="$(node -p "require('./server/package.json').version")"
+          # The version is derived from the tag (feature PRs never bump server/package.json).
+          SERVER_VERSION="${TAG#v}"
+          CODEC_REPO="$(jq -r '.["forgefx-midi"].repo // "sKuhLight/forgefx-midi"' stack.lock.json 2>/dev/null || echo "sKuhLight/forgefx-midi")"
           CODEC_REF="$(jq -r '.["forgefx-midi"].ref // empty' stack.lock.json 2>/dev/null || true)"
           SHA="$(git rev-parse HEAD)"
+          CHAIN_ID="ForgeFX@${TAG}"
+          IMG="ghcr.io/${GITHUB_REPOSITORY,,}:${TAG}"
+          # Rebuild the same release manifest inline (deterministic, no asset dependency).
+          MANIFEST="$(jq -nc \
+            --arg repository "${GITHUB_REPOSITORY}" \
+            --arg version "$SERVER_VERSION" \
+            --arg tag "$TAG" \
+            --arg commit "$SHA" \
+            --arg chainId "$CHAIN_ID" \
+            --arg codecRepo "$CODEC_REPO" \
+            --arg codecRef "$CODEC_REF" \
+            --arg image "$IMG" \
+            '{schemaVersion:1, repository:$repository, version:$version, tag:$tag, commit:$commit,
+              channel:"beta", chainId:$chainId,
+              upstream:{"forgefx-midi":{repo:$codecRepo, ref:$codecRef}},
+              artifacts:[$image], createdAt:(now|todateiso8601)}')"
           echo "Server version: $SERVER_VERSION"
           echo "Pinned codec ref: ${CODEC_REF:-<none — default branch>}"
           echo "Tag commit SHA: $SHA"
+          echo "chainId: $CHAIN_ID"
           echo "server_version=$SERVER_VERSION" >> "$GITHUB_OUTPUT"
           echo "codec_ref=$CODEC_REF" >> "$GITHUB_OUTPUT"
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "chain_id=$CHAIN_ID" >> "$GITHUB_OUTPUT"
+          echo "manifest=$MANIFEST" >> "$GITHUB_OUTPUT"
 
       # Soft-gated: no token → print a notice and succeed (never a red X on forks /
       # unconfigured repos). jq builds the JSON payload so refs/versions can't break quoting.
@@ -43,17 +65,22 @@ jobs:
           SHA: ${{ steps.facts.outputs.sha }}
           SERVER_VERSION: ${{ steps.facts.outputs.server_version }}
           CODEC_REF: ${{ steps.facts.outputs.codec_ref }}
+          CHAIN_ID: ${{ steps.facts.outputs.chain_id }}
+          MANIFEST: ${{ steps.facts.outputs.manifest }}
         run: |
           if [ -z "$TOKEN" ]; then
             echo "STACK_DISPATCH_TOKEN not configured — skipping Axis notify."
             exit 0
           fi
+          if [ -n "${MANIFEST:-}" ]; then MANIFEST_ARG="$MANIFEST"; else MANIFEST_ARG="null"; fi
           PAYLOAD="$(jq -nc \
             --arg tag "$TAG" \
             --arg sha "$SHA" \
             --arg server_version "$SERVER_VERSION" \
             --arg codec_ref "$CODEC_REF" \
-            '{event_type:"server-released", client_payload:{tag:$tag, sha:$sha, server_version:$server_version, codec_ref:$codec_ref}}')"
+            --arg chain_id "$CHAIN_ID" \
+            --argjson manifest "$MANIFEST_ARG" \
+            '{event_type:"server-released", client_payload:{tag:$tag, sha:$sha, server_version:$server_version, codec_ref:$codec_ref, chain_id:$chain_id, manifest:$manifest}}')"
           curl -sf -X POST \
             -H "Authorization: Bearer $TOKEN" \
             -H "Accept: application/vnd.github+json" \

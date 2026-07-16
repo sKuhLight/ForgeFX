@@ -1,0 +1,56 @@
+name: pr-labels
+
+# Sanity check for the release:* label that release-on-main reads after merge. Fails iff a PR
+# carries more than one release:* label; otherwise prints the effective release classification.
+# NOT a required check (informational) — configure branch protection separately.
+on:
+  pull_request:
+    types: [opened, reopened, labeled, unlabeled, synchronize]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  release-label:
+    name: release label sanity
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check single release:* label + report classification
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          LABELS="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR}" --jq '.labels[].name')"
+          REL="$(echo "$LABELS" | grep -E '^release:' || true)"
+          # Precedence: release:hold / release:none always win over a co-present bump label
+          # (the documented opt-out); only then do we fail on more than one bump label.
+          if echo "$REL" | grep -qx 'release:hold'; then
+            echo "Release classification: **release:hold**" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if echo "$REL" | grep -qx 'release:none'; then
+            echo "Release classification: **release:none**" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          BUMP="$(echo "$REL" | grep -E '^release:(patch|minor|major)$' || true)"
+          COUNT="$(echo -n "$BUMP" | grep -c . || true)"
+          if [ "$COUNT" -gt 1 ]; then
+            echo "::error::PR #$PR has multiple release:* labels: $(echo "$BUMP" | tr '\n' ' ')"
+            echo "Multiple release:* labels: $(echo "$BUMP" | tr '\n' ' ')" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          if [ "$COUNT" -eq 1 ]; then
+            echo "Release classification: **$BUMP**" >> "$GITHUB_STEP_SUMMARY"
+          else
+            # No release label → report the default (docs/ci-only → none, else patch).
+            FILES="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR}/files" --paginate --jq '.[].filename')"
+            NONDOCS="$(echo "$FILES" | grep -vE '(^docs/|^\.github/|\.md$)' || true)"
+            if [ -z "$NONDOCS" ]; then
+              echo "Release classification: **docs-only → none**" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "Release classification: **default → patch**" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          fi

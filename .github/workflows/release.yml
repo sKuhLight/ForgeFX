@@ -1,12 +1,13 @@
 name: release
 
 # Stage 2 of the cross-repo release chain (forgefx-midi → ForgeFX → Axis → axisapp.live).
-# Tag a version (e.g. v0.1.0-beta) to run the full test gate against the PINNED codec ref
-# (stack.lock.json), build the multi-arch Docker image, push it to GHCR, and open a DRAFT
-# GitHub release for you to review and publish. See docs/RELEASING.md.
+# A tag (pushed by release-on-main.yml, e.g. v0.6.30-beta) runs the full test gate against the
+# PINNED codec ref (stack.lock.json), builds the multi-arch Docker image, pushes it to GHCR as
+# :tag, and opens a DRAFT release. validate-and-publish then asserts the image is multi-arch,
+# publishes the release, and moves :latest. See docs/RELEASING.md.
 #
-# NOTE: CI (ci.yml) always tracks codec default-branch HEAD — only these tag builds pin the
-# sibling ref via stack.lock.json, so a release is reproducible against a known codec commit.
+# The version is NOT committed in feature PRs — it is derived from the tag and injected into
+# server/package.json in every job that builds or reports it (--allow-same-version keeps it safe).
 on:
   push:
     tags: ['v*']
@@ -14,6 +15,10 @@ on:
 permissions:
   contents: write
   packages: write
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
 
 jobs:
   gate:
@@ -52,6 +57,10 @@ jobs:
           cache-dependency-path: |
             ForgeFX/server/package-lock.json
             forgefx-midi/package-lock.json
+      # Derive the shipped version from the tag (feature PRs never bump it).
+      - name: Inject release version into server/package.json
+        working-directory: ForgeFX/server
+        run: npm version "${GITHUB_REF_NAME#v}" --no-git-tag-version --allow-same-version
       - name: Build codec (server exports resolve to dist/)
         working-directory: forgefx-midi
         run: |
@@ -71,6 +80,11 @@ jobs:
     needs: gate
     steps:
       - uses: actions/checkout@v4
+      # Derive the shipped version from the tag so the image carries the right version
+      # (the Dockerfile COPYs server/package.json into the build).
+      - name: Inject release version into server/package.json
+        working-directory: server
+        run: npm version "${GITHUB_REF_NAME#v}" --no-git-tag-version --allow-same-version
       # the Dockerfile builds the sibling forgefx-midi codec in-image — stage a copy of it
       # inside the build context (see Dockerfile header + ci.yml), pinned to the codec ref
       # from stack.lock.json so the image matches the gated stack.
@@ -100,6 +114,8 @@ jobs:
       - name: Lowercase image name (GHCR requires lowercase)
         id: img
         run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+      # Push :tag ONLY. :latest is moved by validate-and-publish after the draft is validated,
+      # so an unreviewed/unvalidated image never becomes :latest.
       - name: Build & push (amd64 + arm64)
         uses: docker/build-push-action@v6
         with:
@@ -108,7 +124,6 @@ jobs:
           push: true
           tags: |
             ${{ steps.img.outputs.name }}:${{ github.ref_name }}
-            ${{ steps.img.outputs.name }}:latest
 
   release:
     name: draft github release
@@ -116,15 +131,44 @@ jobs:
     needs: [gate, docker]
     steps:
       - uses: actions/checkout@v4
+      # Derive the shipped version from the tag before it is read into the draft body.
+      - name: Inject release version into server/package.json
+        working-directory: server
+        run: npm version "${GITHUB_REF_NAME#v}" --no-git-tag-version --allow-same-version
       - name: Read server version
         id: ver
         run: echo "server=$(node -p "require('./server/package.json').version")" >> "$GITHUB_OUTPUT"
+      # Release manifest — the machine-readable record of what shipped (schemaVersion 1).
+      # Uploaded as a release asset and mirrored into the server-released dispatch payload.
+      - name: Build release manifest
+        run: |
+          set -euo pipefail
+          V="${GITHUB_REF_NAME#v}"
+          IMG="ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_REF_NAME}"
+          CODEC_REPO="$(jq -r '.["forgefx-midi"].repo // "sKuhLight/forgefx-midi"' stack.lock.json)"
+          CODEC_REF="$(jq -r '.["forgefx-midi"].ref // empty' stack.lock.json)"
+          jq -nc \
+            --arg repository "${GITHUB_REPOSITORY}" \
+            --arg version "$V" \
+            --arg tag "${GITHUB_REF_NAME}" \
+            --arg commit "${GITHUB_SHA}" \
+            --arg chainId "ForgeFX@${GITHUB_REF_NAME}" \
+            --arg codecRepo "$CODEC_REPO" \
+            --arg codecRef "$CODEC_REF" \
+            --arg image "$IMG" \
+            '{schemaVersion:1, repository:$repository, version:$version, tag:$tag, commit:$commit,
+              channel:"beta", chainId:$chainId,
+              upstream:{"forgefx-midi":{repo:$codecRepo, ref:$codecRef}},
+              artifacts:[$image], createdAt:(now|todateiso8601)}' \
+            > release-manifest.json
+          echo "release-manifest.json:"; cat release-manifest.json
       - name: Create draft release
         uses: softprops/action-gh-release@v2
         with:
           draft: true
           name: ForgeFX ${{ github.ref_name }}
           generate_release_notes: true
+          files: release-manifest.json
           body: |
             ForgeFX ${{ github.ref_name }} — community beta.
 
@@ -137,4 +181,82 @@ jobs:
             - forgefx-server: `${{ steps.ver.outputs.server }}`
             - forgefx-midi (pinned): `${{ needs.gate.outputs.codec-ref || 'default branch' }}`
 
+            chainId: `ForgeFX@${{ github.ref_name }}`
+
             Independent, third-party software. Not affiliated with Fractal Audio Systems. Use at your own risk — see DISCLAIMER.md.
+
+  validate-and-publish:
+    name: validate GHCR image + publish
+    runs-on: ubuntu-latest
+    needs: [gate, docker, release]
+    permissions:
+      contents: write
+      packages: write
+      issues: write
+    steps:
+      # Emergency stop — leave the draft unpublished.
+      - name: Emergency stop check
+        id: stop
+        shell: bash
+        run: |
+          if [ "${{ vars.RELEASE_AUTOMATION_ENABLED }}" = "false" ]; then
+            echo "::notice::RELEASE_AUTOMATION_ENABLED=false — leaving draft unpublished."
+            echo "Automation halted — draft left unpublished." >> "$GITHUB_STEP_SUMMARY"
+            echo "halt=1" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Set up Buildx
+        if: steps.stop.outputs.halt != '1'
+        uses: docker/setup-buildx-action@v3
+      - name: Log in to GHCR
+        if: steps.stop.outputs.halt != '1'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Assert multi-arch image (amd64 + arm64)
+        id: img
+        if: steps.stop.outputs.halt != '1'
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMG="ghcr.io/${GITHUB_REPOSITORY,,}"
+          echo "name=$IMG" >> "$GITHUB_OUTPUT"
+          INSPECT="$(docker buildx imagetools inspect "${IMG}:${GITHUB_REF_NAME}")"
+          echo "$INSPECT"
+          echo "$INSPECT" | grep -q 'linux/amd64' || { echo "::error::image ${IMG}:${GITHUB_REF_NAME} missing linux/amd64"; exit 1; }
+          echo "$INSPECT" | grep -q 'linux/arm64' || { echo "::error::image ${IMG}:${GITHUB_REF_NAME} missing linux/arm64"; exit 1; }
+          echo "Multi-arch image verified: ${IMG}:${GITHUB_REF_NAME} (amd64 + arm64)." >> "$GITHUB_STEP_SUMMARY"
+      # Publish with the PAT so the release:published event fires release-published.yml (which
+      # dispatches server-released to Axis). GITHUB_TOKEN-triggered events start no workflows, so
+      # without the PAT the publish still happens but the ripple to Axis stalls gracefully.
+      - name: Publish release
+        if: steps.stop.outputs.halt != '1'
+        env:
+          GH_TOKEN: ${{ secrets.STACK_DISPATCH_TOKEN || github.token }}
+        run: |
+          gh release edit "${GITHUB_REF_NAME}" --draft=false
+          echo "Published ${GITHUB_REF_NAME}." >> "$GITHUB_STEP_SUMMARY"
+      - name: Move :latest to the published tag
+        if: steps.stop.outputs.halt != '1'
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMG="${{ steps.img.outputs.name }}"
+          docker buildx imagetools create -t "${IMG}:latest" "${IMG}:${GITHUB_REF_NAME}"
+          echo "Moved :latest → ${GITHUB_REF_NAME}." >> "$GITHUB_STEP_SUMMARY"
+      - name: Failure notify
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          CHAIN="ForgeFX@${GITHUB_REF_NAME}"
+          BODY="ForgeFX validate-and-publish failed (${CHAIN}); the draft was left unpublished. Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          EXISTING="$(gh issue list --label release-failure --state open --search "$CHAIN" --json number --jq '.[0].number // empty' || true)"
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --body "$BODY"
+          else
+            gh issue create --title "release chain failure: ForgeFX ${CHAIN}" --label release-failure --body "$BODY"
+          fi
