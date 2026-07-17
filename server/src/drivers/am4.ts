@@ -403,9 +403,10 @@ class Am4Driver implements DeviceDriver {
   //   fn-0x1F hash dumps (#hashPlacedParams) ONLY when:
   //     • edited bit false→true (and not self-edit): emit `changed` IMMEDIATELY (before the slow hash),
   //       then hash once to seed the successive-edit baseline (skipped when rehashing is disabled).
-  //     • bit stays latched: re-hash at most every ctx.getCadence().editRehashMs (3000 perf / 5000
-  //       balanced / 0 = DISABLED in reduced — then edits reflect on save/scene/channel only). A hash
-  //       diff ⇒ `changed` + new baseline.
+  //     • bit stays latched: re-hash at most every ctx.getCadence().editRehashMs — but this is now 0
+  //       (DISABLED) in EVERY mode (FORGEFX-25 follow-up: the periodic latched re-dump glitched AM4 audio
+  //       after a channel swap). With rehashMs=0 this branch never runs; on-device edits reflect on
+  //       save/scene/channel only. Kept parameterised so a future view-gated rehash can re-enable it.
   //     • edited bit true→false (device-side save): emit `changed` (name/location may have changed) and
   //       reset the hash baseline cheaply — no dump.
   //   #selfEditPending (our own write dirtied the buffer): silent re-seed, no `changed`; the seed hash

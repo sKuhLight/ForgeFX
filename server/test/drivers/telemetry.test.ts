@@ -46,7 +46,7 @@ function cadenceUnit(): void {
   assertEqual(g3bal.tunerMs, 55, 'gen-3 tunerMs');
   const g3perf = cadenceFor(0x11, 'performance');
   assertEqual(g3perf.meterTickMs, 60, 'gen-3 performance meterTickMs');
-  assertEqual(g3perf.editRehashMs, 3000, 'performance editRehashMs');
+  assertEqual(g3perf.editRehashMs, 0, 'performance editRehashMs disabled (latched rehash off in all modes)');
   const g3red = cadenceFor(0x11, 'reduced');
   assertEqual(g3red.meterTickMs, 400, 'reduced meterTickMs');
   assertEqual(g3red.cpuEveryNTicks, 16, 'reduced cpuEveryNTicks');

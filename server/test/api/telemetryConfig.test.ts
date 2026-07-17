@@ -32,19 +32,20 @@ export async function runTelemetryConfigTests(): Promise<void> {
     assertEqual(gd.effective.sceneEveryNTicks, 8, 'balanced sceneEveryNTicks (latency held stable)');
     assertEqual(gd.effective.tunerMs, 55, 'gen-3 tunerMs (family-fixed)');
 
-    // 2 — PUT performance round-trips + tightens the effective cadence (60 / 1500 / editRehash 3000)
+    // 2 — PUT performance round-trips + tightens the effective cadence (60 / 1500). editRehash is now 0
+    //     in EVERY mode (FORGEFX-25 follow-up: the AM4 latched re-dump glitched audio after a channel swap).
     const p = await app.inject({ method: 'PUT', url: '/telemetry/config', payload: { mode: 'performance' } });
     assertEqual(p.statusCode, 200, 'PUT performance status');
     const pd = p.json() as Dto;
     assertEqual(pd.mode, 'performance', 'PUT echoes performance');
     assertEqual(pd.effective.meterTickMs, 60, 'performance meterTickMs');
     assertEqual(pd.effective.editWatchMs, 1500, 'performance editWatchMs');
-    assertEqual(pd.effective.editRehashMs, 3000, 'performance editRehashMs');
+    assertEqual(pd.effective.editRehashMs, 0, 'performance editRehashMs disabled (latched rehash off in all modes)');
     // GET now reflects the switch (in-memory persistence)
     const g2 = (await app.inject({ method: 'GET', url: '/telemetry/config' })).json() as Dto;
     assertEqual(g2.mode, 'performance', 'GET reflects the switch');
 
-    // 3 — reduced disables editRehash (0) and coarsens the meter tick (400) + CPU cadence (16)
+    // 3 — reduced coarsens the meter tick (400) + CPU cadence (16); editRehash stays 0 (as in all modes)
     const r = (await app.inject({ method: 'PUT', url: '/telemetry/config', payload: { mode: 'reduced' } })).json() as Dto;
     assertEqual(r.effective.meterTickMs, 400, 'reduced meterTickMs');
     assertEqual(r.effective.cpuEveryNTicks, 16, 'reduced cpuEveryNTicks');

@@ -7,7 +7,8 @@
 //   performance — tightest cadence (snappiest meters/edit-watch), highest link cost.
 //   balanced    — server DEFAULT. Slightly relaxed meter tick + edit-watch vs. today (invisible
 //                 smoothing); scene/channel latency held stable by keeping the every-Nth offsets at 8.
-//   reduced      — coarsest cadence for constrained links / battery; editRehash disabled.
+//   reduced      — coarsest cadence for constrained links / battery.
+// (AM4 latched-rehash is now disabled in ALL modes — see editRehashMs below.)
 
 export type TelemetryMode = 'performance' | 'balanced' | 'reduced';
 
@@ -73,6 +74,11 @@ export function cadenceFor(modelId: number | null, mode: TelemetryMode): Cadence
     editWatchMs: [1500, 2000, 4000][i]!,
     editWatchSlowMs: [4000, 4000, 8000][i]!,
     tunerMs: fam === 'am4' ? 100 : 55,
-    editRehashMs: [3000, 5000, 0][i]!
+    // Latched-rehash DISABLED in every mode (FORGEFX-25 follow-up): while the AM4 active-buffer edited
+    // bit stays latched (e.g. after a channel swap), periodically re-dumping all placed blocks via fn-0x1F
+    // put a ~2.7 KB multi-frame burst on the AM4 MIDI link every few seconds and audibly glitched its
+    // audio engine. Reloads now ride the CHEAP transitions only (dirty-onset false→true, scene, channel,
+    // save true→false); a 2nd on-device tweak while already dirty reflects on the next such event.
+    editRehashMs: [0, 0, 0][i]!
   };
 }

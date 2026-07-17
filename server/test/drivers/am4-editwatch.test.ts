@@ -1,8 +1,11 @@
-// AM4 transition-gated edit-watch unit tests (FORGEFX-25 — fixes the audio dropouts). Drives the AM4
-// driver's readDeviceEditState() directly against a scripted MockTransport and asserts ON THE WIRE:
-// the heavy fn-0x1F GET_ALL_PARAMS dumps (byte[5]===0x1f) fire ONLY on the gated transitions, never on
-// the steady-latched path. An injected clock (driver.__setClockForTest) makes the rehash budget + cache
-// TTLs deterministic. NO hardware.
+// AM4 edit-watch unit tests (FORGEFX-25 + follow-up — fixes the audio dropouts). Drives the AM4 driver's
+// readDeviceEditState() directly against a scripted MockTransport and asserts ON THE WIRE that the heavy
+// fn-0x1F GET_ALL_PARAMS dumps (byte[5]===0x1f) NEVER fire: the periodic latched re-dump glitched AM4
+// audio after a channel swap, so latched-rehash is now disabled in EVERY mode (editRehashMs=0). Reloads
+// ride the CHEAP transitions only — dirty-onset false→true, scene, channel, save true→false — each of
+// which emits WITHOUT a dump. An injected clock (driver.__setClockForTest) keeps cache TTLs deterministic.
+// NO hardware. (The #hashPlacedParams path stays parameterised behind rehashMs>0 for a future view-gated
+// rehash; with rehashMs=0 it is never reached, which is what these tests pin.)
 //
 // Wire cheat-sheet (all AM4 frames are F0 00 01 74 15 <fn> …):
 //   fn 0x01 buildReadParam — pidLow 0 (bytes6,7=0)  → GET_PATCH edited-bit read (via conn.send)
@@ -117,34 +120,35 @@ export async function runAm4EditWatchTests(): Promise<void> {
     // sanity: DRIVE resolves to a real placed block (else the struct has nothing to dump/hash).
     assert(resolveBlockTypeValue(DRIVE)?.name === 'drive', 'DRIVE code resolves to the drive block');
 
-    // ── A. false→true transition + steady-latched (ZERO dumps) + rehash-after-budget (performance) ──
+    // ── A. false→true onset + steady-latched — ZERO dumps in EVERY mode (latched rehash disabled) ──
     {
       const st: RigState = { edited: false, scene: 0, channelIdx: null, dumpValue: 10 };
-      const { mock, events, driver } = rig('performance', st); // editWatchMs 1500, editRehashMs 3000
+      const { mock, events, driver } = rig('performance', st); // performance: editWatchMs 1500, editRehashMs 0 (rehash off)
       let clock = 1000; driver.__setClockForTest(() => clock);
 
       // tick 1: clean first run → adopt baseline, no dump, no emit.
       clock = 1000; assertEqual(await tickChanged(driver, events), 0, 'A1 clean first tick: no changed');
       assertEqual(dumps(mock), 0, 'A1 clean first tick issues ZERO dumps');
 
-      // tick 2: false→true → EXACTLY one `changed` + one seed dump burst (one placed block → one dump).
+      // tick 2: false→true → EXACTLY one `changed`, and ZERO dumps (no seed dump — rehash disabled).
       st.edited = true; clock = 1100;
       assertEqual(await tickChanged(driver, events), 1, 'A2 false→true emits exactly one changed');
-      assertEqual(dumps(mock), 1, 'A2 false→true seeds exactly one dump burst');
+      assertEqual(dumps(mock), 0, 'A2 false→true issues ZERO dumps (latched rehash disabled)');
 
-      // ticks 3–4: bit stays latched, budget NOT elapsed → ZERO further dumps, no changed.
+      // ticks 3–4: bit stays latched → still ZERO dumps, no changed.
       clock = 1600; assertEqual(await tickChanged(driver, events), 0, 'A3 latched-steady: no changed');
       clock = 2100; await tickChanged(driver, events);
-      assertEqual(dumps(mock), 1, 'A3/A4 steady latched ticks issue ZERO additional dumps until rehash budget elapses');
+      assertEqual(dumps(mock), 0, 'A3/A4 steady latched ticks issue ZERO dumps');
 
-      // tick 5: budget elapsed (>=3000 since seed at 1100) AND the fingerprint changed → rehash + changed.
+      // tick 5: a 2nd on-device param tweak while ALREADY dirty is NOT reloaded (accepted tradeoff — the
+      // fingerprint rehash that used to catch this is disabled; reflection resumes on save/scene/channel).
       st.dumpValue = 20; clock = 4200;
-      assertEqual(await tickChanged(driver, events), 1, 'A5 rehash after budget with a changed hash → changed');
-      assertEqual(dumps(mock), 2, 'A5 rehash issues exactly one more dump');
+      assertEqual(await tickChanged(driver, events), 0, 'A5 a 2nd on-device tweak while latched is NOT reloaded (rehash disabled)');
+      assertEqual(dumps(mock), 0, 'A5 no rehash dump ever');
 
-      // tick 6: latched, budget not re-elapsed → no dump.
+      // tick 6: still latched → still no dump.
       clock = 4700; await tickChanged(driver, events);
-      assertEqual(dumps(mock), 2, 'A6 post-rehash steady tick issues no dump');
+      assertEqual(dumps(mock), 0, 'A6 steady tick issues no dump');
     }
 
     // ── B. true→false (device-side save): `changed` emitted, NO dump ──────────────────────────────
@@ -152,11 +156,11 @@ export async function runAm4EditWatchTests(): Promise<void> {
       const st: RigState = { edited: true, scene: 0, channelIdx: null, dumpValue: 5 };
       const { mock, events, driver } = rig('performance', st);
       let clock = 1000; driver.__setClockForTest(() => clock);
-      clock = 1000; await tickChanged(driver, events); // first run, dirty → seed dump
-      assertEqual(dumps(mock), 1, 'B seed dump on the dirty first tick');
+      clock = 1000; await tickChanged(driver, events); // first run, dirty → adopt baseline, NO dump (rehash disabled)
+      assertEqual(dumps(mock), 0, 'B dirty first tick issues NO dump (rehash disabled)');
       st.edited = false; clock = 2600;
       assertEqual(await tickChanged(driver, events), 1, 'B save (true→false) emits changed');
-      assertEqual(dumps(mock), 1, 'B save issues NO dump (baseline reset is cheap)');
+      assertEqual(dumps(mock), 0, 'B save issues NO dump (baseline reset is cheap)');
     }
 
     // ── C. reduced mode (editRehashMs=0): NO dumps ever on latched-steady; save still emits ──────────
@@ -176,7 +180,7 @@ export async function runAm4EditWatchTests(): Promise<void> {
       assertEqual(dumps(mock), 0, 'C save path issues no dump in reduced mode');
     }
 
-    // ── D. self-edit pending: silent re-seed (no `changed`), baseline stays consistent for the next edit ──
+    // ── D. self-edit pending: silent re-seed (no `changed`), ZERO dumps ──────────────────────────────
     {
       const st: RigState = { edited: false, scene: 0, channelIdx: null, dumpValue: 100 };
       const { mock, events, driver } = rig('performance', st);
@@ -185,12 +189,13 @@ export async function runAm4EditWatchTests(): Promise<void> {
       // our own write flips #selfEditPending; the buffer is now dirty.
       await driver.setBypass!(DRIVE, true);
       st.edited = true; st.dumpValue = 100; clock = 1500;
-      const dumpsBeforeSelfSeed = dumps(mock);
       assertEqual(await tickChanged(driver, events), 0, 'D self-edit tick emits NO changed (silent re-seed)');
-      assert(dumps(mock) === dumpsBeforeSelfSeed + 1, 'D self-edit re-seeds the baseline with one dump');
-      // proof the re-seed is CONSISTENT: a later front-panel edit (changed fingerprint) is still detected.
-      st.dumpValue = 200; clock = 5000; // > 3000 budget since the seed
-      assertEqual(await tickChanged(driver, events), 1, 'D a front-panel edit AFTER a self-edit is still detected');
+      assertEqual(dumps(mock), 0, 'D self-edit re-seed issues ZERO dumps (rehash disabled)');
+      // With latched-rehash disabled, a later on-device param tweak while STILL dirty is NOT reloaded
+      // (accepted tradeoff — reflection resumes on save/scene/channel, tested in B/E/F).
+      st.dumpValue = 200; clock = 5000;
+      assertEqual(await tickChanged(driver, events), 0, 'D a later on-device param tweak while dirty is NOT reloaded (rehash disabled)');
+      assertEqual(dumps(mock), 0, 'D no dump across the whole self-edit path');
     }
 
     // ── E. scene detection every tick (no edited bit, no dump) ───────────────────────────────────────
