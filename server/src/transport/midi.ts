@@ -229,19 +229,36 @@ export class MidiTransport implements Transport {
     return new Promise((resolve) => {
       const frames: number[][] = [];
       let quietTimer: ReturnType<typeof setTimeout> | null = null;
-      const done = () => {
+      let hardTimer: ReturnType<typeof setTimeout> | null = null;
+      let drainingLate = false;
+      const clear = () => {
         if (quietTimer) clearTimeout(quietTimer);
-        clearTimeout(hardTimer);
+        if (hardTimer) clearTimeout(hardTimer);
         this.#handlers.delete(handler);
-        resolve(frames);
+      };
+      const finish = () => { clear(); resolve(frames); };
+      const armQuiet = () => {
+        if (quietTimer) clearTimeout(quietTimer);
+        quietTimer = setTimeout(finish, quietMs);
       };
       const handler = (frame: number[]) => {
+        if (drainingLate) {
+          console.warn(`[forgefx][midi] late RX after timeout fn=0x${(frame[5] ?? 0).toString(16)} len=${frame.length}`);
+          armQuiet();
+          return;
+        }
         frames.push(frame);
-        if (match?.(frames)) return done();
-        if (quietTimer) clearTimeout(quietTimer);
-        quietTimer = setTimeout(done, quietMs);
+        if (match?.(frames)) return finish();
+        // A matched request has a concrete response owner. Do not let unrelated stale frames quiet-complete
+        // it; that releases the queue before the real reply arrives and poisons the next request.
+        if (!match) armQuiet();
       };
-      const hardTimer = setTimeout(done, timeoutMs);
+      hardTimer = setTimeout(() => {
+        if (!match) return finish();
+        drainingLate = true;
+        console.warn(`[forgefx][midi] request timeout fn=0x${(bytes[5] ?? 0).toString(16)} frames=${frames.length}; draining late RX`);
+        armQuiet();
+      }, timeoutMs);
       this.#handlers.add(handler);
       this.send(bytes);
     });
