@@ -609,8 +609,21 @@ export function runtimeProfileFrom(built: BuiltCache, staticProfile: DeviceProfi
     rosterFor(slug: string): TypeModel[] {
       const fam = SLUG_FAMILY[slug.toLowerCase()];
       const cacheRoster = fam ? builtRosters[fam] : undefined;
-      if (!cacheRoster?.length) return staticProfile.rosterFor(slug); // walk didn't map this family → static
-      const byValue = new Map(staticProfile.rosterFor(slug).map((t) => [t.value, t]));
+      const staticRoster = staticProfile.rosterFor(slug);
+      if (!cacheRoster?.length) return staticRoster; // walk didn't map this family → static
+      // gen-3 drivers rescale the device's raw type value against `roster.length - 1` (the highest
+      // ordinal): a cache roster SHORTER than the known-good static one is an incomplete walk (a
+      // dropped reply truncated the enum-label sweep — see forgefx-midi liveWalk's retry fix), and
+      // trusting its length silently shifts every raw value near the top of the range to the WRONG
+      // model (observed: FM3 DISTORT's cache came back 330/331, decoding "USA MK IIC++" as "Friedman
+      // HBE V3"). Fall back to the static roster whole rather than risk that shift; a cache roster
+      // that meets or beats the static count (current firmware, or a family static never covered) is
+      // still device-true and wins as before.
+      if (staticRoster.length > 0 && cacheRoster.length < staticRoster.length) {
+        console.warn(`[devices] cache roster for ${fam} is short (${cacheRoster.length} < ${staticRoster.length} static) — falling back to the static roster`);
+        return staticRoster;
+      }
+      const byValue = new Map(staticRoster.map((t) => [t.value, t]));
       return cacheRoster.map((t) => {
         const s = byValue.get(t.value);
         return { value: t.value, name: t.name, manufacturer: t.manufacturer ?? s?.manufacturer ?? null, basedOn: t.basedOn ?? s?.basedOn ?? null };

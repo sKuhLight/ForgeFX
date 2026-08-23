@@ -9,7 +9,7 @@ import * as deviceCache from '../../src/services/deviceCache.js';
 import * as store from '../../src/store.js';
 import type { BuiltCache, CacheRecord, LiveWalkOptions } from 'forgefx-midi/cache';
 import { buildDefQuery, VIEW_DEFINITION } from 'forgefx-midi/cache';
-import { FM3_PARAMS_BY_FAMILY } from 'forgefx-midi/gen3/fm3';
+import { FM3_PARAMS_BY_FAMILY, FM3_ROSTERS } from 'forgefx-midi/gen3/fm3';
 import type { DeviceEvent, DeviceDriver, DriverCapabilities } from '../../src/drivers/types.js';
 import { MockTransport, handshakeReply, isIdentifyBroadcast, assert, assertEqual, sleep } from '../helpers/mock.js';
 
@@ -74,19 +74,24 @@ function seedRecords(): CacheRecord[] {
   return recs;
 }
 
-/** A build doc with a distinctive DISTORT (amp) roster — proves the runtime profile serves it. */
+/** A build doc with a distinctive DISTORT (amp) roster — proves the runtime profile serves it.
+ *  Renames only entry 0 and keeps the REST of the static roster's names/count intact: a cache
+ *  roster shorter than the static one is (correctly, post-fix) distrusted and falls back to
+ *  static wholesale, so a fixture meant to prove "cache wins" must not itself look truncated. */
 function fakeCacheDoc(): BuiltCache {
+  const staticAmp = FM3_ROSTERS.amp;
+  const names = staticAmp.map((t, i) => (i === 0 ? 'FAKE CACHE AMP' : t.name));
   return {
-    enumOverrides: { DISTORT: { '0': ['FAKE CACHE AMP', 'Other Amp'] } },
+    enumOverrides: { DISTORT: { '0': names } },
     ranges: {},
     rangeSections: {},
-    rosters: { DISTORT: [{ value: 0, name: 'FAKE CACHE AMP', manufacturer: 'ACME', basedOn: 'Fake Stack' }, { value: 1, name: 'Other Amp', manufacturer: null, basedOn: null }] },
+    rosters: { DISTORT: names.map((name, value) => ({ value, name, manufacturer: value === 0 ? 'ACME' : null, basedOn: value === 0 ? 'Fake Stack' : null })) },
     cabIrs: {},
     unmappedSections: [],
     unmappedFamilies: [],
     model: FM3,
     firmware: '12.0',
-    meta: { recordCount: 2, builtAt: '2026-07-12T00:00:00.000Z', source: 'live' }
+    meta: { recordCount: names.length, builtAt: '2026-07-12T00:00:00.000Z', source: 'live' }
   };
 }
 
