@@ -598,9 +598,22 @@ export function runtimeProfileFrom(built: BuiltCache, staticProfile: DeviceProfi
   for (const [fam, rows] of Object.entries(staticProfile.ranges)) mergedRanges[fam] = { ...rows };
   for (const [fam, rows] of Object.entries(built.ranges ?? {})) mergedRanges[fam] = { ...(mergedRanges[fam] ?? {}), ...(rows as Record<number, RangeDef>) };
 
-  // rangeSections: same static-then-cache merge (per family).
+  // rangeSections: same static-then-cache merge (per family) — EXCEPT the wire stride, which the
+  // cache is not allowed to shrink. The walk-built `stride` is the count of records the walk actually
+  // collected for the section, i.e. a LOWER BOUND on its true width, not a measurement of it (an FM3
+  // walk brings back 126 of DISTORT's 144, 62 of CABINET's 106). #channelSlice multiplies that stride
+  // by the active channel, so a short stride points channel B-D at the middle of an earlier channel's
+  // slice and every value read there — the amp model included — is a real number from the wrong param.
+  // The catalog stride is hardware-validated, so take the WIDER of the two: the cache still adds
+  // sections the catalog lacks, and still contributes a wider stride if a firmware ever grows one.
   const mergedSections: RangeSections = { ...staticProfile.rangeSections };
-  for (const [fam, meta] of Object.entries(built.rangeSections ?? {})) mergedSections[fam] = meta as unknown as RangeSections[string];
+  for (const [fam, meta] of Object.entries(built.rangeSections ?? {})) {
+    const cached = meta as unknown as RangeSections[string];
+    const stat = mergedSections[fam];
+    mergedSections[fam] = stat
+      ? { ...cached, stride: Math.max(stat.stride, cached.stride), recordCount: Math.max(stat.recordCount, cached.recordCount) }
+      : cached;
+  }
 
   return {
     ...staticProfile,
