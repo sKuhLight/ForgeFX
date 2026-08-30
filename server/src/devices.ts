@@ -81,8 +81,14 @@ const VIRTUAL_EID_FAMILY: Record<number, string> = { 1: 'GLOBAL', 2: 'CONTROLLER
 const eidFamily = (map?: Record<number, string>) => (eid: number): string | undefined => map?.[eid] ?? VIRTUAL_EID_FAMILY[eid];
 
 // Parse a variant/page selector `value` ("10,11,12") into the numeric block-type values it activates.
+// Blank segments are dropped, so an EMPTY value ("") parses to NO values rather than to [0]: the editor
+// writes a blank value on a group's catch-all page (the default for every type its explicit siblings
+// don't name), and `Number('')` is 0 — without the blank filter that default reads as "type 0 only",
+// which both hides it from every other type and duplicates the type-0 page (see filterPagesBySelector).
 const parseSelectorValues = (value: string | null | undefined): number[] =>
-  value == null ? [] : value.split(',').map((s) => Number(s.trim())).filter((n) => Number.isFinite(n));
+  value == null
+    ? []
+    : value.split(',').map((s) => s.trim()).filter((s) => s !== '').map(Number).filter((n) => Number.isFinite(n));
 
 // Pick the block-type / firmware variant that matches the block's CURRENT type value:
 //   1. variants whose selector `value` list contains typeValue win (the normal per-type case);
@@ -130,24 +136,32 @@ const preferNewestFw = <T extends { fw?: EditorFwRange }>(items: T[]): T[] => {
 };
 
 // Selector filter for one group of same-named pages: a page with no selector value is always kept; a
-// selector-gated page is kept iff the block's CURRENT selector value is in its value list. When the
-// current value is unknown (selector not resolvable) we never include the whole set — prefer the page
-// whose list contains the block's type value, else the first gated page in editor order.
+// selector-gated page is kept iff the block's CURRENT selector value is in its value list. A gated page
+// with an EMPTY value list is the group's DEFAULT — the editor's catch-all, applying to every selector
+// value its explicit siblings don't name (the Amp block ends each of its Ideal/Authentic groups with
+// one; without it, the ~2/3 of amp models with no explicit Ideal page get no Ideal tab at all). It is
+// used only when nothing explicit matches. When the current value is unknown (selector not resolvable)
+// we never include the whole set — prefer the page whose list contains the block's type value, else the
+// group's default, else the first explicitly-gated page in editor order.
 const filterPagesBySelector = (
   group: EditorLayoutPage[],
   typeValue: number | undefined,
   selectors?: SelectorValues,
 ): EditorLayoutPage[] => {
-  const gated = group.filter((p) => p.selectorParamName != null && p.value != null);
-  if (!gated.length) return group; // nothing selector-gated → all pages always apply
-  const ungated = group.filter((p) => p.selectorParamName == null || p.value == null);
-  const cur = selectors?.(gated[0]!.selectorParamName!);
+  const isGated = (p: EditorLayoutPage) => p.selectorParamName != null && p.value != null;
+  const gated = group.filter((p) => isGated(p) && parseSelectorValues(p.value).length > 0);
+  const dflt = group.filter((p) => isGated(p) && parseSelectorValues(p.value).length === 0);
+  if (!gated.length && !dflt.length) return group; // nothing selector-gated → all pages always apply
+  const ungated = group.filter((p) => !isGated(p));
+  const cur = selectors?.((gated[0] ?? dflt[0])!.selectorParamName!);
   if (cur != null) {
-    // known current value → strict membership; a group that matches nothing contributes no page
-    return [...ungated, ...gated.filter((p) => parseSelectorValues(p.value).includes(cur))];
+    // known current value → strict membership, falling back to the group's default page
+    const hit = gated.filter((p) => parseSelectorValues(p.value).includes(cur));
+    return [...ungated, ...(hit.length ? hit : dflt)];
   }
   const byType = typeValue != null ? gated.filter((p) => parseSelectorValues(p.value).includes(typeValue)) : [];
-  return [...ungated, ...(byType.length ? byType : [gated[0]!])];
+  const fallback = dflt.length ? dflt : gated.length ? [gated[0]!] : [];
+  return [...ungated, ...(byType.length ? byType : fallback)];
 };
 
 // Drop controls that the newest firmware would hide: a control gated with an `lt` (only firmware < X)
