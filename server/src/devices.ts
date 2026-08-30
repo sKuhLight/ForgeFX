@@ -593,10 +593,26 @@ export function runtimeProfileFrom(built: BuiltCache, staticProfile: DeviceProfi
   const builtEnums = (built.enumOverrides ?? {}) as Record<string, Record<string, string[]>>;
   const builtCabIrs = built.cabIrs ?? {};
 
-  // ranges: static per-family maps, then the cache's rows merged over them (device-true wins).
+  // ranges: static per-family maps, then the cache's rows merged over them (device-true wins) —
+  // EXCEPT a walk row RE-CLASSIFYING a catalog-known pid. The live walk's enum/float split is a
+  // numeric heuristic (integral bounds + step/scale shape) gated on a label-list probe; it is not
+  // always reliable in EITHER direction — e.g. FM3 fw13.0 DISTORT_INPUTSELECT (paramId 21) walks as
+  // 'float' while the byte-identical REVERB selector (paramId 47) walks as 'enum' on the SAME
+  // device/build, and CABINET_LOCUT1/2 (paramId 62/63) walk as 'enum' despite being continuous Hz
+  // knobs. The static catalog's 'kind' is mined offline from the editor's own cache, so when the walk
+  // disagrees on a pid the static table already classifies, trust the static classification; the walk
+  // otherwise still wins everywhere else, including proving a NEW pid the static table lacks.
   const mergedRanges: Ranges = {};
   for (const [fam, rows] of Object.entries(staticProfile.ranges)) mergedRanges[fam] = { ...rows };
-  for (const [fam, rows] of Object.entries(built.ranges ?? {})) mergedRanges[fam] = { ...(mergedRanges[fam] ?? {}), ...(rows as Record<number, RangeDef>) };
+  for (const [fam, rows] of Object.entries(built.ranges ?? {})) {
+    const dst = (mergedRanges[fam] ??= {});
+    for (const [pidStr, row] of Object.entries(rows as Record<number, RangeDef>)) {
+      const pid = Number(pidStr);
+      const stat = dst[pid];
+      if (stat && stat.kind !== row.kind) continue;
+      dst[pid] = row;
+    }
+  }
 
   // rangeSections: same static-then-cache merge (per family).
   const mergedSections: RangeSections = { ...staticProfile.rangeSections };
