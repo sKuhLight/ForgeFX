@@ -24,6 +24,7 @@ import { runSyncPlanTests, SYNCPLAN_CASE_COUNT } from './api/syncplan.test.js';
 import { runRouterParityTests, ROUTER_PARITY_CASE_COUNT } from './api/router.test.js';
 import { runDeviceCacheTests, DEVICE_CACHE_CASE_COUNT } from './api/device-cache.test.js';
 import { runEditorCacheImportTests, EDITOR_CACHE_IMPORT_CASE_COUNT } from './api/editor-cache-import.test.js';
+import { runColorLabelsImportTests, COLOR_LABELS_IMPORT_CASE_COUNT } from './api/color-labels-import.test.js';
 import { runCloudProfilesTests, CLOUD_PROFILES_CASE_COUNT } from './api/cloud-profiles.test.js';
 import { runPresetConvertTests, PRESET_CONVERT_CASE_COUNT } from './api/preset-convert.test.js';
 import { runPresetConvertExportTests, PRESET_CONVERT_EXPORT_CASE_COUNT } from './api/preset-convert-export.test.js';
@@ -49,6 +50,7 @@ const tests: Array<{ name: string; run: () => void | Promise<void> }> = [
   { name: `api/router (${ROUTER_PARITY_CASE_COUNT} app↔runtime-router parity twins, mocked FM3)`, run: runRouterParityTests },
   { name: `api/device-cache (${DEVICE_CACHE_CASE_COUNT} cases, on-connect self-describe build, mocked FM3/AM4)`, run: runDeviceCacheTests },
   { name: `api/editor-cache-import (${EDITOR_CACHE_IMPORT_CASE_COUNT} cases, .cache byte-source import + disk discovery, mocked FM3/AM4)`, run: runEditorCacheImportTests },
+  { name: `api/color-labels-import (${COLOR_LABELS_IMPORT_CASE_COUNT} cases, FM3-Edit color-assignments parse + disk discovery, no device coupling)`, run: runColorLabelsImportTests },
   { name: `api/cloud-profiles (${CLOUD_PROFILES_CASE_COUNT} cases, shared profile check/pull/publish, mocked cloud)`, run: runCloudProfilesTests },
   { name: `api/preset-convert (${PRESET_CONVERT_CASE_COUNT} cases, cross-device convert offline/connected/501/caps, mocked)`, run: runPresetConvertTests },
   { name: `api/preset-convert-export (${PRESET_CONVERT_EXPORT_CASE_COUNT} cases, FM3→FM3 author round-trip + guards, mocked)`, run: runPresetConvertExportTests }

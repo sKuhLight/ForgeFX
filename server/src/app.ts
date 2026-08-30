@@ -28,6 +28,7 @@ import * as convert from './services/convert.js';
 import type { ConverterPreset } from 'forgefx-midi/convert';
 import * as deviceCache from './services/deviceCache.js';
 import * as editorCacheImport from './services/editorCacheImport.js';
+import * as colorLabelsImport from './services/colorLabelsImport.js';
 import * as editorCacheDiscovery from './services/editorCacheDiscovery.js';
 import * as cloudProfiles from './services/cloudProfiles.js';
 import * as store from './store.js';
@@ -147,6 +148,32 @@ export async function buildApp(registry: DeviceRegistry): Promise<FastifyInstanc
     const r = await editorCacheImport.importEditorCache(registry, store.defaultStore, bytes, { name, force });
     reply.code(r.code);
     return r.body;
+  });
+
+  // ── FM3-Edit preset-color import (color-assignments*.dat → tag names + colors; NOT device-coupled —
+  //    a preset-color file isn't tied to a connected device, so no persisted-cache/model/firmware
+  //    handling like the block above). See services/colorLabelsImport.ts + editorCacheDiscovery.ts. ──
+  app.get('/fm3edit/color-labels/sources', () => ({ candidates: editorCacheDiscovery.discoverColorAssignments() }));
+  // Import: raw octet-stream of the .dat file, OR JSON { path } to read a discovered candidate off disk.
+  // 422 on parse failure (mirrors editor-cache-import's cache-parse-failed handling).
+  app.post<{ Body: Buffer | { path?: string } }>('/fm3edit/color-labels/import', async (req, reply) => {
+    const b = req.body;
+    let bytes: Uint8Array;
+    if (b && !Buffer.isBuffer(b) && typeof b.path === 'string' && b.path) {
+      try { const read = editorCacheDiscovery.readCandidateFile(b.path); bytes = read.bytes; }
+      catch (e) { reply.code(400); return { error: 'cannot read path', message: (e as Error).message }; }
+    } else if (Buffer.isBuffer(b)) {
+      bytes = new Uint8Array(b);
+    } else {
+      reply.code(400); return { error: 'POST the .dat bytes as application/octet-stream, or JSON { path }' };
+    }
+    try {
+      const result = colorLabelsImport.parseColorAssignments(bytes);
+      return result;
+    } catch (e) {
+      reply.code(422);
+      return { error: 'color-labels-parse-failed', message: (e as Error).message };
+    }
   });
 
   // ── unified handlers ──────────────────────────────────────────────────────────────────────────

@@ -95,6 +95,44 @@ export function discoverEditorCaches(opts: DiscoverOpts = {}): EditorCacheCandid
   return out;
 }
 
+/** One discovered `color-assignments*.dat` file on disk (FM3-Edit preset-color labels). */
+export interface ColorAssignmentsCandidate {
+  path: string;
+  editor: string;
+  size: number;
+  mtime: string; // ISO
+}
+
+/** Scan the OS-conventional editor dirs for `color-assignments*.dat` files (glob, not hardcoded
+ *  `_iii`, since other Fractal editors may write a differently-suffixed file). Same fs-walking
+ *  as discoverEditorCaches — silently skips missing/unreadable dirs. */
+export function discoverColorAssignments(opts: DiscoverOpts = {}): ColorAssignmentsCandidate[] {
+  const platform = opts.platform ?? process.platform;
+  const home = opts.home ?? homedir();
+  const env = opts.env ?? process.env;
+  const fs = opts.fs ?? REAL_FS;
+
+  const out: ColorAssignmentsCandidate[] = [];
+  for (const base of baseDirs(platform, home, env, fs)) {
+    if (!fs.existsSync(base)) continue;
+    let editors: string[];
+    try { editors = fs.readdirSync(base); } catch { continue; }
+    for (const editor of editors) {
+      const dir = join(base, editor);
+      let files: string[];
+      try { files = fs.readdirSync(dir); } catch { continue; } // not a dir / unreadable
+      for (const file of files) {
+        if (!file.startsWith('color-assignments') || !file.endsWith('.dat')) continue;
+        const path = join(dir, file);
+        let st: { size: number; mtimeMs: number };
+        try { st = fs.statSync(path); } catch { continue; }
+        out.push({ path, editor, size: st.size, mtime: new Date(st.mtimeMs).toISOString() });
+      }
+    }
+  }
+  return out;
+}
+
 /** Read a discovered candidate off disk (for the `{ path }` import body). Returns the basename +
  *  raw bytes; throws if the file is missing/unreadable. Node-only (real fs). */
 export function readCandidateFile(path: string): { name: string; bytes: Uint8Array } {
