@@ -531,7 +531,6 @@ class Gen3Driver implements DeviceDriver {
     const knobs = defs.filter((p) => {
       const range = this.#prof.ranges[family]?.[p.paramId];
       if (range?.kind !== 'float') return false;
-      if (!KNOB_UNITS.has(p.unit ?? '')) return false;
       if (/bypass/i.test(p.displayLabel ?? p.name)) return false;
       if (range.displayMin === range.displayMax) return false; // unusable (0..0) knob
       if (seenIds.has(p.paramId)) return false; // dedupe same wire paramId (first wins)
