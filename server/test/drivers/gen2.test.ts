@@ -16,7 +16,7 @@ import type { DriverCtx, DeviceEvent } from '../../src/drivers/types.js';
 import { cadenceFor } from '../../src/drivers/telemetryProfiles.js';
 import { MockTransport, assert, assertEqual, hex } from '../helpers/mock.js';
 
-export const GEN2_CASE_COUNT = 8;
+export const GEN2_CASE_COUNT = 9;
 
 function makeDriver(): { driver: ReturnType<typeof createGen2Driver>; mock: MockTransport; events: DeviceEvent[] } {
   const mock = new MockTransport('midi', 'Axe-Fx II XL+');
@@ -74,11 +74,13 @@ export async function runGen2Tests(): Promise<void> {
     eqFrame(mock.sent[0], buildSetBlockChannel(AMP1, 'Y'), 'gen2 setChannel Y');
   }
 
-  // 6. placeCell → fn 0x5A grid cell (0-based row/col from Axis → 1-based wire), emits changed{grid}.
+  // 6. placeCell → fn 0x5A grid cell. W1.6: `row`/`col` are the SHARED 1-indexed grid coordinates
+  //    (the /preset/grid/cell contract; Axis sends 1-indexed for every device), and the gen-2 wire grid
+  //    is also 1-indexed → they pass straight through, like gen-3/AM4. (Was row+1/col+1.)
   {
     const { driver, mock, events } = makeDriver();
-    await driver.placeCell(1, 2, AMP1); // row 1, col 2 (0-based) → wire row 2, col 3
-    eqFrame(mock.sent[0], buildSetGridCell({ row: 2, col: 3, blockId: AMP1 }), 'gen2 placeCell');
+    await driver.placeCell(1, 2, AMP1); // 1-indexed row 1, col 2
+    eqFrame(mock.sent[0], buildSetGridCell({ row: 1, col: 2, blockId: AMP1 }), 'gen2 placeCell');
     assert(events.some((e) => e.type === 'changed' && e.scope === 'grid'), 'placeCell emits changed{grid}');
   }
 
@@ -95,5 +97,13 @@ export async function runGen2Tests(): Promise<void> {
     const { driver, mock } = makeDriver();
     await driver.selectPreset(42);
     eqFrame(mock.sent[0], buildSwitchPreset(42), 'gen2 selectPreset');
+  }
+
+  // 9. W1.6: the bottom-right cell (row 4, col 12) is addressable. The old +1 sent row 5 and threw
+  //    "buildSetGridCell: row out of range (1..4): 5".
+  {
+    const { driver, mock } = makeDriver();
+    await driver.placeCell(4, 12, AMP1);
+    eqFrame(mock.sent[0], buildSetGridCell({ row: 4, col: 12, blockId: AMP1 }), 'gen2 placeCell bottom-right cell');
   }
 }

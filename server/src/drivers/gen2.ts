@@ -343,11 +343,14 @@ class Gen2Driver implements DeviceDriver {
     return { ok: true };
   }
 
-  /** Grid edit (PUT /preset/grid/cell): place/clear a block. `row`/`col` are 0-based from Axis; the
-   *  gen-2 wire grid is 1-based, so add 1. `blockId` 0 = clear. */
+  /** Grid edit (PUT /preset/grid/cell): place/clear a block. `row`/`col` are the shared 1-indexed
+   *  grid coordinates (docs/api-design.md + the /preset/grid/cell contract, "1-indexed row/col,
+   *  matching FM-Edit") — the SAME convention Axis sends for every device. The gen-2 wire grid is also
+   *  1-indexed (buildSetGridCell validates 1..4/1..12), so they pass straight through, like gen-3/AM4.
+   *  `blockId` 0 = clear. */
   async placeCell(row: number, col: number, blockId: number): Promise<{ ok: boolean }> {
     const dev = await this.#openTransport();
-    const frame = buildSetGridCell({ row: row + 1, col: col + 1, blockId });
+    const frame = buildSetGridCell({ row, col, blockId });
     const frames = await dev.request(frame, { timeoutMs: 800, quietMs: 80, match: (fs) => fs.some(isSetGridCellResponse) });
     const ack = frames.find(isSetGridCellResponse);
     this.#invalidate();
