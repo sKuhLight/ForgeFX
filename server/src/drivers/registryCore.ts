@@ -368,6 +368,10 @@ export class DeviceRegistry {
     // too, so it re-primes silently instead of emitting a redundant `changed` (which would drive a
     // second, heavy grid reload on top of the scene handler's own lightweight refresh).
     if (e.type === 'scene') { this.#lastSceneIdx = e.index; this.#lastChannels = null; }
+    // A UI channel write (gen3 setChannel) emits `blockState` AFTER moving the device's active channel —
+    // keep the channel-watch baseline in sync (W2.4) so the next tick doesn't re-emit a redundant
+    // blockState against the stale baseline. (A scene event above also resets it.)
+    else if (e.type === 'blockState') this.#lastChannels = null;
     for (const fn of this.#subscribers) {
       try {
         fn(e);
@@ -907,6 +911,7 @@ export class DeviceRegistry {
     }
     this.#meterSkips = 0;
     let slow = false;
+    const step = this.#meterStep++; // advance once per tick; the every-Nth gates + #pollReflection read this snapshot
     try {
       const dev = await this.transport();
       // A slow link — a generic MIDI interface into 5-pin DIN (≈31.25 kbaud) — can't carry meter polling
@@ -937,48 +942,57 @@ export class DeviceRegistry {
         }
         this.#emit({ type: 'meters', out1L: this.#mDb[0]!, out1R: this.#mDb[1]!, out2L: this.#mDb[2]!, out2R: this.#mDb[3]! });
         // CPU is a heavy 590-byte read → poll it only occasionally (every Nth tick), off the meter path.
-        if (this.#meterStep % cad.cpuEveryNTicks === 0) {
+        if (step % cad.cpuEveryNTicks === 0) {
           const frames = await dev.request(buildCpuPoll(d.modelId), { timeoutMs: 400, quietMs: 25, match: (fs) => fs.some((f) => isCpuResponse(f)) });
           const f = frames.find((x) => isCpuResponse(x));
           if (f) this.#emit({ type: 'cpu', percent: cpuPercentFromRaw(parseCpuRawLoad(f)) });
         }
-        // Front-panel CHANNEL-change watch: a device-side amp/block A–D switch emits no unsolicited
-        // frame and moves no param value (only the active-channel pointer), so the edit-burst diff
-        // can't see it — the amp TYPE NAME is per-channel, so Axis showed the old channel's model.
-        // Poll the tiny fn 0x13 status dump on the meter round-robin (offset 2) and emit `blockState`
-        // on any block's active-channel delta → Axis re-reads only live scene/block state. First read
-        // only primes the baseline (no event).
-        if (this.#meterStep % cad.channelEveryNTicks === 2 && d.getActiveChannels) {
-          const chans = await d.getActiveChannels();
-          if (chans.size > 0) {
-            let moved = false;
-            if (this.#lastChannels) {
-              for (const [eid, ch] of chans) {
-                if (this.#lastChannels.get(eid) !== ch) { moved = true; break; }
-              }
-            }
-            if (moved) this.#emit({ type: 'blockState' });
-            this.#lastChannels = chans;
-          }
-        }
-        // Front-panel SCENE-change watch: gen-3 devices emit NO unsolicited frame on a scene switch
-        // (FM3 field report 2026-07-06 — the panel changed, Axis didn't follow), so poll the tiny
-        // fn 0x0C scene GET on the CPU cadence, offset half a cycle so the two heavier reads never
-        // share a tick. Emits the SAME `scene` event the setScene write path emits, so clients need
-        // no new wiring. First read only primes the baseline (no event).
-        if (this.#meterStep++ % cad.sceneEveryNTicks === 4 && d.getScene) {
-          const { index } = await d.getScene();
-          if (Number.isInteger(index) && index >= 0) {
-            if (this.#lastSceneIdx !== null && index !== this.#lastSceneIdx) this.#emit({ type: 'scene', index });
-            this.#lastSceneIdx = index;
-          }
-        }
       });
+      // W2.1: the cheap scene/channel reflection watches run on BOTH link speeds — on a slow link each
+      // tick is already the throttle (meterSlowMs), so wrapping them in the meter `if (!slow)` and
+      // disabling ALL device→UI reflection was wrong. The METERS above stay skipped on a slow link.
+      await this.#supervised(() => this.#pollReflection(step, cad, !slow));
     } catch {
       /* transient — keep polling */
     }
     // reschedule at the mode's meter tick (or the slow-link cadence)
     if (this.#metersTimer) this.#metersTimer = setTimeout(() => this.#pollMeters(), slow ? cad.meterSlowMs : cad.meterTickMs);
+  }
+
+  /** Front-panel SCENE + active-CHANNEL watches (W2.1). Run on EVERY tick regardless of link speed —
+   *  gated by the every-Nth divider on a fast link, but on a slow link each (meterSlowMs) tick already
+   *  IS the throttle. First read only primes the baseline (no event). Kept out of the meter `if (!slow)`
+   *  so a 5-pin-DIN link still reflects scene/channel changes even though its meters are skipped. */
+  async #pollReflection(step: number, cad: CadenceProfile, gated: boolean): Promise<void> {
+    const d = this.#active;
+    if (!d) return;
+    // CHANNEL-change watch: a device-side amp/block A–D switch emits no unsolicited frame and moves no
+    // param value (only the active-channel pointer), so the edit-burst diff can't see it — the amp TYPE
+    // NAME is per-channel, so Axis showed the old channel's model. Poll the tiny fn 0x13 status dump and
+    // emit `blockState` on any block's active-channel delta → Axis re-reads only live scene/block state.
+    if ((!gated || step % cad.channelEveryNTicks === 2) && d.getActiveChannels) {
+      const chans = await d.getActiveChannels();
+      if (chans.size > 0) {
+        let moved = false;
+        if (this.#lastChannels) {
+          for (const [eid, ch] of chans) {
+            if (this.#lastChannels.get(eid) !== ch) { moved = true; break; }
+          }
+        }
+        if (moved) this.#emit({ type: 'blockState' });
+        this.#lastChannels = chans;
+      }
+    }
+    // SCENE-change watch: gen-3 devices emit NO unsolicited frame on a scene switch (FM3 field report
+    // 2026-07-06 — the panel changed, Axis didn't follow), so poll the tiny fn 0x0C scene GET. Emits the
+    // SAME `scene` event the setScene write path emits, so clients need no new wiring.
+    if ((!gated || step % cad.sceneEveryNTicks === 4) && d.getScene) {
+      const { index } = await d.getScene();
+      if (Number.isInteger(index) && index >= 0) {
+        if (this.#lastSceneIdx !== null && index !== this.#lastSceneIdx) this.#emit({ type: 'scene', index });
+        this.#lastSceneIdx = index;
+      }
+    }
   }
 
   // ── device-edit watch (poll): catch front-panel edits on devices that DON'T push them (AM4 + FM3) ──
@@ -1017,8 +1031,9 @@ export class DeviceRegistry {
     let slow = false;
     try {
       const dev = await this.transport();
-      slow = dev.slow; // a generic 5-pin DIN adapter can't carry the extra poll — back off (see #pollMeters)
-      if (!slow) await this.#supervised(async () => {
+      slow = dev.slow; // a generic 5-pin DIN adapter throttles the poll (reschedule below) — but W2.1: it
+      //                  STILL runs; skipping it entirely left a slow link with no FM3 edit reflection at all.
+      await this.#supervised(async () => {
         const r = await d.readDeviceEditState!();
         if (r.changed) this.#emit({ type: 'changed', scope: 'preset' });
       });

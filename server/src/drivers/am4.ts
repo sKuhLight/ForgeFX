@@ -1001,6 +1001,7 @@ class Am4Driver implements DeviceDriver {
     const dev = await this.#openTransport();
     await dev.sendQueued(buildSwitchScene(index));
     this.#invalidate();
+    this.#ctx.emit({ type: 'scene', index }); // W2.5: like gen-3 setScene — other windows/remotes learn
     return { ok: true, scene: index };
   }
 
