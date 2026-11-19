@@ -4,6 +4,7 @@
 // 409 + force override, the 501 cacheImport gate (AM4), and the disk-discovery scan over a faked fs.
 // Mirrors device-cache.test.ts: mocked registry via __createRegistryForTest + app.inject().
 import '../helpers/env.js'; // MUST be first — points the conn override + data dir at throwaway paths
+import { join, sep } from 'node:path';
 import { buildApp } from '../../src/app.js';
 import { __createRegistryForTest } from '../../src/drivers/registry.js';
 import * as store from '../../src/store.js';
@@ -242,24 +243,29 @@ async function am4Import(): Promise<void> {
 // ── 6. disk discovery over a faked fs + endpoint shape ──
 async function discovery(): Promise<void> {
   // Fake a macOS layout: ~/Library/Application Support/Fractal Audio/<Editor>/effectDefinitions_*.cache
-  const base = '/home/tester/Library/Application Support/Fractal Audio';
+  // The discovery code builds its paths with node:path's join, which uses the HOST's separator even
+  // for a simulated platform, so the fake tree is keyed with the same join: a hard-coded '/' layout
+  // would not match on Windows (backslashes) and the scan would find nothing.
+  const home = '/home/tester';
+  const base = join(home, 'Library', 'Application Support', 'Fractal Audio');
   const tree: Record<string, string[]> = {
     [base]: ['FM3-Edit', 'Axe-Edit III', 'notes.txt'],
-    [`${base}/FM3-Edit`]: ['effectDefinitions_11_12p0.cache', 'other.bin'],
-    [`${base}/Axe-Edit III`]: ['effectDefinitions_10_25p0.cache']
+    [join(base, 'FM3-Edit')]: ['effectDefinitions_11_12p0.cache', 'other.bin'],
+    [join(base, 'Axe-Edit III')]: ['effectDefinitions_10_25p0.cache']
   };
   const fakeFs: DiscoveryFs = {
     existsSync: (p) => p === base,
     readdirSync: (p) => { const e = tree[p]; if (!e) throw new Error('ENOENT'); return e; },
     statSync: (p) => (p.endsWith('.cache') ? { size: 4096, mtimeMs: 1_700_000_000_000 } : (() => { throw new Error('EISDIR'); })())
   };
-  const found = discoverEditorCaches({ platform: 'darwin', home: '/home/tester', env: {}, fs: fakeFs });
+  const found = discoverEditorCaches({ platform: 'darwin', home, env: {}, fs: fakeFs });
   assertEqual(found.length, 2, 'two editor caches discovered');
   const fm3 = found.find((c) => c.model === 0x11);
   assert(fm3 != null, 'FM3 candidate found');
   assertEqual(fm3!.fwMajor, 12, 'FM3 candidate fw major');
   assertEqual(fm3!.file, 'effectDefinitions_11_12p0.cache', 'FM3 candidate file');
-  assert(fm3!.path.endsWith('/FM3-Edit/effectDefinitions_11_12p0.cache'), 'FM3 candidate path under its editor dir');
+  assert(fm3!.path.endsWith(`${sep}${join('FM3-Edit', 'effectDefinitions_11_12p0.cache')}`), 'FM3 candidate path under its editor dir');
+  assertEqual(fm3!.path, join(base, 'FM3-Edit', 'effectDefinitions_11_12p0.cache'), 'FM3 candidate path is the editor dir joined with the file');
   assertEqual(fm3!.size, 4096, 'FM3 candidate size');
   assert(found.some((c) => c.model === 0x10 && c.fwMajor === 25), 'Axe-Fx III candidate found');
 
