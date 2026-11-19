@@ -18,7 +18,7 @@ import { runtimeProfileFrom, isByteExactProfile } from '../../src/devices.js';
 import type { DeviceProfile } from '../../src/devices.js';
 import { assertEqual } from '../helpers/mock.js';
 
-export const WALK_RECLASSIFICATION_CASE_COUNT = 18;
+export const WALK_RECLASSIFICATION_CASE_COUNT = 32;
 
 const DISTORT = 'DISTORT';
 const CABINET = 'CABINET';
@@ -26,6 +26,7 @@ const INPUTSELECT_PID = 21; // catalog enum, live walk says float
 const LOCUT_PID = 62; // catalog float, live walk says enum (and carries a unit)
 const TRIODE_PID = 114; // catalog float, walk float with a refined range
 const NEW_PID = 999; // not in the catalog
+const GAP_PID = 500; // not in the catalog; only a placeholder row ever mentions it
 
 function synthProfile(): DeviceProfile {
   return {
@@ -77,6 +78,16 @@ function catalogKindStands(meta: Record<string, unknown> | undefined): boolean {
   return locut;
 }
 
+/** A cache whose only rows are placeholders (min === max) over a catalog float, a catalog enum and an unknown pid. */
+function placeholderBuilt(meta: Record<string, unknown> | undefined, extra: Record<number, unknown> = {}): never {
+  const ph = (kind: 'float' | 'enum') => ({ kind, displayMin: 0, displayMax: 0, scale: 0, step: 0, typecode: 0 });
+  return {
+    enumOverrides: {}, rosters: {}, cabIrs: {}, rangeSections: {},
+    ...(meta ? { meta } : {}),
+    ranges: { [DISTORT]: { [TRIODE_PID]: ph('float'), [INPUTSELECT_PID]: ph('enum'), [GAP_PID]: ph('float'), ...extra } },
+  } as never;
+}
+
 export function runWalkReclassificationTests(): void {
   // ---- live walk: the catalog's kind stands ----------------------------------------------
   const live = runtimeProfileFrom(builtWith({ source: 'live', recordCount: 3 }, 'Hz'), synthProfile());
@@ -105,6 +116,28 @@ export function runWalkReclassificationTests(): void {
   assertEqual(catalogKindStands({ recordCount: 3 }), true, 'a profile without a source (GET /device/cache calls it live) keeps the catalog kind');
   assertEqual(catalogKindStands(undefined), true, 'a profile without meta keeps the catalog kind');
   assertEqual(catalogKindStands({ source: 'from-the-future' }), true, 'an unknown source keeps the catalog kind');
+
+  // ---- placeholder rows (min === max) never overwrite a catalog range, unless byte-exact ----------
+  const PROVENANCE_NOT_BYTE_EXACT: Array<[string, Record<string, unknown> | undefined]> = [
+    ['live', { source: 'live' }],
+    ['cloud published from a live walk', { source: 'cloud', origin: 'live' }],
+    ['unknown provenance', undefined],
+  ];
+  for (const [label, meta] of PROVENANCE_NOT_BYTE_EXACT) {
+    const m = runtimeProfileFrom(placeholderBuilt(meta), synthProfile());
+    assertEqual(m.ranges[DISTORT]![TRIODE_PID]?.displayMax, 200, `${label}: a placeholder float row does not overwrite a catalog float range`);
+    assertEqual(m.ranges[DISTORT]![INPUTSELECT_PID]?.displayMax, 2, `${label}: a placeholder row of another kind does not overwrite a catalog enum range`);
+    assertEqual(m.ranges[DISTORT]![GAP_PID], undefined, `${label}: a placeholder row for a pid the catalog lacks is not added`);
+  }
+  // A real live row next to placeholders still lands (the guard is about min === max only).
+  const mixed = runtimeProfileFrom(placeholderBuilt({ source: 'live' }, { [NEW_PID]: { kind: 'float', displayMin: 0, displayMax: 5, scale: 1, step: 0, typecode: 0 } }), synthProfile());
+  assertEqual(mixed.ranges[DISTORT]![NEW_PID]?.displayMax, 5, 'a real live row for a new pid still lands next to placeholder rows');
+  // Byte-exact profiles keep today's behaviour: their placeholders are the device's own "unused slot".
+  for (const [label, meta] of [['editor-cache', { source: 'editor-cache' }], ['cloud published from an editor cache', { source: 'cloud', origin: 'bytes' }]] as const) {
+    const m = runtimeProfileFrom(placeholderBuilt(meta), synthProfile());
+    assertEqual(m.ranges[DISTORT]![TRIODE_PID]?.displayMax, 0, `${label}: a byte-exact placeholder row replaces the catalog range (unchanged behaviour)`);
+    assertEqual(m.ranges[DISTORT]![GAP_PID]?.displayMax, 0, `${label}: a byte-exact placeholder row for a new pid is kept (unchanged behaviour)`);
+  }
 
   // ---- the helper itself ---------------------------------------------------------------------
   assertEqual(isByteExactProfile({ source: 'bytes' }), true, "the codec's raw byte-source value is byte-exact");

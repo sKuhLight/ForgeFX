@@ -625,8 +625,9 @@ export function isByteExactProfile(meta: { source?: unknown; origin?: unknown } 
  *   • enumLabelsFor — `built.enumOverrides` first, else static.
  *   • ranges / rangeSections — the cache's per-family entries merged OVER the static ones. A profile
  *     that is not byte-exact (`isByteExactProfile`: a live walk, a cloud profile that came from one,
- *     unknown provenance) is the exception: it never re-classifies the kind of a catalog-known param
- *     and never shrinks a catalog stride (see the comments in the body).
+ *     unknown provenance) is the exception: it never re-classifies the kind of a catalog-known param,
+ *     never overwrites a catalog range with a placeholder row (min === max), and never shrinks a
+ *     catalog stride (see the comments in the body).
  *   • cabIrs — the cache's banks when non-empty, else static.
  * The model byte, grid dims, instanceLimits, params, layouts, FC/Mod/monitor models, and write mode
  * all stay from the static profile (the walk doesn't recover them). Pure — returns a fresh profile.
@@ -649,6 +650,11 @@ export function runtimeProfileFrom(built: BuiltCache, staticProfile: DeviceProfi
   // live row must not re-classify a pid the static catalog already classifies. The static row is
   // kept and only gains the walk's device-true unit. A live row still wins for a pid the catalog
   // lacks, and when it agrees on the kind (it then refines the display range).
+  // The other live-walk exception: a PLACEHOLDER row (displayMin === displayMax, typically 0..0: an
+  // unused slot, or a gap id no source knows) carries no range, so it never replaces a catalog row and
+  // is not added for a pid the catalog lacks. A byte-exact profile keeps its placeholders as they are:
+  // for its firmware an all-zero row says the slot is unused, which is device-true (and it is excluded
+  // from the knob/enum lists by its empty range).
   const mergedRanges: Ranges = {};
   for (const [fam, rows] of Object.entries(staticProfile.ranges)) mergedRanges[fam] = { ...rows };
   for (const [fam, rows] of Object.entries(built.ranges ?? {})) {
@@ -656,9 +662,12 @@ export function runtimeProfileFrom(built: BuiltCache, staticProfile: DeviceProfi
     for (const [pidStr, row] of Object.entries(rows as Record<number, RangeDef>)) {
       const pid = Number(pidStr);
       const stat = dst[pid];
-      if (live && stat && stat.kind !== row.kind) {
-        if (row.unit) dst[pid] = { ...stat, unit: row.unit };
-        continue;
+      if (live) {
+        if (row.displayMin === row.displayMax) continue; // placeholder: no information, keep what we have
+        if (stat && stat.kind !== row.kind) {
+          if (row.unit) dst[pid] = { ...stat, unit: row.unit };
+          continue;
+        }
       }
       dst[pid] = row;
     }
