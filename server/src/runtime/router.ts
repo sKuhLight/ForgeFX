@@ -194,22 +194,11 @@ export function createRouter(deps: RuntimeDeps): {
   // Stored preset name (driver-backed since Phase 6; gen-3 keeps the {number, name:''} stub).
   on('GET', '/presets/:n', (c) => h.presetNameH(Number(c.params.n)));
   // Decode any preset by number (non-disruptive) → library summary: name, scenes, unique blocks.
-  on('GET', '/presets/:n/summary', async (c) => {
-    try {
-      const d = await driver();
-      if (!d.presetSummary) return unsupported(c.reply, 'presetDump');
-      return await d.presetSummary(Number(c.params.n), c.query.get('full') === '1');
-    } catch (e) { c.reply.code(503); return { error: (e as Error).message }; }
-  });
+  on('GET', '/presets/:n/summary', (c) => h.presetSummaryH(c.reply, c.params.n ?? '', c.query.get('full') === '1'));
   // Full per-block decoded params for one preset (every family/param) — deep-search + browser detail.
-  on('GET', '/presets/:n/params', async (c) => {
-    try {
-      const d = await driver();
-      if (!d.presetParams) return unsupported(c.reply, 'presetDump');
-      return { blocks: await d.presetParams(Number(c.params.n)) };
-    } catch (e) { c.reply.code(503); return { error: (e as Error).message }; }
-  });
-  on('GET', '/presets/:n/grid', (c) => h.gridH(c.reply));
+  on('GET', '/presets/:n/params', (c) => h.presetParamsH(c.reply, c.params.n ?? ''));
+  // Grid of the STORED slot `:n` (never the edit buffer — that is /preset/grid); see presetGridH.
+  on('GET', '/presets/:n/grid', (c) => h.presetGridH(c.reply, c.params.n ?? ''));
   on('GET', '/preset/grid', (c) => h.gridH(c.reply));
   on('GET', '/preset/blocks', (c) => h.blocksH(c.reply));
   on('GET', '/preset/scene-state', (c) => h.sceneStateH(c.reply));

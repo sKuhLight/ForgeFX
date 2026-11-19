@@ -61,6 +61,12 @@ function makeFakeFm3(): DeviceDriver {
       { slug: 'amp', name: 'Amp 1', effectId: 58, row: 1, col: 1, fromRows: [], bypassed: false, channel: 'A' }
     ],
     presetRef: async () => ({ number: 3, name: 'Current' }),
+    presetCount: 512,
+    presetGrid: async (n: number) => ({
+      model: 'fm3', name: `SLOT-${n}`, crcValid: true, rows: 4, cols: 12, scenes: [],
+      cells: [{ row: 0, col: 0, effectId: 100 + n, name: `Block ${n}`, isShunt: false, routeFlag: 0, fromRows: [] }],
+      source: 'dump' as const
+    }),
     blocksCatalog: () => [{ slug: 'amp', family: 'AMP', instance: 1, name: 'Amp 1', page: 0, paramCount: 2, typeCount: 1 }],
     blockTypes: () => [{ value: 1, name: 'USA Lead', manufacturer: null, basedOn: null }],
     blockParams: async (eid: number) => ({
@@ -104,6 +110,9 @@ const ROWS: Row[] = [
   { name: 'preset ref', method: 'GET', url: '/preset' },
   { name: 'grid', method: 'GET', url: '/preset/grid' },
   { name: 'grid by number', method: 'GET', url: '/presets/7/grid' },
+  { name: 'grid by number (other slot)', method: 'GET', url: '/presets/8/grid' },
+  { name: 'grid by number (400 malformed)', method: 'GET', url: '/presets/abc/grid' },
+  { name: 'grid by number (400 out of range)', method: 'GET', url: '/presets/512/grid' },
   { name: 'blocks placed', method: 'GET', url: '/preset/blocks' },
   { name: 'blocks catalog', method: 'GET', url: '/blocks' },
   { name: 'block types', method: 'GET', url: '/blocks/amp/types' },

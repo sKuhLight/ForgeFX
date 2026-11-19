@@ -205,6 +205,15 @@ export interface DeviceDriver {
   // ── preset reads ──
   presetRef?(): Promise<{ number: number; name: string }>;
   presetSummary?(presetNumber: number, withParams?: boolean): Promise<PresetSummary>;
+  /** Routing grid of the STORED preset in slot `presetNumber` (GET /presets/:n/grid) — a non-disruptive
+   *  dump decode that never touches the edit buffer (and never the edit-buffer grid cache) — i.e. the SAVED
+   *  state of the slot. Absent on drivers that cannot read a stored slot (capability presetDump): the route
+   *  then answers the LIVE grid only when `presetRef()` (AM4 today) says the requested slot is the loaded
+   *  one, and 501 otherwise (gen-1 / gen-2 / VP4 have neither method → 501 for every slot). */
+  presetGrid?(presetNumber: number): Promise<PresetGridDTO>;
+  /** Number of stored preset slots (valid slot numbers are 0..presetCount-1) — the bound the
+   *  slot-addressed routes validate against. Absent = unknown (only the integer ≥ 0 check applies). */
+  readonly presetCount?: number;
   presetParams?(presetNumber: number): Promise<DecodedBlock[]>;
   /** Raw .syx bytes (the backup blob) + decoded summary for one slot — the backups service's source. */
   dumpRaw?(n: number): Promise<{ bytes: Uint8Array; summary: PresetSummary }>;

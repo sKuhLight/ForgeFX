@@ -53,7 +53,7 @@ export async function buildApp(registry: DeviceRegistry): Promise<FastifyInstanc
   // The unified handler bodies + capability gate — shared with the runtime router (see handlers.ts).
   const {
     driver, unsupported,
-    gridH, blocksH, sceneStateH, blockParamsH, setParamH, bypassH, sceneSetH,
+    gridH, presetGridH, presetSummaryH, presetParamsH, blocksH, sceneStateH, blockParamsH, setParamH, bypassH, sceneSetH,
     presetSelectH, presetStoreH, presetNameH, locationsH,
     backupH, restoreH, fwValidateH, deviceParamH, modModelH,
     telemetryConfigH, telemetrySetH,
@@ -163,21 +163,10 @@ export async function buildApp(registry: DeviceRegistry): Promise<FastifyInstanc
   // Stored preset name (driver-backed since Phase 6; gen-3 keeps the {number, name:''} stub).
   app.get<{ Params: { n: string } }>('/presets/:n', (req) => presetNameH(Number(req.params.n)));
   // Decode any preset by number (non-disruptive) → library summary: name, scenes, unique blocks.
-  app.get<{ Params: { n: string }; Querystring: { full?: string } }>('/presets/:n/summary', async (req, reply) => {
-    try {
-      const d = await driver();
-      if (!d.presetSummary) return unsupported(reply, 'presetDump');
-      return await d.presetSummary(Number(req.params.n), req.query.full === '1');
-    } catch (e) { reply.code(503); return { error: (e as Error).message }; }
-  });
+  app.get<{ Params: { n: string }; Querystring: { full?: string } }>('/presets/:n/summary', async (req, reply) =>
+    presetSummaryH(reply, req.params.n, req.query.full === '1'));
   // Full per-block decoded params for one preset (every family/param) — deep-search + browser detail.
-  app.get<{ Params: { n: string } }>('/presets/:n/params', async (req, reply) => {
-    try {
-      const d = await driver();
-      if (!d.presetParams) return unsupported(reply, 'presetDump');
-      return { blocks: await d.presetParams(Number(req.params.n)) };
-    } catch (e) { reply.code(503); return { error: (e as Error).message }; }
-  });
+  app.get<{ Params: { n: string } }>('/presets/:n/params', async (req, reply) => presetParamsH(reply, req.params.n));
   // ── persistent store: documents (Axis config · library metadata · layouts) ──
   app.get<{ Params: { c: string } }>('/store/:c', (req) => ({ docs: store.listDocs(req.params.c) }));
   app.get<{ Params: { c: string; id: string } }>('/store/:c/:id', (req, reply) => {
@@ -343,7 +332,8 @@ export async function buildApp(registry: DeviceRegistry): Promise<FastifyInstanc
   );
 
   app.get('/preset/grid', async (_req, reply) => gridH(reply));
-  app.get<{ Params: { n: string } }>('/presets/:n/grid', async (_req, reply) => gridH(reply));
+  // Grid of the STORED slot `:n` (never the edit buffer — that is /preset/grid); see presetGridH.
+  app.get<{ Params: { n: string } }>('/presets/:n/grid', async (req, reply) => presetGridH(reply, req.params.n));
   app.get('/preset/blocks', async (_req, reply) => blocksH(reply));
   // Lightweight per-block bypass+channel (no preset dump) — Axis applies it to its cached grid on a scene change.
   app.get('/preset/scene-state', async (_req, reply) => sceneStateH(reply));
