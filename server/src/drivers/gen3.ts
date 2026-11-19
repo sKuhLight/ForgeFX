@@ -17,6 +17,9 @@ import {
   isLooperWaveformResponse,
   parseLooperWaveform,
   buildLooperControl,
+  isMultipurposeResponse,
+  parseMultipurposeResponse,
+  describeMultipurposeResultCode,
   type ModernFractalCodec
 } from 'forgefx-midi/gen3/axe-fx-iii';
 import { wireToDisplay } from 'forgefx-midi/shared';
@@ -27,6 +30,7 @@ import {
   retargetPresetDumpToEditBuffer,
   type DecodedBlock
 } from 'forgefx-midi/devices/gen3';
+import { isTransportTimeout } from '../transport/types.js';
 import { SLUG_FAMILY, type DeviceProfile, type TypeModel, type DeviceLayout, type SelectorValues } from '../devices.js';
 import type {
   DeviceDriver, DriverCapabilities, DriverCtx,
@@ -43,6 +47,26 @@ const BLOCK_META: Record<string, { name: string; page: number }> = (() => {
 })();
 
 const EDIT_BUFFER = 0x3fff; // preset number sentinel = current edit buffer
+
+/** Is the device's own acknowledgement of a preset store EVIDENCED on this model? ForgeFX-side table (the
+ *  codec does not carry this fact; FOLLOW-UP: move it into the codec's per-device config).
+ *   'verified' — an ack was seen on our OWN hardware: a missing ack is a failure (`ok:false`).
+ *   'unknown'  — not seen on our own hardware: a missing ack is only a warning (`ok:true, acked:false,
+ *                warning`); a real 0x64 refusal is `ok:false` either way.
+ *  The ack (an echo of the request's fn/sub ~1.4 s later) has only been REPORTED by a third party for an
+ *  FM3 on fw 13.0. So ALL entries start 'unknown' — flip one only with our own hardware evidence
+ *  (FM3 on fw 12 and 13, then FM9 / Axe-Fx III), never on a report. */
+export type StoreAckEvidence = 'verified' | 'unknown';
+const STORE_ACK_EVIDENCE: Readonly<Record<number, StoreAckEvidence>> = { 0x10: 'unknown', 0x11: 'unknown', 0x12: 'unknown' };
+
+/** How long `store()` waits for the ack, per evidence level and link. The wait ends the instant the ack
+ *  arrives, so the cap only costs time when none comes. 'verified': ~2.9x the reported 1.4 s. 'unknown':
+ *  shorter, because on a model that never acks EVERY successful save would otherwise pay the full cap. A
+ *  slow (5-pin DIN) link gets more. */
+const STORE_ACK_TIMEOUT_MS: Readonly<Record<StoreAckEvidence, { fast: number; slow: number }>> = {
+  verified: { fast: 4000, slow: 8000 },
+  unknown: { fast: 2500, slow: 6000 }
+};
 
 // ── preset-dump decode (forgefx-midi devices/gen3 pipeline) ──
 // Adapter producing the exact DTO the pre-Phase-4 server-local codec (fm3PresetGrid.ts
@@ -162,7 +186,11 @@ class Gen3Driver implements DeviceDriver {
   #ctx: DriverCtx;
   readonly capabilities: DriverCapabilities;
 
-  constructor(profile: DeviceProfile, ctx: DriverCtx) {
+  /** Store-ack evidence for THIS model (see STORE_ACK_EVIDENCE); overridable for tests / a hardware run. */
+  readonly storeAck: StoreAckEvidence;
+
+  constructor(profile: DeviceProfile, ctx: DriverCtx, opts: { storeAck?: StoreAckEvidence } = {}) {
+    this.storeAck = opts.storeAck ?? STORE_ACK_EVIDENCE[profile.model] ?? 'unknown';
     this.#prof = profile;
     this.#codec = createModernFractalCodec(profile.model); // every frame carries THIS device's model byte
     this.#ctx = ctx;
@@ -1354,8 +1382,79 @@ class Gen3Driver implements DeviceDriver {
     const { number } = await this.presetRef();
     if (number >= 0) await this.selectPreset(number);
   }
-  async store(n: number) {
-    return this.#write(this.#codec.buildStorePreset(n));
+  /**
+   * Persist the working buffer to preset slot `n`.
+   *
+   * The device acknowledges a store by echoing the request's envelope (fn 0x01, sub 0x26) — about 1.4 s
+   * after the request on an FM3 (fw 13.0, as reported by the contributor of this change), while the
+   * generic `#write` window is only 120 ms. So the old call could never see its own ack: it returned
+   * `{ok:true}` by ABSENCE of a refusal, and any foreign `0x64` that happened to land in that window (a
+   * refused read while the meter poll was running, say) was misread as the device rejecting the save.
+   * Wait for the echo instead.
+   *
+   * Result contract (HTTP 200 on every outcome; the body says which). `storeAck` (see
+   * STORE_ACK_EVIDENCE) decides what a MISSING ack means:
+   *  • ack seen          → `{ok:true, acked:true, location}` — the device's own reply, even if a stray
+   *                         0x64 from another exchange landed in the same window;
+   *  • 0x64, no ack      → `{ok:false, acked:false, location, error}` — a real refusal (the error carries
+   *                         the device's result code), whatever the evidence level;
+   *  • neither in time   → 'verified': `{ok:false, acked:false, location, error}` (the outcome is unknown —
+   *                         the slot may or may not have been written); 'unknown': `{ok:true,
+   *                         acked:false, location, warning}` — the store was SENT but could not be
+   *                         confirmed, which is all a model without a proven ack can honestly say.
+   *
+   * The wait ends only on the ack or the hard cap: `quietMs` is set to the cap so a gap of silence after
+   * some unrelated early frame can't end it before the (late) ack, and a 0x64 does not end it early either
+   * (a refusal costs the full cap, which is rare and keeps a foreign 0x64 from faking one).
+   */
+  async store(n: number): Promise<{ ok: boolean; acked: boolean; location: number; error?: string; warning?: string }> {
+    const dev = await this.#conn();
+    const bytes = this.#codec.buildStorePreset(n);
+    const model = bytes[4]!;
+    const fn = bytes[5];
+    // The ack repeats the request's envelope up to and including the sub-action: Fractal header, model
+    // byte, fn 0x01, sub 0x26. A frame BYTE-IDENTICAL to the request is our own request coming back (MIDI
+    // thru / loopback), not the device's answer — it is not an ack. (Hardware question: the real ack is
+    // assumed to differ from the request; if a unit's ack ever turns out byte-identical, revisit this.)
+    const sameAsRequest = (f: number[]) => f.length === bytes.length && f.every((b, i) => b === bytes[i]);
+    const isAck = (f: number[]) => f.length > 7 && f[0] === 0xf0 && [1, 2, 3, 4, 5, 6].every((i) => f[i] === bytes[i]) && !sameAsRequest(f);
+    // A refusal is a 0x64 MULTIPURPOSE_RESPONSE echoing fn 0x01.
+    const isReject = (f: number[]) => isMultipurposeResponse(f, model) && f[6] === fn;
+    const caps = STORE_ACK_TIMEOUT_MS[this.storeAck];
+    const timeoutMs = dev.slow ? caps.slow : caps.fast;
+    const unconfirmed = (why: string) => this.storeAck === 'verified'
+      ? {
+          ok: false,
+          acked: false,
+          location: n,
+          error: `${why} — the device did not acknowledge the store within ${timeoutMs} ms, so the preset may or may not have been written to slot ${n}`
+        }
+      : {
+          ok: true,
+          acked: false,
+          location: n,
+          warning: `${why} — no store acknowledgement from the device within ${timeoutMs} ms; the store to slot ${n} was sent but is unconfirmed (acknowledgement not yet verified for this model)`
+        };
+    let frames: number[][];
+    try {
+      frames = await dev.request(bytes, { timeoutMs, quietMs: timeoutMs, match: (fs) => fs.some(isAck) });
+    } catch (e) {
+      // The browser-direct transports REJECT a no-frame request timeout (the Node transports resolve []):
+      // same outcome as silence. Typed (`code`), never matched on message text — see transport/types.ts.
+      if (isTransportTimeout(e)) return unconfirmed('no reply');
+      throw e;
+    }
+    if (frames.some(isAck)) return { ok: true, acked: true, location: n };
+    const reject = frames.find(isReject);
+    if (reject) {
+      let detail = '';
+      try {
+        const code = parseMultipurposeResponse(reject, model).resultCode;
+        detail = ` (result 0x${code.toString(16).padStart(2, '0')}${describeMultipurposeResultCode(code) ? `: ${describeMultipurposeResultCode(code)}` : ''})`;
+      } catch { /* malformed 0x64 — keep the bare message */ }
+      return { ok: false, acked: false, location: n, error: `store to slot ${n} rejected by the device${detail}` };
+    }
+    return unconfirmed('no acknowledgement');
   }
 
   /** Load a raw preset dump (.syx bytes) straight into the device's EDIT BUFFER — no slot is touched
@@ -1382,7 +1481,7 @@ function clamp01(v: number) { return Math.max(0, Math.min(1, v)); }
 function round3(v: number) { return Math.round(v * 1000) / 1000; }
 
 /** Create a gen-3 driver bound to one device profile (Axe-Fx III / FM3 / FM9). */
-export function createGen3Driver(profile: DeviceProfile, ctx: DriverCtx): Gen3Driver {
-  return new Gen3Driver(profile, ctx);
+export function createGen3Driver(profile: DeviceProfile, ctx: DriverCtx, opts?: { storeAck?: StoreAckEvidence }): Gen3Driver {
+  return new Gen3Driver(profile, ctx, opts);
 }
 export type { Gen3Driver };

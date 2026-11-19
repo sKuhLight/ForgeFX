@@ -86,7 +86,7 @@ export function createUnifiedHandlers(registry: DeviceRegistry) {
     // number omitted → store to the CURRENT slot (needs a live preset-number query).
     const n = number ?? (d.presetRef ? (await d.presetRef()).number : undefined);
     if (n == null || !Number.isFinite(n) || n < 0) { reply.code(400); return { error: 'number required' }; }
-    return d.store(n); // gen-3: {ok}; AM4 additionally carries {location, code}
+    return d.store(n); // gen-3: {ok, acked, location, error?|warning?} (see Gen3Driver.store); AM4: {ok, location, code}
   };
   // Stored preset name: driver-backed where supported (AM4 → {number, name, code}); the gen-3
   // drivers don't implement it, so they keep the pre-Phase-6 {number, name:''} stub byte-identically.

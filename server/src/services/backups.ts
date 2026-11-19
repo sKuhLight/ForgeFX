@@ -35,11 +35,13 @@ export async function loadVersion(store: Store, d: DeviceDriver, id: string): Pr
 /** Restore a version to its origin slot: load it into the edit buffer, then commit it to that slot
  *  (DESTRUCTIVE for that slot). This is the "Restore this version to device" action — unlike
  *  loadVersion, it persists to the preset's location, not just the edit buffer. */
-export async function restoreVersion(store: Store, d: DeviceDriver, id: string): Promise<{ ok: boolean; location: number }> {
+export async function restoreVersion(store: Store, d: DeviceDriver, id: string): Promise<{ ok: boolean; location: number; error?: string; warning?: string }> {
   const v = store.getPresetVersion(id);
   if (!v) throw new Error('version not found');
   if (v.location < 0) throw new Error('version has no slot to restore to');
   await loadVersion(store, d, id);
-  await d.store!(v.location);
-  return { ok: true, location: v.location };
+  // The commit's own verdict decides the answer: a store the device refused or never acknowledged must
+  // not be reported as a successful restore.
+  const r = await d.store!(v.location);
+  return { ok: r.ok, location: v.location, ...(r.error ? { error: r.error } : {}), ...(r.warning ? { warning: r.warning } : {}) };
 }

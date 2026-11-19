@@ -40,6 +40,20 @@ bad grid position, `0x0c` DSP overload, etc.
 - **Store is beta.** Save *persistence* is not hardware-verified on the FM3, so `POST
   /preset/store` is flagged beta and should be confirmed on the device. ForgeFX never
   auto-saves during navigation.
+- **Store waits for the device's own acknowledgement.** Unlike the other writes, the device is reported to
+  answer a store with an echo of the request (fn `0x01`, sub `0x26`) about 1.4 s later (an FM3 on fw 13.0,
+  reported by a third party — **not yet seen on this project's own hardware**). `POST /preset/store` waits
+  for it, and what a *missing* ack means depends on a per-model evidence flag (`storeAck` in the gen-3
+  driver; every model is `unknown` until a store is confirmed on our own unit):
+  - ack seen → `{ok:true, acked:true, location}`;
+  - a real `0x64` refusal (and no ack) → `{ok:false, acked:false, location, error}` with the result code;
+  - no ack in time, `verified` model → `{ok:false, acked:false, location, error}` — the slot may or may not
+    have been written;
+  - no ack in time, `unknown` model → `{ok:true, acked:false, location, warning}` — sent, but unconfirmed.
+
+  The wait is capped (`unknown`: 2.5 s, `verified`: 4 s; 6 s / 8 s on a slow link) and ends the instant the ack
+  arrives. A frame byte-identical to the request (MIDI thru / loopback) never counts as the ack.
+  `POST /version/:id/restore` reports the same verdict for its commit step.
 
 ## Confidence
 

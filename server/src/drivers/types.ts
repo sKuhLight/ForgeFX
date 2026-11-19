@@ -258,8 +258,12 @@ export interface DeviceDriver {
    *  sweep write. Reuses the driver's current-preset ref + preset-select machinery; no new wire bytes.
    *  Implemented by gen-3 (capability fullCapture); absent elsewhere. */
   reloadPreset?(): Promise<void>;
-  /** Store the edit buffer to slot n. `location`/`code` are ADDITIVE (AM4). */
-  store?(n: number): Promise<{ ok: boolean; location?: number; code?: string }>;
+  /** Store the edit buffer to slot n. `location`/`code` are ADDITIVE (AM4). `acked`/`error`/`warning` are
+   *  ADDITIVE (gen-3): `acked` = the device's own acknowledgement was seen. `ok:false` + `error` = a real
+   *  refusal, or (on a model whose ack is verified) no acknowledgement in time — outcome unknown.
+   *  `ok:true` + `warning` = sent but unconfirmed (a model whose ack is not yet verified stayed silent).
+   *  Drivers without a known ack (AM4 / VP4 fire-and-forget; gen-2 lenient) omit all three. */
+  store?(n: number): Promise<{ ok: boolean; location?: number; code?: string; acked?: boolean; error?: string; warning?: string }>;
   loadPresetBytes?(syx: Uint8Array): Promise<{ ok: boolean }>;
   setSceneName?(index: number, name: string): Promise<{ ok: boolean }>;
   setPresetName?(name: string): Promise<{ ok: boolean }>;

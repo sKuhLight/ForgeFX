@@ -44,7 +44,7 @@ import { FM3_DESCRIPTOR, FM9_DESCRIPTOR, AXEFX3_DESCRIPTOR, VP4_DESCRIPTOR } fro
 import { AM4_DESCRIPTOR } from 'forgefx-midi/devices/am4';
 import { AXEFX2_DESCRIPTOR } from 'forgefx-midi/devices/gen2';
 import { AXEFXGEN1_DESCRIPTOR } from 'forgefx-midi/devices/gen1';
-import type { Transport, Conn, ConnKind } from '../transport/types.js';
+import { TRANSPORT_TIMEOUT_CODE, isTransportTimeout, type Transport, type Conn, type ConnKind } from '../transport/types.js';
 import { DEFAULT_PROFILE, PROFILES, profileForModel, profileForKey, runtimeProfileFrom, type DeviceProfile } from '../devices.js';
 import { createGen3Driver } from './gen3.js';
 import { createAm4Driver, type Am4Driver } from './am4.js';
@@ -89,6 +89,18 @@ const GEN3_SHUNT_BASE = 1024;
 // Per-transport-instance idempotency flag for #instrumentTransport (double-wrapping would double-count
 // the fn-0x1F echo guard and silently break front-panel edit reflection).
 const INSTRUMENTED = Symbol('forgefx.transport.instrumented');
+
+/** TRANSITIONAL shim: the browser-direct transports (Axis webmidi / webserial / nativeMidi) still reject a
+ *  no-frame request timeout with a plain `Error('<MIDI|Serial> request timed out after Nms')` and no
+ *  `code`. Tag exactly those with the typed `code` the transport contract defines, HERE at the one choke
+ *  point every transport passes through, so no driver ever has to parse that text. Drop the shim once the
+ *  transports set `code` at source (Axis follow-up). Other errors pass through untouched. */
+function withTimeoutCode(e: unknown): unknown {
+  if (e instanceof Error && !isTransportTimeout(e) && /^(?:MIDI|Serial) request timed out after \d+ ?ms$/i.test(e.message)) {
+    (e as Error & { code?: string }).code = TRANSPORT_TIMEOUT_CODE;
+  }
+  return e;
+}
 
 /** One selectable connection as the deps' lister reports it (serial + MIDI, Fractal flagged) —
  *  structurally identical to transport/connection.ts's ConnInfo, re-declared here so the core stays
@@ -998,7 +1010,7 @@ export class DeviceRegistry {
       this.#inFlightRequests++;
       const bulk = bytes[5] === 0x1f; // only a bulk read can elicit a 0x74 burst → echo guard counts it
       if (bulk) this.#pendingBulkReads++;
-      return origRequest(bytes, opts).finally(() => {
+      return origRequest(bytes, opts).catch((e: unknown) => { throw withTimeoutCode(e); }).finally(() => {
         this.#inFlightRequests = Math.max(0, this.#inFlightRequests - 1);
         if (bulk) this.#pendingBulkReads = Math.max(0, this.#pendingBulkReads - 1);
       });

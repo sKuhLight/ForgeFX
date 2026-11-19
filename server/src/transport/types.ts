@@ -24,10 +24,20 @@ export interface Transport {
   /** Serialized large paced send (chunked) for big payloads like a preset-dump → edit buffer.
    *  Optional: transports that don't need pacing (USB-MIDI) can omit it; callers fall back to sendQueued. */
   sendPaced?(bytes: readonly number[], chunk?: number, delayMs?: number): Promise<void>;
-  /** Send a request and collect reply frames (serialized against other requests). */
+  /** Send a request and collect reply frames (serialized against other requests). When the hard
+   *  timeout passes with NO frame at all, a transport either resolves `[]` (the Node serial/MIDI
+   *  transports) or rejects with an error whose `code` is `TRANSPORT_TIMEOUT_CODE` (the browser-direct
+   *  ones) — callers that care use `isTransportTimeout()`, never the message text. */
   request(bytes: readonly number[], opts?: RequestOpts): Promise<number[][]>;
   /** Subscribe to every inbound SysEx frame; returns an unsubscribe fn. */
   onFrame(handler: (frame: number[]) => void): () => void;
+}
+
+/** `Error.code` of a `request()` that timed out without receiving any frame (Node's ETIMEDOUT spelling). */
+export const TRANSPORT_TIMEOUT_CODE = 'ETIMEDOUT';
+/** True for a request-timeout error as described on `Transport.request`. Matches the typed `code` only. */
+export function isTransportTimeout(e: unknown): boolean {
+  return typeof e === 'object' && e !== null && (e as { code?: unknown }).code === TRANSPORT_TIMEOUT_CODE;
 }
 
 export type ConnKind = 'serial' | 'midi';
