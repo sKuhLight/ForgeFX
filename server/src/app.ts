@@ -23,6 +23,7 @@ import cors from '@fastify/cors';
 import { existsSync, statSync, createReadStream } from 'node:fs';
 import { join, resolve, extname } from 'node:path';
 import type { DeviceRegistry } from './drivers/registry.js';
+import { parseHexBytes, sendErrorStatus } from './drivers/sendPolicy.js';
 import * as backups from './services/backups.js';
 import * as convert from './services/convert.js';
 import type { ConverterPreset } from 'forgefx-midi/convert';
@@ -81,10 +82,16 @@ export async function buildApp(registry: DeviceRegistry): Promise<FastifyInstanc
   // ── block & parameter help (curated tooltips; see help.ts) ──
   registerHelpRoutes(app, registry);
 
-  // ── debug probe (raw SysEx round-trip; for FC read-decode RE) ──
-  app.post<{ Body: { hex: string } }>('/debug/raw', async (req, reply) => {
-    try { const bytes = (req.body.hex.match(/../g) ?? []).map((x) => parseInt(x, 16)); return { frames: await registry.rawRequest(bytes) }; }
-    catch (e) { reply.code(503); return { error: (e as Error).message }; }
+  // ── debug probe (raw read-only SysEx round-trip) ──
+  // Malformed hex → 400 here. registry.rawRequest() then applies the probe policy (drivers/sendPolicy.ts)
+  // before the transport is touched: not ONE SysEx frame ≤512 B → 400; anything but a read/query frame for
+  // a known model, or (connected gen-3 unit) a frame byte-identical to a codec read/poll builder — tuner/
+  // CPU/meter polls, tempo/scene GET, raw param-value GET 0x1B used by the FC read-back — → 403.
+  app.post<{ Body: { hex?: unknown } | undefined }>('/debug/raw', async (req, reply) => {
+    const bytes = parseHexBytes(req.body?.hex);
+    if (!bytes) { reply.code(400); return { error: 'hex must be a non-empty, even-length string of hex digits' }; }
+    try { return { frames: await registry.rawRequest(bytes) }; }
+    catch (e) { reply.code(sendErrorStatus(e, 503)); return { error: (e as Error).message }; }
   });
 
   // ── system ──
@@ -218,7 +225,7 @@ export async function buildApp(registry: DeviceRegistry): Promise<FastifyInstanc
       const d = await driver();
       if (!d.loadPresetBytes) return unsupported(reply, 'loadPresetBytes');
       return await backups.loadVersion(store.defaultStore, d, req.params.id);
-    } catch (e) { reply.code(503); return { error: (e as Error).message }; }
+    } catch (e) { reply.code(sendErrorStatus(e, 503)); return { error: (e as Error).message }; }
   });
   // restore a snapshot to its origin slot (load + commit to that slot — destructive for the slot)
   app.post<{ Params: { id: string } }>('/version/:id/restore', async (req, reply) => {
@@ -226,9 +233,10 @@ export async function buildApp(registry: DeviceRegistry): Promise<FastifyInstanc
       const d = await driver();
       if (!d.loadPresetBytes || !d.store) return unsupported(reply, 'loadPresetBytes');
       return await backups.restoreVersion(store.defaultStore, d, req.params.id);
-    } catch (e) { reply.code(503); return { error: (e as Error).message }; }
+    } catch (e) { reply.code(sendErrorStatus(e, 503)); return { error: (e as Error).message }; }
   });
-  // load arbitrary raw .syx bytes (e.g. a cloud/file preset) into the edit buffer
+  // load a .syx preset dump (e.g. a cloud/file preset) into the edit buffer — the driver validates it
+  // as ONE preset dump for the connected model (400 otherwise, see drivers/sendPolicy.ts)
   app.post('/preset/load', async (req, reply) => {
     const buf = req.body as Buffer | undefined;
     if (!buf || !buf.length) { reply.code(400); return { error: 'POST raw .syx bytes as application/octet-stream' }; }
@@ -236,7 +244,7 @@ export async function buildApp(registry: DeviceRegistry): Promise<FastifyInstanc
       const d = await driver();
       if (!d.loadPresetBytes) return unsupported(reply, 'loadPresetBytes');
       return await d.loadPresetBytes(new Uint8Array(buf));
-    } catch (e) { reply.code(503); return { error: (e as Error).message }; }
+    } catch (e) { reply.code(sendErrorStatus(e, 503)); return { error: (e as Error).message }; }
   });
   // version history (all, or for one slot via ?location=)
   app.get<{ Querystring: { location?: string } }>('/versions', (req) => ({ versions: store.listPresetVersions(req.query.location != null ? Number(req.query.location) : undefined) }));

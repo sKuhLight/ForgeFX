@@ -52,6 +52,7 @@ import { createGen2Driver } from './gen2.js';
 import { createGen1Driver } from './gen1.js';
 import { createVp4Driver } from './vp4.js';
 import type { DeviceDriver, DeviceEvent, DriverCtx, DriverCapabilities } from './types.js';
+import { assertRawProbeAllowed } from './sendPolicy.js';
 import { cadenceFor, isTelemetryMode, TELEMETRY_MODES, type TelemetryMode, type CadenceProfile } from './telemetryProfiles.js';
 
 /** Device-cache doc key for the deviceCaches store collection: `<model-hex>_<major>p<minor>`
@@ -696,8 +697,13 @@ export class DeviceRegistry {
     };
   }
 
-  /** DEBUG probe: send a raw SysEx frame, return every response frame as hex (for FC read-decode). */
+  /** DEBUG probe: send ONE raw read-only SysEx frame, return every response frame as hex. The probe
+   *  policy (sendPolicy.ts) is enforced HERE, before the transport is opened or written: only a
+   *  read/query frame for a known model, or — on a connected gen-3 unit — a frame byte-identical to a
+   *  codec read/poll builder for that model (tuner/CPU/meter polls, tempo/scene GET, raw param-value
+   *  GET 0x1B as used by the FC read-back); anything else throws a 400/403 SendRejectedError. */
   async rawRequest(bytes: number[]): Promise<string[]> {
+    assertRawProbeAllowed(bytes, this.#modelId);
     const dev = await this.transport();
     const frames = await dev.request(bytes, { timeoutMs: 1200, quietMs: 120, match: (fs: number[][]) => fs.length > 0 });
     return frames.map((f) => f.map((b) => b.toString(16).padStart(2, '0')).join(''));
