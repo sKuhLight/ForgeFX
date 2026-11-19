@@ -27,7 +27,7 @@ import {
   retargetPresetDumpToEditBuffer,
   type DecodedBlock
 } from 'forgefx-midi/devices/gen3';
-import { SLUG_FAMILY, type DeviceProfile, type TypeModel, type DeviceLayout, type SelectorValues } from '../devices.js';
+import { SLUG_FAMILY, PROFILES, type DeviceProfile, type TypeModel, type DeviceLayout, type SelectorValues } from '../devices.js';
 import type {
   DeviceDriver, DriverCapabilities, DriverCtx,
   PresetGridDTO, PresetBlockDTO, PresetSummary, NamedParam, EnumParam, MeterVal,
@@ -131,11 +131,88 @@ const UNIT_LABEL: Record<string, string> = {
   db: 'dB', hz: 'Hz', ms: 'ms', seconds: 's', percent: '%', bipolar_percent: '%',
   degrees: '°', semitones: 'st', pf: 'pF', ratio: ':1'
 };
-// units that mark a musician-facing knob. 'numeric' = a plain unitless knob (Drive, Tone, Level,
-// cut freqs…) — primary controls in many families; only 'unverified'/'count'/'enum' are non-knobs.
-const KNOB_UNITS = new Set([
-  'numeric', 'knob_0_10', 'knob_0_20', 'db', 'hz', 'ms', 'seconds', 'percent', 'bipolar_percent', 'ratio', 'semitones', 'degrees'
+// Catalog unit codes that mark a CONTINUOUS control (a dial), i.e. everything except 'enum'.
+// A float-kind range alone is not enough to call a param a knob: some selectors ship a float-typed
+// range record under unit 'enum' (CABINET_ZOOM, the CONTROLLERS_*_MODE rows, GLOBAL_SEND_MIDI_CLOCK
+// …), and rendering those as dials would write fractional values into a selector.
+// This allowlist is an interim guard; the lasting source for widget choice is the device-true
+// kind/labels of the profile.
+//   'numeric' = a plain unitless knob (Drive, Tone, Level, cut freqs…) and the other unit codes below
+//   are established continuous controls.
+const ESTABLISHED_KNOB_UNITS = ['numeric', 'knob_0_10', 'knob_0_20', 'db', 'hz', 'ms', 'seconds', 'percent', 'bipolar_percent', 'ratio', 'semitones', 'degrees'];
+//   'unverified' = the catalog could not confirm a unit, 'count' = a catch-all that holds both real
+//   continuous values (a filter Q) and plain stepper counts, 'pf' = capacitance. The catalog's unit
+//   is NOT evidence of continuity for these, so they are admitted conservatively (see isKnobParam).
+const PROVISIONAL_KNOB_UNITS = new Set(['unverified', 'count', 'pf']);
+const KNOB_UNITS = new Set([...ESTABLISHED_KNOB_UNITS, ...PROVISIONAL_KNOB_UNITS]);
+
+// Params that look like a dial but are not one, which no range heuristic can tell apart. Keyed by the
+// catalog param name; extend only with a reason.
+const NOT_A_KNOB = new Set([
+  'MOD_EFFECTID', // the modifier's target block id: a knob would silently retarget the modifier
+  'GLOBAL_CS_CHAN_BEGIN', // its paramId lies outside the fn-0x1F body, so the read-back is always the minimum
 ]);
+
+/** `FAMILY.NAME` of every param that is a selector ('enum' unit) on ANY gen-3 device's static catalog.
+ *  The same param can carry a confirmed unit on one device and 'unverified' on another (TENTAP_DECAYSTYLE
+ *  is a 2-way selector on the Axe-Fx III). Consulted only for the provisional units, whose catalog unit
+ *  proves nothing on this device. */
+let enumElsewhere: Set<string> | undefined;
+function isEnumOnAnyDevice(family: string, name: string): boolean {
+  if (!enumElsewhere) {
+    enumElsewhere = new Set();
+    for (const prof of Object.values(PROFILES)) {
+      for (const [fam, list] of Object.entries(prof.params)) for (const q of list) if (q.unit === 'enum') enumElsewhere.add(`${fam}.${q.name}`);
+    }
+  }
+  return enumElsewhere.has(`${family}.${name}`);
+}
+
+/** A range that reads like a stepper or selector rather than a dial: integral bounds with either an
+ *  integer step, or no step and a small span (<= 64 values). Deliberately conservative (it also hides
+ *  a plain 0..1 range): used only to vet the provisional units, whose catalog unit proves nothing. */
+function looksDiscrete(range: { displayMin: number; displayMax: number; step?: number }): boolean {
+  if (!Number.isInteger(range.displayMin) || !Number.isInteger(range.displayMax)) return false;
+  const step = range.step ?? 0;
+  if (step >= 1 && Number.isInteger(step)) return true;
+  return step === 0 && range.displayMax - range.displayMin <= 64;
+}
+
+type FamilyParam = DeviceProfile['params'][string][number];
+
+/** Is this catalog param a knob: a float-kind range with a usable span (min !== max), a continuous
+ *  catalog unit (KNOB_UNITS), not the bypass flag and not a known non-dial (NOT_A_KNOB). A param on one
+ *  of the provisional units ('unverified' / 'count' / 'pf') must also not be a selector on another
+ *  gen-3 device, be label-less, and not look like a stepper (integer step, or integral bounds over a
+ *  small span). Shared by blockParams() and meters(), so the grid's meter param is always one of the
+ *  block's knobs. */
+function isKnobParam(profile: DeviceProfile, family: string, p: FamilyParam): boolean {
+  const range = profile.ranges[family]?.[p.paramId];
+  if (range?.kind !== 'float') return false;
+  if (!KNOB_UNITS.has(p.unit ?? '')) return false;
+  if (/bypass/i.test(p.displayLabel ?? p.name)) return false;
+  if (range.displayMin === range.displayMax) return false; // 0..0 is an unusable knob
+  if (NOT_A_KNOB.has(p.name)) return false;
+  if (PROVISIONAL_KNOB_UNITS.has(p.unit ?? '')) {
+    // Only where this device's catalog unit proves nothing: an established unit is trusted as-is, so a
+    // later catalog change on one device can never silently hide a dial on the others.
+    if (isEnumOnAnyDevice(family, p.name)) return false;
+    if ((profile.enumLabelsFor(family, p.paramId)?.length ?? 0) > 0) return false; // labels = a selector
+    if (looksDiscrete(range)) return false;
+  }
+  return true;
+}
+
+/** The family's knob params, one per wire paramId (first wins). Exported for the per-device
+ *  knob-count test. */
+export function knobParams(profile: DeviceProfile, family: string): FamilyParam[] {
+  const seenIds = new Set<number>();
+  return (profile.params[family] ?? []).filter((p) => {
+    if (!isKnobParam(profile, family, p) || seenIds.has(p.paramId)) return false;
+    seenIds.add(p.paramId);
+    return true;
+  });
+}
 
 /** Append 1/2/3… to labels that repeat within a list (e.g. the cab's four "Low Cut" mic params),
  * so the UI can tell otherwise-identical controls apart. Mutates the items' `name`. */
@@ -217,15 +294,44 @@ class Gen3Driver implements DeviceDriver {
   #conn() { return this.#ctx.transport(); }
   #emit: DriverCtx['emit'] = (e) => this.#ctx.emit(e);
 
+  /** fn-0x1F channel-block geometry for a family: one channel's slice width, how many channels the
+   *  body carries, and where the active channel's slice starts.
+   *
+   *  The profile's table stride is only a hint. A static catalog stride was measured on one firmware
+   *  (and some were never confirmed on the device they ship for), and a walk-built stride is the
+   *  number of records the walk managed to collect, not the section's true width. A wrong stride is
+   *  silent and destructive: base = channel x stride lands mid-way through an EARLIER channel's slice,
+   *  so every param read for channels B-D, the amp model included, is a real, valid-looking value
+   *  from the wrong param.
+   *
+   *  The reply is the tiebreaker. The body is whole channel slices back to back (at most A-D), so
+   *  itemCount = channels x stride, and a stride only counts when it divides itemCount into 1-4
+   *  slices. That also rejects a short stride that merely happens to divide the body, because it
+   *  would imply more than four channels. Order of preference:
+   *    1. the table stride, when the reply agrees with it (or advertised no count at all);
+   *    2. itemCount / 4, the four-channel layout of a channel-bearing block;
+   *    3. one slice spanning the whole body (a block that is not channel-blocked; only channel A is
+   *       real there, so base stays 0).
+   *  `channelBlocked: false` (the virtual effects GLOBAL / CONTROLLERS / MODIFIER / FC, which have no
+   *  channels A-D) skips all of that: the whole body is the one slice. Dividing it by four, or trusting
+   *  a drifted table stride, would shrink the slice and make decodeEditBurst drop every device edit
+   *  from that paramId on. */
   #channelSlice(
     family: string | undefined,
     bulk: { itemCount: number; values: readonly number[] },
     activeChannel: number,
+    channelBlocked = true,
   ): { stride: number; channelCount: number; base: number } {
+    if (!channelBlocked) return { stride: Math.max(1, bulk.values.length), channelCount: 1, base: 0 };
+    const MAX_CHANNELS = 4;
     const tableStride = family ? this.#prof.rangeSections[family]?.stride : undefined;
-    const stride = tableStride && tableStride > 0
-      ? tableStride
-      : (bulk.itemCount > 0 && bulk.itemCount % 4 === 0 ? bulk.itemCount / 4 : Math.max(1, bulk.values.length));
+    const tableFits = !!tableStride && tableStride > 0
+      && (bulk.itemCount <= 0 || (bulk.itemCount % tableStride === 0 && bulk.itemCount / tableStride <= MAX_CHANNELS));
+    const stride = tableFits
+      ? tableStride!
+      : bulk.itemCount > 0 && bulk.itemCount % MAX_CHANNELS === 0
+        ? bulk.itemCount / MAX_CHANNELS
+        : Math.max(1, bulk.values.length);
     const basis = bulk.itemCount > 0 ? bulk.itemCount : bulk.values.length;
     const channelCount = Math.max(1, Math.floor(basis / stride));
     return { stride, channelCount, base: Math.min(activeChannel, channelCount - 1) * stride };
@@ -512,6 +618,7 @@ class Gen3Driver implements DeviceDriver {
     const codecSlug = slugForEffectId(eid) ?? ''; // audio blocks resolve via the codec
     // virtual effects (GLOBAL=1, Controllers=2, Modifier=3, FC=199) resolve via the profile's effectId map
     const family = SLUG_FAMILY[codecSlug.toLowerCase()] ?? this.#prof.familyForEffectId(eid);
+    const hasChannels = !!SLUG_FAMILY[codecSlug.toLowerCase()]; // an audio block; the virtual effects have no channels A-D
     const slug = codecSlug || (family ? family.toLowerCase() : ''); // virtual effects key on the family name
     const meta = BLOCK_META[codecSlug];
     const blockName = meta?.name ?? family ?? slug;
@@ -523,21 +630,11 @@ class Gen3Driver implements DeviceDriver {
       return { block: blockName, slug, page, named: [], enums: [], type: null, layout }; // no device-true param family mapped
     }
     const defs = this.#prof.params[family] ?? [];
-    // knob params = continuous, musician-facing: a float range + a real display unit
-    // (drops enum selectors, internal 'numeric'/'unverified' params, and bypass flags).
-    // knobs = every continuous param with a usable range. We expose ALL real controls (the UI
-    // organizes them); only genuinely-dead params are dropped: no range (min===max) or the bypass flag.
-    const seenIds = new Set<number>();
-    const knobs = defs.filter((p) => {
-      const range = this.#prof.ranges[family]?.[p.paramId];
-      if (range?.kind !== 'float') return false;
-      if (!KNOB_UNITS.has(p.unit ?? '')) return false;
-      if (/bypass/i.test(p.displayLabel ?? p.name)) return false;
-      if (range.displayMin === range.displayMax) return false; // unusable (0..0) knob
-      if (seenIds.has(p.paramId)) return false; // dedupe same wire paramId (first wins)
-      seenIds.add(p.paramId);
-      return true;
-    });
+    // knobs = every continuous param with a usable range: a float-kind range AND a continuous catalog
+    // unit (KNOB_UNITS; this keeps selectors that carry a float-typed range record out of the dial
+    // list). We expose ALL real controls (the UI organizes them); besides that only genuinely-dead
+    // params are dropped: no range (min===max) or the bypass flag.
+    const knobs = knobParams(this.#prof, family);
     // enums = every discrete selector. The family TYPE selector is excluded (header retype palette),
     // plus the raw bypass flag; everything else (modes, slopes, mics, mic/cab pickers…) is shown.
     const typeId = this.#paramId(family, 'type');
@@ -561,7 +658,7 @@ class Gen3Driver implements DeviceDriver {
         this.#watchedChannel = activeCh; // keep the device-edit-burst diff on the same channel (see decodeEditBurst)
         const frames = await dev.request(this.#codec.buildBlockBulkReadPoll(eid), { timeoutMs: dev.slow ? 8000 : 2500, quietMs: dev.slow ? 600 : 120, match: (fs) => fs.some((f) => f[5] === 0x76) });
         const bulk = this.#codec.assembleGen3BlockBulkRead(frames);
-        const { stride, base } = this.#channelSlice(family, bulk, activeCh);
+        const { stride, base } = this.#channelSlice(family, bulk, activeCh, hasChannels);
         // Prime the device-edit-push baseline with the OPEN channel's values so a later front-panel
         // edit's burst diffs cleanly to the moved param (no first-sight reload — see decodeEditBurst).
         this.#editSnapshot.set(eid, bulk.values.slice(base, base + stride));
@@ -928,11 +1025,13 @@ class Gen3Driver implements DeviceDriver {
       const family = slug ? SLUG_FAMILY[slug] : undefined;
       if (!slug || !family) continue;
       const defs = this.#prof.params[family] ?? [];
+      // A knob in blockParams()'s sense (isKnobParam), narrowed to the meter-worthy ones: not a 0..1
+      // flag-like range and a human label rather than a raw symbol.
       const knobs = defs.filter((p) => {
         const r = this.#prof.ranges[family]?.[p.paramId];
-        if (r?.kind !== 'float' || r.displayMin === r.displayMax || (r.displayMin === 0 && r.displayMax === 1)) return false;
+        if (!isKnobParam(this.#prof, family, p) || (r?.displayMin === 0 && r.displayMax === 1)) return false;
         const label = p.displayLabel ?? p.name;
-        return KNOB_UNITS.has(p.unit ?? '') && !/bypass/i.test(label) && !/_/.test(label) && !/^[A-Z][A-Z0-9+]*$/.test(label);
+        return !/_/.test(label) && !/^[A-Z][A-Z0-9+]*$/.test(label);
       });
       const primary = knobs.find((p) => /level|mix|master|volume|gain|drive/i.test(p.displayLabel ?? p.name)) ?? knobs[0];
       if (!primary) continue;
@@ -1082,7 +1181,7 @@ class Gen3Driver implements DeviceDriver {
 
   /** Map a raw 0..65534 wire value to {value, norm, unit, min, max, log} via the device-true FM3 range.
    * Taper: a device-true explicit `range.taper` ('log'→log10; 'linear'|'flat'|'custom'→linear) wins;
-   * absent it falls back to the typecode heuristic (middle nibble 4/5 = log10, e.g. freq cuts, else linear). */
+   * absent it falls back to the typecode heuristic (middle nibble 4 = log10, e.g. freq cuts; every other nibble linear). */
   #display(family: string | undefined, paramId: number, raw: number): { value: number; norm: number; unit?: string; min?: number; max?: number; log?: boolean } {
     const norm = clamp01(raw / 65534);
     const range = family ? this.#prof.ranges[family]?.[paramId] : undefined;
@@ -1093,7 +1192,11 @@ class Gen3Driver implements DeviceDriver {
         // 'custom' taper's `taperPoints` are NOT applied on the wire yet, so custom is served linear
         // for now (the Axis side documents the same). A log sweep still requires a positive range —
         // wireToDisplay throws on log10 with displayMin<=0 — the same guard the nibble heuristic uses.
-        // When NO explicit taper is present, fall back to the unchanged typecode-nibble heuristic.
+        // When NO explicit taper is present, fall back to the typecode-nibble heuristic: only nibble 4
+        // marks a log taper, every other nibble is linear. Nibble 5 used to count as log too, but the
+        // explicit tapers in the FM9 and Axe-Fx III catalogs have it linear every time (7 and 17 params,
+        // none log), while nibble 4 is log for all but a few. The FM3 catalog carries no explicit tapers,
+        // so for the FM3 the rule is carried over from those two devices, not measured on it.
         // `range.taper` reads device-true from a static-catalog row today, and reads the same field once
         // walk-built RangeDefs carry it (parallel WP) — no rework needed here either way.
         let log: boolean;
@@ -1101,7 +1204,7 @@ class Gen3Driver implements DeviceDriver {
           log = range.taper === 'log' && range.displayMin > 0;
         } else {
           const taperNib = (range.typecode >> 4) & 0xf;
-          log = (taperNib === 4 || taperNib === 5) && range.displayMin > 0;
+          log = taperNib === 4 && range.displayMin > 0;
         }
         const v = wireToDisplay(raw, { displayMin: range.displayMin, displayMax: range.displayMax, displayScale: log ? 'log10' : 'linear' });
         // Prefer the DEVICE-TRUE unit captured by the live-walk (RangeDef.unit, view 0x00)
@@ -1170,12 +1273,13 @@ class Gen3Driver implements DeviceDriver {
     try { bulk = this.#codec.assembleGen3BlockBulkRead(frames); } catch { return { events: [], reload: false }; }
     const eid = bulk.blockId;
     if (bulk.values.length === 0) return { events: [], reload: false }; // head-only / empty — nothing to read
-    const family = SLUG_FAMILY[(slugForEffectId(eid) ?? '').toLowerCase()] ?? this.#prof.familyForEffectId(eid);
+    const audioFamily = SLUG_FAMILY[(slugForEffectId(eid) ?? '').toLowerCase()];
+    const family = audioFamily ?? this.#prof.familyForEffectId(eid);
     const defs = family ? (this.#prof.params[family] ?? []) : [];
     if (!family || defs.length === 0) return { events: [], reload: false }; // no param family mapped
     // Slice the block's ACTIVE channel (the one blockParams surfaced) — the body is channel-blocked, so
     // diffing against channel A while the user has B-D open would flag every A/B-different param as "moved".
-    const { stride, base } = this.#channelSlice(family, bulk, eid === this.#watchedEid ? this.#watchedChannel : 0);
+    const { stride, base } = this.#channelSlice(family, bulk, eid === this.#watchedEid ? this.#watchedChannel : 0, !!audioFamily);
     const cur = bulk.values.slice(base, base + stride);
     const prev = this.#editSnapshot.get(eid);
     this.#editSnapshot.set(eid, cur);

@@ -96,14 +96,15 @@ const parseSelectorValues = (value: string | null | undefined): number[] =>
 //      variants all carry value:null but differ by `fw`;
 //   3. else every variant (degenerate: nothing declared).
 // Within the winning set, prefer the firmware-pinned variant (amp DISTORT ships every historical fw
-// layout with exactly one pinned:true), else the first in editor order.
-const selectVariant = (block: EditorBlockLayout, typeValue?: number): EditorLayoutVariant | undefined => {
+// layout with exactly one pinned:true), else the variant named `preferName` (a per-family hint, see
+// AM4_PREFERRED_VARIANT), else the first in editor order.
+const selectVariant = (block: EditorBlockLayout, typeValue?: number, preferName?: string): EditorLayoutVariant | undefined => {
   const variants = block.variants;
   if (!variants.length) return undefined;
   let cands = typeValue == null ? [] : variants.filter((v) => parseSelectorValues(v.value).includes(typeValue));
   if (!cands.length) cands = variants.filter((v) => v.value == null);
   if (!cands.length) cands = variants;
-  return cands.find((v) => v.pinned) ?? cands[0];
+  return cands.find((v) => v.pinned) ?? (preferName ? cands.find((v) => v.name === preferName) : undefined) ?? cands[0];
 };
 
 // Lookup from an editor selector parameter symbol (e.g. 'DISTORT_EQTYPE', 'DISTORT_TYPE') to the block's
@@ -205,11 +206,11 @@ export const resolveLayoutPages = (
 
 // Resolve a family's editor layout to the wire DeviceLayout for the block's CURRENT type value, with the
 // selected variant's pages filtered to the current selector/firmware state (see resolveLayoutPages).
-const layoutFrom = (layouts: DeviceEditorLayouts) =>
+const layoutFrom = (layouts: DeviceEditorLayouts, preferredVariant: Record<string, string> = {}) =>
   (family: string, typeValue?: number, selectors?: SelectorValues): DeviceLayout | undefined => {
     const block = layouts[family];
     if (!block) return undefined;
-    const variant = selectVariant(block, typeValue);
+    const variant = selectVariant(block, typeValue, preferredVariant[family]);
     if (!variant) return undefined;
     return {
       editorName: block.editorName,
@@ -230,7 +231,12 @@ const AM4_FAMILY_BY_BLOCK: Record<string, string> = {
   chorus: 'CHORUS', flanger: 'FLANGER', rotary: 'ROTARY', phaser: 'PHASER', wah: 'WAH', volpan: 'VOLUME',
   tremolo: 'TREMOLO', filter: 'FILTER', drive: 'FUZZ', enhancer: 'ENHANCER', gate: 'GATE',
 };
-const am4LayoutOf = layoutFrom(AM4_LAYOUTS);
+// The AM4 DISTORT layout holds two unconditional (value-less) variants: the device-global setup pages
+// ('Global': Audio / Footswitches / MIDI / Remote / Global — also the block's editorName) listed first, and
+// the actual 'Amp' editor. Plain first-wins selection served the global pages on the AM4 amp block, so name
+// the block editor. (The layout data itself should tag the global variant; that is a forgefx-midi matter.)
+const AM4_PREFERRED_VARIANT: Record<string, string> = { DISTORT: 'Amp' };
+const am4LayoutOf = layoutFrom(AM4_LAYOUTS, AM4_PREFERRED_VARIANT);
 /** Editor-authentic layout for an AM4 block (by its lowercase block name, e.g. 'amp'/'drive'), for the
  *  block's current type value. Controls join to the AM4 catalog by cacheId in the codec; unresolved
  *  paramIds ride through as null (display-only). Undefined for a block with no AM4 layout. */
@@ -591,13 +597,36 @@ export const profileForModel = (model: number): DeviceProfile => PROFILES[model]
 export const profileForKey = (key: string): DeviceProfile | undefined => Object.values(PROFILES).find((p) => p.key === key);
 
 /**
+ * Is a persisted device-cache profile byte-exact device data (decoded from an editor `.cache`), as
+ * opposed to a live-walk reconstruction? The vocabulary of `meta.source` as it is actually persisted
+ * in `deviceCaches`:
+ *   • 'editor-cache' — an editor-cache import (services/editorCacheImport.ts), byte-exact;
+ *   • 'live'         — an on-device walk (services/deviceCache.ts, the codec's own value), heuristic;
+ *   • 'cloud'        — a pulled profile (services/cloudProfiles.ts); the build kind it was published
+ *                      from rides in `meta.origin` ('bytes' | 'live', normalised on publish), so it is
+ *                      byte-exact only when that origin is a byte source;
+ *   • 'bytes'        — the codec's raw byte-source value (never persisted as-is by ForgeFX, but it is
+ *                      what a cloud profile's `origin` carries).
+ * Anything else, including a missing source (GET /device/cache reports that as 'live' too), counts as
+ * NOT byte-exact: unknown provenance gets the cautious live-walk treatment in runtimeProfileFrom.
+ */
+export function isByteExactProfile(meta: { source?: unknown; origin?: unknown } | undefined): boolean {
+  const isByteKind = (v: unknown) => v === 'editor-cache' || v === 'bytes';
+  if (!meta) return false;
+  return meta.source === 'cloud' ? isByteKind(meta.origin) : isByteKind(meta.source);
+}
+
+/**
  * Overlay a device-cache-derived `BuiltCache` (from the on-connect self-describe walk) onto a static
  * gen-3 profile: DEVICE data wins where the cache has it, the static profile supplies everything else.
  *   • rosterFor — the family's device-true model list from `built.rosters` (keyed by catalog family,
  *     mapped from slug via SLUG_FAMILY), with the STATIC roster's manufacturer/basedOn LINEAGE
  *     overlaid by value (the cache carries names only); families the walk didn't map fall back to static.
  *   • enumLabelsFor — `built.enumOverrides` first, else static.
- *   • ranges / rangeSections — the cache's per-family entries merged OVER the static ones.
+ *   • ranges / rangeSections — the cache's per-family entries merged OVER the static ones. A profile
+ *     that is not byte-exact (`isByteExactProfile`: a live walk, a cloud profile that came from one,
+ *     unknown provenance) is the exception: it never re-classifies the kind of a catalog-known param
+ *     and never shrinks a catalog stride (see the comments in the body).
  *   • cabIrs — the cache's banks when non-empty, else static.
  * The model byte, grid dims, instanceLimits, params, layouts, FC/Mod/monitor models, and write mode
  * all stay from the static profile (the walk doesn't recover them). Pure — returns a fresh profile.
@@ -607,14 +636,46 @@ export function runtimeProfileFrom(built: BuiltCache, staticProfile: DeviceProfi
   const builtEnums = (built.enumOverrides ?? {}) as Record<string, Record<string, string[]>>;
   const builtCabIrs = built.cabIrs ?? {};
 
+  // Provenance decides how far the cache may override the static tables. A byte-exact profile (an
+  // editor cache import, or a cloud profile that was published from one) is exact device data for its
+  // firmware, possibly newer than the static catalog, so it always wins. Everything else is treated
+  // as a live-walk reconstruction (a heuristic), including a cloud profile that came from a walk and
+  // a profile of unknown provenance.
+  const live = !isByteExactProfile(built.meta);
+
   // ranges: static per-family maps, then the cache's rows merged over them (device-true wins).
+  // One exception, for a live-walk profile only: its enum/float split is a numeric heuristic (integral
+  // bounds, step/scale shape, gated on a label probe) and is not reliable in either direction, so a
+  // live row must not re-classify a pid the static catalog already classifies. The static row is
+  // kept and only gains the walk's device-true unit. A live row still wins for a pid the catalog
+  // lacks, and when it agrees on the kind (it then refines the display range).
   const mergedRanges: Ranges = {};
   for (const [fam, rows] of Object.entries(staticProfile.ranges)) mergedRanges[fam] = { ...rows };
-  for (const [fam, rows] of Object.entries(built.ranges ?? {})) mergedRanges[fam] = { ...(mergedRanges[fam] ?? {}), ...(rows as Record<number, RangeDef>) };
+  for (const [fam, rows] of Object.entries(built.ranges ?? {})) {
+    const dst = (mergedRanges[fam] ??= {});
+    for (const [pidStr, row] of Object.entries(rows as Record<number, RangeDef>)) {
+      const pid = Number(pidStr);
+      const stat = dst[pid];
+      if (live && stat && stat.kind !== row.kind) {
+        if (row.unit) dst[pid] = { ...stat, unit: row.unit };
+        continue;
+      }
+      dst[pid] = row;
+    }
+  }
 
-  // rangeSections: same static-then-cache merge (per family).
+  // rangeSections: same static-then-cache merge (per family). The stride is the other live-walk
+  // exception: it is the number of records the walk managed to collect (placeholder slots and filler
+  // rows are dropped), so it is a lower bound on the section's width and must not shrink a catalog
+  // stride. A byte-exact profile carries every slot and wins outright, which is also what corrects a
+  // catalog stride that does not match the connected firmware. Either way the stride is only a
+  // hint: #channelSlice validates it against the reply's itemCount before slicing a channel.
   const mergedSections: RangeSections = { ...staticProfile.rangeSections };
-  for (const [fam, meta] of Object.entries(built.rangeSections ?? {})) mergedSections[fam] = meta as unknown as RangeSections[string];
+  for (const [fam, meta] of Object.entries(built.rangeSections ?? {})) {
+    const cached = meta as unknown as RangeSections[string];
+    const stat = mergedSections[fam];
+    mergedSections[fam] = live && stat ? { ...cached, stride: Math.max(stat.stride, cached.stride) } : cached;
+  }
 
   return {
     ...staticProfile,

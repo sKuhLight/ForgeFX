@@ -52,6 +52,26 @@ const checks: Array<{ name: string; ok: () => boolean }> = [
   { name: 'AM4 COMP with no matching type falls back to the first variant', ok: () => am4LayoutFor('compressor', 99999)?.variantName === 'Analog' },
   { name: 'unknown family → undefined', ok: () => fm3.layoutFor('NOT_A_FAMILY') === undefined && axe3.layoutFor('NOT_A_FAMILY', 3) === undefined },
 
+  // ── AM4 amp: DISTORT holds two value-less variants, the device-global setup pages ('Global', also the
+  //    layout's editorName) listed first and the real 'Amp' editor; the amp block must get the latter ──
+  { name: "AM4 amp serves the 'Amp' variant, not the device-global setup pages", ok: () => {
+    const l = am4LayoutFor('amp', 7);
+    return !!l && l.variantName === 'Amp' && l.variantValue === null
+      && !l.pages.some((p) => ['Audio', 'Footswitches', 'MIDI/Remote', 'Global'].includes(p.name))
+      && l.pages.some((p) => p.name === 'Amp'); } },
+  { name: 'AM4 amp: the variant is picked whatever the type value (unknown, or none at all)', ok: () =>
+    am4LayoutFor('amp', 99999)?.variantName === 'Amp' && am4LayoutFor('amp')?.variantName === 'Amp' },
+  { name: "AM4 amp: a model an explicit page names gets exactly that Amp page (7 → '7,8,93')", ok: () => {
+    const ampPages = (am4LayoutFor('amp', 7)?.pages ?? []).filter((p) => p.name === 'Amp');
+    return ampPages.length === 1 && ampPages[0]!.value === '7,8,93'; } },
+  { name: "AM4 amp: a model no explicit page names gets the group's catch-all Amp page (#86 reaches AM4)", ok: () => {
+    const byType = (am4LayoutFor('amp', 99999)?.pages ?? []).filter((p) => p.name === 'Amp');
+    const sel: SelectorValues = (n) => (n === 'DISTORT_TYPE' ? 99999 : undefined);
+    const bySelector = (resolveLayoutPages(am4LayoutFor('amp', 99999)?.pages ?? [], 99999, sel)).filter((p) => p.name === 'Amp');
+    return byType.length === 1 && byType[0]!.value === '' && bySelector.length === 1 && bySelector[0]!.value === ''; } },
+  { name: 'the per-family variant hint is AM4-only: gen-3 amp selection is unchanged', ok: () =>
+    fm3.layoutFor('DISTORT', 5)?.variantName === 'Amp GTE 8.00' && axe3.layoutFor('DISTORT', 0)?.variantName === 'Amp GTE 28.09' },
+
   // ── v2 passthrough shape ──
   { name: 'Axe-Fx III DISTORT layout is v2-shaped (pages→rows→controls)', ok: () => { const l = axe3.layoutFor('DISTORT', 0); return !!l && shapeOk(l); } },
   { name: 'AM4 COMP layout is v2-shaped', ok: () => { const l = am4LayoutFor('compressor', 6); return !!l && shapeOk(l); } },
