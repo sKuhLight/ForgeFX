@@ -17,14 +17,16 @@
 // runtime/cloud.ts (itself browser-safe). check-browser-safe.ts enforces it.
 import { deviceCacheKey, type DeviceRegistry } from '../drivers/registryCore.js';
 import { resolveCacheKey } from './deviceCache.js';
-import { checkProfileSchema, staleFields, type StaleReason } from '../profileSchema.js';
+import { CURRENT_CACHE_SCHEMA, checkProfileSchema, staleFields, type StaleReason } from '../profileSchema.js';
 import type { Store } from '../runtime/store.js';
 import type { ImportResult } from './editorCacheImport.js';
 
 /** The slice of the Cloud service these functions need — structural so tests fake it in two lines
  *  (and so the browser twin can pass its own Cloud instance through RuntimeDeps.cloud). */
 export interface DeviceProfileCloud {
-  deviceProfileGet(model: number, firmware: string): Promise<{ profile: unknown; contentHash: string; source: string; recordCount: number | null; createdAt: string } | null>;
+  /** `schema` = the profile schema this build can use (always passed): the endpoint answers with the newest
+   *  row of that schema, so builds on different schemas do not hide each other's shared profiles. */
+  deviceProfileGet(model: number, firmware: string, schema?: number): Promise<{ profile: unknown; contentHash: string; source: string; recordCount: number | null; createdAt: string } | null>;
   deviceProfilePublish(body: { model: number; firmware: string; source: 'live-walk' | 'editor-cache'; profile: unknown }): Promise<{ code: number; body: unknown }>;
 }
 
@@ -67,8 +69,9 @@ export async function cloudCacheCheck(cloud: DeviceProfileCloud | null, store: S
   if (!cloud) return { enabled: false, available: false };
   const id = await deviceIdentity(store, registry);
   if (!id) return { enabled: true, available: false };
-  const row = await cloud.deviceProfileGet(id.model, id.firmware);
+  const row = await cloud.deviceProfileGet(id.model, id.firmware, CURRENT_CACHE_SCHEMA);
   if (!row) return { enabled: true, available: false };
+  // Backstop for a cloud endpoint that ignores the schema filter (older deployment): still judge the row.
   const verdict = checkProfileSchema(row.profile);
   if (!verdict.usable) {
     LAST_CHECK.delete(registry); // never let a pull reuse a row that was just judged unusable
@@ -92,7 +95,7 @@ export async function cloudCachePull(cloud: DeviceProfileCloud | null, store: St
   if (!id) return { code: 503, body: { error: 'no device detected' } };
 
   const cached = LAST_CHECK.get(registry);
-  const row = cached?.key === id.key ? cached.row : await cloud.deviceProfileGet(id.model, id.firmware);
+  const row = cached?.key === id.key ? cached.row : await cloud.deviceProfileGet(id.model, id.firmware, CURRENT_CACHE_SCHEMA);
   if (!row) return { code: 404, body: { error: 'no cloud profile for this device+firmware' } };
 
   const p = row.profile as { meta?: Record<string, unknown> } | null;

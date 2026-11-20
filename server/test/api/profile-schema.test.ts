@@ -21,11 +21,12 @@ import {
 } from '../../src/profileSchema.js';
 import * as runtimeBarrel from '../../src/runtime/index.js';
 import { CACHE_SCHEMA, type BuiltCache, type CacheRecord, type LiveWalkOptions } from 'forgefx-midi/cache';
+import { createCloud } from '../../src/runtime/cloud.js';
 import { MockTransport, handshakeReply, isIdentifyBroadcast, assert, assertEqual } from '../helpers/mock.js';
 import { seedRecords, fakeCacheDoc, sectionsDoc } from './device-cache.test.js';
 import { CACHE_BYTES } from './editor-cache-import.test.js';
 
-export const PROFILE_SCHEMA_CASE_COUNT = 10;
+export const PROFILE_SCHEMA_CASE_COUNT = 11;
 
 const FM3 = 0x11;
 const KEY = '11_12p0'; // FM3 fw 12.0
@@ -298,11 +299,12 @@ function profileRow(schema: unknown) {
   };
 }
 
-function fakeCloud(row: ReturnType<typeof profileRow> | null): DeviceProfileCloud & { gets: number; published: unknown[] } {
+function fakeCloud(row: ReturnType<typeof profileRow> | null): DeviceProfileCloud & { gets: number; published: unknown[]; asked: Array<[number, string, number | undefined]> } {
   const f = {
     gets: 0,
     published: [] as unknown[],
-    async deviceProfileGet() { f.gets++; return row; },
+    asked: [] as Array<[number, string, number | undefined]>,
+    async deviceProfileGet(model: number, firmware: string, schema?: number) { f.gets++; f.asked.push([model, firmware, schema]); return row; },
     async deviceProfilePublish(body: unknown) { f.published.push(body); return { code: 201, body: { ok: true } }; }
   };
   return f;
@@ -358,6 +360,39 @@ async function cloudCheckAndPull(): Promise<void> {
     const bad = await cloudCachePull(fakeCloud({ profile: { nope: 1 } } as never), store.defaultStore, registry);
     assertEqual(bad.code, 422, 'malformed row still 422');
   } finally { clearDoc(); await app.close(); }
+}
+
+// ── 7b. the cloud GET asks for the schema this build can use (so builds on different schemas coexist) ──
+async function cloudAsksForCurrentSchema(): Promise<void> {
+  const { app, registry } = await makeApp();
+  try {
+    clearDoc();
+    const c1 = fakeCloud(profileRow(CACHE_SCHEMA));
+    await cloudCacheCheck(c1, store.defaultStore, registry);
+    assertEqual(JSON.stringify(c1.asked), JSON.stringify([[FM3, '12.0', CACHE_SCHEMA]]), 'check asks for (model, firmware, current schema)');
+  } finally { clearDoc(); await app.close(); }
+  // a pull that has no cached check row (fresh registry) fetches itself, with the same schema
+  const second = await makeApp();
+  try {
+    const c2 = fakeCloud(profileRow(CACHE_SCHEMA));
+    await cloudCachePull(c2, store.defaultStore, second.registry);
+    assertEqual(JSON.stringify(c2.asked), JSON.stringify([[FM3, '12.0', CACHE_SCHEMA]]), 'pull asks for the current schema too');
+  } finally { clearDoc(); await second.app.close(); }
+
+  // the real client puts it on the wire as a query parameter; omitted, the URL is the legacy one
+  const urls: string[] = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: unknown) => {
+    urls.push(String(input));
+    return { ok: false, status: 404, json: async () => ({}) } as unknown as Response;
+  }) as typeof fetch;
+  try {
+    const cloud = createCloud({ url: 'https://cloud.invalid', anonKey: 'anon-test-key' }, store.defaultStore);
+    assertEqual(await cloud.deviceProfileGet(17, '12.0', CACHE_SCHEMA), null, 'a 404 is no profile');
+    assertEqual(await cloud.deviceProfileGet(17, '12.0'), null, 'a 404 is no profile (legacy call)');
+    assertEqual(urls[0], `https://cloud.invalid/functions/v1/device-profiles?model=17&firmware=12.0&schema=${CACHE_SCHEMA}`, 'schema rides on the GET');
+    assertEqual(urls[1], 'https://cloud.invalid/functions/v1/device-profiles?model=17&firmware=12.0', 'no schema param when none is given');
+  } finally { globalThis.fetch = realFetch; }
 }
 
 // ── 8. cloud publish: a stale local profile is never uploaded ──
@@ -468,6 +503,7 @@ export async function runProfileSchemaTests(): Promise<void> {
   await buildOverStale();
   await importAndSources();
   await cloudCheckAndPull();
+  await cloudAsksForCurrentSchema();
   await cloudPublishGate();
   await walkLimitsIgnoreStale();
   await routerParity();

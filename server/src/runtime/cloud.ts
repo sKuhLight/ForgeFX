@@ -131,11 +131,14 @@ export class Cloud {
   // ── shared device-definition profile store (axis-cloud `device-profiles` edge fn; META-22) ──
   /** Fetch the newest shared device-definition profile for (model, firmware), or null when cloud is
    *  off / none exists / the fetch fails. Anonymous endpoint — no session needed (profiles are shared,
-   *  non-user data), so this works signed-out. */
-  async deviceProfileGet(model: number, firmware: string): Promise<{ profile: unknown; contentHash: string; source: string; recordCount: number | null; createdAt: string } | null> {
+   *  non-user data), so this works signed-out. `schema` is the profile schema this client can use: the
+   *  endpoint then answers with the newest row of THAT schema (so clients on different schemas never
+   *  hide each other's profiles); omitted, an older endpoint/client contract applies (newest row). */
+  async deviceProfileGet(model: number, firmware: string, schema?: number): Promise<{ profile: unknown; contentHash: string; source: string; recordCount: number | null; createdAt: string } | null> {
     if (!this.#enabled()) return null;
     try {
-      const u = `${this.#cfg.url}/functions/v1/device-profiles?model=${model}&firmware=${encodeURIComponent(firmware)}`;
+      const sch = schema !== undefined ? `&schema=${encodeURIComponent(String(schema))}` : '';
+      const u = `${this.#cfg.url}/functions/v1/device-profiles?model=${model}&firmware=${encodeURIComponent(firmware)}${sch}`;
       const res = await fetch(u, { headers: { apikey: this.#cfg.anonKey }, signal: AbortSignal.timeout(15000) });
       if (!res.ok) return null;
       const d = await res.json() as { profile: unknown; content_hash: string; source: string; record_count: number | null; created_at: string };
