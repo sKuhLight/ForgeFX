@@ -31,7 +31,7 @@ import {
   type ConverterPreset,
   type ConversionEvent,
 } from 'forgefx-midi/convert';
-import type { DeviceDriver } from '../drivers/types.js';
+import { EmptyPresetError, type DeviceDriver } from '../drivers/types.js';
 
 /** The response DTO both the offline (`convertFromSyx`) and connected (`convertFromDriver`) paths
  *  return — exactly the wire contract POST /preset/convert serves on 200. */
@@ -47,7 +47,7 @@ export interface ConvertResponse {
 }
 
 /** A service error carrying the HTTP status the route should map it to (400 undecodable/bad target,
- *  501 no source capability, 503 device unreachable). */
+ *  422 source is an empty preset slot, 501 no source capability, 503 device unreachable). */
 export class ConvertError extends Error {
   readonly statusCode: number;
   constructor(statusCode: number, message: string) {
@@ -102,8 +102,17 @@ function liftFromSyx(bytes: Uint8Array): ConverterPreset {
   if (model === undefined) throw new ConvertError(400, 'not a SysEx preset dump (no F0 frame found)');
   const gen3 = GEN3_DEVICE_BY_MODEL[model];
   if (gen3) {
+    let decoded: ReturnType<typeof decodeGen3PresetDump>;
     try {
-      return liftGen3Preset(decodeGen3PresetDump(bytes, model), gen3);
+      decoded = decodeGen3PresetDump(bytes, model);
+    } catch (e) {
+      throw new ConvertError(400, `could not decode gen-3 preset dump: ${(e as Error).message}`);
+    }
+    // An unused slot decodes to an empty preset: there is nothing to convert (and nothing the export
+    // authoring path could validate), so refuse it instead of "converting" it to an empty target.
+    if (decoded.empty) throw new ConvertError(422, 'source preset slot is empty');
+    try {
+      return liftGen3Preset(decoded, gen3);
     } catch (e) {
       throw new ConvertError(400, `could not decode gen-3 preset dump: ${(e as Error).message}`);
     }
@@ -169,7 +178,13 @@ async function liftCurrentPreset(driver: DeviceDriver): Promise<ConverterPreset>
   if (!driver.backupPreset) {
     throw new ConvertError(501, 'the connected device cannot dump its current preset');
   }
-  const dump = await driver.backupPreset();
+  let dump: Awaited<ReturnType<NonNullable<DeviceDriver['backupPreset']>>>;
+  try {
+    dump = await driver.backupPreset();
+  } catch (e) {
+    if (e instanceof EmptyPresetError) throw new ConvertError(422, 'source preset slot is empty');
+    throw e;
+  }
   return liftFromSyx(Uint8Array.from(dump.bytes));
 }
 

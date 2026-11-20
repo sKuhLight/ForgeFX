@@ -7,6 +7,7 @@
 // the router uses a tiny status recorder), so the exact same code produces the exact same
 // status+body on both surfaces. NO node:/fastify imports — this module must load in a browser.
 import type { DeviceRegistry } from '../drivers/registryCore.js';
+import { EmptyPresetError } from '../drivers/types.js';
 
 /** The one reply capability the shared handlers need: set the response status. FastifyReply's
  *  `code()` matches; the runtime router records the status into its RouterResponse. */
@@ -108,7 +109,11 @@ export function createUnifiedHandlers(registry: DeviceRegistry) {
   const backupH = async (reply: StatusSink, location?: number) => {
     const d = await driver();
     if (!d.backupPreset) return unsupported(reply, 'backupDump');
-    try { return await d.backupPreset(location); } catch (e) { reply.code(503); return { error: (e as Error).message }; }
+    try { return await d.backupPreset(location); } catch (e) {
+      // an unused slot has nothing to back up (its all-zero dump is not a restorable preset): 422, not 503
+      reply.code(e instanceof EmptyPresetError ? e.statusCode : 503);
+      return { error: (e as Error).message };
+    }
   };
   const restoreH = async (reply: StatusSink, bytes?: number[]) => {
     if (!Array.isArray(bytes) || !bytes.length) { reply.code(400); return { error: 'bytes[] of one preset dump required' }; }

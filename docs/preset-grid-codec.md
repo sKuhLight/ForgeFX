@@ -55,6 +55,12 @@ leaf, emitting `decompSize` bytes.
 > save on the device, so an edited-but-unsaved buffer reports `crcValid: false` — the grid
 > still decodes correctly (the decode does not depend on the CRC).
 
+> An **unused preset slot** reads back as a normal full-length dump whose `raw_patch` is entirely
+> zero (stored CRC 0, no name, no code tree). There is nothing to decompress, so it is reported as
+> an empty preset: `empty: true`, blank name, no grid/scenes/blocks, `crcValid: false`. An all-zero
+> dump is not a restorable preset, so exporting it (`POST /preset/backup`) or using it as a
+> conversion source is refused with HTTP 422, and the local Presets folder scan skips it.
+
 ### 4. The grid
 
 In the decompressed body, the grid table starts at offset `0x104`. It is **column-major**,

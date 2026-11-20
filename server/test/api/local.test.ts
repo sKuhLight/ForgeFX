@@ -45,6 +45,8 @@ function makeFakeFm3(): DeviceDriver {
     grid: async () => ({ model: 'fm3', name: 'TEST', crcValid: true, rows: 1, cols: 1, scenes: [], cells: [], source: 'dump' as const }),
     decodePresetBytes: (bytes: Uint8Array) => {
       if (bytes[0] !== 0xf0 || bytes.length < 8) throw new Error('not a preset');
+      // tag 0x7e stands in for an unused-slot dump (the real decoder flags those `empty`)
+      if (bytes[6] === 0x7e) return { name: '', number: -1, crcValid: false, empty: true, scenes: [], blocks: [] } as never;
       return { name: `P${bytes[6]}`, number: bytes[6], scenes: [], blocks: [], params: [{ big: 'payload' }] } as never;
     }
   } as DeviceDriver;
@@ -98,11 +100,13 @@ export async function runLocalTests(): Promise<void> {
     mkdirSync(join(root, 'Presets', 'Sub'), { recursive: true });
     writeFileSync(join(root, 'Presets', 'Sub', 'Two.syx'), presetSyx(9));
     writeFileSync(join(root, 'Presets', 'ir-file.syx'), JUNK);
+    writeFileSync(join(root, 'Presets', 'Unused Slot.syx'), presetSyx(0x7e)); // an empty-slot dump
     res = await inject({ method: 'GET', url: '/local/presets' });
     assertEqual(res.statusCode, 200, 'scan status');
     const scan = res.json() as { entries: { path: string; name: string; summary: Record<string, unknown> }[]; skipped: number };
     assertEqual(scan.entries.length, 2, 'scan entries count');
-    assertEqual(scan.skipped, 1, 'junk .syx skipped');
+    assertEqual(scan.skipped, 2, 'junk .syx and empty-slot .syx skipped');
+    assert(!scan.entries.some((e) => e.path === 'Unused Slot.syx'), 'empty-slot .syx is not listed under its file name');
     const two = scan.entries.find((e) => e.path === 'Sub/Two.syx');
     assert(two, 'subdir entry found');
     assertEqual(two!.name, 'P9', 'decoded name');

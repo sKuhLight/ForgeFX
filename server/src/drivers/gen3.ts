@@ -28,6 +28,7 @@ import {
   type DecodedBlock
 } from 'forgefx-midi/devices/gen3';
 import { SLUG_FAMILY, PROFILES, type DeviceProfile, type TypeModel, type DeviceLayout, type SelectorValues } from '../devices.js';
+import { EmptyPresetError } from './types.js';
 import type {
   DeviceDriver, DriverCapabilities, DriverCtx,
   PresetGridDTO, PresetBlockDTO, PresetSummary, NamedParam, EnumParam, MeterVal,
@@ -62,6 +63,9 @@ interface DecodedDumpDTO {
   cols: number;
   grid: { effectId: number; row: number; col: number; routeFlag: number; name: string; isShunt: boolean; fromRows: number[] }[];
   sceneNames: string[];
+  /** ADDITIVE: present (true) only for an unused preset slot — an all-zero patch with no name, grid,
+   *  scenes or valid CRC. Omitted for every populated preset so existing payloads are unchanged. */
+  empty?: boolean;
 }
 /** Decoded dump: the DTO plus the decompressed body (per-block param decode source). */
 interface DecodedDump {
@@ -91,6 +95,27 @@ function dumpBytesFromFrames(frames: readonly (readonly number[])[]): Uint8Array
 function decodeDump(frames: readonly (readonly number[])[], prof: DeviceProfile): DecodedDump {
   const parsed = parsePresetDump(dumpBytesFromFrames(frames), 0, prof.model);
   const raw = decodeRawPatch(parsed.chunkPayloads);
+  if (raw.empty) {
+    // An unused slot reads back as a normal full-length dump with an all-zero patch: nothing to
+    // decompress or decode. Answer it as an empty preset (blank name, no grid/scenes, CRC not valid)
+    // so every dump-backed route answers normally instead of failing the whole request.
+    return {
+      dump: {
+        modelId: prof.model,
+        modelName: prof.name,
+        name: '',
+        crcValid: false,
+        crc: raw.storedCrc,
+        rows: prof.rows,
+        cols: prof.cols,
+        grid: [],
+        sceneNames: [],
+        empty: true
+      },
+      body: raw.body,
+      decompSize: 0
+    };
+  }
   const body3 = decodeGen3Body(raw.body, prof.model);
   let name = '';
   for (let i = 0x08; i < 0x28; i++) {
@@ -450,10 +475,12 @@ class Gen3Driver implements DeviceDriver {
 
   /** Verbatim .syx dump for POST /preset/backup (capability `backupDump`) — the library's
    *  export-to-disk + audition source. Location omitted → the currently selected preset's slot
-   *  (gen-3 dumps by slot; the raw edit-buffer stream is a different frame format, not a .syx). */
+   *  (gen-3 dumps by slot; the raw edit-buffer stream is a different frame format, not a .syx).
+   *  An unused slot is refused (`EmptyPresetError` → 422): its all-zero dump is not a restorable preset. */
   async backupPreset(location?: number): Promise<{ location: number | null; code: string | null; name: string; bytes: number[] }> {
     const n = location ?? (await this.presetRef()).number;
     const { bytes, summary } = await this.dumpRaw(n);
+    if (summary.empty) throw new EmptyPresetError();
     return { location: n, code: null, name: summary.name, bytes: Array.from(bytes) };
   }
 
@@ -501,7 +528,11 @@ class Gen3Driver implements DeviceDriver {
       const ref = blockRefForEid(c.effectId);
       seen.set(c.effectId, { effectId: c.effectId, slug: ref?.slug ?? null, name: c.name, instance: ref?.instance ?? null });
     }
-    return { number: presetNumber, name: d.name, model: d.modelName, crcValid: d.crcValid, crc: d.crc, scenes: d.sceneNames, blocks: [...seen.values()], models, amps: models.amp ?? [] };
+    return {
+      number: presetNumber, name: d.name, model: d.modelName, crcValid: d.crcValid, crc: d.crc, scenes: d.sceneNames,
+      blocks: [...seen.values()], models, amps: models.amp ?? [],
+      ...(d.empty ? { empty: true } : {})
+    };
   }
 
   /** Decompressed preset body as hex — for per-block param-decode RE (diff bodies across known param
