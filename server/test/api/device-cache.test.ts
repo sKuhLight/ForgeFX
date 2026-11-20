@@ -13,7 +13,7 @@ import { FM3_PARAMS_BY_FAMILY } from 'forgefx-midi/gen3/fm3';
 import type { DeviceEvent, DeviceDriver, DriverCapabilities } from '../../src/drivers/types.js';
 import { MockTransport, handshakeReply, isIdentifyBroadcast, assert, assertEqual, sleep } from '../helpers/mock.js';
 
-export const DEVICE_CACHE_CASE_COUNT = 10;
+export const DEVICE_CACHE_CASE_COUNT = 12;
 
 const FM3 = 0x11;
 const KEY = '11_12p0'; // FM3 fw 12.0
@@ -90,6 +90,23 @@ function fakeCacheDoc(): BuiltCache {
   };
 }
 
+/** The hard ceiling the walk received for `block` (undefined = no entry, so the codec default applies). */
+const boundOf = (opts: LiveWalkOptions, block: number): number | undefined => opts.paramBoundByBlock?.[block];
+/** The known table size the walk received for `block` (undefined = no entry). */
+const sizeOf = (opts: LiveWalkOptions, block: number): number | undefined => opts.paramKnownSizeByBlock?.[block];
+
+/** A stored profile with the given per-family section strides and provenance, for the limit derivation.
+ *  `rowsOf` lists a family's rows as ids 0..n-1 (what a byte-exact cache carries for its own id space). */
+function sectionsDoc(sections: Record<string, number>, meta: Record<string, unknown>, rowsOf: Record<string, number> = {}): BuiltCache {
+  const base = fakeCacheDoc();
+  const rangeSections = Object.fromEntries(Object.entries(sections).map(([fam, n]) => [fam, { sectionTag: 1, stride: n, recordCount: n }]));
+  const ranges = Object.fromEntries(Object.entries(rowsOf).map(([fam, n]) => [
+    fam,
+    Object.fromEntries(Array.from({ length: n }, (_, i) => [i, { kind: 'float', displayMin: 0, displayMax: 1, typecode: 0 }]))
+  ]));
+  return { ...base, rangeSections, ranges, meta: { ...base.meta, ...meta } as BuiltCache['meta'] } as BuiltCache;
+}
+
 // ── 1. firmware populate ──
 async function firmwarePresent(): Promise<void> {
   const { app, registry } = await makeApp(FM3, { fw: [12, 0, '2026-01-01'] });
@@ -133,9 +150,24 @@ async function buildHappyPath(): Promise<void> {
       assertEqual(opts.interQueryMs, 3, 'walk opts carry the hardware-proven 3 ms inter-query pacing');
       assertEqual(opts.blockPauseMs, 150, 'walk opts carry the 150 ms inter-block breather');
       assertEqual(opts.maxParamId, 127, 'walk opts stay inside the 7-bit param envelope');
-      // default build is READ-ONLY: no mode, no write hooks (byte-identical to the shipped HW walk)
+      // default build is READ-ONLY: no mode, no write hooks
       assertEqual(opts.mode, undefined, 'default build passes no mode (read-only)');
       assertEqual(opts.write, undefined, 'read-only build passes no write hooks');
+      // per-block limits come from the catalog's table strides: a known size for the instances the unit
+      // has (early stop off below it) and a hard ceiling of stride - 1 + 32, capped at 127 in read-only
+      const bounds = Object.values(opts.paramBoundByBlock ?? {});
+      assert(bounds.length > 0, 'read-only build passes per-block ceilings from the catalog');
+      assert(bounds.every((b) => b <= 127), 'no read-only ceiling above the 127 envelope');
+      assertEqual(sizeOf(opts, 78), 29, 'FM3 chorus known size is its 29-slot stride');
+      assertEqual(boundOf(opts, 78), 60, 'FM3 chorus ceiling is 29 - 1 + 32');
+      assertEqual(sizeOf(opts, 80), undefined, 'a chorus instance the FM3 does not have gets no known size');
+      assertEqual(boundOf(opts, 80), 60, 'a missing instance still gets the hard ceiling');
+      assertEqual(sizeOf(opts, 58), 144, 'FM3 amp known size is its 144-slot stride');
+      assertEqual(boundOf(opts, 58), 127, 'FM3 amp ceiling is capped at 127 in read-only');
+      assertEqual(sizeOf(opts, 1), undefined, 'FM3 global is not a contiguous table: no known size');
+      assertEqual(boundOf(opts, 1), 127, 'FM3 global ceiling (131 + 32) is capped at 127 in read-only');
+      assertEqual(sizeOf(opts, 0), undefined, 'block 0 has no known size');
+      assertEqual(boundOf(opts, 0), undefined, 'read-only needs no entry for an unknown block (the default is already 127)');
       opts.onProgress?.({ phase: 'block-start', block: 0, blockIndex: 0, blockCount: 2, records: 0, enumLabels: 0, queries: 0 });
       opts.onProgress?.({ phase: 'block-done', block: 0, blockIndex: 1, blockCount: 2, records: expectedRecords, enumLabels: 0, queries: 4 });
       opts.onProgress?.({ phase: 'done', blockIndex: 2, blockCount: 2, records: expectedRecords, enumLabels: 0, queries: 4 });
@@ -312,7 +344,32 @@ async function fullBuildWithHooks(): Promise<void> {
     const fullWalk = async (_t: unknown, opts: LiveWalkOptions): Promise<CacheRecord[]> => {
       sawFull = true;
       assertEqual(opts.mode, 'full', 'full build passes mode:full to the walk');
-      assertEqual(opts.maxParamId, 16383, 'full build lifts the param cap to the 14-bit space');
+      assertEqual(opts.maxParamId, 511, 'full build keeps 511 as the cap, never the 14-bit space');
+      const all = Object.values(opts.paramBoundByBlock ?? {});
+      assertEqual(all.length, 256, 'full mode bounds every block of the effect-id byte, known or not');
+      assert(all.every((b) => b <= 511), 'every full-mode ceiling is below 512');
+      assert(!all.includes(16383), 'no ceiling reaches the 14-bit space');
+      // FM3 catalog strides: DISTORT 144, CABINET 106 (recordCount 110 also counts special records), DELAY 88
+      assertEqual(sizeOf(opts, 58), 144, 'FM3 amp (instance 1) known size 144');
+      assertEqual(boundOf(opts, 58), 175, 'FM3 amp ceiling 144 - 1 + 32');
+      for (const eid of [59, 60, 61]) {
+        assertEqual(sizeOf(opts, eid), undefined, `FM3 amp eid ${eid} is an instance the unit lacks: no known size`);
+        assertEqual(boundOf(opts, eid), 175, `FM3 amp eid ${eid} still gets the hard ceiling`);
+      }
+      assertEqual(sizeOf(opts, 62), 106, 'FM3 cab known size is its stride 106, not the record count 110');
+      assertEqual(boundOf(opts, 62), 137, 'FM3 cab ceiling 106 - 1 + 32');
+      assertEqual(sizeOf(opts, 71), 88, 'FM3 delay instance 2 exists');
+      assertEqual(sizeOf(opts, 72), undefined, 'FM3 delay instance 3 does not');
+      assertEqual(boundOf(opts, 70), 119, 'FM3 delay ceiling 88 - 1 + 32');
+      assertEqual(sizeOf(opts, 1), undefined, 'FM3 global (virtual eid 1) is not a contiguous table: no known size');
+      assertEqual(boundOf(opts, 1), 163, 'FM3 global ceiling is its low region end 131 + 32');
+      assertEqual(sizeOf(opts, 2), 130, 'FM3 controllers (virtual eid 2) known size 130');
+      assertEqual(boundOf(opts, 2), 161, 'FM3 controllers ceiling 130 - 1 + 32');
+      // blocks with no known size (incl. block 0) are capped at the HW-proven 127, not left at 511
+      for (const eid of [0, 36, 134, 142, 190, 199]) {
+        assertEqual(sizeOf(opts, eid), undefined, `eid ${eid} has no known table size`);
+        assertEqual(boundOf(opts, eid), 127, `eid ${eid} is capped at 127 in full mode`);
+      }
       assert(opts.write != null, 'full build passes write hooks');
       await opts.write!.send(SET_FRAME);   // codec would build the SET; the host just puts bytes on the wire
       await opts.write!.reloadPreset();    // per-block non-destructive reload
@@ -346,6 +403,140 @@ async function fullWithoutCapability(): Promise<void> {
     assertEqual(res.statusCode, 501, 'full without fullCapture → 501');
     assertEqual((res.json() as { capability?: string }).capability, 'fullCapture', '501 names the fullCapture capability');
   } finally {
+    await app.close();
+  }
+}
+
+// ── 8. walkBlockLimits: derivation from the static catalog (pure, no device) ──
+async function walkBoundDerivation(): Promise<void> {
+  const full = deviceCache.walkBlockLimits(FM3, 'full');
+  const ro = deviceCache.walkBlockLimits(FM3, 'read-only');
+  assertEqual(full.knownSize[58], 144, 'FM3 full: DISTORT known size 144');
+  assertEqual(full.bound[58], 175, 'FM3 full: DISTORT ceiling 144 - 1 + 32');
+  assertEqual(full.knownSize[78], 29, 'FM3 full: CHORUS known size 29');
+  assertEqual(full.bound[78], 60, 'FM3 full: CHORUS ceiling 60');
+  assertEqual(ro.knownSize[78], 29, 'FM3 read-only: CHORUS known size 29');
+  assertEqual(ro.bound[78], 60, 'FM3 read-only: CHORUS ceiling 60');
+  assertEqual(ro.knownSize[58], 144, 'FM3 read-only: the known size is passed whole');
+  assertEqual(ro.bound[58], 127, 'FM3 read-only: DISTORT ceiling capped at 127');
+  assert(Object.values(ro.bound).every((b) => b <= 127), 'read-only ceilings never exceed 127');
+  assert(Object.values(full.bound).every((b) => b <= 511), 'full ceilings never exceed 511');
+  for (const eid of Object.keys(full.bound).map(Number)) assert(eid >= 0 && eid <= 255, `limit key ${eid} is an effect-id byte`);
+  // a known size always has a ceiling that covers its table (nothing the catalog knows is cut), except by the mode cap
+  for (const eid of Object.keys(full.knownSize).map(Number)) assert(full.bound[eid]! >= full.knownSize[eid]! - 1, `full ceiling of ${eid} covers its known table`);
+  for (const eid of Object.keys(ro.knownSize).map(Number)) assert(ro.bound[eid] !== undefined, `read-only known size of ${eid} comes with a ceiling`);
+
+  // (1) the known size is the wire STRIDE, not the record count: FM3 CABINET has 110 records but ids 0..105
+  assertEqual(full.knownSize[62], 106, 'FM3 CABINET known size is the stride 106, not recordCount 110');
+  assertEqual(full.bound[62], 137, 'FM3 CABINET ceiling 106 - 1 + 32');
+  // (1) a section that is not a contiguous table gets NO known size and a bound from its low region
+  assertEqual(full.knownSize[1], undefined, 'FM3 GLOBAL: no known size');
+  assertEqual(full.bound[1], 163, 'FM3 GLOBAL full: last low contiguous id 131 + 32');
+  assertEqual(ro.knownSize[1], undefined, 'FM3 GLOBAL read-only: no known size');
+  assertEqual(ro.bound[1], 127, 'FM3 GLOBAL read-only: capped at 127');
+  const fm9 = deviceCache.walkBlockLimits(0x12, 'full');
+  assertEqual(fm9.knownSize[1], undefined, 'FM9 GLOBAL: no known size');
+  assertEqual(fm9.bound[1], 178, 'FM9 GLOBAL full: 146 + 32');
+  const axe3 = deviceCache.walkBlockLimits(0x10, 'full');
+  assertEqual(axe3.knownSize[1], undefined, 'Axe-Fx III GLOBAL: no known size');
+  assertEqual(axe3.bound[1], 165, 'Axe-Fx III GLOBAL full: 133 + 32');
+  assertEqual(deviceCache.walkBlockLimits(0x12, 'read-only').bound[1], 127, 'FM9 GLOBAL read-only: capped at 127');
+  assertEqual(deviceCache.walkBlockLimits(0x10, 'read-only').bound[1], 127, 'Axe-Fx III GLOBAL read-only: capped at 127');
+  // every other mapped family is a contiguous table (the catalog's ordinary ids all fit below its stride)
+  for (const [name, lim, eids] of [['FM3', full, [2, 3, 37, 46, 58, 62, 66, 70, 78, 114, 118, 126]], ['FM9', fm9, [2, 3, 58, 62, 70, 78, 114, 118, 126]], ['III', axe3, [2, 3, 58, 62, 70, 78, 114, 118, 126]]] as const) {
+    for (const eid of eids) assert(lim.knownSize[eid] !== undefined, `${name} eid ${eid} is a contiguous table with a known size`);
+  }
+
+  // (3) the known size only goes to instances the unit has (instanceLimits[slug] ?? defaultInstances)
+  for (const [eid, known] of [[58, true], [59, false], [60, false], [61, false], [70, true], [71, true], [72, false], [73, false]] as const) {
+    assertEqual(full.knownSize[eid] !== undefined, known, `FM3 eid ${eid} known size iff the instance exists`);
+    assert(full.bound[eid] !== undefined && full.bound[eid]! > 0, `FM3 eid ${eid} always has a hard ceiling`);
+  }
+  assertEqual(full.bound[59], full.bound[58], 'a missing instance shares the family ceiling');
+  assertEqual(fm9.knownSize[59], 147, 'FM9 has two amps: instance 2 is known');
+  assertEqual(fm9.knownSize[60], undefined, 'FM9 amp instance 3 is not');
+  assertEqual(axe3.knownSize[73], 89, 'the Axe-Fx III has four delays: instance 4 is known');
+  assertEqual(axe3.knownSize[60], undefined, 'the Axe-Fx III has two amps: instance 3 is not');
+  assertEqual(axe3.bound[60], 173, 'a missing III amp instance still gets the ceiling 142 - 1 + 32');
+
+  // (4) unknown blocks: FULL caps them at the HW-proven 127 (block 0 included), read-only needs no entry
+  for (const eid of [0, 36, 134, 142, 190, 199, 200, 255]) {
+    assertEqual(full.knownSize[eid], undefined, `eid ${eid}: no known size`);
+    assertEqual(full.bound[eid], 127, `eid ${eid}: full mode caps an unknown block at 127`);
+    assertEqual(ro.knownSize[eid], undefined, `eid ${eid}: read-only no known size`);
+    assertEqual(ro.bound[eid], undefined, `eid ${eid}: read-only no entry (default 127)`);
+  }
+  assertEqual(Object.keys(full.bound).length, 256, 'full mode: every block has a ceiling');
+
+  // other models resolve through their own catalog; instances of a family share the ceiling
+  for (const eid of [70, 71, 72, 73]) assertEqual(fm9.bound[eid], 122, `FM9 delay eid ${eid} ceiling 91 - 1 + 32`);
+  assertEqual(fm9.knownSize[70], 91, 'FM9 delay known size 91');
+  assertEqual(fm9.bound[58], 178, 'FM9 full: DISTORT 147 slots, ceiling 178');
+  assertEqual(axe3.bound[58], 173, 'Axe-Fx III full: DISTORT 142 slots, ceiling 173 (audio eids resolve without a profile effect-id table)');
+  assertEqual(axe3.knownSize[62], 106, 'Axe-Fx III full: CABINET known size is the stride 106');
+  // no gen-3 catalog: no entries, codec defaults everywhere
+  for (const [model, mode] of [[0x15, 'full'], [0x14, 'read-only']] as const) {
+    const none = deviceCache.walkBlockLimits(model, mode);
+    assertEqual(Object.keys(none.knownSize).length + Object.keys(none.bound).length, 0, `model 0x${model.toString(16)} has no gen-3 catalog, so no limits`);
+  }
+
+  // a BYTE-EXACT stored profile refines the catalog per family (wins outright, larger or smaller)...
+  const exact = sectionsDoc({ DISTORT: 150, CHORUS: 20 }, { source: 'editor-cache' }, { DISTORT: 150, CHORUS: 20 });
+  const withExact = deviceCache.walkBlockLimits(FM3, 'full', exact);
+  assertEqual(withExact.knownSize[58], 150, 'editor-cache DISTORT 150 slots is the known size (larger than the catalog)');
+  assertEqual(withExact.bound[58], 181, 'editor-cache DISTORT ceiling 150 - 1 + 32');
+  assertEqual(withExact.knownSize[78], 20, 'editor-cache CHORUS 20 slots is the known size (exact data also shrinks)');
+  assertEqual(withExact.bound[78], 51, 'editor-cache CHORUS ceiling 20 - 1 + 32');
+  assertEqual(withExact.bound[70], 119, 'a family the stored profile does not carry keeps the catalog size');
+  assertEqual(deviceCache.walkBlockLimits(FM3, 'read-only', exact).bound[78], 51, 'read-only uses the same sizes below the 127 cap');
+  // an exact cache whose rows run past its stride is not a contiguous table: no known size, bound from the rows
+  const wide = sectionsDoc({ CHORUS: 20 }, { source: 'editor-cache' }, { CHORUS: 29 });
+  const withWide = deviceCache.walkBlockLimits(FM3, 'full', wide);
+  assertEqual(withWide.knownSize[78], undefined, 'rows beyond the stride: no known size');
+  assertEqual(withWide.bound[78], 60, 'rows beyond the stride: bound from the low region end 28 + 32');
+  // an exact cache without rows for the family is judged by the catalog's ids (CHORUS ids reach 28)
+  const noRows = sectionsDoc({ CHORUS: 20 }, { source: 'editor-cache' });
+  assertEqual(deviceCache.walkBlockLimits(FM3, 'full', noRows).knownSize[78], undefined, 'catalog ids beyond an exact stride: no known size');
+  const cloudBytes = sectionsDoc({ DISTORT: 150 }, { source: 'cloud', origin: 'bytes' }, { DISTORT: 150 });
+  assertEqual(deviceCache.walkBlockLimits(FM3, 'full', cloudBytes).knownSize[58], 150, 'a cloud profile of byte origin is exact');
+  // (5) an UNUSABLE exact stride falls back to the catalog's stride; the family is not dropped
+  for (const bad of [0, -3, Number.NaN, Number.POSITIVE_INFINITY]) {
+    const doc = sectionsDoc({ DISTORT: bad, CHORUS: 20 }, { source: 'editor-cache' }, { CHORUS: 20 });
+    const l = deviceCache.walkBlockLimits(FM3, 'full', doc);
+    assertEqual(l.knownSize[58], 144, `exact DISTORT stride ${bad} falls back to the catalog stride 144`);
+    assertEqual(l.bound[58], 175, `exact DISTORT stride ${bad} falls back to the catalog ceiling`);
+    assertEqual(l.knownSize[78], 20, `the usable CHORUS stride of the same doc still applies (${bad})`);
+  }
+  // ...but a LIVE-walk profile (or unknown provenance) never moves a limit: its sizes are a heuristic
+  for (const meta of [{ source: 'live' }, { source: 'cloud', origin: 'live' }, { source: undefined }]) {
+    const doc = sectionsDoc({ DISTORT: 442, CHORUS: 5 }, meta, { DISTORT: 442, CHORUS: 5 });
+    const l = deviceCache.walkBlockLimits(FM3, 'full', doc);
+    assertEqual(l.knownSize[58], 144, `${JSON.stringify(meta)} profile does not raise the DISTORT size`);
+    assertEqual(l.bound[58], 175, `${JSON.stringify(meta)} profile does not raise the DISTORT ceiling`);
+    assertEqual(l.knownSize[78], 29, `${JSON.stringify(meta)} profile does not shrink the CHORUS size`);
+    assertEqual(l.bound[78], 60, `${JSON.stringify(meta)} profile does not shrink the CHORUS ceiling`);
+  }
+}
+
+// ── 9. a force-rebuild over a byte-exact stored cache walks with ITS sizes (store to walk options) ──
+async function walkBoundFromStoredCache(): Promise<void> {
+  store.defaultStore.delDoc('deviceCaches', KEY);
+  store.defaultStore.putDoc('deviceCaches', KEY, sectionsDoc({ CHORUS: 40 }, { source: 'editor-cache' }, { CHORUS: 40 }));
+  const { app, registry } = await makeApp(FM3, { fw: [12, 0] });
+  try {
+    let seen: LiveWalkOptions | null = null;
+    const spyWalk = async (_t: unknown, opts: LiveWalkOptions): Promise<CacheRecord[]> => { seen = opts; return seedRecords(); };
+    const r = await deviceCache.startCacheBuild(store.defaultStore, registry, { force: true, walkImpl: spyWalk });
+    assertEqual((r.body as { started?: boolean }).started, true, 'forced rebuild started');
+    await deviceCache.cacheBuildPromise(registry);
+    assert(seen != null, 'walk invoked');
+    assertEqual(sizeOf(seen!, 78), 40, 'stored byte-exact CHORUS (40 slots) is the known size, not the catalog 29');
+    assertEqual(boundOf(seen!, 78), 71, 'stored byte-exact CHORUS ceiling is 40 - 1 + 32, not the catalog 60');
+    assertEqual(sizeOf(seen!, 62), 106, 'a family the stored cache does not carry keeps the catalog stride');
+    assertEqual(boundOf(seen!, 62), 127, 'catalog CABINET ceiling 137 is capped at 127 in read-only');
+    assertEqual(seen!.maxParamId, 127, 'read-only ceiling unchanged');
+  } finally {
+    store.defaultStore.delDoc('deviceCaches', KEY);
     await app.close();
   }
 }
@@ -389,5 +580,7 @@ export async function runDeviceCacheTests(): Promise<void> {
   await noSelfDescribe();
   await fullBuildWithHooks();
   await fullWithoutCapability();
+  await walkBoundDerivation();
+  await walkBoundFromStoredCache();
   await replyMatcher();
 }

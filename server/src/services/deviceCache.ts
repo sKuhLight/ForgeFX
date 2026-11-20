@@ -13,8 +13,10 @@ import { FM3_PARAMS } from 'forgefx-midi/gen3/fm3';
 import { FM9_PARAMS } from 'forgefx-midi/gen3/fm9';
 import { PARAMS as AXE3_PARAMS } from 'forgefx-midi/gen3/axe-fx-iii';
 import { isFractalHeaderFrame } from 'forgefx-midi/shared';
+import { blockRefForEid } from 'forgefx-midi/devices/gen3';
 import { AM4_CACHE_PARAMS, AM4_SEEDS } from 'forgefx-midi/am4';
 import { deviceCacheKey, type DeviceRegistry } from '../drivers/registryCore.js';
+import { PROFILES, SLUG_FAMILY, isByteExactProfile, type DeviceProfile } from '../devices.js';
 import type { Store } from '../runtime/store.js';
 import type { Transport } from '../transport/types.js';
 
@@ -77,17 +79,123 @@ const WALK_PACE_MS = 3;
 /** Breather between blocks, in ms — the hardware-proven sweep always paused between blocks; a
  *  continuous 128-block stream without let-up contributed to the FORGEFX-32 wedge. */
 const WALK_BLOCK_PAUSE_MS = 150;
-/** READ-ONLY walk param ceiling: params 0..127 only. This default sweep is HARDWARE-PROVEN byte-for-byte
- *  — the 14-bit param space (body[5] set, id > 127) was never live-swept read-only on a real unit, so the
- *  read-only build stays inside the validated envelope. Keep this at 127; the read-only cache must remain
- *  byte-identical to the shipped HW-verified walk. */
+/** READ-ONLY walk param ceiling: params 0..127 only. The 14-bit param space (body[5] set, id > 127) was
+ *  never live-swept read-only on a real unit, so the read-only build stays inside the validated envelope.
+ *  Keep this at 127. It is also the hard bound of every block whose table size is unknown in FULL mode.
+ *  Per-block limits (`walkBlockLimits`) can only narrow a read-only walk inside it, never widen it. */
 const WALK_MAX_PARAM_ID = 127;
-/** FULL-mode walk param ceiling: the codec's full 14-bit param space (2^14 − 1). Full capture is the
- *  CaptureRig-parity write-sweep, and the rig sweeps the whole 14-bit id range to reach sparse high-id
- *  (id > 127) records; the codec bounds this walk itself (filler / absent-run / block-probe guards end
- *  each block long before 16383), so lifting the host cap here just removes an artificial floor and lets
- *  those guards do the real bounding. Full mode is model-gated (fullCapture) so it never runs unverified. */
-const WALK_MAX_PARAM_ID_FULL = 16383;
+/** FULL-mode cap on a per-block hard bound: 511, the highest id of the largest table seen on a unit
+ *  (FM3 fw 13.0, block 0), also the codec's own FULL default. Far past a table's end the device answers
+ *  pseudo definitions, and one read-only definition query at block 0 param 1000 froze an FM3 until a
+ *  power cycle, so this must NEVER be the 14-bit space (16383): junk answers past the end keep resetting
+ *  the codec's absent-run stop and a walk would run on to its ceiling. The codec does NOT bound the walk
+ *  by itself, the host supplies the ceilings. Every block of 0..`WALK_BOUND_MAX_BLOCK` gets an explicit
+ *  per-block bound (`walkBlockLimits`), so this only caps the bounds derived from a known table. */
+const WALK_MAX_PARAM_ID_FULL = 511;
+/** Block (effect id) addresses the per-block limits are computed for: the whole effect-id byte. The
+ *  codec's default sweep covers 0..160 today; entries for blocks it does not visit are inert. */
+const WALK_BOUND_MAX_BLOCK = 255;
+
+/** Headroom of the hard bound past a known table, and the largest id gap that still counts as one
+ *  contiguous region: room for the params a newer firmware appends to a table (FM3 fw 13.0 over the
+ *  fw 12.0 catalog: CHORUS 29 -> 32, FUZZ 43 -> 44, MIXER 17 -> 21), yet nowhere near the far ids a unit
+ *  may not survive. Equals the codec's default stop run (a run of this many absent ids ends a block). */
+const WALK_BOUND_MARGIN = 32;
+
+/** Per-block limits for the live walk, keyed by block address (= gen-3 effect id). */
+export interface WalkBlockLimits {
+  /** The codec's `paramKnownSizeByBlock`: the wire stride (slots) of the block's family, for the
+   *  instances the unit has. Ids below it are walked without the absent-run stop, so a sparse table
+   *  keeps its real rows after long id gaps. */
+  knownSize: Record<number, number>;
+  /** The codec's `paramBoundByBlock`: a HARD ceiling (highest id, inclusive), never queried above. */
+  bound: Record<number, number>;
+}
+
+/** A usable wire stride: a finite number of at least one slot. */
+const usableStride = (n: unknown): n is number => typeof n === 'number' && Number.isFinite(n) && n >= 1;
+
+/** Last id of the low contiguous region of a sorted id list: the id before the first gap wider than
+ *  `WALK_BOUND_MARGIN`. FM3 GLOBAL: ids run to 131, then jump to 902. */
+function lastLowContiguousId(sortedIds: readonly number[]): number {
+  let last = sortedIds[0]!;
+  for (const id of sortedIds) {
+    if (id - last > WALK_BOUND_MARGIN) break;
+    last = id;
+  }
+  return last;
+}
+
+/** Known table size and hard ceiling per block for the live walk (see `WalkBlockLimits`).
+ *
+ *  Table size: the family's `stride` in `rangeSections`, the wire slot count (a table of N slots holds
+ *  ids 0..N-1). NOT `recordCount`: that also counts special table records (ids >= 0xff00) that no walk
+ *  reaches (FM3 CABINET: 110 records, ids 0..105). The sections are the STATIC catalog of the model,
+ *  replaced per family by the stored cache of the attached firmware when that one is byte-exact
+ *  (`byteExact`: editor-cache import / byte-sourced cloud profile, exact device data that wins outright,
+ *  as in `runtimeProfileFrom`; an unusable stride in it falls back to the catalog's, the family is not
+ *  dropped). A stored LIVE-walk profile is deliberately NOT used: its sizes are a heuristic (a pre-bound
+ *  walk may have counted junk past the table end), and a bound must never come from the very junk it
+ *  exists to stop.
+ *
+ *  Block to family is the mapping the driver uses everywhere (`blockRefForEid` slug, then `SLUG_FAMILY`,
+ *  else the profile's virtual effect ids GLOBAL/CONTROLLERS/MOD). Per block:
+ *   - Contiguous table (every catalog id below 0xff00 fits below the stride): hard bound
+ *     `min(stride - 1 + WALK_BOUND_MARGIN, mode cap)`, plus the known size when the unit HAS that
+ *     instance (`instanceLimits[slug] ?? defaultInstances`: FM3 amp instance 1 yes, 2..4 no). The known
+ *     size switches the absent-run stop off below it; a missing instance only gets the bound, so the
+ *     codec's empty-block probe skips it cheaply.
+ *   - Not a contiguous table (the catalog has ids beyond the stride: GLOBAL carries its real params in
+ *     a low region and a few far ids): NO known size, the stride says nothing about where the real
+ *     rows end. Hard bound `min(lastLowContiguousId + WALK_BOUND_MARGIN, mode cap)` (FM3 GLOBAL 131).
+ *   - Unknown block (no family, no section, unusable stride): FULL mode caps it at 127, the HW-proven
+ *     envelope, instead of the 511 default (block 0 is a system table that answers junk and froze at
+ *     param 1000). Read-only needs no entry: its default is already 127 with the stop run.
+ *
+ *  The size is a floor, not a promise: the catalog may predate the connected firmware, which can append
+ *  params to a table, so the bound leaves `WALK_BOUND_MARGIN` ids of headroom and the codec keeps its
+ *  stop run beyond the known size. Mode cap: read-only 127 (HW-proven envelope), full 511. */
+export function walkBlockLimits(model: number, mode: BuildMode, byteExact?: BuiltCache | null): WalkBlockLimits {
+  const limits: WalkBlockLimits = { knownSize: {}, bound: {} };
+  const profile: DeviceProfile | undefined = PROFILES[model];
+  if (!profile) return limits; // no gen-3 catalog for this model: codec defaults everywhere
+  const exact = byteExact && isByteExactProfile(byteExact.meta) ? byteExact : null;
+  const strides: Record<string, number> = {};
+  for (const [family, meta] of Object.entries(profile.rangeSections)) {
+    if (usableStride(meta.stride)) strides[family] = Math.floor(meta.stride);
+  }
+  for (const [family, meta] of Object.entries(exact?.rangeSections ?? {})) {
+    if (usableStride(meta.stride)) strides[family] = Math.floor(meta.stride);
+  }
+  const cap = mode === 'full' ? WALK_MAX_PARAM_ID_FULL : WALK_MAX_PARAM_ID;
+  // Ordinary param ids (below the 0xff00 special records) of a family: the byte-exact cache's rows when it
+  // carries any for the family (exact for the firmware), else the static catalog's params and ranges.
+  const idsOf = (family: string): number[] => {
+    const exactIds = Object.keys(exact?.ranges?.[family] ?? {}).map(Number);
+    const ids = exactIds.length > 0
+      ? exactIds
+      : [...(profile.params[family] ?? []).map((d) => d.paramId), ...Object.keys(profile.ranges[family] ?? {}).map(Number)];
+    return [...new Set(ids)].filter((i) => Number.isInteger(i) && i >= 0 && i < 0xff00).sort((x, y) => x - y);
+  };
+  for (let block = 0; block <= WALK_BOUND_MAX_BLOCK; block++) {
+    const ref = blockRefForEid(block);
+    const family = (ref ? SLUG_FAMILY[ref.slug] : undefined) ?? profile.familyForEffectId(block);
+    const stride = family ? strides[family] : undefined;
+    if (family === undefined || stride === undefined) {
+      if (mode === 'full') limits.bound[block] = WALK_MAX_PARAM_ID; // unknown block: the HW-proven envelope
+      continue;
+    }
+    const ids = idsOf(family);
+    if (ids.length > 0 && ids[ids.length - 1]! + 1 > stride) {
+      limits.bound[block] = Math.min(lastLowContiguousId(ids) + WALK_BOUND_MARGIN, cap); // not a contiguous table
+      continue;
+    }
+    limits.bound[block] = Math.min(stride - 1 + WALK_BOUND_MARGIN, cap);
+    const present = !ref || ref.instance <= (profile.instanceLimits[ref.slug] ?? profile.defaultInstances);
+    if (present) limits.knownSize[block] = stride;
+  }
+  return limits;
+}
 
 /** Adapt the registry's shared Transport to the codec's minimal LiveTransport: one query → the first
  *  matching Fractal reply frame, or null on timeout. The matcher mirrors the CaptureRig's HW-proven
@@ -139,12 +247,18 @@ async function runBuild(store: Store, registry: DeviceRegistry, job: CacheJob, w
         reloadPreset: () => driver.reloadPreset?.() ?? Promise.resolve()
       };
     }
+    // Per-block known table size + hard ceiling (see walkBlockLimits). A byte-exact stored cache for this
+    // firmware (force-rebuild over an editor-cache import) is exact device data and refines the catalog.
+    const stored = store.getDoc('deviceCaches', key);
+    const limits = walkBlockLimits(model, mode, stored && !stored.deleted ? (stored.data as BuiltCache) : null);
     const walkOpts: LiveWalkOptions = {
       model,
       ...(full ? { mode: 'full' as const, write } : {}),
       interQueryMs: WALK_PACE_MS,
       blockPauseMs: WALK_BLOCK_PAUSE_MS,
       maxParamId: full ? WALK_MAX_PARAM_ID_FULL : WALK_MAX_PARAM_ID,
+      paramKnownSizeByBlock: limits.knownSize,
+      paramBoundByBlock: limits.bound,
       signal: controller.signal,
       onProgress: (p) => {
         if (controller.signal.aborted) return;
