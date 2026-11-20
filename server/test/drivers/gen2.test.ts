@@ -74,7 +74,7 @@ export async function runGen2Tests(): Promise<void> {
     eqFrame(mock.sent[0], buildSetBlockChannel(AMP1, 'Y'), 'gen2 setChannel Y');
   }
 
-  // 6. placeCell → fn 0x5A grid cell. W1.6: `row`/`col` are the SHARED 1-indexed grid coordinates
+  // 6. placeCell → fn 0x5A grid cell. `row`/`col` are the SHARED 1-indexed grid coordinates
   //    (the /preset/grid/cell contract; Axis sends 1-indexed for every device), and the gen-2 wire grid
   //    is also 1-indexed → they pass straight through, like gen-3/AM4. (Was row+1/col+1.)
   {
@@ -99,7 +99,7 @@ export async function runGen2Tests(): Promise<void> {
     eqFrame(mock.sent[0], buildSwitchPreset(42), 'gen2 selectPreset');
   }
 
-  // 9. W1.6: the bottom-right cell (row 4, col 12) is addressable. The old +1 sent row 5 and threw
+  // 9. The bottom-right cell (row 4, col 12) is addressable. The old +1 sent row 5 and threw
   //    "buildSetGridCell: row out of range (1..4): 5".
   {
     const { driver, mock } = makeDriver();

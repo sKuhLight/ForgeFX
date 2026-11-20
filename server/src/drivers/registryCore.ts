@@ -369,7 +369,7 @@ export class DeviceRegistry {
     // second, heavy grid reload on top of the scene handler's own lightweight refresh).
     if (e.type === 'scene') { this.#lastSceneIdx = e.index; this.#lastChannels = null; }
     // A UI channel write (gen3 setChannel) emits `blockState` AFTER moving the device's active channel —
-    // keep the channel-watch baseline in sync (W2.4) so the next tick doesn't re-emit a redundant
+    // keep the channel-watch baseline in sync so the next tick doesn't re-emit a redundant
     // blockState against the stale baseline. (A scene event above also resets it.)
     else if (e.type === 'blockState') this.#lastChannels = null;
     for (const fn of this.#subscribers) {
@@ -948,7 +948,7 @@ export class DeviceRegistry {
           if (f) this.#emit({ type: 'cpu', percent: cpuPercentFromRaw(parseCpuRawLoad(f)) });
         }
       });
-      // W2.1: the cheap scene/channel reflection watches run on BOTH link speeds — on a slow link each
+      // The cheap scene/channel reflection watches run on BOTH link speeds — on a slow link each
       // tick is already the throttle (meterSlowMs), so wrapping them in the meter `if (!slow)` and
       // disabling ALL device→UI reflection was wrong. The METERS above stay skipped on a slow link.
       await this.#supervised(() => this.#pollReflection(step, cad, !slow));
@@ -959,7 +959,7 @@ export class DeviceRegistry {
     if (this.#metersTimer) this.#metersTimer = setTimeout(() => this.#pollMeters(), slow ? cad.meterSlowMs : cad.meterTickMs);
   }
 
-  /** Front-panel SCENE + active-CHANNEL watches (W2.1). Run on EVERY tick regardless of link speed —
+  /** Front-panel SCENE + active-CHANNEL watches. Run on EVERY tick regardless of link speed —
    *  gated by the every-Nth divider on a fast link, but on a slow link each (meterSlowMs) tick already
    *  IS the throttle. First read only primes the baseline (no event). Kept out of the meter `if (!slow)`
    *  so a 5-pin-DIN link still reflects scene/channel changes even though its meters are skipped. */
@@ -1031,7 +1031,7 @@ export class DeviceRegistry {
     let slow = false;
     try {
       const dev = await this.transport();
-      slow = dev.slow; // a generic 5-pin DIN adapter throttles the poll (reschedule below) — but W2.1: it
+      slow = dev.slow; // a generic 5-pin DIN adapter throttles the poll (reschedule below) — but it
       //                  STILL runs; skipping it entirely left a slow link with no FM3 edit reflection at all.
       await this.#supervised(async () => {
         const r = await d.readDeviceEditState!();

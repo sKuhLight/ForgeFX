@@ -703,7 +703,7 @@ class Gen3Driver implements DeviceDriver {
    *  crash-prone dump path (a full dump right after a scene switch hits the device mid-rebuild). */
   async sceneState(): Promise<{ effectId: number; bypassed: boolean; channel: string | null }[]> {
     const status = await this.#statusByEffectId();
-    // W2.2: an EMPTY status map means the fn-0x13 read failed/timed out (#statusByEffectId swallows the
+    // An EMPTY status map means the fn-0x13 read failed/timed out (#statusByEffectId swallows the
     // error). A real preset always has ≥ Output blocks, so `[]` can never be a legitimate scene state —
     // returning it made the route answer 200 `[]` and Axis kept the previous scene's bypass/channel
     // forever. Throw so the route maps it to 503 and Axis's `.catch(() => null) → load()` fallback fires.

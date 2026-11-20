@@ -344,7 +344,7 @@ class Gen2Driver implements DeviceDriver {
   }
 
   /** Grid edit (PUT /preset/grid/cell): place/clear a block. `row`/`col` are the shared 1-indexed
-   *  grid coordinates (docs/api-design.md + the /preset/grid/cell contract, "1-indexed row/col,
+   *  grid coordinates (the /preset/grid/cell route contract, "1-indexed row/col,
    *  matching FM-Edit") — the SAME convention Axis sends for every device. The gen-2 wire grid is also
    *  1-indexed (buildSetGridCell validates 1..4/1..12), so they pass straight through, like gen-3/AM4.
    *  `blockId` 0 = clear. */

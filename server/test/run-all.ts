@@ -19,7 +19,7 @@ import { runKnobUnitsTests, KNOB_UNITS_CASE_COUNT } from './drivers/knob-units.t
 import { runTablesTests, TABLES_CASE_COUNT } from './drivers/tables.test.js';
 import { runLayoutsTests, LAYOUTS_CASE_COUNT } from './drivers/layouts.test.js';
 import { runTelemetryTests, TELEMETRY_CASE_COUNT } from './drivers/telemetry.test.js';
-import { runW2ReflectionTests, W2_REFLECTION_CASE_COUNT } from './drivers/w2-reflection.test.js';
+import { runReflectionTests, REFLECTION_CASE_COUNT } from './drivers/reflection.test.js';
 import { runAliasParityTests, ALIAS_PARITY_CASE_COUNT } from './api/alias-parity.test.js';
 import { runCapsTests, CAPS_CASE_COUNT } from './api/caps.test.js';
 import { runTelemetryConfigTests, TELEMETRY_CONFIG_CASE_COUNT } from './api/telemetryConfig.test.js';
@@ -52,7 +52,7 @@ const tests: Array<{ name: string; run: () => void | Promise<void> }> = [
   { name: `drivers/tables (${TABLES_CASE_COUNT} identity checks, paramId cross-contamination guard)`, run: runTablesTests },
   { name: `drivers/layouts (${LAYOUTS_CASE_COUNT} editor-layout v2 variant-selection + passthrough)`, run: runLayoutsTests },
   { name: `drivers/telemetry (${TELEMETRY_CASE_COUNT} cadence/traffic/echo-guard/yield cases)`, run: runTelemetryTests },
-  { name: `drivers/w2-reflection (${W2_REFLECTION_CASE_COUNT} slow-link/scene-state/blockState/scene cases)`, run: runW2ReflectionTests },
+  { name: `drivers/reflection (${REFLECTION_CASE_COUNT} slow-link/scene-state/blockState/scene cases)`, run: runReflectionTests },
   { name: `api/alias-parity (${ALIAS_PARITY_CASE_COUNT} alias↔unified twins, mocked AM4)`, run: runAliasParityTests },
   { name: `api/caps (${CAPS_CASE_COUNT} device capability matrices)`, run: runCapsTests },
   { name: `api/telemetryConfig (${TELEMETRY_CONFIG_CASE_COUNT} GET/PUT mode + event + parity)`, run: runTelemetryConfigTests },

@@ -1,12 +1,11 @@
-// Workstream W2 — polling / reflection supervisor regressions. Mocked transport, NO hardware.
-//   W2.1 a slow (5-pin DIN) link must still run the cheap scene/channel reflection watches
-//        (throttled) instead of disabling ALL device→UI reflection; meters stay skipped.
-//   W2.2 a FAILED fn-0x13 status read must surface as an error, not be reported as an EMPTY scene
-//        state ([] blinds Axis's bypass/channel view).
-//   W2.4 a UI channel write must not be followed by a redundant blockState from the channel watch
-//        (the registry's channel baseline is only reset on `scene` events today).
-//   W2.5 AM4 setScene must emit a `scene` event like gen-3's setScene (other windows/remotes learn).
-// W2.3 is documented / design-flagged (see the W2 report) — not encoded here.
+// Polling / reflection supervisor regressions. Mocked transport, NO hardware.
+//   1. a slow (5-pin DIN) link must still run the cheap scene/channel reflection watches
+//      (throttled) instead of disabling ALL device→UI reflection; meters stay skipped.
+//   2. a FAILED fn-0x13 status read must surface as an error, not be reported as an EMPTY scene
+//      state ([] blinds the client's bypass/channel view).
+//   3. a UI channel write must not be followed by a redundant blockState from the channel watch
+//      (the registry's channel baseline used to be reset only on `scene` events).
+//   4. AM4 setScene must emit a `scene` event like gen-3's setScene (other windows/remotes learn).
 import '../helpers/env.js'; // MUST stay first — isolates ~/.forgefx-conn / data dir before transport loads
 import { __createRegistryForTest, type DeviceRegistry } from '../../src/drivers/registry.js';
 import { setProfileOverride, setConnOverride } from '../../src/transport/connection.js';
@@ -18,7 +17,7 @@ import type { Conn } from '../../src/transport/types.js';
 import type { DeviceDriver, DeviceEvent, DriverCtx, DriverCapabilities } from '../../src/drivers/types.js';
 import { MockTransport, handshakeReply, isIdentifyBroadcast, assert, assertEqual, sleep } from '../helpers/mock.js';
 
-export const W2_REFLECTION_CASE_COUNT = 5;
+export const REFLECTION_CASE_COUNT = 5;
 
 function makeReg(conn: Conn | null, mock: MockTransport): DeviceRegistry {
   return __createRegistryForTest({
@@ -49,7 +48,7 @@ function gen3Caps(extra: Partial<DriverCapabilities> = {}): DriverCapabilities {
 }
 const fakeGrid = async () => ({ model: 'fm3', name: 'x', crcValid: true, rows: 4, cols: 12, scenes: [], cells: [], source: 'dump' as const });
 
-/** W2.1 — a slow link still reflects scene + channel changes (throttled); meters stay skipped. */
+/** A slow link still reflects scene + channel changes (throttled); meters stay skipped. */
 async function slowLinkReflection(): Promise<void> {
   const mock = new MockTransport('serial', '/dev/ttyACM0');
   (mock as { slow: boolean }).slow = true; // generic 5-pin DIN adapter — the exact case detect() supports
@@ -73,13 +72,13 @@ async function slowLinkReflection(): Promise<void> {
   await sleep(2600); // slow tick = 2000 ms; need prime + one change tick
   unsub();
 
-  assert(sceneCalls >= 2, `W2.1: the scene watch ran on a slow link (getScene calls=${sceneCalls})`);
-  assert(events.some((e) => e.type === 'scene' && e.index === 1), 'W2.1: a slow-link scene change still yields a scene event');
-  assert(chanCalls >= 1, `W2.1: the channel watch ran on a slow link (getActiveChannels calls=${chanCalls})`);
-  assert(!mock.sent.some((f) => f[5] === 0x01), 'W2.1: meter/CPU reads (fn 0x01) stay skipped on a slow link');
+  assert(sceneCalls >= 2, `the scene watch ran on a slow link (getScene calls=${sceneCalls})`);
+  assert(events.some((e) => e.type === 'scene' && e.index === 1), 'a slow-link scene change still yields a scene event');
+  assert(chanCalls >= 1, `the channel watch ran on a slow link (getActiveChannels calls=${chanCalls})`);
+  assert(!mock.sent.some((f) => f[5] === 0x01), 'meter/CPU reads (fn 0x01) stay skipped on a slow link');
 }
 
-/** W2.2 — a failed status read must throw, not masquerade as an empty scene state. */
+/** A failed status read must throw, not masquerade as an empty scene state. */
 async function emptySceneStateIsAnError(): Promise<void> {
   // silent fn-0x13 → the status read failed
   const silent = new MockTransport('serial', '/dev/ttyACM0');
@@ -88,7 +87,7 @@ async function emptySceneStateIsAnError(): Promise<void> {
   const drvFail = createGen3Driver(PROFILES[0x11]!, { transport: async () => silent, emit: () => {}, getCadence: () => cadenceFor(0x11, 'balanced') });
   let threw = false;
   try { await drvFail.sceneState!(); } catch { threw = true; }
-  assert(threw, 'W2.2: a failed fn-0x13 read must surface as an error, not an empty sceneState []');
+  assert(threw, 'a failed fn-0x13 read must surface as an error, not an empty sceneState []');
 
   // positive control: a real (non-empty) status dump still parses through
   const ok = new MockTransport('serial', '/dev/ttyACM0');
@@ -97,10 +96,10 @@ async function emptySceneStateIsAnError(): Promise<void> {
   ok.reply = () => [dump];
   const drvOk = createGen3Driver(PROFILES[0x11]!, { transport: async () => ok, emit: () => {}, getCadence: () => cadenceFor(0x11, 'balanced') });
   const st = await drvOk.sceneState!();
-  assertEqual(st.length, 2, 'W2.2: a valid status dump yields per-block scene state');
+  assertEqual(st.length, 2, 'a valid status dump yields per-block scene state');
 }
 
-/** W2.4 — a UI channel write must not trigger a redundant blockState from the channel watch. */
+/** A UI channel write must not trigger a redundant blockState from the channel watch. */
 async function noDuplicateBlockState(): Promise<void> {
   const mock = new MockTransport('serial', '/dev/ttyACM0');
   mock.isOpen = true;
@@ -127,15 +126,15 @@ async function noDuplicateBlockState(): Promise<void> {
   const before = events.filter((e) => e.type === 'blockState').length;
   await fake.setChannel!(1, 'B');
   const afterWrite = events.filter((e) => e.type === 'blockState').length;
-  assertEqual(afterWrite - before, 1, 'W2.4: the UI channel write emits exactly one blockState');
+  assertEqual(afterWrite - before, 1, 'the UI channel write emits exactly one blockState');
   await waitFor(() => chanCalls >= 2, 3000, 'the next channel-watch tick');
   await sleep(150); // let any extra tick land
   const total = events.filter((e) => e.type === 'blockState').length;
-  assertEqual(total - before, 1, 'W2.4: no redundant blockState after the UI channel write (stale baseline reset)');
+  assertEqual(total - before, 1, 'no redundant blockState after the UI channel write (stale baseline reset)');
   unsub();
 }
 
-/** W2.5 — AM4 setScene emits a scene event like gen-3's setScene. */
+/** AM4 setScene emits a scene event like gen-3's setScene. */
 async function am4SetSceneEmitsScene(): Promise<void> {
   const mock = new MockTransport('serial', '/dev/ttyACM0');
   mock.isOpen = true;
@@ -143,10 +142,10 @@ async function am4SetSceneEmitsScene(): Promise<void> {
   const ctx: DriverCtx = { transport: async () => mock, emit: (e) => events.push(e), getCadence: () => cadenceFor(0x15, 'balanced') };
   const drv = createAm4Driver(ctx);
   await drv.setScene(2);
-  assert(events.some((e) => e.type === 'scene' && e.index === 2), 'W2.5: AM4 setScene emits a scene event (like gen-3)');
+  assert(events.some((e) => e.type === 'scene' && e.index === 2), 'AM4 setScene emits a scene event (like gen-3)');
 }
 
-/** W2.1 (second half) — the FM3 device-edit watch poll also still runs on a slow link (throttled). */
+/** The FM3 device-edit watch poll also still runs on a slow link (throttled). */
 async function slowLinkEditWatch(): Promise<void> {
   const mock = new MockTransport('serial', '/dev/ttyACM0');
   (mock as { slow: boolean }).slow = true;
@@ -165,18 +164,18 @@ async function slowLinkEditWatch(): Promise<void> {
   const unsub = reg.subscribe(() => {});
   await sleep(2600); // primer at editWatchMs (2000 ms), then the slow reschedule (4000 ms)
   unsub();
-  assert(editReads >= 1, `W2.1: the FM3 edit-watch poll still runs on a slow link (reads=${editReads})`);
+  assert(editReads >= 1, `the FM3 edit-watch poll still runs on a slow link (reads=${editReads})`);
 }
 
-export async function runW2ReflectionTests(): Promise<void> {
+export async function runReflectionTests(): Promise<void> {
   setConnOverride(null);
   setProfileOverride(null);
   const cases: [string, () => Promise<void>][] = [
-    ['W2.1 slow-link reflection', slowLinkReflection],
-    ['W2.2 empty sceneState is an error', emptySceneStateIsAnError],
-    ['W2.1 slow-link edit-watch', slowLinkEditWatch],
-    ['W2.4 no duplicate blockState', noDuplicateBlockState],
-    ['W2.5 AM4 setScene emits scene', am4SetSceneEmitsScene]
+    ['slow-link reflection', slowLinkReflection],
+    ['empty sceneState is an error', emptySceneStateIsAnError],
+    ['slow-link edit-watch', slowLinkEditWatch],
+    ['no duplicate blockState', noDuplicateBlockState],
+    ['AM4 setScene emits scene', am4SetSceneEmitsScene]
   ];
   const failures: string[] = [];
   for (const [name, fn] of cases) {
