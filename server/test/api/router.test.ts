@@ -171,7 +171,7 @@ const ROWS: Row[] = [
 ];
 
 // dynamic follow-ups (need the version id from the backup row) + local rows + subscribe + the two
-// firmware-gate twins (full capture on fw 13.0 / unknown firmware) = extra cases
+// firmware-gate twins (full capture on fw 14.0 / unknown firmware) = extra cases
 export const ROUTER_PARITY_CASE_COUNT = ROWS.length + 10;
 
 function deepEq(a: unknown, b: unknown): boolean {
@@ -183,12 +183,12 @@ function deepEq(a: unknown, b: unknown): boolean {
   return ka.every((k) => deepEq((a as Record<string, unknown>)[k], (b as Record<string, unknown>)[k]));
 }
 
-// FULL-mode cache build is refused on firmware 13+ and on unknown firmware: the Fastify route and its
+// FULL-mode cache build is refused above the verified firmware (FM3: 13.0) and on unknown firmware: the Fastify route and its
 // Browser-Direct twin answer the SAME 501 (they share startCacheBuild). A self-describe + fullCapture
 // fake (the main matrix fake has both off) over a registry whose fn 0x08 reply is scripted — or silent.
 async function fullCaptureFirmwareGateParity(): Promise<void> {
   const cases: Array<{ fw?: [number, number]; expectedFirmware: string | null; label: string }> = [
-    { fw: [13, 0], expectedFirmware: '13.0', label: 'fw 13.0' },
+    { fw: [14, 0], expectedFirmware: '14.0', label: 'fw 14.0' },
     { expectedFirmware: null, label: 'unknown firmware' }
   ];
   for (const c of cases) {
@@ -302,7 +302,7 @@ export async function runRouterParityTests(): Promise<void> {
     const cfgEvents = events.filter((e) => e.type === 'config' && (e as { id?: string }).id === 'parity-ui');
     assert(cfgEvents.length >= 2, `config fan-out reaches router subscribers (got ${cfgEvents.length})`);
 
-    // 9..10 — firmware gate on full-mode cache builds (fw 13.0 + unknown firmware) holds on both twins
+    // 9..10 — firmware gate on full-mode cache builds (fw 14.0 + unknown firmware) holds on both twins
     await fullCaptureFirmwareGateParity();
   } finally {
     await app.close();

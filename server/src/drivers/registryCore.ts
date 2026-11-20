@@ -66,14 +66,14 @@ export function deviceCacheKey(modelId: number, major: number, minor: number): s
  *  self-describe walk that also taper-sweeps, i.e. WRITES to the device — is allowed. Each entry is a
  *  version on which a full capture was actually carried out successfully; anything newer is refused
  *  (fail closed) because a newer firmware may change the end-of-table behaviour the walk relies on —
- *  FM3 firmware 13.0 did: the released walk does not stop at the end of a block (the end-marker replies
- *  are counted as real records), so it runs for a very long time and would write sweep values to
- *  parameters that do not exist. Fractal numbers firmware per model (the Axe-Fx III is on 32.x while the
+ *  FM3 firmware 13.0 did: a walk without the table-end bound does not stop at the end of a block (the
+ *  end-marker replies are counted as real records), so it runs for a very long time and would write sweep
+ *  values to parameters that do not exist. The bounded walk is verified on FM3 13.0. Fractal numbers firmware per model (the Axe-Fx III is on 32.x while the
  *  FM3/FM9 are on 12.x/13.x), so the table is keyed by model byte. A model without an entry is never
  *  allowed. Raise an entry only after a full capture has been verified on that newer version.
  *  Read-only mode is intentionally NOT governed by this table. */
 export const FULL_CAPTURE_MAX_VERIFIED_FW: Readonly<Record<number, { readonly major: number; readonly minor: number }>> = {
-  0x11: { major: 12, minor: 0 }, // FM3
+  0x11: { major: 13, minor: 0 }, // FM3 (13.0 verified with the table-end-bounded walk)
   0x12: { major: 12, minor: 0 }, // FM9
   0x10: { major: 32, minor: 6 }  // Axe-Fx III
 };

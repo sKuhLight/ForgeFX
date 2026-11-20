@@ -224,17 +224,18 @@ async function gen1(): Promise<void> {
 }
 
 // fullCapture follows the firmware, per model: offered only on a known firmware at or below the model's
-// verified version (FM3/FM9 12.0, Axe-Fx III 32.6 — major.minor), withheld above it and when the firmware
+// verified version (FM3 13.0, FM9 12.0, Axe-Fx III 32.6 — major.minor), withheld above it and when the firmware
 // is unknown / unusable. The build route refuses full mode in exactly those cases (see deviceCache.ts).
 async function fullCaptureFirmwareGate(): Promise<void> {
   type FwCase = { fw?: [number, number]; expected: boolean; label: string };
   const perModel: Array<{ modelId: number; name: string; cases: FwCase[] }> = [
     { modelId: 0x11, name: 'FM3', cases: [
-      { fw: [12, 0], expected: true, label: 'fw 12.0 (verified)' },
-      { fw: [11, 99], expected: true, label: 'fw 11.99 (lower major, high minor)' },
-      { fw: [12, 1], expected: false, label: 'fw 12.1' },
-      { fw: [12, 99], expected: false, label: 'fw 12.99 (high minor boundary)' },
-      { fw: [13, 0], expected: false, label: 'fw 13.0' }
+      { fw: [13, 0], expected: true, label: 'fw 13.0 (verified)' },
+      { fw: [12, 99], expected: true, label: 'fw 12.99 (lower major, high minor)' },
+      { fw: [12, 0], expected: true, label: 'fw 12.0' },
+      { fw: [13, 1], expected: false, label: 'fw 13.1' },
+      { fw: [13, 99], expected: false, label: 'fw 13.99 (high minor boundary)' },
+      { fw: [14, 0], expected: false, label: 'fw 14.0' }
     ] },
     { modelId: 0x12, name: 'FM9', cases: [
       { fw: [12, 0], expected: true, label: 'fw 12.0 (verified)' },

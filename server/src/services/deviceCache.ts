@@ -353,8 +353,9 @@ export async function startCacheBuild(store: Store, registry: DeviceRegistry, op
   // sends fn 0x08 and clears the cached firmware, which must never happen in the middle of a running walk.
   if (JOBS.has(registry)) return { code: 409, body: { error: 'building' } };
   // FULL mode WRITES to the device, so it additionally needs a firmware it has been verified on: per model, at
-  // or below FULL_CAPTURE_MAX_VERIFIED_FW (e.g. FM3 firmware 13.0's walk does not stop at a block's end and
-  // would write sweep values to non-existent params). The firmware is RE-READ right before deciding (fn 0x08,
+  // or below FULL_CAPTURE_MAX_VERIFIED_FW (a firmware can move the table ends the walk relies on: on FM3 13.0 a walk
+  // without the table-end bound did not stop at a block's end and would have written sweep values to
+  // non-existent params). The firmware is RE-READ right before deciding (fn 0x08,
   // the detect path) so a unit that changed firmware or went quiet since detect() is never judged on a stale
   // version; a silent unit is unknown and therefore refused (fail closed). Same 501/capability shape as the
   // gates above, plus additive `reason: 'firmware'` / `firmware` / `message` fields. Read-only mode is

@@ -550,8 +550,8 @@ async function walkBoundFromStoredCache(): Promise<void> {
 }
 
 // ── 6b. FULL-mode firmware gate: full capture is allowed only on a firmware the model's full capture is
-//    verified on (FM3 <= 12.0 here), and refused above it and on unknown firmware (FM3 13.0's walk would not
-//    stop at a block's end and would write sweep values to non-existent params); read-only mode is never
+//    verified on (FM3 <= 13.0 here), and refused above it and on unknown firmware (a firmware can move the
+//    table ends the walk relies on); read-only mode is never
 //    gated. Service-level, via the walkImpl seam. ──
 type GateOutcome = { code: number; body: Record<string, unknown>; walkCalls: number; walkModes: Array<string | undefined>; setFrames: number };
 
@@ -586,30 +586,35 @@ async function fullFirmwareGate(): Promise<void> {
   assertEqual(ok.walkModes.join(','), 'full', 'fw 12.0 walk runs in full mode');
   assertEqual(ok.setFrames, 1, 'fw 12.0 full walk may write (SET reached the transport)');
 
-  // fw 12.1 (just above the FM3's verified 12.0) → refused too: allowlist, not "major < 13"
-  const justAbove = await runGateScenario([12, 1], 'full');
-  assertEqual(justAbove.code, 501, 'full on fw 12.1 → 501');
-  assertEqual(justAbove.body.reason, 'firmware', 'fw 12.1 refusal reason: firmware');
-  assertEqual(justAbove.walkCalls, 0, 'fw 12.1 never walks');
-  assertEqual(justAbove.setFrames, 0, 'fw 12.1 writes nothing');
+  // fw 13.0 (the FM3's verified version) → allowed
+  const ok13 = await runGateScenario([13, 0], 'full');
+  assertEqual(ok13.code, 200, 'full on fw 13.0 → 200');
+  assertEqual(ok13.walkModes.join(','), 'full', 'fw 13.0 walk runs in full mode');
 
-  // fw 13.0 → refused: 501 fullCapture/firmware, the walk is never invoked and nothing is written
-  const blocked = await runGateScenario([13, 0], 'full');
-  assertEqual(blocked.code, 501, 'full on fw 13.0 → 501');
+  // fw 13.1 (just above the FM3's verified 13.0) → refused: allowlist, not "major < 14"
+  const justAbove = await runGateScenario([13, 1], 'full');
+  assertEqual(justAbove.code, 501, 'full on fw 13.1 → 501');
+  assertEqual(justAbove.body.reason, 'firmware', 'fw 13.1 refusal reason: firmware');
+  assertEqual(justAbove.walkCalls, 0, 'fw 13.1 never walks');
+  assertEqual(justAbove.setFrames, 0, 'fw 13.1 writes nothing');
+
+  // fw 14.0 → refused: 501 fullCapture/firmware, the walk is never invoked and nothing is written
+  const blocked = await runGateScenario([14, 0], 'full');
+  assertEqual(blocked.code, 501, 'full on fw 14.0 → 501');
   assertEqual(blocked.body.error, 'unsupported', '501 keeps the unsupported error code');
   assertEqual(blocked.body.capability, 'fullCapture', '501 names the fullCapture capability');
   assertEqual(blocked.body.reason, 'firmware', '501 carries reason: firmware');
-  assertEqual(blocked.body.firmware, '13.0', '501 reports the detected firmware');
+  assertEqual(blocked.body.firmware, '14.0', '501 reports the detected firmware');
   const blockedMsg = String(blocked.body.message);
-  assert(/verified/.test(blockedMsg) && blockedMsg.includes('13.0') && /use read-only/.test(blockedMsg), '501 message names the detected firmware, says verified-only, and points at read-only');
-  assert(!/FM3|firmware 13 and later/.test(blockedMsg), '501 message makes no model-specific claim');
+  assert(/verified/.test(blockedMsg) && blockedMsg.includes('14.0') && /use read-only/.test(blockedMsg), '501 message names the detected firmware, says verified-only, and points at read-only');
+  assert(!/FM3|firmware 14 and later/.test(blockedMsg), '501 message makes no model-specific claim');
   assertEqual(blocked.walkCalls, 0, 'refused full build never starts the walk');
   assertEqual(blocked.setFrames, 0, 'refused full build writes nothing to the device');
 
-  // a later firmware is refused too (threshold is "13 and later")
-  const later = await runGateScenario([14, 3], 'full');
-  assertEqual(later.code, 501, 'full on fw 14.3 → 501');
-  assertEqual(later.walkCalls, 0, 'fw 14.3 never walks');
+  // a later firmware is refused too
+  const later = await runGateScenario([15, 3], 'full');
+  assertEqual(later.code, 501, 'full on fw 15.3 → 501');
+  assertEqual(later.walkCalls, 0, 'fw 15.3 never walks');
 
   // unknown firmware (silent fn 0x08) → refused, firmware reported as null
   const unknown = await runGateScenario(undefined, 'full');
@@ -622,10 +627,10 @@ async function fullFirmwareGate(): Promise<void> {
   assertEqual(unknown.walkCalls, 0, 'unknown firmware never walks');
   assertEqual(unknown.setFrames, 0, 'unknown firmware writes nothing');
 
-  // read-only on fw 13.0 stays allowed: plain read-only walk (no mode, no write hooks), no SET frame
-  const ro = await runGateScenario([13, 0], 'read-only');
-  assertEqual(ro.code, 200, 'read-only on fw 13.0 → 200');
-  assertEqual(ro.body.started, true, 'read-only on fw 13.0 starts the build');
+  // read-only on an unverified fw 14.0 stays allowed: plain read-only walk (no mode, no write hooks), no SET frame
+  const ro = await runGateScenario([14, 0], 'read-only');
+  assertEqual(ro.code, 200, 'read-only on fw 14.0 → 200');
+  assertEqual(ro.body.started, true, 'read-only on fw 14.0 starts the build');
   assertEqual(ro.walkModes.length, 1, 'read-only walk ran once');
   assertEqual(ro.walkModes[0], undefined, 'read-only walk passes no mode');
   assertEqual(ro.setFrames, 0, 'read-only walk writes nothing');
@@ -664,16 +669,16 @@ async function fullFirmwareFreshness(): Promise<void> {
     assertEqual(registry.firmwareInfo()?.version, '12.0', 'initial detect reads 12.0');
     assertEqual(await fullCaps(), true, 'caps offer fullCapture on 12.0');
 
-    // (a) unit now reports 13.0; re-detect replaces the cached version, caps follow, full is refused
-    state.fw = [13, 0];
+    // (a) unit now reports 14.0; re-detect replaces the cached version, caps follow, full is refused
+    state.fw = [14, 0];
     await registry.detect();
-    assertEqual(registry.firmwareInfo()?.version, '13.0', 're-detect picks up 13.0');
-    assertEqual(await fullCaps(), false, 'caps withdraw fullCapture after re-detect on 13.0');
+    assertEqual(registry.firmwareInfo()?.version, '14.0', 're-detect picks up 14.0');
+    assertEqual(await fullCaps(), false, 'caps withdraw fullCapture after re-detect on 14.0');
     let r = await full();
-    assertEqual(r.code, 501, 'full after re-detect on 13.0 → 501');
-    assertEqual(body(r).firmware, '13.0', 'refusal reports 13.0');
+    assertEqual(r.code, 501, 'full after re-detect on 14.0 → 501');
+    assertEqual(body(r).firmware, '14.0', 'refusal reports 14.0');
 
-    // (b) unit goes silent; re-detect CLEARS the version (no stale 13.0 / 12.0 left behind) → refused, firmware null
+    // (b) unit goes silent; re-detect CLEARS the version (no stale 14.0 / 12.0 left behind) → refused, firmware null
     state.fw = undefined;
     await registry.detect();
     assertEqual(registry.firmwareInfo(), null, 're-detect on a silent unit clears the stale firmware');
@@ -686,11 +691,11 @@ async function fullFirmwareFreshness(): Promise<void> {
     state.fw = [12, 0];
     await registry.detect();
     assertEqual(registry.firmwareInfo()?.version, '12.0', 're-detect back on 12.0');
-    state.fw = [13, 0]; // no re-detect
+    state.fw = [14, 0]; // no re-detect
     r = await full();
-    assertEqual(r.code, 501, 'stale 12.0 + unit now 13.0, no re-detect → pre-gate re-read refuses');
-    assertEqual(body(r).firmware, '13.0', 'pre-gate re-read reports the fresh 13.0');
-    assertEqual(registry.firmwareInfo()?.version, '13.0', 'pre-gate re-read refreshed the registry');
+    assertEqual(r.code, 501, 'stale 12.0 + unit now 14.0, no re-detect → pre-gate re-read refuses');
+    assertEqual(body(r).firmware, '14.0', 'pre-gate re-read reports the fresh 14.0');
+    assertEqual(registry.firmwareInfo()?.version, '14.0', 'pre-gate re-read refreshed the registry');
     state.fw = [12, 0];
     await registry.detect();
     state.fw = undefined; // goes silent, no re-detect
@@ -730,15 +735,15 @@ async function fullFirmwareFreshness(): Promise<void> {
 // Same gate over HTTP: POST body `mode` plumbing + the 501 response shape.
 async function fullFirmwareGateHttp(): Promise<void> {
   const fake = makeGen3Fake(gen3FakeCaps({ fullCapture: true }), []);
-  const { app, registry } = await makeAppWithFake(FM3, fake, [13, 0]);
+  const { app, registry } = await makeAppWithFake(FM3, fake, [14, 0]);
   try {
     const res = await app.inject({ method: 'POST', url: '/device/cache/build', payload: { mode: 'full' } });
-    assertEqual(res.statusCode, 501, 'HTTP full on fw 13.0 → 501');
+    assertEqual(res.statusCode, 501, 'HTTP full on fw 14.0 → 501');
     const b = res.json() as { error?: string; capability?: string; reason?: string; firmware?: string | null; message?: string };
     assertEqual(b.error, 'unsupported', 'HTTP 501 error');
     assertEqual(b.capability, 'fullCapture', 'HTTP 501 capability');
     assertEqual(b.reason, 'firmware', 'HTTP 501 reason');
-    assertEqual(b.firmware, '13.0', 'HTTP 501 firmware');
+    assertEqual(b.firmware, '14.0', 'HTTP 501 firmware');
     assert(typeof b.message === 'string' && b.message.length > 0, 'HTTP 501 carries a message');
     assertEqual(deviceCache.cacheBuildPromise(registry), null, 'refused full build leaves no job running');
   } finally {
