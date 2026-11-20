@@ -5,7 +5,7 @@
 // store imports keep this module browser-safe for the runtime router.
 import type { Store } from '../runtime/store.js';
 import type { PresetVersion, Backup } from '../runtime/storeBackend.js';
-import type { DeviceDriver } from '../drivers/types.js';
+import type { DeviceDriver, StoreReason } from '../drivers/types.js';
 
 /** Snapshot one preset into the version store (dedup'd by CRC). Returns the version, or null if empty. */
 export async function backupPreset(store: Store, d: DeviceDriver, n: number, source: 'manual' | 'auto' | 'backup' = 'manual', backupId?: string): Promise<PresetVersion | null> {
@@ -35,13 +35,23 @@ export async function loadVersion(store: Store, d: DeviceDriver, id: string): Pr
 /** Restore a version to its origin slot: load it into the edit buffer, then commit it to that slot
  *  (DESTRUCTIVE for that slot). This is the "Restore this version to device" action — unlike
  *  loadVersion, it persists to the preset's location, not just the edit buffer. */
-export async function restoreVersion(store: Store, d: DeviceDriver, id: string): Promise<{ ok: boolean; location: number; error?: string; warning?: string }> {
+export async function restoreVersion(
+  store: Store, d: DeviceDriver, id: string
+): Promise<{ ok: boolean; location: number; acked?: boolean; reason?: StoreReason; error?: string; warning?: string }> {
   const v = store.getPresetVersion(id);
   if (!v) throw new Error('version not found');
   if (v.location < 0) throw new Error('version has no slot to restore to');
   await loadVersion(store, d, id);
   // The commit's own verdict decides the answer: a store the device refused or never acknowledged must
-  // not be reported as a successful restore.
+  // not be reported as a successful restore. The store's own acked / reason pass through unchanged
+  // (additive: absent for drivers that don't report them).
   const r = await d.store!(v.location);
-  return { ok: r.ok, location: v.location, ...(r.error ? { error: r.error } : {}), ...(r.warning ? { warning: r.warning } : {}) };
+  return {
+    ok: r.ok,
+    location: v.location,
+    ...(r.acked !== undefined ? { acked: r.acked } : {}),
+    ...(r.reason ? { reason: r.reason } : {}),
+    ...(r.error ? { error: r.error } : {}),
+    ...(r.warning ? { warning: r.warning } : {})
+  };
 }

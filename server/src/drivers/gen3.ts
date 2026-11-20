@@ -35,7 +35,7 @@ import { SLUG_FAMILY, type DeviceProfile, type TypeModel, type DeviceLayout, typ
 import type {
   DeviceDriver, DriverCapabilities, DriverCtx,
   PresetGridDTO, PresetBlockDTO, PresetSummary, NamedParam, EnumParam, MeterVal,
-  FcSwitchState, FcReadState
+  FcSwitchState, FcReadState, StoreReason
 } from './types.js';
 
 // slug → { name, page=base effect id } from the authoritative codec base table (replaces the old
@@ -55,17 +55,51 @@ const EDIT_BUFFER = 0x3fff; // preset number sentinel = current edit buffer
  *                warning`); a real 0x64 refusal is `ok:false` either way.
  *  The ack repeats the request's fn/sub envelope (it is not byte-identical to the request). It is VERIFIED
  *  on our own FM3 (model byte 0x11): it arrives ~0.8–0.9 s after the request on fw 12.0 and ~1.25–1.35 s on
- *  fw 13.0. FM9 (0x12) and Axe-Fx III (0x10) are still 'unknown' — flip one only with our own hardware
- *  evidence for that model, never on a report. */
+ *  fw 13.0, over USB. FM9 (0x12) and Axe-Fx III (0x10) are still 'unknown' — flip one only with our own
+ *  hardware evidence for that model, never on a report.
+ *
+ *  A level is only as wide as what was measured, so the table entry carries its scope as data
+ *  (`StoreAckScope`) and `resolveStoreAck` narrows it to 'unknown' outside it: the FM3's 'verified' holds on
+ *  a fast (USB) link and firmware >= 12.0 only; a slow (5-pin DIN) link, older firmware, or firmware that
+ *  could not be read all fall back to the lenient 'unknown'. */
 export type StoreAckEvidence = 'verified' | 'unknown';
-const STORE_ACK_EVIDENCE: Readonly<Record<number, StoreAckEvidence>> = { 0x10: 'unknown', 0x11: 'verified', 0x12: 'unknown' };
+export interface StoreAckScope {
+  readonly level: StoreAckEvidence;
+  /** The level holds on firmware >= [major, minor] only; older or unknown firmware → 'unknown'. */
+  readonly minFirmware?: readonly [number, number];
+  /** The level holds on a fast (USB) link only; a slow (5-pin DIN) link → 'unknown'. */
+  readonly fastLinkOnly?: boolean;
+}
+const STORE_ACK_EVIDENCE: Readonly<Record<number, StoreAckScope>> = {
+  0x10: { level: 'unknown' },
+  0x11: { level: 'verified', minFirmware: [12, 0], fastLinkOnly: true },
+  0x12: { level: 'unknown' }
+};
+
+/** The effective store-ack evidence for one model entry on THIS link and firmware (pure). `firmware` is the
+ *  running firmware the registry read at detect time (null = not read / not known). */
+export function resolveStoreAck(
+  scope: StoreAckScope | undefined,
+  link: { slow: boolean; firmware: { major: number; minor: number } | null }
+): StoreAckEvidence {
+  if (!scope || scope.level !== 'verified') return 'unknown';
+  if (scope.fastLinkOnly && link.slow) return 'unknown';
+  if (scope.minFirmware) {
+    const fw = link.firmware;
+    if (!fw) return 'unknown';
+    const [major, minor] = scope.minFirmware;
+    if (fw.major < major || (fw.major === major && fw.minor < minor)) return 'unknown';
+  }
+  return 'verified';
+}
 
 /** How long `store()` waits for the ack, per evidence level and link. The wait ends the instant the ack
- *  arrives, so the cap only costs time when none comes. 'verified': 4 s is ~3x the slowest FM3 ack measured
- *  (~1.35 s, fw 13.0). 'unknown': shorter, because on a model that never acks EVERY successful save would
- *  otherwise pay the full cap. A slow (5-pin DIN) link gets more. */
+ *  arrives, so the cap only costs time when none comes. 'verified': the fast 6 s is ~4.4x the slowest FM3 ack
+ *  measured (~1.35 s, fw 13.0); the slow 8 s was not measured and stays under the client's 12 s request
+ *  ceiling, which includes queue time. 'unknown': shorter, because on a model that never acks EVERY
+ *  successful save would otherwise pay the full cap. A slow (5-pin DIN) link gets more. */
 const STORE_ACK_TIMEOUT_MS: Readonly<Record<StoreAckEvidence, { fast: number; slow: number }>> = {
-  verified: { fast: 4000, slow: 8000 },
+  verified: { fast: 6000, slow: 8000 },
   unknown: { fast: 2500, slow: 6000 }
 };
 
@@ -187,11 +221,14 @@ class Gen3Driver implements DeviceDriver {
   #ctx: DriverCtx;
   readonly capabilities: DriverCapabilities;
 
-  /** Store-ack evidence for THIS model (see STORE_ACK_EVIDENCE); overridable for tests / a hardware run. */
-  readonly storeAck: StoreAckEvidence;
+  /** Store-ack evidence scope for THIS model (see STORE_ACK_EVIDENCE). */
+  readonly storeAckScope: StoreAckScope | undefined;
+  /** An INJECTED evidence level (tests / a hardware run): overrides the table, scope included. */
+  readonly storeAckOverride: StoreAckEvidence | undefined;
 
   constructor(profile: DeviceProfile, ctx: DriverCtx, opts: { storeAck?: StoreAckEvidence } = {}) {
-    this.storeAck = opts.storeAck ?? STORE_ACK_EVIDENCE[profile.model] ?? 'unknown';
+    this.storeAckScope = STORE_ACK_EVIDENCE[profile.model];
+    this.storeAckOverride = opts.storeAck;
     this.#prof = profile;
     this.#codec = createModernFractalCodec(profile.model); // every frame carries THIS device's model byte
     this.#ctx = ctx;
@@ -1383,6 +1420,11 @@ class Gen3Driver implements DeviceDriver {
     const { number } = await this.presetRef();
     if (number >= 0) await this.selectPreset(number);
   }
+  /** The store-ack evidence in force right now: an injected level wins, else the model's table entry narrowed
+   *  to this link (`slow`) and the firmware the registry read at detect time (see `resolveStoreAck`). */
+  storeAckFor(slow: boolean): StoreAckEvidence {
+    return this.storeAckOverride ?? resolveStoreAck(this.storeAckScope, { slow, firmware: this.#ctx.getFirmware?.() ?? null });
+  }
   /**
    * Persist the working buffer to preset slot `n`.
    *
@@ -1391,24 +1433,29 @@ class Gen3Driver implements DeviceDriver {
    * `#write` window is only 120 ms. So the old call could never see its own ack: it returned
    * `{ok:true}` by ABSENCE of a refusal, and any foreign `0x64` that happened to land in that window (a
    * refused read while the meter poll was running, say) was misread as the device rejecting the save.
-   * Wait for the echo instead.
+   * Wait for the acknowledgement instead.
    *
-   * Result contract (HTTP 200 on every outcome; the body says which). `storeAck` (see
-   * STORE_ACK_EVIDENCE) decides what a MISSING ack means:
+   * Result contract (HTTP 200 on every outcome; the body says which). The evidence level in force on this
+   * link and firmware (`storeAckFor`, see STORE_ACK_EVIDENCE) decides what a MISSING ack means. `reason`
+   * (additive) tells a refusal from an unknown outcome without parsing text: 'rejected' = a fn-0x01 refusal
+   * (0x64) was seen in the store window and no ack followed; 'no-ack' = nothing acknowledged the store in
+   * time. It is set on every `ok:false` and on the lenient no-ack warning, and absent on an acknowledged
+   * store.
    *  • ack seen          → `{ok:true, acked:true, location}` — the device's own reply, even if a stray
    *                         0x64 from another exchange landed in the same window;
-   *  • 0x64, no ack      → `{ok:false, acked:false, location, error}` — a real refusal (the error carries
-   *                         the device's result code), whatever the evidence level;
-   *  • neither in time   → 'verified': `{ok:false, acked:false, location, error}` (the outcome is unknown —
-   *                         the slot may or may not have been written); 'unknown': `{ok:true,
-   *                         acked:false, location, warning}` — the store was SENT but could not be
-   *                         confirmed, which is all a model without a proven ack can honestly say.
+   *  • 0x64, no ack      → `{ok:false, acked:false, reason:'rejected', location, error}` — a real refusal
+   *                         (the error carries the device's result code), whatever the evidence level;
+   *  • neither in time   → 'verified': `{ok:false, acked:false, reason:'no-ack', location, error}` (the
+   *                         outcome is unknown — the slot may or may not have been written); 'unknown':
+   *                         `{ok:true, acked:false, reason:'no-ack', location, warning}` — the store was
+   *                         SENT but could not be confirmed, which is all a model without a proven ack (or
+   *                         a link / firmware outside what was measured) can honestly say.
    *
    * The wait ends only on the ack or the hard cap: `quietMs` is set to the cap so a gap of silence after
    * some unrelated early frame can't end it before the (late) ack, and a 0x64 does not end it early either
    * (a refusal costs the full cap, which is rare and keeps a foreign 0x64 from faking one).
    */
-  async store(n: number): Promise<{ ok: boolean; acked: boolean; location: number; error?: string; warning?: string }> {
+  async store(n: number): Promise<{ ok: boolean; acked: boolean; reason?: StoreReason; location: number; error?: string; warning?: string }> {
     const dev = await this.#conn();
     const bytes = this.#codec.buildStorePreset(n);
     const model = bytes[4]!;
@@ -1419,23 +1466,30 @@ class Gen3Driver implements DeviceDriver {
     // from the request on fw 12.0 and 13.0; for the other models that is still an assumption — if a unit's
     // ack ever turns out byte-identical, revisit this.)
     const sameAsRequest = (f: number[]) => f.length === bytes.length && f.every((b, i) => b === bytes[i]);
+    // The ack carries no slot (nothing after the sub-action identifies which preset it answers), so a late
+    // ack from an EARLIER store cannot be told apart from this one's.
     const isAck = (f: number[]) => f.length > 7 && f[0] === 0xf0 && [1, 2, 3, 4, 5, 6].every((i) => f[i] === bytes[i]) && !sameAsRequest(f);
-    // A refusal is a 0x64 MULTIPURPOSE_RESPONSE echoing fn 0x01.
+    // A refusal is a 0x64 MULTIPURPOSE_RESPONSE echoing fn 0x01. Its body carries no sub-action, so ANY fn-0x01
+    // refusal seen in the store window counts: a late refusal of a preceding fn-0x01 write can be attributed
+    // to this store. That is what `reason:'rejected'` means — a fn-0x01 refusal was seen and no ack followed.
     const isReject = (f: number[]) => isMultipurposeResponse(f, model) && f[6] === fn;
-    const caps = STORE_ACK_TIMEOUT_MS[this.storeAck];
+    const evidence = this.storeAckFor(dev.slow);
+    const caps = STORE_ACK_TIMEOUT_MS[evidence];
     const timeoutMs = dev.slow ? caps.slow : caps.fast;
-    const unconfirmed = (why: string) => this.storeAck === 'verified'
+    const unconfirmed = (why: string) => evidence === 'verified'
       ? {
           ok: false,
           acked: false,
+          reason: 'no-ack' as const,
           location: n,
           error: `${why} — the device did not acknowledge the store within ${timeoutMs} ms, so the preset may or may not have been written to slot ${n}`
         }
       : {
           ok: true,
           acked: false,
+          reason: 'no-ack' as const,
           location: n,
-          warning: `${why} — no store acknowledgement from the device within ${timeoutMs} ms; the store to slot ${n} was sent but is unconfirmed (acknowledgement not yet verified for this model)`
+          warning: `${why} — no store acknowledgement from the device within ${timeoutMs} ms; the store to slot ${n} was sent but is unconfirmed (acknowledgement not verified for this model, link and firmware)`
         };
     let frames: number[][];
     try {
@@ -1454,7 +1508,7 @@ class Gen3Driver implements DeviceDriver {
         const code = parseMultipurposeResponse(reject, model).resultCode;
         detail = ` (result 0x${code.toString(16).padStart(2, '0')}${describeMultipurposeResultCode(code) ? `: ${describeMultipurposeResultCode(code)}` : ''})`;
       } catch { /* malformed 0x64 — keep the bare message */ }
-      return { ok: false, acked: false, location: n, error: `store to slot ${n} rejected by the device${detail}` };
+      return { ok: false, acked: false, reason: 'rejected', location: n, error: `store to slot ${n} rejected by the device${detail}` };
     }
     return unconfirmed('no acknowledgement');
   }
