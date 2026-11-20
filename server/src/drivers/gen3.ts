@@ -31,7 +31,7 @@ import {
   retargetPresetDumpToEditBuffer,
   type DecodedBlock
 } from 'forgefx-midi/devices/gen3';
-import { isTransportTimeout } from '../transport/types.js';
+import { isTransportTimeout, type Transport } from '../transport/types.js';
 import { SLUG_FAMILY, PROFILES, type DeviceProfile, type TypeModel, type DeviceLayout, type SelectorValues } from '../devices.js';
 import { EmptyPresetError } from './types.js';
 import type {
@@ -50,6 +50,112 @@ const BLOCK_META: Record<string, { name: string; page: number }> = (() => {
 })();
 
 const EDIT_BUFFER = 0x3fff; // preset number sentinel = current edit buffer
+
+// ── reply shapes of the two multi-frame reads, so a late reply to an EARLIER read can never pass for this
+// one (the transport only holds the link for a short drain after a lost reply; anything later reaches the
+// next request, and only these matchers keep it out) ──
+const isFrameOf = (f: readonly number[], model: number, fn: number): boolean =>
+  f.length > 6 && f[0] === 0xf0 && f[1] === 0x00 && f[2] === 0x01 && f[3] === 0x74 && f[4] === model && f[5] === fn;
+
+/** Preset dump: a 0x77 header, 0x78 chunks, a 0x79 terminator. The header names the dump's preset number in
+ *  bytes 6-7 (MSB-first 7-bit pair — the field retargetPresetDumpToEditBuffer rewrites; 0x3FFF = the edit
+ *  buffer). How strictly a read holds the device to that number is per model (DUMP_HEADER_POLICY). */
+type DumpHeaderCheck =
+  /** Only a header naming the requested preset number counts. */
+  | 'strict'
+  /** Complete at once on a header naming the requested number; if only whole dumps naming another number
+   *  arrive, use the LAST of them after the quiet gap (a device answers in order, so a late reply to an
+   *  earlier read comes first) and log it once. Owned frames and the terminator logic still keep a stale
+   *  tail out. */
+  | 'prefer'
+  /** Any header (the device does not name the request in it). */
+  | 'any';
+/** Per model: [stored-slot reads, edit-buffer reads] — the STARTING policy of a connection; tighten as tester
+ *  evidence comes in. Within a connection a 'prefer' kind turns 'strict' as soon as the device has sent one
+ *  header naming the requested number (the driver's per-connection session, see #dumpHeaderPlan).
+ *   FM3 stored slots: strict (being verified on hardware, incl. empty slots and slots >= 128).
+ *   FM9 / Axe-Fx III stored slots: prefer — the header is not verified on these yet.
+ *   Edit buffer, every model: prefer the 0x3FFF sentinel (or the CURRENT slot, when the driver knows it) —
+ *   what a device writes there is not verified, and another stored-slot header there may be a late scan reply,
+ *   so it never completes the read by itself. */
+const DUMP_HEADER_POLICY: Readonly<Record<number, readonly [stored: DumpHeaderCheck, editBuffer: DumpHeaderCheck]>> = {
+  0x11: ['strict', 'prefer'], // FM3
+  0x12: ['prefer', 'prefer'], // FM9
+  0x10: ['prefer', 'prefer'] // Axe-Fx III
+};
+const dumpHeaderCheck = (model: number, target: number): DumpHeaderCheck =>
+  (DUMP_HEADER_POLICY[model] ?? ['prefer', 'prefer'])[target === EDIT_BUFFER ? 1 : 0];
+const dumpHeaderNumber = (f: readonly number[]) => ((f[6]! & 0x7f) << 7) | (f[7]! & 0x7f);
+const dumpFramesOnly = (fs: number[][], model: number) => fs.filter((f) => isFrameOf(f, model, 0x77) || isFrameOf(f, model, 0x78) || isFrameOf(f, model, 0x79));
+/** Every WHOLE dump in `frames` whose header passes `want` — each its header through the 0x79 after it, that
+ *  dump's frames only. A terminator without a wanted header before it (the tail of an earlier dump) is never
+ *  part of one. */
+function wholeDumps(frames: number[][], model: number, want: (header: number[]) => boolean): number[][][] {
+  const out: number[][][] = [];
+  let start = -1;
+  for (let i = 0; i < frames.length; i++) {
+    const f = frames[i]!;
+    if (isFrameOf(f, model, 0x77)) start = want(f) ? i : -1;
+    else if (start >= 0 && isFrameOf(f, model, 0x79)) {
+      out.push(dumpFramesOnly(frames.slice(start, i + 1), model));
+      start = -1;
+    }
+  }
+  return out;
+}
+/** How one dump read judges headers: the effective check, and which headers NAME the request. */
+interface DumpHeaderPlan { check: DumpHeaderCheck; named: (header: number[]) => boolean }
+/** Request options for one dump: complete at once on a whole dump whose header the plan calls named; own the
+ *  headers the check may use and the chunks after them, so a dump that stops short ends one quiet gap after
+ *  its last chunk (the transport drains the rest), and a whole dump under 'prefer' ends one quiet gap after its
+ *  terminator without a drain (`settles`). */
+function presetDumpOpts(model: number, plan: DumpHeaderPlan, timeoutMs: number, quietMs: number) {
+  const { check, named } = plan;
+  const usable = (f: number[]) => check !== 'strict' || named(f);
+  let inOurs = false;
+  return {
+    timeoutMs,
+    quietMs,
+    match: (fs: number[][]) => wholeDumps(fs, model, named).length > 0,
+    owns: (f: number[]) => {
+      if (isFrameOf(f, model, 0x77)) return (inOurs = usable(f));
+      return inOurs && (isFrameOf(f, model, 0x78) || isFrameOf(f, model, 0x79));
+    },
+    settles: (f: number[]) => isFrameOf(f, model, 0x79)
+  };
+}
+
+/** Block bulk read (fn 0x1F poll): a 0x74 head naming the block (bytes 6-7, LSB-first 7-bit pair), 0x75
+ *  bodies, a 0x76 end. Only a burst whose head names THIS block answers the poll — a spontaneous broadcast or
+ *  another block's late burst does not. */
+const isBulkHeadFor = (f: readonly number[], model: number, eid: number): boolean =>
+  isFrameOf(f, model, 0x74) && f.length >= 11 && ((f[6]! & 0x7f) | ((f[7]! & 0x7f) << 7)) === eid;
+const bulkFramesOnly = (fs: number[][], model: number) => fs.filter((f) => isFrameOf(f, model, 0x74) || isFrameOf(f, model, 0x75) || isFrameOf(f, model, 0x76));
+/** The first whole burst for `eid` (its head through the next 0x76), or null. */
+function bulkReadSpan(frames: number[][], model: number, eid: number): number[][] | null {
+  let start = -1;
+  for (let i = 0; i < frames.length; i++) {
+    const f = frames[i]!;
+    if (isFrameOf(f, model, 0x74)) start = isBulkHeadFor(f, model, eid) ? i : -1;
+    else if (start >= 0 && isFrameOf(f, model, 0x76)) return bulkFramesOnly(frames.slice(start, i + 1), model);
+  }
+  return null;
+}
+/** What a bulk read hands its caller: the whole burst for `eid`, else the last one that started for it (a lost
+ *  0x76 — assembleGen3BlockBulkRead decodes what arrived), else nothing (→ "no 0x74 head", as for silence). */
+function bulkReadFrames(frames: number[][], model: number, eid: number): number[][] {
+  const whole = bulkReadSpan(frames, model, eid);
+  if (whole) return whole;
+  let last = -1;
+  frames.forEach((f, i) => { if (isBulkHeadFor(f, model, eid)) last = i; });
+  if (last < 0) return [];
+  const tail: number[][] = [frames[last]!];
+  for (const f of frames.slice(last + 1)) {
+    if (isFrameOf(f, model, 0x74)) break; // another block's burst
+    if (isFrameOf(f, model, 0x75)) tail.push(f);
+  }
+  return tail;
+}
 
 /** Is the device's own acknowledgement of a preset store EVIDENCED on this model? ForgeFX-side table (the
  *  codec does not carry this fact; FOLLOW-UP: move it into the codec's per-device config).
@@ -441,11 +547,64 @@ class Gen3Driver implements DeviceDriver {
     return { ok: true };
   }
 
-  /** Write + watch a short window for a 0x64 rejection. For structural ops where a reject matters. */
+  /** Write + watch a short window for a 0x64 rejection. For structural ops where a reject matters.
+   *  The device answers an accepted write with silence and a refused one with a 0x64 MULTIPURPOSE_RESPONSE
+   *  `[echoedFn, resultCode]`, so only a 0x64 from this model echoing THIS write's function is its refusal (one
+   *  too short to carry a function counts, conservatively). A foreign 0x64 — a late refusal of another
+   *  operation — neither ends the window nor fails the write.
+   *  `rejectOnly`: silence until the window closes is the success outcome, so the transport neither warns nor
+   *  holds the link for a late reply after it; a browser-direct transport that still reports the silence as
+   *  a typed timeout gets the same answer. */
   async #write(bytes: number[]): Promise<{ ok: boolean }> {
     const dev = await this.#conn();
-    const frames = await dev.request(bytes, { timeoutMs: 120, quietMs: 60, match: (fs) => fs.some((f) => f[5] === 0x64) });
-    return { ok: !frames.some((f) => f[5] === 0x64) };
+    const model = bytes[4]!;
+    const fn = bytes[5];
+    const isOwnRejection = (f: number[]) => isMultipurposeResponse(f, model) && (f.length < 9 || f[6] === fn);
+    // The device's synchronous echo of THIS write — a SET's value echo carries the same function, sub-action,
+    // effect id and param id (bytes 6-11). A frame byte-identical to the request is our own write coming back
+    // (loopback), not an echo. The echo is OWNED, not a match: whether a device ever echoes a write it then
+    // refuses is not known, so after an echo the write stays open for its quiet gap (half the window) and a
+    // refusal of its function arriving in that time is still this write's; then it ends as accepted, earlier
+    // than the full window.
+    const sameAsRequest = (f: number[]) => f.length === bytes.length && f.every((b, i) => b === bytes[i]);
+    const isOwnEcho = (f: number[]) =>
+      bytes.length >= 14 && f.length >= 14 && f[0] === 0xf0 && f[1] === 0x00 && f[2] === 0x01 && f[3] === 0x74
+      && f[4] === model && f[5] === fn && [6, 7, 8, 9, 10, 11].every((i) => f[i] === bytes[i]) && !sameAsRequest(f);
+    // A slow link (5-pin DIN) needs a longer refusal window: the request itself takes ~10-20 ms on the wire.
+    const timeoutMs = dev.slow ? 250 : 120;
+    let frames: number[][];
+    try {
+      frames = await dev.request(bytes, {
+        timeoutMs,
+        quietMs: timeoutMs / 2,
+        rejectOnly: true,
+        match: (fs) => fs.some(isOwnRejection),
+        owns: isOwnEcho
+      });
+    } catch (e) {
+      if (isTransportTimeout(e)) return { ok: true }; // silence: accepted
+      throw e;
+    }
+    return { ok: !frames.some(isOwnRejection) };
+  }
+
+  /** One fn-0x1F bulk read of block `eid`: the burst whose 0x74 head names `eid` (bulkReadFrames), never another
+   *  block's late burst. Its head and bodies are owned, so a burst whose 0x76 is lost still ends one quiet gap
+   *  after its last body (and the transport drains the rest) instead of waiting the full timeout. */
+  async #bulkRead(dev: Transport, eid: number, timeoutMs: number, quietMs: number, routine = false): Promise<number[][]> {
+    const model = this.#prof.model;
+    let inOurs = false;
+    const frames = await dev.request(this.#codec.buildBlockBulkReadPoll(eid), {
+      timeoutMs,
+      quietMs,
+      routine,
+      match: (fs) => bulkReadSpan(fs, model, eid) !== null,
+      owns: (f) => {
+        if (isFrameOf(f, model, 0x74)) return (inOurs = isBulkHeadFor(f, model, eid));
+        return inOurs && isFrameOf(f, model, 0x75);
+      }
+    });
+    return bulkReadFrames(frames, model, eid);
   }
 
   /** Current preset number + name (one query). */
@@ -458,6 +617,7 @@ class Gen3Driver implements DeviceDriver {
     const f = frames.find((x) => this.#codec.isQueryPatchNameResponse(x));
     if (!f) return { number: -1, name: '' };
     const r = this.#codec.parseQueryPatchNameResponse(f);
+    if (r.presetNumber >= 0) this.#session(dev).currentSlot = r.presetNumber;
     return { number: r.presetNumber, name: r.name };
   }
 
@@ -484,19 +644,71 @@ class Gen3Driver implements DeviceDriver {
     // several seconds with ~1s gaps between chunks. The USB-tuned windows (5s / 180ms quiet) give up mid
     // dump. Widen them so the transfer completes; the 0x79-terminator `match` still returns the instant the
     // dump is whole, so a fast link isn't slowed.
+    // Only a whole dump counts (a 0x77 header through the 0x79 after it — a tail never does), and which header
+    // is acceptable is per model (DUMP_HEADER_POLICY): a late whole dump of another slot decoded as this one
+    // shifted every later slot by one in a library scan.
     const slow = dev.slow;
-    let frames: number[][] = [];
+    const model = this.#prof.model;
+    const what = target === EDIT_BUFFER ? 'edit buffer' : `slot ${target}`;
+    let partial: number[][] = [];
     for (let attempt = 1; attempt <= 3; attempt++) {
-      frames = await dev.request(this.#codec.buildRequestPresetDump(target), {
-        timeoutMs: slow ? 25000 : 5000,
-        quietMs: slow ? 1500 : 180,
-        match: (fs) => fs.some((f) => f[5] === 0x79) // 0x79 = dump terminator
-      });
-      const ok = frames.some((f) => f[5] === 0x78) && frames.some((f) => f[5] === 0x79);
-      if (ok) return frames;
-      console.log(`[forgefx] presetDump: incomplete attempt ${attempt}/3 (frames=${frames.length}, 0x78=${frames.some((f) => f[5] === 0x78)}, 0x79=${frames.some((f) => f[5] === 0x79)}) — retrying`);
+      const plan = this.#dumpHeaderPlan(dev, target);
+      const frames = await dev.request(this.#codec.buildRequestPresetDump(target), presetDumpOpts(model, plan, slow ? 25000 : 5000, slow ? 1500 : 180));
+      let whole = wholeDumps(frames, model, plan.named)[0];
+      if (whole && dumpHeaderNumber(whole[0]!) === target) this.#session(dev).learned.add(target === EDIT_BUFFER ? 'edit' : 'stored');
+      if (!whole && plan.check === 'prefer') {
+        whole = wholeDumps(frames, model, () => true).at(-1);
+        if (whole) this.#noteDumpHeader(what, dumpHeaderNumber(whole[0]!));
+      }
+      if (whole && whole.some((f) => f[5] === 0x78)) return whole;
+      // keep what started (from the last usable header) for the decoder's error message
+      let last = -1;
+      frames.forEach((f, i) => { if (isFrameOf(f, model, 0x77) && (plan.check !== 'strict' || plan.named(f))) last = i; });
+      partial = last < 0 ? [] : dumpFramesOnly(frames.slice(last), model);
+      console.log(`[forgefx] presetDump: incomplete ${what} attempt ${attempt}/3 (frames=${frames.length}, header=${last >= 0}, 0x78=${partial.some((f) => f[5] === 0x78)}, 0x79=${partial.some((f) => f[5] === 0x79)}) — retrying`);
     }
-    return frames; // still incomplete → let decodePresetDump throw its clear error
+    return partial; // still incomplete → let decodePresetDump throw its clear error
+  }
+  /** Log ONCE per driver and kind of read that a 'prefer' dump read fell back to a dump whose header names
+   *  another preset number — the evidence needed to tighten DUMP_HEADER_POLICY for this model. */
+  #noteDumpHeader(what: string, named: number): void {
+    const kind = what === 'edit buffer' ? what : 'stored slot';
+    if (this.#dumpHeaderNoted.has(kind)) return;
+    this.#dumpHeaderNoted.add(kind);
+    const n = named === EDIT_BUFFER ? 'the edit buffer (0x3FFF)' : `slot ${named}`;
+    console.warn(`[forgefx] presetDump: ${what} read answered by a dump whose header names ${n} — used it (no dump naming the request arrived; header check is lenient for model 0x${this.#prof.model.toString(16)}). Logged once.`);
+  }
+  #dumpHeaderNoted = new Set<string>();
+
+  /** What the driver learned about THIS connection (reset on reconnect — a new transport — and on re-detect,
+   *  see resetSession): which dump-read kinds the device has proven to name the requested number in their
+   *  header, and the current slot when the driver knows it (set by presetRef / selectPreset). */
+  #sessionState: { transport: Transport; learned: Set<'stored' | 'edit'>; currentSlot: number | null } | null = null;
+  #session(dev: Transport) {
+    if (this.#sessionState?.transport !== dev) this.#sessionState = { transport: dev, learned: new Set(), currentSlot: null };
+    return this.#sessionState;
+  }
+  /** A fresh detect: forget what was learned about the connection. */
+  resetSession(): void {
+    this.#sessionState = null;
+  }
+  /** How a dump read of `target` judges headers on this connection. Starts from DUMP_HEADER_POLICY; a
+   *  'prefer' kind becomes 'strict' once the device has named the requested number in a header (so a late dump
+   *  of another slot can never be used as a fallback again). An edit-buffer read also treats a header naming
+   *  the CURRENT slot as named when the driver knows it (devices may write that instead of 0x3FFF) — that does
+   *  not count as proof, since a front-panel preset change can make the known slot stale. */
+  #dumpHeaderPlan(dev: Transport, target: number): DumpHeaderPlan {
+    const s = this.#session(dev);
+    const base = dumpHeaderCheck(this.#prof.model, target);
+    const kind = target === EDIT_BUFFER ? 'edit' : 'stored';
+    const check: DumpHeaderCheck = base === 'prefer' && s.learned.has(kind) ? 'strict' : base;
+    const current = target === EDIT_BUFFER ? s.currentSlot : null;
+    const named = (h: number[]) => {
+      if (check === 'any') return true;
+      const n = dumpHeaderNumber(h);
+      return n === target || (current !== null && n === current);
+    };
+    return { check, named };
   }
 
   /** Routing grid of ONE STORED SLOT (GET /presets/:n/grid): the dump the device returns for slot `n`,
@@ -631,12 +843,7 @@ class Gen3Driver implements DeviceDriver {
   /** Decompressed preset body as hex — for per-block param-decode RE (diff bodies across known param
    *  changes to locate offsets). Dumps the active edit buffer. */
   async presetBodyHex(): Promise<{ len: number; hex: string }> {
-    const dev = await this.#conn();
-    const frames = await dev.request(this.#codec.buildRequestPresetDump(EDIT_BUFFER), {
-      timeoutMs: 5000,
-      quietMs: 180,
-      match: (fs) => fs.some((f) => f[5] === 0x79)
-    });
+    const frames = await this.#dumpFrames(EDIT_BUFFER); // the same whole-dump matching (and retry) as every dump read
     const parsed = parsePresetDump(dumpBytesFromFrames(frames), 0, this.#prof.model);
     const { body } = decodeRawPatch(parsed.chunkPayloads);
     return { len: body.length, hex: Buffer.from(body).toString('hex') };
@@ -648,7 +855,8 @@ class Gen3Driver implements DeviceDriver {
     try {
       // fractal-midi's isStatusDumpResponse is locked to model 0x10 (III), so match the
       // 0x13 frame ourselves (any model) and parse the id-id-dd triples inline.
-      const frames = await dev.request(this.#codec.buildStatusDump(), { timeoutMs: 1500, match: (fs) => fs.some((f) => f[5] === 0x13) });
+      // fn-only matcher: the status dump carries no request id (polled by the channel watch)
+      const frames = await dev.request(this.#codec.buildStatusDump(), { timeoutMs: 1500, routine: true, match: (fs) => fs.some((f) => f[5] === 0x13) });
       const f = frames.find((x) => x[5] === 0x13);
       if (f) {
         const payload = f.slice(6, f.length - 2);
@@ -792,7 +1000,7 @@ class Gen3Driver implements DeviceDriver {
         // active one, not always channel A. Costs one status round-trip per open — worth it for correctness.
         const activeCh = (await this.#statusByEffectId()).get(eid)?.channel ?? 0;
         this.#watchedChannel = activeCh; // keep the device-edit-burst diff on the same channel (see decodeEditBurst)
-        const frames = await dev.request(this.#codec.buildBlockBulkReadPoll(eid), { timeoutMs: dev.slow ? 8000 : 2500, quietMs: dev.slow ? 600 : 120, match: (fs) => fs.some((f) => f[5] === 0x76) });
+        const frames = await this.#bulkRead(dev, eid, dev.slow ? 8000 : 2500, dev.slow ? 600 : 120);
         const bulk = this.#codec.assembleGen3BlockBulkRead(frames);
         const { stride, base } = this.#channelSlice(family, bulk, activeCh, hasChannels);
         // Prime the device-edit-push baseline with the OPEN channel's values so a later front-panel
@@ -1059,11 +1267,7 @@ class Gen3Driver implements DeviceDriver {
    *  (only non-zero pids), first channel. The client computes pids from the FC/Modifier model. */
   async rawBlock(eid: number): Promise<{ eid: number; values: Record<number, number> }> {
     const dev = await this.#conn();
-    const frames = await dev.request(this.#codec.buildBlockBulkReadPoll(eid), {
-      timeoutMs: 2500,
-      quietMs: 120,
-      match: (fs) => fs.some((f) => f[5] === 0x76)
-    });
+    const frames = await this.#bulkRead(dev, eid, 2500, 120);
     const bulk = this.#codec.assembleGen3BlockBulkRead(frames);
     const values: Record<number, number> = {};
     bulk.values.forEach((v, i) => {
@@ -1101,7 +1305,7 @@ class Gen3Driver implements DeviceDriver {
     let base = 0;
     try {
       const dev = await this.#conn();
-      const frames = await dev.request(this.#codec.buildBlockBulkReadPoll(eid), { timeoutMs: 2500, quietMs: 120, match: (fs) => fs.some((f) => f[5] === 0x76) });
+      const frames = await this.#bulkRead(dev, eid, 2500, 120);
       const bulk = this.#codec.assembleGen3BlockBulkRead(frames);
       values = bulk.values;
       const activeCh = (await this.#statusByEffectId()).get(eid)?.channel ?? 0;
@@ -1168,7 +1372,7 @@ class Gen3Driver implements DeviceDriver {
       const vals: Record<number, MeterVal> = {};
       let typeName = '';
       try {
-        const frames = await dev.request(this.#codec.buildBlockBulkReadPoll(c.effectId), { timeoutMs: 2000, quietMs: 100, match: (fs) => fs.some((f) => f[5] === 0x76) });
+        const frames = await this.#bulkRead(dev, c.effectId, 2000, 100);
         const bulk = this.#codec.assembleGen3BlockBulkRead(frames);
         const activeCh = status.get(c.effectId)?.channel ?? 0;
         const { base } = this.#channelSlice(family, bulk, activeCh);
@@ -1225,7 +1429,7 @@ class Gen3Driver implements DeviceDriver {
       for (const def of defs) {
         try {
           const frames = await dev.request(buildBlockMonitorPoll(eid, def.pid, model), {
-            timeoutMs: 800, quietMs: 40,
+            timeoutMs: 800, quietMs: 40, routine: true,
             match: (fs) => fs.some((f) => isBlockMonitorResponse(f, eid, def.pid))
           });
           const r = frames.find((f) => isBlockMonitorResponse(f, eid, def.pid));
@@ -1264,13 +1468,13 @@ class Gen3Driver implements DeviceDriver {
     let position: number | null = null;
     let level: number | null = null;
     try {
-      const wf = await dev.request(buildLooperWaveformPoll(eid, model), { timeoutMs: 900, quietMs: 60, match: (fs) => fs.some((f) => isLooperWaveformResponse(f, eid)) });
+      const wf = await dev.request(buildLooperWaveformPoll(eid, model), { timeoutMs: 900, quietMs: 60, routine: true, match: (fs) => fs.some((f) => isLooperWaveformResponse(f, eid)) });
       const r = wf.find((f) => isLooperWaveformResponse(f, eid));
       if (r) wave = parseLooperWaveform(r);
     } catch { /* no waveform this tick */ }
     for (const [pid, isPos] of [[14, true], [22, false]] as const) {
       try {
-        const fr = await dev.request(buildBlockMonitorPoll(eid, pid, model), { timeoutMs: 500, quietMs: 40, match: (fs) => fs.some((f) => isBlockMonitorResponse(f, eid, pid)) });
+        const fr = await dev.request(buildBlockMonitorPoll(eid, pid, model), { timeoutMs: 500, quietMs: 40, routine: true, match: (fs) => fs.some((f) => isBlockMonitorResponse(f, eid, pid)) });
         const rr = fr.find((f) => isBlockMonitorResponse(f, eid, pid));
         if (rr) { const v = parseBlockMonitorNorm(rr); if (isPos) position = v; else level = v; }
       } catch { /* skip */ }
@@ -1389,7 +1593,7 @@ class Gen3Driver implements DeviceDriver {
     const dev = await this.#conn();
     let frames: number[][];
     try {
-      frames = await dev.request(this.#codec.buildBlockBulkReadPoll(eid), { timeoutMs: dev.slow ? 4000 : 1500, quietMs: dev.slow ? 300 : 100, match: (fs) => fs.some((f) => f[5] === 0x76) });
+      frames = await this.#bulkRead(dev, eid, dev.slow ? 4000 : 1500, dev.slow ? 300 : 100, true); // edit-watch tick: routine poll
     } catch { return { changed: false }; } // no reply / timeout — keep last baseline
     const res = this.decodeEditBurst(frames);
     if (res.reload) return { changed: true }; // first sight of this block → let the registry emit a reload
@@ -1510,7 +1714,8 @@ class Gen3Driver implements DeviceDriver {
   /** Current scene index (0-based). Parsed via the bound codec's 0x0C payload parser. */
   async getScene(): Promise<{ index: number }> {
     const dev = await this.#conn();
-    const frames = await dev.request(this.#codec.buildGetScene(), { timeoutMs: 1200, match: (fs) => fs.some((f) => f[5] === 0x0c) });
+    // fn-only matcher: the scene reply carries nothing that ties it to one request (polled by the scene watch)
+    const frames = await dev.request(this.#codec.buildGetScene(), { timeoutMs: 1200, routine: true, match: (fs) => fs.some((f) => f[5] === 0x0c) });
     const f = frames.find((x) => x[5] === 0x0c);
     if (!f) return { index: -1 }; // FAILED read (racy/late on a busy link) — sentinel so the scene watch
     //                               and UI skip it, instead of fabricating scene 1 (caused a 2↔1 badge flicker)
@@ -1577,6 +1782,8 @@ class Gen3Driver implements DeviceDriver {
   async selectPreset(n: number) {
     this.#gridCache = null;
     const r = await this.#write(this.#codec.buildSwitchPresetSysEx(n));
+    if (r.ok) this.#session(await this.#conn()).currentSlot = n; // the edit buffer now holds slot n
+    else if (this.#sessionState) this.#sessionState.currentSlot = null; // refused: no longer sure
     this.#emit({ type: 'changed', scope: 'preset' });
     return r;
   }

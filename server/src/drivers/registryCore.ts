@@ -639,6 +639,9 @@ export class DeviceRegistry {
     try {
       const dev = await this.transport();
       const port = this.#transport?.label ?? conn.id;
+      // Any Fractal-headed frame identifies the unit (its model byte is all detection needs), so the matcher is
+      // deliberately broad: this is the first exchange on a freshly opened link, and whichever Fractal frame
+      // arrives first names the same device.
       const frames = await dev.request(buildIdentifyBroadcast(), { timeoutMs: 1500, quietMs: 60, match: (fs) => fs.some((f) => isFractalHeaderFrame(f)) });
       const f = frames.find((x) => isFractalHeaderFrame(x));
       let modelId = f ? parseIdentifyResponse(f)!.modelId : -1;
@@ -689,6 +692,7 @@ export class DeviceRegistry {
    *  without gen-3 telemetry — the AM4 — must never receive gen-3 polls). */
   #activate(d: DeviceDriver | null) {
     this.#active = d;
+    d?.resetSession?.(); // a (re)detect starts a new session: forget what the driver learned about the last one
     if (d && !d.capabilities.telemetry.outputMeters) this.#stopMeters();
     if (d && !d.capabilities.telemetry.tuner && this.#tunerTimer) { clearTimeout(this.#tunerTimer); this.#tunerTimer = null; }
     // Device-edit watch is capability-gated (deviceEditWatch = AM4 + FM3, which don't push): stop it on a device that doesn't need it,
@@ -724,7 +728,9 @@ export class DeviceRegistry {
       const frames = await dev.request(buildFirmwareVersionQuery(modelId), {
         timeoutMs: 800,
         quietMs: 40,
-        match: (fs) => fs.some((f) => isFractalHeaderFrame(f) && f[5] === FN_FIRMWARE_VERSION)
+        // same predicate as the extraction below (connected model only), so a stray 0x08 from elsewhere neither
+        // completes the read nor gets parsed
+        match: (fs) => fs.some((f) => isFractalHeaderFrame(f) && f[5] === FN_FIRMWARE_VERSION && f[4] === modelId)
       });
       // only a reply from the CONNECTED model counts (f[4] = model byte); a major of 0 is no real version
       const f = frames.find((x) => isFractalHeaderFrame(x) && x[5] === FN_FIRMWARE_VERSION && x[4] === modelId);
@@ -784,6 +790,9 @@ export class DeviceRegistry {
   async rawRequest(bytes: number[]): Promise<string[]> {
     assertRawProbeAllowed(bytes, this.#modelId);
     const dev = await this.transport();
+    // Debug probe, deliberately accept-anything: the probe exists to show WHATEVER the device answers to an
+    // arbitrary read frame, so the first frame completes it (a late frame from an earlier request can too —
+    // it is shown as hex, never interpreted).
     const frames = await dev.request(bytes, { timeoutMs: 1200, quietMs: 120, match: (fs: number[][]) => fs.length > 0 });
     return frames.map((f) => f.map((b) => b.toString(16).padStart(2, '0')).join(''));
   }
@@ -837,6 +846,7 @@ export class DeviceRegistry {
           const frames = await dev.request(buildTunerPoll(d.modelId), {
             timeoutMs: 300,
             quietMs: 35,
+            routine: true,
             match: (fs) => fs.some((f) => isTunerResponse(f))
           });
           const f = frames.find((x) => isTunerResponse(x));
@@ -936,7 +946,7 @@ export class DeviceRegistry {
         // refreshes every tick, not once per round-robin → smooth, not choppy.
         for (let i = 0; i < 4; i++) {
           const meter = GEN3_OUTPUT_METERS[i]!;
-          const frames = await dev.request(buildOutputMeterPoll(meter, d.modelId), { timeoutMs: 200, quietMs: 12, match: (fs) => fs.some((f) => isOutputMeterResponse(f, meter)) });
+          const frames = await dev.request(buildOutputMeterPoll(meter, d.modelId), { timeoutMs: 200, quietMs: 12, routine: true, match: (fs) => fs.some((f) => isOutputMeterResponse(f, meter)) });
           const f = frames.find((x) => isOutputMeterResponse(x, meter));
           if (f) {
             const raw = meterRmsToDb(parseOutputMeterRms(f), DeviceRegistry.METER_FLOOR, DeviceRegistry.METER_CEIL);
@@ -948,7 +958,7 @@ export class DeviceRegistry {
         this.#emit({ type: 'meters', out1L: this.#mDb[0]!, out1R: this.#mDb[1]!, out2L: this.#mDb[2]!, out2R: this.#mDb[3]! });
         // CPU is a heavy 590-byte read → poll it only occasionally (every Nth tick), off the meter path.
         if (step % cad.cpuEveryNTicks === 0) {
-          const frames = await dev.request(buildCpuPoll(d.modelId), { timeoutMs: 400, quietMs: 25, match: (fs) => fs.some((f) => isCpuResponse(f)) });
+          const frames = await dev.request(buildCpuPoll(d.modelId), { timeoutMs: 400, quietMs: 25, routine: true, match: (fs) => fs.some((f) => isCpuResponse(f)) });
           const f = frames.find((x) => isCpuResponse(x));
           if (f) this.#emit({ type: 'cpu', percent: cpuPercentFromRaw(parseCpuRawLoad(f)) });
         }

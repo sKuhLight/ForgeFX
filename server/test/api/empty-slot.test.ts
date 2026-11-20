@@ -12,7 +12,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createModernFractalCodec } from 'forgefx-midi/gen3/axe-fx-iii';
 import { buildTestApp } from '../helpers/api.js';
-import { handshakeReply, isIdentifyBroadcast, assert, assertEqual } from '../helpers/mock.js';
+import { handshakeReply, isIdentifyBroadcast, dumpAnswering, assert, assertEqual } from '../helpers/mock.js';
 import { createRouter } from '../../src/runtime/router.js';
 import { PROFILES } from '../../src/devices.js';
 import { EmptyPresetError, type DeviceDriver } from '../../src/drivers/types.js';
@@ -82,7 +82,7 @@ export async function runEmptySlotTests(): Promise<void> {
   const dumps = new Map<string, number[][]>([
     [key(codec.buildRequestPresetDump(EMPTY_SLOT)), emptyDumpFrames(EMPTY_SLOT)],
     [key(codec.buildRequestPresetDump(BACKUP_SLOT)), emptyDumpFrames(BACKUP_SLOT)],
-    [key(codec.buildRequestPresetDump(POPULATED_SLOT)), framesOf(FM3_PRESET_5)]
+    [key(codec.buildRequestPresetDump(POPULATED_SLOT)), dumpAnswering(codec.buildRequestPresetDump(POPULATED_SLOT), framesOf(FM3_PRESET_5))]
   ]);
   mock.reply = (req) => (isIdentifyBroadcast(req) ? [handshakeReply(FM3)] : dumps.get(key(req)) ?? []);
   const router = createRouter({ registry, store: store.defaultStore });

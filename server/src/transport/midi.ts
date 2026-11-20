@@ -5,12 +5,13 @@ import { createRequire } from 'node:module';
 import { appendFileSync } from 'node:fs';
 import type { Input as MidiInput, Output as MidiOutput } from '@julusian/midi';
 import type { Transport, RequestOpts } from './types.js';
+import { RequestQueue } from './requestQueue.js';
 
 // LAZY + FAULT-TOLERANT load of the native MIDI binding. In a packaged desktop build the native
 // .node may be missing/incompatible; a static import would throw at module load and take down the
 // whole server (and with it the serial/FM3 path). Loading it lazily + guarded means MIDI simply
 // degrades to "no MIDI ports" while serial keeps working.
-type MidiMod = { Input: new () => MidiInput; Output: new () => MidiOutput };
+export type MidiMod = { Input: new () => MidiInput; Output: new () => MidiOutput };
 let _midi: MidiMod | null | undefined;
 function midi(): MidiMod | null {
   if (_midi === undefined) {
@@ -114,17 +115,21 @@ export class MidiTransport implements Transport {
   #inId: string;
   #outId: string;
 
-  /** Open a USB-MIDI device by its (independent) input + output port names. */
-  constructor(inId: string, outId: string) {
+  #midiImpl: MidiMod | undefined;
+
+  /** Open a USB-MIDI device by its (independent) input + output port names. `midiImpl` replaces the native
+   *  binding (tests hand in fake ports — no hardware). */
+  constructor(inId: string, outId: string, midiImpl?: MidiMod) {
     this.#inId = inId;
     this.#outId = outId;
+    this.#midiImpl = midiImpl;
     this.label = inId === outId ? inId : `${inId} ⇄ ${outId}`;
     this.slow = !FRACTAL_RE.test(inId) && !FRACTAL_RE.test(outId);
   }
 
   async open(): Promise<void> {
     if (this.#in && this.#out) return;
-    const m = midi();
+    const m = this.#midiImpl ?? midi();
     if (!m) throw new Error('MIDI transport unavailable (native binding @julusian/midi not loaded)');
     const inp = new m.Input();
     const out = new m.Output();
@@ -201,50 +206,17 @@ export class MidiTransport implements Transport {
     return () => this.#handlers.delete(handler);
   }
 
-  // requests run one at a time (shared MIDI stream), same contract as the serial transport
-  #chain: Promise<unknown> = Promise.resolve();
+  // requests run one at a time (shared MIDI stream) on the same request queue as the serial transport, which
+  // also decides when a request is complete — see transport/requestQueue.ts.
+  #queue = new RequestQueue(
+    { send: (bytes) => this.send(bytes), onFrame: (handler) => this.onFrame(handler) },
+    { tag: 'midi' }
+  );
   request(bytes: readonly number[], opts: RequestOpts = {}): Promise<number[][]> {
-    const task = () => this.#once(bytes, opts);
-    const p = this.#chain.then(task, task);
-    this.#chain = p.then(
-      () => {},
-      () => {}
-    );
-    return p;
+    return this.#queue.request(bytes, opts);
   }
   sendQueued(bytes: readonly number[], settleMs = 20): Promise<void> {
-    const task = () =>
-      new Promise<void>((resolve) => {
-        this.send(bytes);
-        setTimeout(resolve, settleMs);
-      });
-    const p = this.#chain.then(task, task);
-    this.#chain = p.then(
-      () => {},
-      () => {}
-    );
-    return p;
-  }
-  #once(bytes: readonly number[], { timeoutMs = 1500, quietMs = 90, match }: RequestOpts = {}): Promise<number[][]> {
-    return new Promise((resolve) => {
-      const frames: number[][] = [];
-      let quietTimer: ReturnType<typeof setTimeout> | null = null;
-      const done = () => {
-        if (quietTimer) clearTimeout(quietTimer);
-        clearTimeout(hardTimer);
-        this.#handlers.delete(handler);
-        resolve(frames);
-      };
-      const handler = (frame: number[]) => {
-        frames.push(frame);
-        if (match?.(frames)) return done();
-        if (quietTimer) clearTimeout(quietTimer);
-        quietTimer = setTimeout(done, quietMs);
-      };
-      const hardTimer = setTimeout(done, timeoutMs);
-      this.#handlers.add(handler);
-      this.send(bytes);
-    });
+    return this.#queue.sendQueued(bytes, settleMs);
   }
 
   #tapPath: string | null = process.env.FORGEFX_TAP ? (process.env.FORGEFX_TAP === '1' ? 'tap.log' : process.env.FORGEFX_TAP) : null;

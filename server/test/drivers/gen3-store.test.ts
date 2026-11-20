@@ -12,9 +12,12 @@
 //         a frame byte-identical to the request (loopback) is NOT an ack.
 // An injected `storeAck` overrides the table (scope included).
 //
-// The mock transport applies the REAL transport semantics (a quiet gap after the last frame, a hard cap,
-// an early return on `match`) in VIRTUAL time, so a 1.4 s ack is tested without waiting 1.4 s — and so a
-// driver that passes a too-short quiet gap or cap fails here instead of on a unit.
+// The mock transport applies the any-frame quiet-gap rules (a quiet gap after the last frame of ANY kind, a
+// hard cap, an early return on `match`) in VIRTUAL time, so a 1.4 s ack is tested without waiting 1.4 s — and
+// so a driver that passes a too-short quiet gap or cap fails here instead of on a unit. Those are still the
+// browser-direct transports' rules, and the stricter case: the Node transports' shared queue no longer lets an
+// unrelated frame arm a matched request's quiet gap. The store over that REAL queue (timing, outcome, and when
+// the link is free again) is covered in drivers/reply-matching.
 import { createModernFractalCodec } from 'forgefx-midi/gen3/axe-fx-iii';
 import { createGen3Driver, resolveStoreAck, type StoreAckEvidence, type StoreAckScope } from '../../src/drivers/gen3.js';
 import { cadenceFor } from '../../src/drivers/telemetryProfiles.js';

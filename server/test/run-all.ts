@@ -4,6 +4,9 @@
 //
 // Run: npm test   (tsx test/run-all.ts)
 import './helpers/env.js'; // MUST stay the first import: isolates ~/.forgefx-conn before transport/connection.ts loads
+import { runRequestQueueTests, REQUEST_QUEUE_CASE_COUNT } from './transport/request-queue.test.js';
+import { runTransportWiringTests, TRANSPORT_WIRING_CASE_COUNT } from './transport/transport-wiring.test.js';
+import { runReplyMatchingTests, REPLY_MATCHING_CASE_COUNT } from './drivers/reply-matching.test.js';
 import { runDetectionTests, DETECTION_CASE_COUNT } from './drivers/detection.test.js';
 import { runGen2Tests, GEN2_CASE_COUNT } from './drivers/gen2.test.js';
 import { runGen1Tests, GEN1_CASE_COUNT } from './drivers/gen1.test.js';
@@ -12,6 +15,7 @@ import { runAm4EditWatchTests, AM4_EDITWATCH_CASE_COUNT } from './drivers/am4-ed
 import { runVp4Tests, VP4_CASE_COUNT } from './drivers/vp4.test.js';
 import { runModelByteTests, MODELBYTE_CASE_COUNT } from './drivers/modelbyte.test.js';
 import { runGen3StoreTests, GEN3_STORE_CASE_COUNT } from './drivers/gen3-store.test.js';
+import { runWriteRejectionTests, WRITE_REJECTION_CASE_COUNT } from './drivers/write-rejection.test.js';
 import { runDefinitionCompletenessTests, DEFINITION_COMPLETENESS_CASE_COUNT } from './drivers/definition-completeness.test.js';
 import { runChannelSliceTests, CHANNEL_SLICE_CASE_COUNT } from './drivers/channel-slice.test.js';
 import { runWalkReclassificationTests, WALK_RECLASSIFICATION_CASE_COUNT } from './drivers/walk-reclassification.test.js';
@@ -38,6 +42,9 @@ import { runEmptySlotTests, EMPTY_SLOT_CASE_COUNT } from './api/empty-slot.test.
 import { runPresetGridSlotTests, PRESET_GRID_SLOT_CASE_COUNT } from './api/preset-grid-slot.test.js';
 
 const tests: Array<{ name: string; run: () => void | Promise<void> }> = [
+  { name: `transport/request-queue (${REQUEST_QUEUE_CASE_COUNT} cases, lost/late/incomplete reply, unrelated frames, quiet gap, bounded drain + floor, reject-only hold-back, guards, close, paced send; fake link, virtual time)`, run: runRequestQueueTests },
+  { name: `transport/transport-wiring (${TRANSPORT_WIRING_CASE_COUNT} cases, real serial + MIDI transports on the queue over fake ports)`, run: runTransportWiringTests },
+  { name: `drivers/reply-matching (${REPLY_MATCHING_CASE_COUNT} cases, per-model dump header policy, per-block bulk reads, store + write echoes, AM4 backup location over the real queue)`, run: runReplyMatchingTests },
   { name: `drivers/detection (${DETECTION_CASE_COUNT} cases, mocked Conn/Transport)`, run: runDetectionTests },
   { name: `drivers/gen2 (${GEN2_CASE_COUNT} cases, Axe-Fx II write frames + caps)`, run: runGen2Tests },
   { name: `drivers/gen1 (${GEN1_CASE_COUNT} cases, Axe-Fx gen-1 dump grid + caps)`, run: runGen1Tests },
@@ -46,6 +53,7 @@ const tests: Array<{ name: string; run: () => void | Promise<void> }> = [
   { name: `drivers/vp4 (${VP4_CASE_COUNT} cases, VP4 gated writes + structure read + caps)`, run: runVp4Tests },
   { name: `drivers/modelbyte (${MODELBYTE_CASE_COUNT} cases, wrong-model-byte guard)`, run: runModelByteTests },
   { name: `drivers/gen3-store (${GEN3_STORE_CASE_COUNT} cases, store waits for the device ack: ack/late ack/no ack/0x64, virtual-time transport)`, run: runGen3StoreTests },
+  { name: `drivers/write-rejection (${WRITE_REJECTION_CASE_COUNT} cases, 0x64 attributed by echoed function, reject-only write timing over the real queue)`, run: runWriteRejectionTests },
   { name: `drivers/definition-completeness (${DEFINITION_COMPLETENESS_CASE_COUNT} cases, blockParams unit/taper passthrough)`, run: runDefinitionCompletenessTests },
   { name: `drivers/channel-slice (${CHANNEL_SLICE_CASE_COUNT} cases, fn-0x1F channel stride, cache overlay by provenance, channel-less edit diffs)`, run: runChannelSliceTests },
   { name: `drivers/walk-reclassification (${WALK_RECLASSIFICATION_CASE_COUNT} cases, non-byte-exact profiles never reclassify a catalog kind; editor-cache / cloud-from-cache override)`, run: runWalkReclassificationTests },

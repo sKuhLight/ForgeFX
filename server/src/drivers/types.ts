@@ -203,6 +203,11 @@ export interface DriverCtx {
  *  parsing `error` / `warning` text. */
 export type StoreReason = 'rejected' | 'no-ack';
 
+/** Result of a confirmed write (see the `── writes ──` note on DeviceDriver for what `ok` means per family).
+ *  `acked` is ADDITIVE: `true` when the device's own acknowledgement of THIS write was seen (AM4 command ack /
+ *  param-write echo) — acknowledged and not refused, which is still not proof the write took effect. */
+export interface WriteResult { ok: boolean; acked?: boolean }
+
 /**
  * Per-device driver surface. Method signatures are IDENTICAL to the pre-driver Device methods so the
  * route handlers keep working unchanged. Optional methods are capability-gated: a driver that lacks
@@ -223,6 +228,9 @@ export interface DeviceDriver {
    *  driver reads through the profile changes. Implemented by gen-3 (capability selfDescribe); absent
    *  on drivers whose profile is fixed. */
   applyRuntimeProfile?(profile: DeviceProfile): void;
+  /** A (re)detect activated this driver: forget what it learned about the previous connection (gen-3: the
+   *  dump-header strictness proven on it and the known current slot). Drivers keep no such state otherwise. */
+  resetSession?(): void;
 
   /** Routing grid (the AM4 serves its 4 slots as a 1×4 grid DTO). */
   grid(): Promise<PresetGridDTO>;
@@ -278,11 +286,20 @@ export interface DeviceDriver {
   bindModifier?(slot: number, targetEffectId: number, targetParam: number, source: number): Promise<{ ok: boolean; error?: string; slotEid?: number; slot?: number; targetEffectId?: number; targetParam?: number; source?: number }>;
 
   // ── writes ──
-  setParam?(eid: number, paramId: number, value: number, continuous: boolean): Promise<{ ok: boolean }>;
-  setType?(eid: number, value: number): Promise<{ ok: boolean }>;
+  // What `ok` on a write result means differs by family — none of them means "applied":
+  //   gen-3 confirmed writes (discrete setParam, setType, placeCell, cable, names, preset select): `ok:true` =
+  //     no refusal for this write's function in its window (silence, or the device's value echo); `ok:false` =
+  //     a 0x64 refusal echoing that function. Fire-and-forget writes (continuous setParam, bypass, channel,
+  //     scene, tempo) report `ok:true` = sent.
+  //   AM4: `ok:true` = the device ACKNOWLEDGED the write (the 18-byte command ack or the 64-byte param-write
+  //     echo) and did not refuse it, with `acked:true` (WriteResult). The AM4 acks a write to an absent block
+  //     the same way while it silently does nothing, so this is "acknowledged, not refused", not "applied".
+  //     `ok:false` = no acknowledgement in time.
+  setParam?(eid: number, paramId: number, value: number, continuous: boolean): Promise<WriteResult>;
+  setType?(eid: number, value: number): Promise<WriteResult>;
   setBypass?(eid: number, bypassed: boolean): Promise<{ ok: boolean }>;
-  setChannel?(eid: number, channel: string): Promise<{ ok: boolean }>;
-  placeCell?(row: number, col: number, blockId: number): Promise<{ ok: boolean }>;
+  setChannel?(eid: number, channel: string): Promise<WriteResult>;
+  placeCell?(row: number, col: number, blockId: number): Promise<WriteResult>;
   selectCell?(row: number, col: number): Promise<{ ok: boolean }>;
   cable?(srcRow: number, srcCol: number, destRow: number, connect: boolean): Promise<{ ok: boolean }>;
   /** Switch the active preset. `code` is ADDITIVE (AM4 bank-letter location code, e.g. "C02"). */
@@ -301,8 +318,8 @@ export interface DeviceDriver {
    *  four. */
   store?(n: number): Promise<{ ok: boolean; location?: number; code?: string; acked?: boolean; reason?: StoreReason; error?: string; warning?: string }>;
   loadPresetBytes?(syx: Uint8Array): Promise<{ ok: boolean }>;
-  setSceneName?(index: number, name: string): Promise<{ ok: boolean }>;
-  setPresetName?(name: string): Promise<{ ok: boolean }>;
+  setSceneName?(index: number, name: string): Promise<WriteResult>;
+  setPresetName?(name: string): Promise<WriteResult>;
 
   // ── tempo / scene ──
   getTempo?(): Promise<{ bpm: number }>;
@@ -333,7 +350,7 @@ export interface DeviceDriver {
   /** Offline firmware .syx integrity check (POST /firmware/validate) — capability firmwareValidate. */
   validateFirmware?(bytes: number[]): { valid: boolean; messages?: number; blocks?: number; headerTag?: number[]; finalizeTag?: number[]; error?: string };
   /** Device/global param write by catalog key (PUT /device/param) — capability deviceParams. */
-  setParamByKey?(key: string, value: number): Promise<{ ok: boolean }>;
+  setParamByKey?(key: string, value: number): Promise<WriteResult>;
   /** Modifier address model (GET /mod/model). Superset DTO: always carries `bindingSupported`. */
   modifierModel?(): Record<string, unknown> | null;
 

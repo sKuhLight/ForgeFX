@@ -21,7 +21,7 @@ import { PROFILES } from '../../src/devices.js';
 import * as store from '../../src/store.js';
 import type { DeviceDriver, DriverCapabilities, PresetGridDTO } from '../../src/drivers/types.js';
 import { buildTestApp } from '../helpers/api.js';
-import { MockTransport, handshakeReply, isIdentifyBroadcast, assert, assertEqual } from '../helpers/mock.js';
+import { MockTransport, handshakeReply, isIdentifyBroadcast, dumpAnswering, assert, assertEqual } from '../helpers/mock.js';
 
 export const PRESET_GRID_SLOT_CASE_COUNT = 62;
 
@@ -212,7 +212,7 @@ async function realDriver(): Promise<void> {
   const dump = framesOf(new Uint8Array(FM3_FIXTURE));
   const mock = new MockTransport('serial', 'mock-fm3-grid-slot');
   mock.isOpen = true;
-  mock.reply = (req) => (req[5] === 0x03 ? dump : []); // any preset-dump request is answered with the fixture
+  mock.reply = (req) => (req[5] === 0x03 ? dumpAnswering(req, dump) : []); // any preset-dump request is answered with the fixture
   const driver = createGen3Driver(prof, { transport: async () => mock, emit: () => {}, getCadence: () => cadenceFor(null, 'balanced') });
 
   assertEqual(driver.presetCount, 512, 'FM3 has 512 stored slots');
@@ -272,7 +272,7 @@ async function realDriver(): Promise<void> {
 async function realDriverEndToEnd(): Promise<void> {
   const dump = framesOf(new Uint8Array(FM3_FIXTURE));
   const t = await buildTestApp(0x11);
-  t.mock.reply = (req) => (isIdentifyBroadcast(req) ? [handshakeReply(0x11)] : req[5] === 0x03 ? dump : []);
+  t.mock.reply = (req) => (isIdentifyBroadcast(req) ? [handshakeReply(0x11)] : req[5] === 0x03 ? dumpAnswering(req, dump) : []);
   const router = createRouter({ registry: t.registry, store: store.defaultStore });
   try {
     const r = await bothSurfaces(t, router, '/presets/5/grid');
@@ -293,7 +293,7 @@ async function axeFx3HighSlot(): Promise<void> {
   const prof = PROFILES[0x10]!;
   const mock = new MockTransport('serial', 'mock-axe3-grid-slot');
   mock.isOpen = true;
-  mock.reply = (req) => (req[5] === 0x03 ? dump : []);
+  mock.reply = (req) => (req[5] === 0x03 ? dumpAnswering(req, dump) : []);
   const driver = createGen3Driver(prof, { transport: async () => mock, emit: () => {}, getCadence: () => cadenceFor(null, 'balanced') });
   const g = await driver.presetGrid!(700);
   const want = compact(codec.buildRequestPresetDump(700));
@@ -303,7 +303,7 @@ async function axeFx3HighSlot(): Promise<void> {
   assert(g.rows === 6 && g.cols === 14 && g.cells.length > 0, 'III slot grid decodes (6x14, cells present)');
 
   const t = await buildTestApp(0x10);
-  t.mock.reply = (req) => (isIdentifyBroadcast(req) ? [handshakeReply(0x10)] : req[5] === 0x03 ? dump : []);
+  t.mock.reply = (req) => (isIdentifyBroadcast(req) ? [handshakeReply(0x10)] : req[5] === 0x03 ? dumpAnswering(req, dump) : []);
   const router = createRouter({ registry: t.registry, store: store.defaultStore });
   try {
     assertEqual((await bothSurfaces(t, router, '/presets/700/grid')).status, 200, 'III: slot 700 → 200 on both surfaces');
