@@ -190,7 +190,18 @@ export interface DriverCtx {
    *  run their own edit-watch cadence (the AM4 redesign uses `editRehashMs`) read it here instead of
    *  hardcoding intervals, so a mode switch reaches them without a re-wire. */
   getCadence(): CadenceProfile;
+  /** The running firmware the registry read from the device at detect time (gen-3 `fn 0x08`), or null when
+   *  it was not read / is not known. Resolved AT CALL TIME (the driver is built before detection reads it).
+   *  Optional: a ctx without it simply reports no firmware. */
+  getFirmware?(): { major: number; minor: number } | null;
 }
+
+/** Why a store was not a plain acknowledged success (gen-3, additive on the store result): 'rejected' = a
+ *  fn-0x01 refusal (0x64) was seen in the store window and no ack followed (the 0x64 carries no sub-action, so
+ *  a late refusal of a preceding fn-0x01 write can be attributed to the store); 'no-ack' = nothing
+ *  acknowledged it in time (the slot may or may not have been written). Callers branch on this instead of
+ *  parsing `error` / `warning` text. */
+export type StoreReason = 'rejected' | 'no-ack';
 
 /**
  * Per-device driver surface. Method signatures are IDENTICAL to the pre-driver Device methods so the
@@ -272,8 +283,14 @@ export interface DeviceDriver {
    *  sweep write. Reuses the driver's current-preset ref + preset-select machinery; no new wire bytes.
    *  Implemented by gen-3 (capability fullCapture); absent elsewhere. */
   reloadPreset?(): Promise<void>;
-  /** Store the edit buffer to slot n. `location`/`code` are ADDITIVE (AM4). */
-  store?(n: number): Promise<{ ok: boolean; location?: number; code?: string }>;
+  /** Store the edit buffer to slot n. `location`/`code` are ADDITIVE (AM4). `acked`/`reason`/`error`/`warning`
+   *  are ADDITIVE (gen-3): `acked` = the device's own acknowledgement was seen. `ok:false` + `error` = a real
+   *  refusal (`reason:'rejected'`), or (where the ack is verified for this model, link and firmware) no
+   *  acknowledgement in time (`reason:'no-ack'`, outcome unknown). `ok:true` + `warning` = sent but
+   *  unconfirmed (the ack is not verified here and none came; also `reason:'no-ack'`). `reason` is absent on
+   *  an acknowledged store. Drivers without a known ack (AM4 / VP4 fire-and-forget; gen-2 lenient) omit all
+   *  four. */
+  store?(n: number): Promise<{ ok: boolean; location?: number; code?: string; acked?: boolean; reason?: StoreReason; error?: string; warning?: string }>;
   loadPresetBytes?(syx: Uint8Array): Promise<{ ok: boolean }>;
   setSceneName?(index: number, name: string): Promise<{ ok: boolean }>;
   setPresetName?(name: string): Promise<{ ok: boolean }>;

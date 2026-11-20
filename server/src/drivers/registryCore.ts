@@ -44,7 +44,7 @@ import { FM3_DESCRIPTOR, FM9_DESCRIPTOR, AXEFX3_DESCRIPTOR, VP4_DESCRIPTOR } fro
 import { AM4_DESCRIPTOR } from 'forgefx-midi/devices/am4';
 import { AXEFX2_DESCRIPTOR } from 'forgefx-midi/devices/gen2';
 import { AXEFXGEN1_DESCRIPTOR } from 'forgefx-midi/devices/gen1';
-import type { Transport, Conn, ConnKind } from '../transport/types.js';
+import { TRANSPORT_TIMEOUT_CODE, isTransportTimeout, type Transport, type Conn, type ConnKind } from '../transport/types.js';
 import { DEFAULT_PROFILE, PROFILES, profileForModel, profileForKey, runtimeProfileFrom, type DeviceProfile } from '../devices.js';
 import { createGen3Driver } from './gen3.js';
 import { createAm4Driver, type Am4Driver } from './am4.js';
@@ -89,6 +89,18 @@ const GEN3_SHUNT_BASE = 1024;
 // Per-transport-instance idempotency flag for #instrumentTransport (double-wrapping would double-count
 // the fn-0x1F echo guard and silently break front-panel edit reflection).
 const INSTRUMENTED = Symbol('forgefx.transport.instrumented');
+
+/** TRANSITIONAL shim: the browser-direct transports (Axis webmidi / webserial / nativeMidi) still reject a
+ *  no-frame request timeout with a plain `Error('<MIDI|Serial> request timed out after Nms')` and no
+ *  `code`. Tag exactly those with the typed `code` the transport contract defines, HERE at the one choke
+ *  point every transport passes through, so no driver ever has to parse that text. Drop the shim once the
+ *  transports set `code` at source (Axis follow-up). Other errors pass through untouched. */
+function withTimeoutCode(e: unknown): unknown {
+  if (e instanceof Error && !isTransportTimeout(e) && /^(?:MIDI|Serial) request timed out after \d+ ?ms$/i.test(e.message)) {
+    (e as Error & { code?: string }).code = TRANSPORT_TIMEOUT_CODE;
+  }
+  return e;
+}
 
 /** One selectable connection as the deps' lister reports it (serial + MIDI, Fractal flagged) —
  *  structurally identical to transport/connection.ts's ConnInfo, re-declared here so the core stays
@@ -182,7 +194,12 @@ export class DeviceRegistry {
   #active: DeviceDriver | null = null;
   // One driver instance per model byte (grid caches etc. survive re-detects of the same unit).
   #drivers = new Map<number, DeviceDriver>();
-  #ctx: DriverCtx = { transport: () => this.transport(), emit: (e) => this.#emit(e), getCadence: () => this.#cadence() };
+  #ctx: DriverCtx = {
+    transport: () => this.transport(),
+    emit: (e) => this.#emit(e),
+    getCadence: () => this.#cadence(),
+    getFirmware: () => this.#firmware // read at call time: drivers are built before detect() reads it
+  };
 
   get profile() { return this.#prof; }
 
@@ -338,6 +355,14 @@ export class DeviceRegistry {
         await t.open();
         this.#instrumentTransport(t); // echo-guard + traffic counters + interactive-request tracking
         this.#transport = t;
+        // A NEW transport may reach another unit, or the same one after a reboot / re-plug, so a firmware
+        // read over the previous one can no longer be trusted. Clear it rather than re-read here: the read
+        // itself goes through transport() (it would recurse), and the next detect() redoes it. Null is the
+        // safe value — the FM3 store-ack scope reads it as "unknown" (lenient), deviceInfo() reports no
+        // firmware, and applyRuntimeCache() simply does nothing (no cache key is built from a stale value).
+        // (Today a dropped connection goes through selectConnection(), which clears it too; this keeps the
+        // invariant for any other path that ends up opening a new transport.)
+        this.#firmware = null;
         return t;
       })().catch((e) => {
         this.#connecting = null; // allow a retry on the next request
@@ -638,8 +663,12 @@ export class DeviceRegistry {
 
   /** Best-effort firmware-version read (fn 0x08) over the shared transport — gen-3 only (the query is
    *  HW-verified on the FM3, shared on FM9/III; AM4/gen1/gen2 are never queried). Silence/timeout or a
-   *  non-gen-3 model leaves `#firmware` null; never throws (detection must not depend on it). */
+   *  non-gen-3 model leaves `#firmware` null; never throws (detection must not depend on it).
+   *  The value is cleared FIRST, before the model check and the read: a re-detect that fails, or lands on a
+   *  non-gen-3 unit, must not keep an earlier unit's firmware (the store-ack scope and the device-cache key
+   *  both read it). While the read is in flight the value is null — consumers treat that as "unknown". */
   async #populateFirmware(modelId: number): Promise<void> {
+    this.#firmware = null;
     if (modelId < 0 || DEVICE_MODELS[modelId]?.gen !== 3) return;
     try {
       const dev = await this.transport();
@@ -998,7 +1027,7 @@ export class DeviceRegistry {
       this.#inFlightRequests++;
       const bulk = bytes[5] === 0x1f; // only a bulk read can elicit a 0x74 burst → echo guard counts it
       if (bulk) this.#pendingBulkReads++;
-      return origRequest(bytes, opts).finally(() => {
+      return origRequest(bytes, opts).catch((e: unknown) => { throw withTimeoutCode(e); }).finally(() => {
         this.#inFlightRequests = Math.max(0, this.#inFlightRequests - 1);
         if (bulk) this.#pendingBulkReads = Math.max(0, this.#pendingBulkReads - 1);
       });

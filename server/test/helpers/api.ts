@@ -16,10 +16,14 @@ export interface TestApp {
 }
 
 /** Build app + isolated registry with the given model detected (via mocked handshake). An optional
- *  fake driver is seeded into the registry's driver cache BEFORE detection activates it. */
-export async function buildTestApp(modelId: number, fakeDriver?: DeviceDriver): Promise<TestApp> {
+ *  fake driver is seeded into the registry's driver cache BEFORE detection activates it. `opts.firmware`
+ *  answers detect's fn 0x08 firmware query (frame[6]=major, frame[7]=minor); omitted → that query is silent. */
+export async function buildTestApp(modelId: number, fakeDriver?: DeviceDriver, opts: { firmware?: readonly [number, number] } = {}): Promise<TestApp> {
   const mock = new MockTransport('serial', `mock-0x${modelId.toString(16)}`);
-  mock.reply = (req) => (isIdentifyBroadcast(req) ? [handshakeReply(modelId)] : []);
+  const fw = opts.firmware;
+  mock.reply = (req) => isIdentifyBroadcast(req)
+    ? [handshakeReply(modelId)]
+    : fw && req[0] === 0xf0 && req[5] === 0x08 ? [[0xf0, 0x00, 0x01, 0x74, modelId, 0x08, fw[0], fw[1], 0x00, 0x00, 0xf7]] : [];
   const registry = __createRegistryForTest({
     resolveConn: async () => ({ transport: 'serial', id: mock.label }),
     openConn: () => mock
