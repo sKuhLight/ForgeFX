@@ -63,7 +63,7 @@ import { AM4_DESCRIPTOR, readActiveBufferEditedBit, readAllParams, decodeAm4Pres
 import type { MidiConnection } from 'forgefx-midi/core/midi';
 import type { DispatchCtx, PresetSnapshot } from 'forgefx-midi/core';
 import type { Transport } from '../transport/types.js';
-import type { DeviceDriver, DriverCapabilities, DriverCtx, PresetGridDTO, PresetBlockDTO, NamedParam, EnumParam, Am4Slot } from './types.js';
+import type { DeviceDriver, DriverCapabilities, DriverCtx, PresetGridDTO, PresetBlockDTO, NamedParam, EnumParam, Am4Slot, WriteResult } from './types.js';
 import { am4LayoutFor, type TypeModel, type DeviceLayout } from '../devices.js';
 
 /** Split a raw byte stream into its complete F0..F7 SysEx messages. */
@@ -119,6 +119,26 @@ const STRUCT_SCENE_OFFSET = 0x08;
 // (log (8).txt, 2026-07-03) across 7 presets: every /preset/select round-trip left this field
 // equal to the selected location (Interface=0, Electric=2, AC-20=7, …, Bass NoAmp DI=11).
 const STRUCT_LOCATION_OFFSET = 0x00;
+
+/** The AM4's acknowledgement of one of OUR writes, in either documented shape:
+ *   - the 18-byte command ack of an addressing-only command (rename, scene name, save) — `isCommandAck`;
+ *   - the 64-byte param-write echo of a SET (WRITE 0x0001 or SET_NORM 0x0002, also block placement): envelope,
+ *     function, pidLow, pidHigh and ACTION echo the write, hdr4 = 0x0028 (40-byte descriptor payload).
+ *  The 23-byte receipt-echo of our own bytes (USB-MIDI loopback, hdr4 0x0004) is neither. Recognising the param
+ *  echo ends a write as soon as the device answers — `isCommandAck` alone never matched a SET's echo, so
+ *  those writes ran to their timeout (and reported ok:false). */
+function isWriteAck(write: number[], f: number[]): boolean {
+  if (isCommandAck(write, f)) return true;
+  if (f.length < 16) return false;
+  for (let i = 0; i < 12; i++) if (f[i] !== write[i]) return false;
+  return f[14] === 0x28 && f[15] === 0x00;
+}
+/** An AM4 write's result: `ok:true, acked:true` = the device acknowledged THIS write and did not refuse it.
+ *  That is NOT "applied": the AM4 acks a write to an absent block the same way while it silently does nothing
+ *  (see isWriteEcho in the codec). No ack in the window → `ok:false`. */
+function ackResult(write: number[], frames: number[][]): WriteResult {
+  return frames.some((f) => isWriteAck(write, f)) ? { ok: true, acked: true } : { ok: false };
+}
 
 /** The 192-byte structure response: F0 …74 15 01 …[1f 00]… <220 septets> cksum F7. */
 function isStructResponse(r: number[]): boolean {
@@ -536,6 +556,7 @@ class Am4Driver implements DeviceDriver {
         const frames = await dev.request(req, {
           timeoutMs: dev.slow ? 1200 : 800,
           quietMs: dev.slow ? 100 : 50,
+          routine: true, // the edit watch polls this every tick
           match: (fs) => fs.some((f) => isFor(f, pidLow) && parseActiveChannelResponse(f) !== null),
         });
         const idx = frames
@@ -781,7 +802,12 @@ class Am4Driver implements DeviceDriver {
    *  preset). Returns the decoded name + whether the slot is empty, or null if no name frame came back. */
   async #readPresetName(dev: Transport, location: number): Promise<{ name: string; isEmpty: boolean } | null> {
     const req = buildGetPresetName(location);
-    const frames = await dev.request(req, { timeoutMs: dev.slow ? 1200 : 600, quietMs: dev.slow ? 120 : 60, match: (fs) => fs.length > 0 });
+    // Complete only on THIS location's name frame (the parser checks the location echo): an accept-anything
+    // matcher let a late frame from an earlier read end the request and leave the real name for the next one.
+    const isOurName = (f: number[]) => {
+      try { parseGetPresetNameResponse(f, location); return true; } catch { return false; }
+    };
+    const frames = await dev.request(req, { timeoutMs: dev.slow ? 1200 : 600, quietMs: dev.slow ? 120 : 60, match: (fs) => fs.some(isOurName) });
     for (const f of frames) {
       try {
         const r = parseGetPresetNameResponse(f, location);
@@ -830,8 +856,8 @@ class Am4Driver implements DeviceDriver {
   async setParamByKey(key: string, displayValue: number) {
     const dev = await this.#openTransport();
     const frame = buildSetParam(key as ParamKey, displayValue);
-    const res = await dev.request(frame, { timeoutMs: 600, quietMs: 60, match: (fs) => fs.some((f) => isCommandAck(frame, f)) });
-    return { ok: res.some((f) => isCommandAck(frame, f)) };
+    const res = await dev.request(frame, { timeoutMs: 600, quietMs: 60, match: (fs) => fs.some((f) => isWriteAck(frame, f)) });
+    return ackResult(frame, res);
   }
 
   /** Write a continuous param by wire ADDRESS (the block editor's effectId=pidLow + paramId=pidHigh),
@@ -841,18 +867,18 @@ class Am4Driver implements DeviceDriver {
     const dev = await this.#openTransport();
     const n = Math.max(0, Math.min(1, norm));
     const frame = buildSetParamNorm({ pidLow, pidHigh }, n);
-    const res = await dev.request(frame, { timeoutMs: 600, quietMs: 50, match: (fs) => fs.some((f) => isCommandAck(frame, f)) });
+    const res = await dev.request(frame, { timeoutMs: 600, quietMs: 50, match: (fs) => fs.some((f) => isWriteAck(frame, f)) });
     this.#invalidate();
-    return { ok: res.some((f) => isCommandAck(frame, f)) };
+    return ackResult(frame, res);
   }
 
   /** Write a discrete/enum param by wire ADDRESS to a raw internal value (the enum ordinal). */
   async setParamValue(pidLow: number, pidHigh: number, value: number) {
     const dev = await this.#openTransport();
     const frame = buildSetFloatParam({ pidLow, pidHigh }, value);
-    const res = await dev.request(frame, { timeoutMs: 600, quietMs: 50, match: (fs) => fs.some((f) => isCommandAck(frame, f)) });
+    const res = await dev.request(frame, { timeoutMs: 600, quietMs: 50, match: (fs) => fs.some((f) => isWriteAck(frame, f)) });
     this.#invalidate();
-    return { ok: res.some((f) => isCommandAck(frame, f)) };
+    return ackResult(frame, res);
   }
 
   /** Generic driver write (unified PUT /preset/blocks/:addr/params/:paramId): addr = pidLow,
@@ -906,10 +932,10 @@ class Am4Driver implements DeviceDriver {
     const clean = (name ?? '').replace(/[^\x20-\x7e]/g, '').slice(0, 32); // printable ASCII, ≤32 (codec throws otherwise)
     const dev = await this.#openTransport();
     const frame = buildSetPresetName(loc, clean);
-    const res = await dev.request(frame, { timeoutMs: 600, quietMs: 50, match: (fs) => fs.some((f) => isCommandAck(frame, f)) });
+    const res = await dev.request(frame, { timeoutMs: 600, quietMs: 50, match: (fs) => fs.some((f) => isWriteAck(frame, f)) });
     this.#invalidate();
     this.#ctx.emit({ type: 'changed', scope: 'preset' });
-    return { ok: res.some((f) => isCommandAck(frame, f)) };
+    return ackResult(frame, res);
   }
 
   /** Rename a scene (POST /scene/name; capability sceneNamesWritable). `index` is 0-based (UI passes
@@ -920,10 +946,10 @@ class Am4Driver implements DeviceDriver {
     const clean = (name ?? '').replace(/[^\x20-\x7e]/g, '').slice(0, 32);
     const dev = await this.#openTransport();
     const frame = buildSetSceneName(index, clean);
-    const res = await dev.request(frame, { timeoutMs: 600, quietMs: 50, match: (fs) => fs.some((f) => isCommandAck(frame, f)) });
+    const res = await dev.request(frame, { timeoutMs: 600, quietMs: 50, match: (fs) => fs.some((f) => isWriteAck(frame, f)) });
     this.#invalidate();
     this.#ctx.emit({ type: 'changed', scope: 'preset' });
-    return { ok: res.some((f) => isCommandAck(frame, f)) };
+    return ackResult(frame, res);
   }
 
   /** Change a placed block's model/type (POST /preset/blocks/:eid/type). AM4 addresses blocks by pidLow
@@ -989,11 +1015,11 @@ class Am4Driver implements DeviceDriver {
     }
     const dev = await this.#openTransport();
     const frame = buildSetBlockType(col as 1 | 2 | 3 | 4, blockId);
-    const res = await dev.request(frame, { timeoutMs: 600, quietMs: 50, match: (fs) => fs.some((f) => isCommandAck(frame, f)) });
+    const res = await dev.request(frame, { timeoutMs: 600, quietMs: 50, match: (fs) => fs.some((f) => isWriteAck(frame, f)) });
     this.#invalidate();
     this.#ctx.emit({ type: 'changed', scope: 'grid' }); // live: other UIs / SSE re-read the chain
     this.#log(`placeCell: slot ${col} <- ${blockId ? `blockType 0x${blockId.toString(16)}` : 'cleared'}`);
-    return { ok: res.some((f) => isCommandAck(frame, f)) };
+    return ackResult(frame, res);
   }
 
   /** Switch the active scene (0..3). */
@@ -1023,7 +1049,7 @@ class Am4Driver implements DeviceDriver {
         const req = buildReadParam({ pidLow: AM4_TUNER_PID_LOW, pidHigh: ch }, READ_TYPE_LIVE_POLL);
         const hit = (f: number[]) => isPollResponse(f) && f[6] === AM4_TUNER_PID_LOW && f[8] === ch;
         try {
-          const frames = await dev.request(req, { timeoutMs: dev.slow ? 400 : 250, quietMs: dev.slow ? 60 : 30, match: (fs) => fs.some(hit) });
+          const frames = await dev.request(req, { timeoutMs: dev.slow ? 400 : 250, quietMs: dev.slow ? 60 : 30, routine: true, match: (fs) => fs.some(hit) });
           const f = frames.find(hit);
           return f ? parseReadResponse(f).asFloat32() : null;
         } catch {
@@ -1089,11 +1115,36 @@ class Am4Driver implements DeviceDriver {
   async backupPreset(location?: number): Promise<{ location: number | null; code: string | null; name: string; bytes: number[]; sceneNames?: string[]; crcValid?: boolean }> {
     const dev = await this.#openTransport();
     const req = location == null ? buildRequestActiveBufferDump() : buildRequestStoredPresetDump(location);
-    const frames = await dev.request(req, { timeoutMs: 5000, quietMs: 200, match: (fs) => fs.some((f) => f[4] === 0x15 && f[5] === 0x79) });
-    const dumpMsgs = frames.filter((f) => f[4] === 0x15 && (f[5] === 0x77 || f[5] === 0x78 || f[5] === 0x79));
+    // A dump is its 0x77 header, 0x78 chunks and the 0x79 after them: complete only on a terminator that
+    // follows a header (a late tail of an earlier dump does not), own the header and chunks so a dump that
+    // stops short ends one quiet gap after its last chunk instead of the full 5 s, and keep only that dump.
+    const is = (f: number[], fn: number) => f[0] === 0xf0 && f[4] === 0x15 && f[5] === fn;
+    const span = (fs: number[][]): number[][] | null => {
+      let start = -1;
+      for (let i = 0; i < fs.length; i++) {
+        if (is(fs[i]!, 0x77)) start = i;
+        else if (start >= 0 && is(fs[i]!, 0x79)) return fs.slice(start, i + 1);
+      }
+      return null;
+    };
+    let inDump = false;
+    const frames = await dev.request(req, {
+      timeoutMs: 5000,
+      quietMs: 200,
+      match: (fs) => span(fs) !== null,
+      owns: (f) => (is(f, 0x77) ? (inDump = true) : inDump && is(f, 0x78))
+    });
+    const dumpMsgs = (span(frames) ?? frames).filter((f) => is(f, 0x77) || is(f, 0x78) || is(f, 0x79));
     const raw = Uint8Array.from(dumpMsgs.flat());
     const dump = parseAm4PresetDump(raw); // validates every envelope + checksum; throws on malformed
     const loc = am4DumpLocation(dump);
+    // The header names what the dump is (capture-documented: bank 0x7F = the active buffer, else bank*4+sub).
+    // A dump of anything else is a late reply to an earlier read (a scan) — never back it up as this one.
+    const wanted = location == null ? 'the active buffer' : formatLocationCode(location);
+    const got = loc.active ? 'the active buffer' : (loc.code ?? `location ${loc.index}`);
+    if (location == null ? !loc.active : loc.active || loc.index !== location) {
+      throw new Error(`backup of ${wanted} returned the dump of ${got} — a late reply to an earlier read; try again`);
+    }
     // ADDITIVE opt-in decode (crcValid + scene names) atop the opaque, byte-identical `bytes` — a
     // corrupt dump degrades to no extra fields (am4DecodeEnrichment never throws) and still backs up.
     const enrich = am4DecodeEnrichment(dump.raw);
