@@ -61,6 +61,35 @@ export function deviceCacheKey(modelId: number, major: number, minor: number): s
   return `${modelId.toString(16).padStart(2, '0')}_${major}p${minor}`;
 }
 
+/** Per gen-3 model, the HIGHEST firmware (major.minor) on which the cache build's FULL mode — the live
+ *  self-describe walk that also taper-sweeps, i.e. WRITES to the device — is allowed. Each entry is a
+ *  version on which a full capture was actually carried out successfully; anything newer is refused
+ *  (fail closed) because a newer firmware may change the end-of-table behaviour the walk relies on —
+ *  FM3 firmware 13.0 did: the released walk does not stop at the end of a block (the end-marker replies
+ *  are counted as real records), so it runs for a very long time and would write sweep values to
+ *  parameters that do not exist. Fractal numbers firmware per model (the Axe-Fx III is on 32.x while the
+ *  FM3/FM9 are on 12.x/13.x), so the table is keyed by model byte. A model without an entry is never
+ *  allowed. Raise an entry only after a full capture has been verified on that newer version.
+ *  Read-only mode is intentionally NOT governed by this table. */
+export const FULL_CAPTURE_MAX_VERIFIED_FW: Readonly<Record<number, { readonly major: number; readonly minor: number }>> = {
+  0x11: { major: 12, minor: 0 }, // FM3
+  0x12: { major: 12, minor: 0 }, // FM9
+  0x10: { major: 32, minor: 6 }  // Axe-Fx III
+};
+
+/** Whether FULL-mode capture is permitted for `modelId` on the given running firmware: only a KNOWN,
+ *  well-formed firmware (major >= 1) that is at or below the model's entry in
+ *  {@link FULL_CAPTURE_MAX_VERIFIED_FW} (major.minor comparison). Unknown firmware, an unknown model, or
+ *  a version above the verified one is refused — full mode writes to the device, so it never runs
+ *  against a version it has not been verified on. Shared by the cache-build service (the actual gate)
+ *  and the capabilities DTO (so the UI does not offer it). */
+export function fullCaptureAllowedOnFirmware(modelId: number, fw: { major: number; minor: number } | null | undefined): boolean {
+  if (fw == null || !Number.isInteger(fw.major) || !Number.isInteger(fw.minor) || fw.major < 1 || fw.minor < 0) return false;
+  const max = FULL_CAPTURE_MAX_VERIFIED_FW[modelId];
+  if (!max) return false;
+  return fw.major < max.major || (fw.major === max.major && fw.minor <= max.minor);
+}
+
 /** The /telemetry/config DTO both surfaces serve: the current mode, its resolved cadence, and the
  *  full mode list. Cumulative-counter-free — traffic rides the SSE `traffic` event + /diag. */
 export interface TelemetryConfigDto { mode: TelemetryMode; effective: CadenceProfile; modes: readonly TelemetryMode[]; }
@@ -194,6 +223,14 @@ export class DeviceRegistry {
   /** Running firmware (populated best-effort on gen-3 during detect), or null. Includes the numeric
    *  major/minor the deviceCache key needs alongside the display `version`. */
   firmwareInfo(): { major: number; minor: number; version: string; build: string } | null { return this.#firmware; }
+  /** Re-read the running firmware (fn 0x08, the same path detect() uses) for the CURRENT model and
+   *  return it — null when the device is silent / replies for another model / reports major 0. The
+   *  previous value is always cleared first, so a unit that changed firmware (or went quiet) since
+   *  detect() never leaves a stale version behind. Used by the full-capture gate right before it decides. */
+  async refreshFirmware(): Promise<{ major: number; minor: number; version: string; build: string } | null> {
+    await this.#populateFirmware(this.#modelId);
+    return this.#firmware;
+  }
   /** Public emit seam: services (device-cache build progress) publish on the same SSE bus the drivers
    *  reach through DriverCtx.emit. */
   emitEvent(e: DeviceEvent): void { this.#emit(e); }
@@ -466,7 +503,10 @@ export class DeviceRegistry {
       // FULL-mode self-describe write-sweep (POST /device/cache/build with mode:'full'). True only for the
       // CaptureRig-proven gen-3 trio (III/FM3/FM9); false on VP4/AM4/gen-1/gen-2. Derived from the driver
       // cap so the DTO can't drift. Inserted after cacheImport (additive-only ordering — see #capabilitiesDto).
-      fullCapture: c.fullCapture,
+      // Also firmware-gated per model (FULL_CAPTURE_MAX_VERIFIED_FW; unknown firmware = false): detect()
+      // populates #firmware before any caps DTO is served, so the UI never offers a mode the build route
+      // would refuse. (The build route re-reads the firmware itself right before gating.)
+      fullCapture: c.fullCapture && fullCaptureAllowedOnFirmware(mid, this.#firmware),
       editorLayouts: c.editorLayouts,
       firmwareValidate: !!d.validateFirmware,
       // Cross-device preset conversion (POST /preset/convert with no source): the current preset can be
@@ -637,9 +677,12 @@ export class DeviceRegistry {
   }
 
   /** Best-effort firmware-version read (fn 0x08) over the shared transport — gen-3 only (the query is
-   *  HW-verified on the FM3, shared on FM9/III; AM4/gen1/gen2 are never queried). Silence/timeout or a
-   *  non-gen-3 model leaves `#firmware` null; never throws (detection must not depend on it). */
+   *  HW-verified on the FM3, shared on FM9/III; AM4/gen1/gen2 are never queried). Always clears the
+   *  previous value first, so silence/timeout, a non-gen-3 model, a reply whose model byte is not the
+   *  connected model, or a major of 0 all leave `#firmware` null (= unknown) instead of a stale version;
+   *  never throws (detection must not depend on it). */
   async #populateFirmware(modelId: number): Promise<void> {
+    this.#firmware = null;
     if (modelId < 0 || DEVICE_MODELS[modelId]?.gen !== 3) return;
     try {
       const dev = await this.transport();
@@ -648,9 +691,10 @@ export class DeviceRegistry {
         quietMs: 40,
         match: (fs) => fs.some((f) => isFractalHeaderFrame(f) && f[5] === FN_FIRMWARE_VERSION)
       });
-      const f = frames.find((x) => isFractalHeaderFrame(x) && x[5] === FN_FIRMWARE_VERSION);
+      // only a reply from the CONNECTED model counts (f[4] = model byte); a major of 0 is no real version
+      const f = frames.find((x) => isFractalHeaderFrame(x) && x[5] === FN_FIRMWARE_VERSION && x[4] === modelId);
       const v = f ? parseFirmwareVersionReply(f) : null;
-      if (v) this.#firmware = { major: v.major, minor: v.minor, version: formatFirmwareVersion(v.major, v.minor), build: v.build ?? '' };
+      if (v && v.major > 0) this.#firmware = { major: v.major, minor: v.minor, version: formatFirmwareVersion(v.major, v.minor), build: v.build ?? '' };
     } catch {
       /* silence / timeout / dead port → firmware stays null */
     }

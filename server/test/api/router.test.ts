@@ -161,8 +161,9 @@ const ROWS: Row[] = [
   { name: 'unknown route 404', method: 'GET', url: '/definitely/not/a/route' }
 ];
 
-// dynamic follow-ups (need the version id from the backup row) + local rows + subscribe = extra cases
-export const ROUTER_PARITY_CASE_COUNT = ROWS.length + 8;
+// dynamic follow-ups (need the version id from the backup row) + local rows + subscribe + the two
+// firmware-gate twins (full capture on fw 13.0 / unknown firmware) = extra cases
+export const ROUTER_PARITY_CASE_COUNT = ROWS.length + 10;
 
 function deepEq(a: unknown, b: unknown): boolean {
   if (Object.is(a, b)) return true;
@@ -171,6 +172,35 @@ function deepEq(a: unknown, b: unknown): boolean {
   const ka = Object.keys(a as object), kb = Object.keys(b as object);
   if (ka.length !== kb.length) return false;
   return ka.every((k) => deepEq((a as Record<string, unknown>)[k], (b as Record<string, unknown>)[k]));
+}
+
+// FULL-mode cache build is refused on firmware 13+ and on unknown firmware: the Fastify route and its
+// Browser-Direct twin answer the SAME 501 (they share startCacheBuild). A self-describe + fullCapture
+// fake (the main matrix fake has both off) over a registry whose fn 0x08 reply is scripted — or silent.
+async function fullCaptureFirmwareGateParity(): Promise<void> {
+  const cases: Array<{ fw?: [number, number]; expectedFirmware: string | null; label: string }> = [
+    { fw: [13, 0], expectedFirmware: '13.0', label: 'fw 13.0' },
+    { expectedFirmware: null, label: 'unknown firmware' }
+  ];
+  for (const c of cases) {
+    const fake = { ...makeFakeFm3(), capabilities: { ...CAPS, selfDescribe: true, cacheImport: true, fullCapture: true } } as DeviceDriver;
+    const { app, registry } = await buildTestApp(0x11, fake, c.fw ? { firmware: c.fw } : undefined);
+    try {
+      const router = createRouter({ registry, store: store.defaultStore });
+      const res = await app.inject({ method: 'POST', url: '/device/cache/build', payload: { mode: 'full' } });
+      const routed = await router.handle('POST', '/device/cache/build', JSON.stringify({ mode: 'full' }));
+      assertEqual(res.statusCode, 501, `full capture on ${c.label}: app → 501`);
+      assertEqual(routed.status, 501, `full capture on ${c.label}: router twin → 501`);
+      const appJson = JSON.parse(res.payload) as Record<string, unknown>;
+      const routerJson = JSON.parse(routed.body as string) as Record<string, unknown>;
+      assert(deepEq(appJson, routerJson), `full capture on ${c.label}: body parity\napp:    ${JSON.stringify(appJson)}\nrouter: ${JSON.stringify(routerJson)}`);
+      assertEqual(appJson.capability, 'fullCapture', `${c.label}: 501 names fullCapture`);
+      assertEqual(appJson.reason, 'firmware', `${c.label}: 501 reason is firmware`);
+      assertEqual(appJson.firmware, c.expectedFirmware, `${c.label}: 501 reports the detected firmware`);
+    } finally {
+      await app.close();
+    }
+  }
 }
 
 export async function runRouterParityTests(): Promise<void> {
@@ -262,6 +292,9 @@ export async function runRouterParityTests(): Promise<void> {
     unsub();
     const cfgEvents = events.filter((e) => e.type === 'config' && (e as { id?: string }).id === 'parity-ui');
     assert(cfgEvents.length >= 2, `config fan-out reaches router subscribers (got ${cfgEvents.length})`);
+
+    // 9..10 — firmware gate on full-mode cache builds (fw 13.0 + unknown firmware) holds on both twins
+    await fullCaptureFirmwareGateParity();
   } finally {
     await app.close();
     rmSync(localRoot, { recursive: true, force: true });
