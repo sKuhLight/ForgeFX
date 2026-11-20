@@ -7,6 +7,17 @@ import type { TypeModel, DeviceLayout, DeviceProfile } from '../devices.js';
 import type { Transport } from '../transport/types.js';
 import type { TelemetryMode, CadenceProfile } from './telemetryProfiles.js';
 
+/** Thrown by a driver's verbatim-dump export when the slot is an unused (empty) preset slot: its dump is
+ *  all zeros, not a restorable preset, so there is nothing to export or back up. Routes map it to 422
+ *  (`statusCode`), not the generic 503 "device unreachable". No imports — safe in the browser runtime. */
+export class EmptyPresetError extends Error {
+  readonly statusCode = 422;
+  constructor(message = 'empty preset slot') {
+    super(message);
+    this.name = 'EmptyPresetError';
+  }
+}
+
 /** Library-friendly decoded preset: name, scenes, and the unique effect blocks it contains. */
 export type PresetSummary = {
   number: number;
@@ -15,6 +26,9 @@ export type PresetSummary = {
   crcValid: boolean;
   /** Content fingerprint (stored CRC16) — changes when the preset changes; used to detect stale cache. */
   crc: number;
+  /** ADDITIVE: `true` only for an unused preset slot (blank name, no blocks/scenes, `crcValid: false`).
+   *  Omitted for every populated preset. Clients skip such slots instead of treating them as presets. */
+  empty?: boolean;
   scenes: string[];
   blocks: { effectId: number; slug: string | null; name: string; instance: number | null }[];
   /** Distinct model names in use per block family (amp/drive/cab/reverb/…) — for "presets using model X".

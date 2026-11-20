@@ -107,7 +107,8 @@ export async function scanPresets(ad: FolderAdapter, decode: DecodeFn, force: bo
         }
       }
       next[key] = rec;
-      if (!rec.summary) { skipped++; continue; }
+      // undecodable (IR/cab/firmware) or an unused-slot dump (`empty`): not a preset, so don't list it
+      if (!rec.summary || rec.summary.empty === true) { skipped++; continue; }
       entries.push({
         path: rel.slice(PRESETS_SUB.length + 1),
         name: typeof rec.summary.name === 'string' && rec.summary.name ? (rec.summary.name as string) : it.name.replace(/\.syx$/i, ''),
