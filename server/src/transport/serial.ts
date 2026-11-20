@@ -5,16 +5,27 @@
 import { SerialPort } from 'serialport';
 import { existsSync, readdirSync, appendFileSync } from 'node:fs';
 import type { Transport, RequestOpts } from './types.js';
-import { RequestQueue } from './requestQueue.js';
+import { RequestQueue, pacedWrite } from './requestQueue.js';
 
 const SYSEX_START = 0xf0;
 const SYSEX_END = 0xf7;
 const BY_ID_DIR = '/dev/serial/by-id';
 
+/** The part of a `SerialPort` the transport uses (so tests can hand in a fake port — no hardware). */
+export interface SerialPortLike {
+  readonly isOpen: boolean;
+  on(event: 'data', listener: (buf: Buffer) => void): unknown;
+  on(event: 'error', listener: (err: Error) => void): unknown;
+  write(data: Buffer): unknown;
+  close(callback: () => void): unknown;
+}
+
 export interface TransportOpts {
   /** explicit device path; otherwise auto-detected */
   path?: string;
   baudRate?: number;
+  /** Port factory (default: a real `SerialPort`). Tests pass a fake. */
+  openPort?: (opts: { path: string; baudRate: number }, onOpen: (err: Error | null) => void) => SerialPortLike;
 }
 
 /** Resolve the device path. An explicit FORGEFX_SERIAL wins (e.g. /dev/fm3 in Docker); otherwise
@@ -104,7 +115,7 @@ export async function detectPath(): Promise<string | null> {
 }
 
 export class FractalSerial implements Transport {
-  #port: SerialPort | null = null;
+  #port: SerialPortLike | null = null;
   #rx: number[] = [];
   #frameHandlers = new Set<(frame: number[]) => void>();
   readonly kind = 'serial' as const;
@@ -119,8 +130,10 @@ export class FractalSerial implements Transport {
     if (!path) throw new Error('No FM3 serial port found (looked for by-id Fractal if03, then /dev/ttyACM0)');
     this.path = path;
     this.#baud = opts.baudRate ?? 115200;
+    this.#openPort = opts.openPort ?? ((o, onOpen) => new SerialPort(o, onOpen));
   }
   #baud: number;
+  #openPort: NonNullable<TransportOpts['openPort']>;
 
   // ── capture tap (FORGEFX_TAP=1 → ./tap.log, or FORGEFX_TAP=/path) ──
   // Timestamps every RX/TX SysEx frame so we can diff FM3-Edit traffic (CPU + tuner discovery).
@@ -138,7 +151,7 @@ export class FractalSerial implements Transport {
   async open(): Promise<void> {
     if (this.#port?.isOpen) return;
     await new Promise<void>((resolve, reject) => {
-      const port = new SerialPort({ path: this.path, baudRate: this.#baud }, (err) => (err ? reject(err) : resolve()));
+      const port = this.#openPort({ path: this.path, baudRate: this.#baud }, (err) => (err ? reject(err) : resolve()));
       port.on('data', (buf: Buffer) => this.#ingest(buf));
       port.on('error', () => {});
       this.#port = port;
@@ -180,24 +193,20 @@ export class FractalSerial implements Transport {
 
   /** Send a large payload (e.g. a full preset dump → edit buffer) in small paced chunks. The FM3's CDC
    *  serial drops bytes if flooded — the editor bridge paces at ~64 B / 3 ms, so we match that. Serialized
-   *  on the request queue so it never interleaves with a read. */
+   *  on the request queue so it never interleaves with a read. A port that closes (or a write that throws)
+   *  mid-pump rejects the send and frees the queue — it never leaves the queue waiting forever. */
   sendPaced(bytes: readonly number[], chunk = 64, delayMs = 3): Promise<void> {
-    return this.#queue.serialize(
-      () =>
-        new Promise<void>((resolve, reject) => {
-          if (!this.#port?.isOpen) return reject(new Error('port not open'));
-          this.#logTap('TX', bytes);
-          const buf = Buffer.from(bytes);
-          let off = 0;
-          const pump = () => {
-            if (off >= buf.length) { setTimeout(resolve, 20); return; } // settle before the next request
-            this.#port!.write(buf.subarray(off, off + chunk));
-            off += chunk;
-            setTimeout(pump, delayMs);
-          };
-          pump();
-        })
-    );
+    return this.#queue.serialize(() => {
+      if (!this.#port?.isOpen) return Promise.reject(new Error('port not open'));
+      this.#logTap('TX', bytes);
+      const buf = Buffer.from(bytes);
+      return pacedWrite(
+        { isOpen: () => !!this.#port?.isOpen, write: (start, end) => { this.#port!.write(buf.subarray(start, end)); } },
+        buf.length,
+        chunk,
+        delayMs
+      );
+    });
   }
 
   // serial is a single shared stream — requests MUST run one at a time, or reply frames from concurrent

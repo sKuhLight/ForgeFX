@@ -41,26 +41,39 @@ export class VirtualClock implements QueueClock {
 }
 export const flush = () => new Promise<void>((r) => setImmediate(r));
 
-/** A device link: records every TX with its virtual time; `emit` delivers an inbound frame. */
+/** A device link: records every TX with its virtual time; `emit` delivers an inbound frame. `device` (when set)
+ *  plays the device: it sees every frame that goes out and can schedule replies on the clock. */
 export class FakeLink implements ExchangeLink {
   readonly sent: { at: number; bytes: number[] }[] = [];
   readonly handlers = new Set<(frame: number[]) => void>();
   failNextSend: Error | null = null;
+  /** A closed port: every send throws, as the real transports do. */
+  closed = false;
+  /** Subscribing throws (a transport whose handler registry is broken). */
+  failSubscribe: Error | null = null;
+  device: ((bytes: number[], at: number) => void) | null = null;
   constructor(readonly clock: VirtualClock) {}
   send(bytes: readonly number[]): void {
+    if (this.closed) throw new Error('port not open');
     if (this.failNextSend) {
       const e = this.failNextSend;
       this.failNextSend = null;
       throw e;
     }
     this.sent.push({ at: this.clock.t, bytes: [...bytes] });
+    this.device?.([...bytes], this.clock.t);
   }
   onFrame(handler: (frame: number[]) => void): () => void {
+    if (this.failSubscribe) throw this.failSubscribe;
     this.handlers.add(handler);
     return () => { this.handlers.delete(handler); };
   }
   emit(frame: readonly number[]): void {
     for (const h of [...this.handlers]) h([...frame]);
+  }
+  /** Emit `frame` at absolute virtual time `at`. */
+  emitAt(at: number, frame: readonly number[]): void {
+    this.clock.at(at, () => this.emit(frame));
   }
   /** Virtual time the n-th frame went out (undefined while it has not). */
   sentAt(n: number): number | undefined {

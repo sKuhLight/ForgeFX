@@ -17,8 +17,8 @@ export type { DeviceDriver, DriverCapabilities, DriverCtx, DeviceEvent } from '.
 export type { Transport, RequestOpts, Conn, ConnKind } from '../transport/types.js';
 // the request/completion engine of the Node transports, for in-page transports to share (browser-safe)
 export {
-  RequestQueue, LATE_DRAIN_LIMITS, isResultEcho,
-  type ExchangeLink, type LateDrainLimits, type RequestQueueOpts, type QueueClock
+  RequestQueue, LATE_DRAIN_LIMITS, SAME_TICK_MS, isResultEcho, pacedWrite,
+  type ExchangeLink, type LateDrainLimits, type RequestQueueOpts, type QueueClock, type PacedPort
 } from '../transport/requestQueue.js';
 export { PROFILES, DEFAULT_PROFILE, profileForModel, profileForKey, SLUG_FAMILY, type DeviceProfile } from '../devices.js';
 

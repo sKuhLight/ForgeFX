@@ -11,7 +11,7 @@ import { RequestQueue } from './requestQueue.js';
 // .node may be missing/incompatible; a static import would throw at module load and take down the
 // whole server (and with it the serial/FM3 path). Loading it lazily + guarded means MIDI simply
 // degrades to "no MIDI ports" while serial keeps working.
-type MidiMod = { Input: new () => MidiInput; Output: new () => MidiOutput };
+export type MidiMod = { Input: new () => MidiInput; Output: new () => MidiOutput };
 let _midi: MidiMod | null | undefined;
 function midi(): MidiMod | null {
   if (_midi === undefined) {
@@ -115,17 +115,21 @@ export class MidiTransport implements Transport {
   #inId: string;
   #outId: string;
 
-  /** Open a USB-MIDI device by its (independent) input + output port names. */
-  constructor(inId: string, outId: string) {
+  #midiImpl: MidiMod | undefined;
+
+  /** Open a USB-MIDI device by its (independent) input + output port names. `midiImpl` replaces the native
+   *  binding (tests hand in fake ports — no hardware). */
+  constructor(inId: string, outId: string, midiImpl?: MidiMod) {
     this.#inId = inId;
     this.#outId = outId;
+    this.#midiImpl = midiImpl;
     this.label = inId === outId ? inId : `${inId} ⇄ ${outId}`;
     this.slow = !FRACTAL_RE.test(inId) && !FRACTAL_RE.test(outId);
   }
 
   async open(): Promise<void> {
     if (this.#in && this.#out) return;
-    const m = midi();
+    const m = this.#midiImpl ?? midi();
     if (!m) throw new Error('MIDI transport unavailable (native binding @julusian/midi not loaded)');
     const inp = new m.Input();
     const out = new m.Output();

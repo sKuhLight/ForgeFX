@@ -5,6 +5,7 @@
 // Run: npm test   (tsx test/run-all.ts)
 import './helpers/env.js'; // MUST stay the first import: isolates ~/.forgefx-conn before transport/connection.ts loads
 import { runRequestQueueTests, REQUEST_QUEUE_CASE_COUNT } from './transport/request-queue.test.js';
+import { runTransportWiringTests, TRANSPORT_WIRING_CASE_COUNT } from './transport/transport-wiring.test.js';
 import { runDetectionTests, DETECTION_CASE_COUNT } from './drivers/detection.test.js';
 import { runGen2Tests, GEN2_CASE_COUNT } from './drivers/gen2.test.js';
 import { runGen1Tests, GEN1_CASE_COUNT } from './drivers/gen1.test.js';
@@ -40,7 +41,8 @@ import { runEmptySlotTests, EMPTY_SLOT_CASE_COUNT } from './api/empty-slot.test.
 import { runPresetGridSlotTests, PRESET_GRID_SLOT_CASE_COUNT } from './api/preset-grid-slot.test.js';
 
 const tests: Array<{ name: string; run: () => void | Promise<void> }> = [
-  { name: `transport/request-queue (${REQUEST_QUEUE_CASE_COUNT} cases, lost/late reply, unrelated frames, quiet gap, bounded drain, reject-only writes; fake link, virtual time)`, run: runRequestQueueTests },
+  { name: `transport/request-queue (${REQUEST_QUEUE_CASE_COUNT} cases, lost/late/incomplete reply, unrelated frames, quiet gap, bounded drain + floor, reject-only hold-back, guards, close, paced send; fake link, virtual time)`, run: runRequestQueueTests },
+  { name: `transport/transport-wiring (${TRANSPORT_WIRING_CASE_COUNT} cases, real serial + MIDI transports on the queue over fake ports)`, run: runTransportWiringTests },
   { name: `drivers/detection (${DETECTION_CASE_COUNT} cases, mocked Conn/Transport)`, run: runDetectionTests },
   { name: `drivers/gen2 (${GEN2_CASE_COUNT} cases, Axe-Fx II write frames + caps)`, run: runGen2Tests },
   { name: `drivers/gen1 (${GEN1_CASE_COUNT} cases, Axe-Fx gen-1 dump grid + caps)`, run: runGen1Tests },
