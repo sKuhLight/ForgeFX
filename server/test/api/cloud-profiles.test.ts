@@ -9,7 +9,8 @@ import { buildApp } from '../../src/app.js';
 import { __createRegistryForTest } from '../../src/drivers/registry.js';
 import * as store from '../../src/store.js';
 import { cloudCacheCheck, cloudCachePull, cloudCachePublish, type DeviceProfileCloud } from '../../src/services/cloudProfiles.js';
-import type { BuiltCache } from 'forgefx-midi/cache';
+import { CACHE_SCHEMA } from 'forgefx-midi/cache';
+import { loadUsableProfile } from '../../src/profileSchema.js';
 import { MockTransport, handshakeReply, isIdentifyBroadcast, assert, assertEqual } from '../helpers/mock.js';
 
 export const CLOUD_PROFILES_CASE_COUNT = 6;
@@ -32,7 +33,7 @@ async function makeRegistry(model: number, fw?: [number, number]) {
   const registry = __createRegistryForTest({
     resolveConn: async () => ({ transport: 'serial', id: mock.label }),
     openConn: () => mock,
-    loadDeviceCache: (k: string) => { const d = store.defaultStore.getDoc('deviceCaches', k); return d && !d.deleted ? (d.data as BuiltCache) : null; }
+    loadDeviceCache: (k: string) => loadUsableProfile(store.defaultStore, k)
   });
   await registry.detect();
   return registry;
@@ -42,7 +43,7 @@ async function makeRegistry(model: number, fw?: [number, number]) {
  *  pull only requires an object with meta). */
 function profileRow(source: 'live' | 'bytes' = 'live') {
   return {
-    profile: { ranges: { DISTORT: {} }, rangeSections: {}, rosters: {}, enumOverrides: {}, cabIrs: {}, meta: { recordCount: 42, source } },
+    profile: { ranges: { DISTORT: {} }, rangeSections: {}, rosters: {}, enumOverrides: {}, cabIrs: {}, meta: { schema: CACHE_SCHEMA, recordCount: 42, source } },
     contentHash: 'abc123', source: source === 'live' ? 'live-walk' : 'editor-cache', recordCount: 42, createdAt: '2026-07-13T00:00:00Z'
   };
 }
@@ -113,7 +114,7 @@ async function pullGates(): Promise<void> {
   assertEqual(noid.code, 503, 'AM4 without persisted doc → 503 (no firmware identity)');
 
   // ...but once a doc is persisted under the FILE firmware, publish derives the identity from it
-  store.defaultStore.putDoc('deviceCaches', '15_66p1', { ranges: {}, meta: { recordCount: 1, source: 'editor-cache' } });
+  store.defaultStore.putDoc('deviceCaches', '15_66p1', { ranges: {}, meta: { schema: CACHE_SCHEMA, recordCount: 1, source: 'editor-cache' } });
   const cloudPub = fakeCloud(null);
   const pub = await cloudCachePublish(cloudPub, store.defaultStore, am4);
   assertEqual(pub.code, 201, 'AM4 publish derives identity from the persisted key');
@@ -128,7 +129,7 @@ async function publishMapping(): Promise<void> {
   const registry = await makeRegistry(FM3, [12, 0]);
   try {
     // live-walk doc → API source live-walk, uploaded meta.source live
-    store.defaultStore.putDoc('deviceCaches', KEY, { ranges: {}, meta: { recordCount: 1, source: 'live' } });
+    store.defaultStore.putDoc('deviceCaches', KEY, { ranges: {}, meta: { schema: CACHE_SCHEMA, recordCount: 1, source: 'live' } });
     const cloud1 = fakeCloud(null);
     const r1 = await cloudCachePublish(cloud1, store.defaultStore, registry);
     assertEqual(r1.code, 201, 'live publish passes the fn result through');
@@ -137,7 +138,7 @@ async function publishMapping(): Promise<void> {
     assertEqual(b1.profile.meta.source, 'live', 'uploaded meta.source stays live');
 
     // editor-cache doc → API source editor-cache, uploaded meta.source normalized to bytes
-    store.defaultStore.putDoc('deviceCaches', KEY, { ranges: {}, meta: { recordCount: 1, source: 'editor-cache', importedAt: 'x' } });
+    store.defaultStore.putDoc('deviceCaches', KEY, { ranges: {}, meta: { schema: CACHE_SCHEMA, recordCount: 1, source: 'editor-cache', importedAt: 'x' } });
     const cloud2 = fakeCloud(null);
     await cloudCachePublish(cloud2, store.defaultStore, registry);
     const b2 = cloud2.published[0] as { source: string; profile: { meta: { source: string } } };
@@ -156,12 +157,12 @@ async function publishRefusals(): Promise<void> {
     const missing = await cloudCachePublish(fakeCloud(null), store.defaultStore, registry);
     assertEqual(missing.code, 404, 'nothing persisted → 404');
 
-    store.defaultStore.putDoc('deviceCaches', KEY, { meta: { source: 'cloud', origin: 'live' } });
+    store.defaultStore.putDoc('deviceCaches', KEY, { meta: { schema: CACHE_SCHEMA, source: 'cloud', origin: 'live' } });
     const circular = await cloudCachePublish(fakeCloud(null), store.defaultStore, registry);
     assertEqual(circular.code, 409, 'cloud-sourced profile → 409 (nothing new to share)');
 
     // signed-out: the cloud service itself answers 401 — passed through verbatim
-    store.defaultStore.putDoc('deviceCaches', KEY, { meta: { source: 'live' } });
+    store.defaultStore.putDoc('deviceCaches', KEY, { meta: { schema: CACHE_SCHEMA, source: 'live' } });
     const signedOut: DeviceProfileCloud = {
       async deviceProfileGet() { return null; },
       async deviceProfilePublish() { return { code: 401, body: { error: 'not signed in' } }; }

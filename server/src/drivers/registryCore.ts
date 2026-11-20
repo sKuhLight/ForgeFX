@@ -46,6 +46,7 @@ import { AXEFX2_DESCRIPTOR } from 'forgefx-midi/devices/gen2';
 import { AXEFXGEN1_DESCRIPTOR } from 'forgefx-midi/devices/gen1';
 import { TRANSPORT_TIMEOUT_CODE, isTransportTimeout, type Transport, type Conn, type ConnKind } from '../transport/types.js';
 import { DEFAULT_PROFILE, PROFILES, profileForModel, profileForKey, runtimeProfileFrom, type DeviceProfile } from '../devices.js';
+import { checkProfileSchema } from '../profileSchema.js';
 import { createGen3Driver } from './gen3.js';
 import { createAm4Driver, type Am4Driver } from './am4.js';
 import { createGen2Driver } from './gen2.js';
@@ -170,7 +171,9 @@ export interface RegistryDeps {
   midiAvailable(): boolean;
   /** Load a persisted device cache for the given key (deviceCacheKey), or null when none exists.
    *  Injected so the core stays store-agnostic: the Node server reads defaultStore; a browser runtime
-   *  its own. Absent → the registry never swaps in a runtime profile (static profile only). */
+   *  its own. Absent → the registry never swaps in a runtime profile (static profile only). A hook
+   *  should return only profiles this build may use (`loadUsableProfile`); applyRuntimeCache re-checks
+   *  the schema anyway, so a hook that forgets cannot make a stale profile live. */
   loadDeviceCache?(key: string): BuiltCache | null | Promise<BuiltCache | null>;
 }
 
@@ -730,7 +733,8 @@ export class DeviceRegistry {
   /** Swap the active driver's profile for a device-cache-derived RUNTIME profile when a cache doc
    *  exists for the attached model+firmware. Called on a fresh detect AND by the deviceCache service
    *  after a build completes. No-op without a loadDeviceCache hook, a selfDescribe driver, known
-   *  firmware, or a stored cache. Never throws. */
+   *  firmware, or a stored cache this build may use (a profile with a missing/outdated/newer schema
+   *  is never applied — the static profile stays). Never throws. */
   async applyRuntimeCache(): Promise<void> {
     if (!this.#deps.loadDeviceCache) return;
     const d = this.#active;
@@ -739,7 +743,7 @@ export class DeviceRegistry {
     const key = deviceCacheKey(mid, this.#firmware.major, this.#firmware.minor);
     let built: BuiltCache | null = null;
     try { built = (await this.#deps.loadDeviceCache(key)) ?? null; } catch { built = null; }
-    if (!built) return;
+    if (!built || !checkProfileSchema(built).usable) return; // absent, or stale (see profileSchema.ts): keep the static profile
     const runtime = runtimeProfileFrom(built, PROFILES[mid] ?? this.#prof);
     d.applyRuntimeProfile(runtime);
     if (PROFILES[mid]) this.#prof = runtime; // keep /diag + reporting profile in sync for gen-3

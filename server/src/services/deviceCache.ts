@@ -17,6 +17,7 @@ import { blockRefForEid } from 'forgefx-midi/devices/gen3';
 import { AM4_CACHE_PARAMS, AM4_SEEDS } from 'forgefx-midi/am4';
 import { deviceCacheKey, fullCaptureAllowedOnFirmware, type DeviceRegistry } from '../drivers/registryCore.js';
 import { PROFILES, SLUG_FAMILY, isByteExactProfile, type DeviceProfile } from '../devices.js';
+import { CURRENT_CACHE_SCHEMA, loadStoredProfile, type StaleReason } from '../profileSchema.js';
 import type { Store } from '../runtime/store.js';
 import type { Transport } from '../transport/types.js';
 
@@ -48,10 +49,22 @@ export interface StartResult { code: number; body: unknown }
 
 export interface CacheStatus {
   key: string | null;
+  /** A profile doc is stored under `key` — whether or not this build may use it (see `stale`). */
   exists: boolean;
   building: boolean;
   progress?: { done: number; total: number; phase: string };
-  meta?: { recordCount: number; builtAt: string | null; firmware: string | null; unmappedSections: number; unmappedFamilies: number; source: string };
+  meta?: {
+    recordCount: number; builtAt: string | null; firmware: string | null; unmappedSections: number; unmappedFamilies: number; source: string;
+    /** The stored profile's schema stamp (null = none). */
+    schema: number | null;
+  };
+  /** The stored profile is not usable by this build (schema missing / outdated / newer): it is not
+   *  applied at runtime, does not count as built, and must be re-read. False when nothing is stored. */
+  stale: boolean;
+  /** Why it is stale — only present when `stale`. */
+  staleReason?: StaleReason;
+  /** The schema this build writes and accepts. */
+  currentSchema: number;
 }
 
 /** Gen-3 param catalog for the walk's section→family voter, by model byte. Only selfDescribe (gen-3
@@ -249,9 +262,10 @@ async function runBuild(store: Store, registry: DeviceRegistry, job: CacheJob, w
       };
     }
     // Per-block known table size + hard ceiling (see walkBlockLimits). A byte-exact stored cache for this
-    // firmware (force-rebuild over an editor-cache import) is exact device data and refines the catalog.
-    const stored = store.getDoc('deviceCaches', key);
-    const limits = walkBlockLimits(model, mode, stored && !stored.deleted ? (stored.data as BuiltCache) : null);
+    // firmware (force-rebuild over an editor-cache import) is exact device data and refines the catalog;
+    // a stale one (outdated schema) is not trusted for that either.
+    const stored = loadStoredProfile(store, key);
+    const limits = walkBlockLimits(model, mode, stored.state === 'usable' ? stored.profile : null);
     const walkOpts: LiveWalkOptions = {
       model,
       ...(full ? { mode: 'full' as const, write } : {}),
@@ -313,17 +327,19 @@ export function resolveCacheKey(store: Store, registry: DeviceRegistry): string 
   return docs.sort((a, b) => b.updatedAt - a.updatedAt)[0]!.id;
 }
 
-/** GET /device/cache — current key + existence + live build progress + stored-doc meta. */
+/** GET /device/cache — current key + existence + live build progress + stored-doc meta, plus whether
+ *  the stored profile is stale (schema this build cannot use) and the current schema number. */
 export async function cacheStatus(store: Store, registry: DeviceRegistry): Promise<CacheStatus> {
   await registry.driver(); // ensure detection ran so model/firmware are populated
   const key = resolveCacheKey(store, registry);
   const job = JOBS.get(registry);
-  const doc = key ? store.getDoc('deviceCaches', key) : null;
-  const exists = !!(doc && !doc.deleted);
-  const out: CacheStatus = { key, exists, building: !!job };
+  const stored = key ? loadStoredProfile(store, key) : ({ state: 'absent' } as const);
+  const exists = stored.state !== 'absent';
+  const out: CacheStatus = { key, exists, building: !!job, stale: stored.state === 'stale', currentSchema: CURRENT_CACHE_SCHEMA };
   if (job) out.progress = { ...job.progress };
-  if (exists) {
-    const data = doc!.data as BuiltCache;
+  if (stored.state === 'stale') out.staleReason = stored.check.reason;
+  if (stored.state !== 'absent') {
+    const data = stored.profile;
     out.meta = {
       recordCount: data.meta?.recordCount ?? 0,
       builtAt: data.meta?.builtAt ?? null,
@@ -332,7 +348,8 @@ export async function cacheStatus(store: Store, registry: DeviceRegistry): Promi
       unmappedFamilies: data.unmappedFamilies?.length ?? 0,
       // Where the persisted profile came from: 'live' (A3 walk), 'editor-cache' (import), 'cloud'
       // (pull). Axis surfaces this next to the device info.
-      source: (data.meta as { source?: string } | undefined)?.source ?? 'live'
+      source: (data.meta as { source?: string } | undefined)?.source ?? 'live',
+      schema: stored.check.schema
     };
   }
   return out;
@@ -381,8 +398,9 @@ export async function startCacheBuild(store: Store, registry: DeviceRegistry, op
   const fw = registry.firmwareInfo();
   if (model < 0 || !fw) return { code: 503, body: { error: 'no device detected or firmware unknown' } };
   const key = deviceCacheKey(model, fw.major, fw.minor);
-  const existing = store.getDoc('deviceCaches', key);
-  if (existing && !existing.deleted && !opts?.force) {
+  // Only a USABLE profile counts as "already built": a stale one (outdated schema) is rebuilt without
+  // `force` and overwritten by the new build (it is never deleted up front, a cancelled/failed build leaves it).
+  if (loadStoredProfile(store, key).state === 'usable' && !opts?.force) {
     registry.emitEvent({ type: 'cacheBuild', phase: 'already-built', done: 0, total: 0, key, model, firmware: fw.version });
     return { code: 200, body: { ok: true, already: true } };
   }

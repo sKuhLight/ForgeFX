@@ -9,7 +9,7 @@ import { midiAvailable } from '../transport/midi.js';
 import * as store from '../store.js';
 import { createRegistry, type DeviceRegistry, type RegistryDeps } from './registryCore.js';
 import type { DeviceDriver } from './types.js';
-import type { BuiltCache } from 'forgefx-midi/cache';
+import { loadUsableProfile } from '../profileSchema.js';
 
 export type { DeviceRegistry, RegistryDeps, ConnInfo } from './registryCore.js';
 
@@ -25,8 +25,9 @@ const nodeDeps: RegistryDeps = {
   autoDetectPath,
   midiAvailable,
   // On-connect device-cache lookup: the registry swaps in the device-true runtime profile when a
-  // build exists for the attached model+firmware. Reads the same fs store the /device/cache routes write.
-  loadDeviceCache: (key) => { const d = store.getDoc('deviceCaches', key); return d && !d.deleted ? (d.data as BuiltCache) : null; }
+  // build exists for the attached model+firmware. Reads the same fs store the /device/cache routes write;
+  // a profile with an outdated/unknown schema is not applied (the bundled profile stays), see profileSchema.ts.
+  loadDeviceCache: (key) => loadUsableProfile(store, key)
 };
 
 export const registry = createRegistry(nodeDeps);

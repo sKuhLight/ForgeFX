@@ -22,6 +22,12 @@ export { createStore, type Store } from './store.js';
 export { createMemStoreBackend } from './memStoreBackend.js';
 export type { StoreBackend, StoreCodec, Doc, PresetVersion, Backup, JsonWriteOpts } from './storeBackend.js';
 
+// ── device-definition profile schema gate (usable vs stale; the lookup behind every apply hook) ──
+export {
+  CURRENT_CACHE_SCHEMA, checkProfileSchema, staleFields, loadStoredProfile, loadUsableProfile,
+  type StaleReason, type ProfileSchemaCheck, type StoredProfile
+} from '../profileSchema.js';
+
 // ── local storage folder (Presets/ library + Sync/ mirror) ──
 export type { FolderAdapter, FolderEntry } from './folderAdapter.js';
 export {

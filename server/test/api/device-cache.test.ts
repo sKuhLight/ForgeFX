@@ -8,7 +8,7 @@ import { __createRegistryForTest, __setDriverForTest, type DeviceRegistry } from
 import * as deviceCache from '../../src/services/deviceCache.js';
 import * as store from '../../src/store.js';
 import type { BuiltCache, CacheRecord, LiveWalkOptions } from 'forgefx-midi/cache';
-import { buildDefQuery, VIEW_DEFINITION } from 'forgefx-midi/cache';
+import { buildDefQuery, VIEW_DEFINITION, CACHE_SCHEMA } from 'forgefx-midi/cache';
 import { FM3_PARAMS_BY_FAMILY } from 'forgefx-midi/gen3/fm3';
 import type { DeviceEvent, DeviceDriver, DriverCapabilities } from '../../src/drivers/types.js';
 import { MockTransport, handshakeReply, isIdentifyBroadcast, assert, assertEqual, sleep } from '../helpers/mock.js';
@@ -56,7 +56,7 @@ async function makeApp(model: number, opts?: { fw?: [number, number, string?]; l
 // cross-family scoring low so each seed wins its own section.
 const SEED_TAGS: Record<string, number> = { DISTORT: 10, CABINET: 11, REVERB: 12, DELAY: 13, FUZZ: 25 };
 
-function seedRecords(): CacheRecord[] {
+export function seedRecords(): CacheRecord[] {
   const byFam = FM3_PARAMS_BY_FAMILY as unknown as Record<string, { paramId: number; unit?: string; displayMin?: number; displayMax?: number }[]>;
   const fams = Object.keys(SEED_TAGS);
   // how many seed families use each paramId (lower = more distinctive)
@@ -74,8 +74,9 @@ function seedRecords(): CacheRecord[] {
   return recs;
 }
 
-/** A build doc with a distinctive DISTORT (amp) roster — proves the runtime profile serves it. */
-function fakeCacheDoc(): BuiltCache {
+/** A build doc with a distinctive DISTORT (amp) roster — proves the runtime profile serves it. Stamped
+ *  with the current schema, so it is a usable profile. */
+export function fakeCacheDoc(): BuiltCache {
   return {
     enumOverrides: { DISTORT: { '0': ['FAKE CACHE AMP', 'Other Amp'] } },
     ranges: {},
@@ -86,7 +87,7 @@ function fakeCacheDoc(): BuiltCache {
     unmappedFamilies: [],
     model: FM3,
     firmware: '12.0',
-    meta: { recordCount: 2, builtAt: '2026-07-12T00:00:00.000Z', source: 'live' }
+    meta: { schema: CACHE_SCHEMA, recordCount: 2, builtAt: '2026-07-12T00:00:00.000Z', source: 'live' }
   };
 }
 
@@ -97,7 +98,7 @@ const sizeOf = (opts: LiveWalkOptions, block: number): number | undefined => opt
 
 /** A stored profile with the given per-family section strides and provenance, for the limit derivation.
  *  `rowsOf` lists a family's rows as ids 0..n-1 (what a byte-exact cache carries for its own id space). */
-function sectionsDoc(sections: Record<string, number>, meta: Record<string, unknown>, rowsOf: Record<string, number> = {}): BuiltCache {
+export function sectionsDoc(sections: Record<string, number>, meta: Record<string, unknown>, rowsOf: Record<string, number> = {}): BuiltCache {
   const base = fakeCacheDoc();
   const rangeSections = Object.fromEntries(Object.entries(sections).map(([fam, n]) => [fam, { sectionTag: 1, stride: n, recordCount: n }]));
   const ranges = Object.fromEntries(Object.entries(rowsOf).map(([fam, n]) => [

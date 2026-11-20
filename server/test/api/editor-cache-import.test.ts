@@ -10,7 +10,8 @@ import { __createRegistryForTest } from '../../src/drivers/registry.js';
 import * as store from '../../src/store.js';
 import { parseEditorCacheFilename } from '../../src/services/editorCacheImport.js';
 import { discoverEditorCaches, type DiscoveryFs } from '../../src/services/editorCacheDiscovery.js';
-import type { BuiltCache, CacheRecord } from 'forgefx-midi/cache';
+import type { CacheRecord } from 'forgefx-midi/cache';
+import { loadUsableProfile } from '../../src/profileSchema.js';
 import { FM3_PARAMS_BY_FAMILY } from 'forgefx-midi/gen3/fm3';
 import { AM4_CACHE_PARAMS, AM4_SEEDS } from 'forgefx-midi/am4';
 import { MockTransport, handshakeReply, isIdentifyBroadcast, assert, assertEqual } from '../helpers/mock.js';
@@ -41,7 +42,7 @@ async function makeApp(model: number, fw?: [number, number]) {
     resolveConn: async () => ({ transport: 'serial', id: mock.label }),
     openConn: () => mock,
     // Load a persisted cache back out of the store so applyRuntimeCache can swap the profile after import.
-    loadDeviceCache: (k: string) => { const d = store.defaultStore.getDoc('deviceCaches', k); return d && !d.deleted ? (d.data as BuiltCache) : null; }
+    loadDeviceCache: (k: string) => loadUsableProfile(store.defaultStore, k)
   });
   await registry.detect();
   const app = await buildApp(registry);
@@ -73,7 +74,7 @@ function seedRecords(): CacheRecord[] {
 }
 
 /** Minimal little-endian cache encoder (inverse of parseCacheRecords), matching the codec's own test. */
-function encodeCache(records: readonly CacheRecord[]): Uint8Array {
+export function encodeCache(records: readonly CacheRecord[]): Uint8Array {
   const bytes: number[] = [];
   const u16 = (v: number) => bytes.push(v & 0xff, (v >>> 8) & 0xff);
   const u32 = (v: number) => bytes.push(v & 0xff, (v >>> 8) & 0xff, (v >>> 16) & 0xff, (v >>> 24) & 0xff);
@@ -95,7 +96,7 @@ function encodeCache(records: readonly CacheRecord[]): Uint8Array {
   return new Uint8Array(bytes);
 }
 
-const CACHE_BYTES = encodeCache(seedRecords());
+export const CACHE_BYTES = encodeCache(seedRecords());
 
 function importReq(app: Awaited<ReturnType<typeof makeApp>>['app'], name: string, force = false, bytes: Uint8Array = CACHE_BYTES) {
   return app.inject({
