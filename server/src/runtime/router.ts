@@ -22,6 +22,7 @@ import * as editorCacheImport from '../services/editorCacheImport.js';
 import * as cloudProfiles from '../services/cloudProfiles.js';
 import { blockHelpBySlug, helpIndex } from '../help.js';
 import { createUnifiedHandlers } from './handlers.js';
+import { sendErrorStatus } from '../drivers/sendPolicy.js';
 import { putStoreDoc } from './services.js';
 import { createLocalService } from './localService.js';
 import type { FolderAdapter } from './folderAdapter.js';
@@ -230,14 +231,15 @@ export function createRouter(deps: RuntimeDeps): {
     if (!bytes || !bytes.length) { c.reply.code(400); return { error: 'POST raw .syx bytes as application/octet-stream, or JSON {bytes:number[]}' }; }
     return h.decodeH(c.reply, Uint8Array.from(bytes));
   }, { octet: true });
-  // load arbitrary raw .syx bytes (e.g. a cloud/file preset) into the edit buffer
+  // load a .syx preset dump (e.g. a cloud/file preset) into the edit buffer — the driver validates it
+  // as ONE preset dump for the connected model (400 otherwise, see drivers/sendPolicy.ts)
   on('POST', '/preset/load', async (c) => {
     if (!c.raw || !c.raw.length) { c.reply.code(400); return { error: 'POST raw .syx bytes as application/octet-stream' }; }
     try {
       const d = await driver();
       if (!d.loadPresetBytes) return unsupported(c.reply, 'loadPresetBytes');
       return await d.loadPresetBytes(c.raw);
-    } catch (e) { c.reply.code(503); return { error: (e as Error).message }; }
+    } catch (e) { c.reply.code(sendErrorStatus(e, 503)); return { error: (e as Error).message }; }
   }, { octet: true });
 
   // ── catalog ──
@@ -482,7 +484,7 @@ export function createRouter(deps: RuntimeDeps): {
       const d = await driver();
       if (!d.loadPresetBytes) return unsupported(c.reply, 'loadPresetBytes');
       return await backups.loadVersion(store, d, c.params.id!);
-    } catch (e) { c.reply.code(503); return { error: (e as Error).message }; }
+    } catch (e) { c.reply.code(sendErrorStatus(e, 503)); return { error: (e as Error).message }; }
   });
   // restore a snapshot to its origin slot (load + commit to that slot — destructive for the slot)
   on('POST', '/version/:id/restore', async (c) => {
@@ -490,7 +492,7 @@ export function createRouter(deps: RuntimeDeps): {
       const d = await driver();
       if (!d.loadPresetBytes || !d.store) return unsupported(c.reply, 'loadPresetBytes');
       return await backups.restoreVersion(store, d, c.params.id!);
-    } catch (e) { c.reply.code(503); return { error: (e as Error).message }; }
+    } catch (e) { c.reply.code(sendErrorStatus(e, 503)); return { error: (e as Error).message }; }
   });
   // version history (all, or for one slot via ?location=)
   on('GET', '/versions', (c) => {

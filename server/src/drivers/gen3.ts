@@ -20,6 +20,7 @@ import {
   isMultipurposeResponse,
   parseMultipurposeResponse,
   describeMultipurposeResultCode,
+  buildGetRawParamValue,
   type ModernFractalCodec
 } from 'forgefx-midi/gen3/axe-fx-iii';
 import { wireToDisplay } from 'forgefx-midi/shared';
@@ -38,6 +39,7 @@ import type {
   PresetGridDTO, PresetBlockDTO, PresetSummary, NamedParam, EnumParam, MeterVal,
   FcSwitchState, FcReadState, StoreReason
 } from './types.js';
+import { validatedPresetDump } from './sendPolicy.js';
 
 // slug → { name, page=base effect id } from the authoritative codec base table (replaces the old
 // defs.js pack lookup; block names + base ids are codec facts, not editor-cache definitions).
@@ -1008,14 +1010,7 @@ class Gen3Driver implements DeviceDriver {
     if (!model.liveState) throw new Error('live FC state read is not supported for this device model (FM3 only); the address model is available via GET /fc/model');
     const eid = model.effectId;
     const config = layout * model.configsPerLayout! + view * model.switches! + sw;
-    const enc14 = (n: number) => [n & 0x7f, (n >> 7) & 0x7f];
-    const build = (pid: number): number[] => {
-      const f = [0xf0, 0x00, 0x01, 0x74, this.#prof.model, 0x01, 0x1b, 0x00, ...enc14(eid), ...enc14(pid), 0, 0, 0, 0, 0, 0, 0, 0, 0];
-      let cs = 0;
-      for (const b of f) cs ^= b;
-      f.push(cs & 0x7f, 0xf7);
-      return f;
-    };
+    const build = (pid: number): number[] => buildGetRawParamValue(eid, pid, this.#prof.model); // codec raw-value GET (sub 0x1B)
     const read = async (pid: number): Promise<number | null> => {
       const match = (f: number[]) =>
         f[5] === 0x01 && f[6] === 0x1b && f[7] === 0x00 && (f[8]! | (f[9]! << 7)) === eid && (f[10]! | (f[11]! << 7)) === pid;
@@ -1681,10 +1676,14 @@ class Gen3Driver implements DeviceDriver {
    *  7-bit pair. A dump captured from slot N still names N — re-sending it verbatim makes the unit
    *  treat it as a store-to-N, NOT a load. Retargeting the header to 0x3FFF (`7F 7F`, the
    *  edit-buffer sentinel) is exactly what FM3-Edit's "Audition" does: the preset goes live in the
-   *  edit buffer, no slot is written. We patch that field and fix the frame checksum in place. */
+   *  edit buffer, no slot is written. We patch that field and fix the frame checksum in place.
+   *
+   *  Only ONE well-formed preset dump for THIS model goes out: anything else (other frames around it,
+   *  a bank, another model's dump, 8-bit bytes) throws a 400 SendRejectedError before the transport
+   *  is touched (sendPolicy.ts). */
   async loadPresetBytes(syx: Uint8Array): Promise<{ ok: boolean }> {
+    const bytes = validatedPresetDump(syx, this.#prof.model);
     const dev = await this.#conn();
-    const bytes = Array.from(syx);
     retargetPresetDumpToEditBuffer(bytes);
     if (dev.sendPaced) await dev.sendPaced(bytes);
     else await dev.sendQueued(bytes);

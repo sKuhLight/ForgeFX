@@ -8,6 +8,7 @@
 // status+body on both surfaces. NO node:/fastify imports — this module must load in a browser.
 import type { DeviceRegistry } from '../drivers/registryCore.js';
 import { EmptyPresetError } from '../drivers/types.js';
+import { presetDumpFramesViolation } from '../drivers/sendPolicy.js';
 
 /** The one reply capability the shared handlers need: set the response status. FastifyReply's
  *  `code()` matches; the runtime router records the status into its RouterResponse. */
@@ -170,6 +171,10 @@ export function createUnifiedHandlers(registry: DeviceRegistry) {
     if (!Array.isArray(bytes) || !bytes.length) { reply.code(400); return { error: 'bytes[] of one preset dump required' }; }
     const d = await driver();
     if (!d.restorePreset) return unsupported(reply, 'restoreDump');
+    // Only preset-dump frames for the connected model, split exactly at their own boundaries, reach the
+    // driver — no frame hidden inside a chunk behind an inner F7/F0 (drivers/sendPolicy.ts).
+    const refused = presetDumpFramesViolation(bytes, d.modelId);
+    if (refused) { reply.code(refused.status); return { error: refused.message }; }
     try { return await d.restorePreset(bytes); } catch (e) { reply.code(400); return { error: (e as Error).message }; }
   };
   const fwValidateH = async (reply: StatusSink, bytes?: number[]) => {
