@@ -702,7 +702,14 @@ class Gen3Driver implements DeviceDriver {
    *  and re-apply just this. One small round-trip; keeps scene changes snappy and OFF the heavy,
    *  crash-prone dump path (a full dump right after a scene switch hits the device mid-rebuild). */
   async sceneState(): Promise<{ effectId: number; bypassed: boolean; channel: string | null }[]> {
-    const status = await this.#statusByEffectId();
+    let status = await this.#statusByEffectId();
+    // A scene switch leaves the unit busy rebuilding for a moment, so the first status read can come back
+    // empty even though the device is fine. Retry once shortly after before treating it as a failure — the
+    // alternative (503 → the client's full preset dump) lands on the device exactly while it is rebuilding.
+    if (status.size === 0) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 200));
+      status = await this.#statusByEffectId();
+    }
     // An EMPTY status map means the fn-0x13 read failed/timed out (#statusByEffectId swallows the
     // error). A real preset always has ≥ Output blocks, so `[]` can never be a legitimate scene state —
     // returning it made the route answer 200 `[]` and Axis kept the previous scene's bypass/channel

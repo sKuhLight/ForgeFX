@@ -17,7 +17,7 @@ import type { Conn } from '../../src/transport/types.js';
 import type { DeviceDriver, DeviceEvent, DriverCtx, DriverCapabilities } from '../../src/drivers/types.js';
 import { MockTransport, handshakeReply, isIdentifyBroadcast, assert, assertEqual, sleep } from '../helpers/mock.js';
 
-export const REFLECTION_CASE_COUNT = 6;
+export const REFLECTION_CASE_COUNT = 7;
 
 function makeReg(conn: Conn | null, mock: MockTransport): DeviceRegistry {
   return __createRegistryForTest({
@@ -92,6 +92,7 @@ async function emptySceneStateIsAnError(): Promise<void> {
   let threw = false;
   try { await drvFail.sceneState!(); } catch { threw = true; }
   assert(threw, 'a failed fn-0x13 read must surface as an error, not an empty sceneState []');
+  assertEqual(silent.sent.filter((f) => f[5] === 0x13).length, 2, 'a failed status read is retried exactly once before throwing');
 
   // positive control: a real (non-empty) status dump still parses through
   const ok = new MockTransport('serial', '/dev/ttyACM0');
@@ -101,6 +102,21 @@ async function emptySceneStateIsAnError(): Promise<void> {
   const drvOk = createGen3Driver(PROFILES[0x11]!, { transport: async () => ok, emit: () => {}, getCadence: () => cadenceFor(0x11, 'balanced') });
   const st = await drvOk.sceneState!();
   assertEqual(st.length, 2, 'a valid status dump yields per-block scene state');
+  assertEqual(ok.sent.filter((f) => f[5] === 0x13).length, 1, 'a successful status read is not repeated');
+}
+
+/** The device is still rebuilding right after a scene switch: an empty first status read is retried once
+ *  and the retry's dump is used, instead of failing (503 → the client falls back to a full preset dump). */
+async function sceneStateRetriesAnEmptyFirstRead(): Promise<void> {
+  const mock = new MockTransport('serial', '/dev/ttyACM0');
+  mock.isOpen = true;
+  const dump = [0xf0, 0x00, 0x01, 0x74, 0x11, 0x13, 0x02, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0xf7];
+  let statusReads = 0;
+  mock.reply = (req) => (req[5] === 0x13 ? (++statusReads === 1 ? [] : [dump]) : []);
+  const drv = createGen3Driver(PROFILES[0x11]!, { transport: async () => mock, emit: () => {}, getCadence: () => cadenceFor(0x11, 'balanced') });
+  const st = await drv.sceneState!();
+  assertEqual(st.length, 2, 'the retry after an empty first read yields the scene state');
+  assertEqual(statusReads, 2, 'exactly one retry was issued');
 }
 
 /** A UI channel write must not trigger a redundant blockState from the channel watch. */
@@ -216,6 +232,7 @@ export async function runReflectionTests(): Promise<void> {
   const cases: [string, () => Promise<void>][] = [
     ['slow-link reflection', slowLinkReflection],
     ['empty sceneState is an error', emptySceneStateIsAnError],
+    ['sceneState retries an empty first read', sceneStateRetriesAnEmptyFirstRead],
     ['slow-link yield back-off', slowLinkYieldBackoff],
     ['slow-link edit-watch', slowLinkEditWatch],
     ['no duplicate blockState', noDuplicateBlockState],
