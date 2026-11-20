@@ -692,6 +692,7 @@ export class DeviceRegistry {
    *  without gen-3 telemetry — the AM4 — must never receive gen-3 polls). */
   #activate(d: DeviceDriver | null) {
     this.#active = d;
+    d?.resetSession?.(); // a (re)detect starts a new session: forget what the driver learned about the last one
     if (d && !d.capabilities.telemetry.outputMeters) this.#stopMeters();
     if (d && !d.capabilities.telemetry.tuner && this.#tunerTimer) { clearTimeout(this.#tunerTimer); this.#tunerTimer = null; }
     // Device-edit watch is capability-gated (deviceEditWatch = AM4 + FM3, which don't push): stop it on a device that doesn't need it,

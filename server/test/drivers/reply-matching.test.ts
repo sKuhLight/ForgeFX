@@ -24,7 +24,7 @@ import { dumpAnswering, assert, assertEqual } from '../helpers/mock.js';
 import { VirtualClock, FakeLink, QueueTransport, track } from '../helpers/virtualLink.js';
 
 // One case = one executed check() (the suite verifies the count itself at the end).
-export const REPLY_MATCHING_CASE_COUNT = 42;
+export const REPLY_MATCHING_CASE_COUNT = 51;
 let executed = 0;
 function check(cond: unknown, msg: string): void {
   executed++;
@@ -396,6 +396,88 @@ async function am4BackupChecksLocation(): Promise<void> {
       );
     });
   }
+
+  // a stale dump of location 9 arrives first, then this request's own dump of location 5: the stale one is
+  // ignored by the matcher and the request completes on its own dump — no "try again"
+  const { clock, link, transport } = rig();
+  const am4 = createAm4Driver({ transport: async () => transport, emit: () => {}, getCadence: () => cadenceFor(0x15, 'balanced') });
+  const own = am4DumpFrames(1, 1);
+  link.device = (_bytes, at) => {
+    am4DumpFrames(2, 1).forEach((f, i) => link.emitAt(at + 10 + i, f));
+    own.forEach((f, i) => link.emitAt(at + 50 + i, f));
+  };
+  await quietly(async () => {
+    const p = track(clock, am4.backupPreset(5));
+    await clock.advanceTo(10_000);
+    check(p.done && !p.error && p.value?.location === 5 && p.at === 50 + own.length - 1, `am4 backup: a stale dump of another location is skipped and the own dump completes the backup (at ${p.at}, ${String((p.error as Error)?.message ?? '')})`);
+  });
+}
+
+// ── adaptive header policy + the current slot as an edit-buffer header ───────────────────────────────────
+async function headerPolicyAdapts(): Promise<void> {
+  // FM9 starts 'prefer' for stored slots. Once the device has named a requested slot in a header, the
+  // connection is 'strict': a later read answered only by another slot's dump fails instead of using it.
+  const mk = () => {
+    const r = rig();
+    r.link.device = (bytes, at) => {
+      if (bytes[5] !== 0x03) return;
+      const slot = headerSlot(bytes);
+      dumpNaming(FM9_FIXTURE, slot === 7 ? 4 : slot).forEach((f, i) => r.link.emitAt(at + 10 + i, f)); // slot 7 → slot 4's dump
+    };
+    return r;
+  };
+  let conn = mk();
+  const driver = createGen3Driver(PROFILES[FM9]!, { transport: async () => conn.transport, emit: () => {}, getCadence: () => cadenceFor(null, 'balanced'), getFirmware: () => null });
+  const read = async (slot: number) => {
+    const p = track(conn.clock, driver.dumpRaw(slot));
+    await conn.clock.advanceTo(conn.clock.t + 30_000);
+    return p;
+  };
+  await quietly(async () => {
+    const fresh = await read(7);
+    check(fresh.done && !fresh.error && headerSlot(fresh.value!.bytes) === 4, 'adaptive: a fresh FM9 connection still falls back (prefer)');
+    const proven = await read(3);
+    check(proven.done && !proven.error && headerSlot(proven.value!.bytes) === 3, 'adaptive: the device names slot 3 in its header');
+    const strict = await read(7);
+    check(strict.done && !!strict.error, 'adaptive: after that, another slot\'s dump is never used again on this connection (strict)');
+    conn = mk(); // reconnect: a new transport
+    const again = await read(7);
+    check(again.done && !again.error && headerSlot(again.value!.bytes) === 4, 'adaptive: a reconnect starts from the table again (prefer)');
+    await read(3); // proven again on the new connection
+    driver.resetSession(); // what the registry does on (re)detect
+    const redetected = await read(7);
+    check(redetected.done && !redetected.error, 'adaptive: a re-detect starts from the table again too');
+  });
+
+  // edit buffer: once the driver knows the current slot, a header naming it is the edit buffer's own (no
+  // quiet-gap wait); a stored-slot header naming anything else still is not
+  for (const knows of [false, true]) {
+    const { clock, link, transport } = rig();
+    const driver3 = gen3Over(transport);
+    let dumpAt = -1;
+    link.device = (bytes, at) => {
+      if (bytes[5] !== 0x03) return;
+      dumpAt = at;
+      dumpNaming(FIXTURE, 9).forEach((f, i) => link.emitAt(at + 10 + i, f)); // a late scan reply
+      dumpNaming(FIXTURE, 5).forEach((f, i) => link.emitAt(at + 60 + i, f)); // the edit buffer, naming slot 5
+    };
+    await quietly(async () => {
+      if (knows) {
+        const sel = track(clock, driver3.selectPreset(5)); // silent accept → current slot 5
+        await clock.advanceTo(clock.t + 500);
+        check(sel.done && sel.value?.ok === true, 'edit buffer: selectPreset(5) accepted');
+      }
+      const p = track(clock, driver3.dumpRaw(0x3fff)); // the reader grid() uses
+      await clock.advanceTo(clock.t + 5000);
+      const terminatorAt = dumpAt + 60 + FIXTURE.length - 1;
+      check(
+        p.done && !p.error && headerSlot(p.value!.bytes) === 5 && p.at === (knows ? terminatorAt : terminatorAt + 180),
+        knows
+          ? `edit buffer: with the current slot known (5), its header is accepted at the terminator — no +180 ms (at ${p.at - dumpAt})`
+          : `edit buffer: without it, today's behaviour — the last whole dump after the quiet gap (at ${p.at - dumpAt})`
+      );
+    });
+  }
 }
 const isFrameSent = (sent: { bytes: number[] }[], f: number[]) => sent.some((s) => s.bytes.length === f.length && s.bytes.every((b, i) => b === f[i]));
 
@@ -406,5 +488,6 @@ export async function runReplyMatchingTests(): Promise<void> {
   await storeOnTheRealQueue();
   await writesEndOnTheirEcho();
   await am4BackupChecksLocation();
+  await headerPolicyAdapts();
   assertEqual(executed, REPLY_MATCHING_CASE_COUNT, 'reply-matching: REPLY_MATCHING_CASE_COUNT is in step with the executed checks');
 }

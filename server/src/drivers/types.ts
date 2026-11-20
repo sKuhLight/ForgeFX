@@ -228,6 +228,9 @@ export interface DeviceDriver {
    *  driver reads through the profile changes. Implemented by gen-3 (capability selfDescribe); absent
    *  on drivers whose profile is fixed. */
   applyRuntimeProfile?(profile: DeviceProfile): void;
+  /** A (re)detect activated this driver: forget what it learned about the previous connection (gen-3: the
+   *  dump-header strictness proven on it and the known current slot). Drivers keep no such state otherwise. */
+  resetSession?(): void;
 
   /** Routing grid (the AM4 serves its 4 slots as a 1×4 grid DTO). */
   grid(): Promise<PresetGridDTO>;

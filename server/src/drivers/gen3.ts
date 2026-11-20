@@ -70,11 +70,14 @@ type DumpHeaderCheck =
   | 'prefer'
   /** Any header (the device does not name the request in it). */
   | 'any';
-/** Per model: [stored-slot reads, edit-buffer reads]. Tighten as tester evidence comes in.
+/** Per model: [stored-slot reads, edit-buffer reads] — the STARTING policy of a connection; tighten as tester
+ *  evidence comes in. Within a connection a 'prefer' kind turns 'strict' as soon as the device has sent one
+ *  header naming the requested number (the driver's per-connection session, see #dumpHeaderPlan).
  *   FM3 stored slots: strict (being verified on hardware, incl. empty slots and slots >= 128).
  *   FM9 / Axe-Fx III stored slots: prefer — the header is not verified on these yet.
- *   Edit buffer, every model: prefer the 0x3FFF sentinel — what a device writes there is not verified, and a
- *   stored-slot header there may also be a late scan reply, so it never completes the read by itself. */
+ *   Edit buffer, every model: prefer the 0x3FFF sentinel (or the CURRENT slot, when the driver knows it) —
+ *   what a device writes there is not verified, and another stored-slot header there may be a late scan reply,
+ *   so it never completes the read by itself. */
 const DUMP_HEADER_POLICY: Readonly<Record<number, readonly [stored: DumpHeaderCheck, editBuffer: DumpHeaderCheck]>> = {
   0x11: ['strict', 'prefer'], // FM3
   0x12: ['prefer', 'prefer'], // FM9
@@ -100,14 +103,15 @@ function wholeDumps(frames: number[][], model: number, want: (header: number[]) 
   }
   return out;
 }
-/** Request options for one dump of `target`: complete at once on a whole dump naming it (or any header under
- *  'any'); own the headers the policy may use and the chunks after them, so a dump that stops short ends one
- *  quiet gap after its last chunk (the transport drains the rest), and a whole dump under 'prefer' ends one
- *  quiet gap after its terminator without a drain (`settles`). */
-function presetDumpOpts(model: number, target: number, timeoutMs: number, quietMs: number) {
-  const check = dumpHeaderCheck(model, target);
-  const named = (f: number[]) => check === 'any' || dumpHeaderNumber(f) === target;
-  const usable = (f: number[]) => check !== 'strict' || dumpHeaderNumber(f) === target;
+/** How one dump read judges headers: the effective check, and which headers NAME the request. */
+interface DumpHeaderPlan { check: DumpHeaderCheck; named: (header: number[]) => boolean }
+/** Request options for one dump: complete at once on a whole dump whose header the plan calls named; own the
+ *  headers the check may use and the chunks after them, so a dump that stops short ends one quiet gap after
+ *  its last chunk (the transport drains the rest), and a whole dump under 'prefer' ends one quiet gap after its
+ *  terminator without a drain (`settles`). */
+function presetDumpOpts(model: number, plan: DumpHeaderPlan, timeoutMs: number, quietMs: number) {
+  const { check, named } = plan;
+  const usable = (f: number[]) => check !== 'strict' || named(f);
   let inOurs = false;
   return {
     timeoutMs,
@@ -613,6 +617,7 @@ class Gen3Driver implements DeviceDriver {
     const f = frames.find((x) => this.#codec.isQueryPatchNameResponse(x));
     if (!f) return { number: -1, name: '' };
     const r = this.#codec.parseQueryPatchNameResponse(f);
+    if (r.presetNumber >= 0) this.#session(dev).currentSlot = r.presetNumber;
     return { number: r.presetNumber, name: r.name };
   }
 
@@ -644,23 +649,21 @@ class Gen3Driver implements DeviceDriver {
     // shifted every later slot by one in a library scan.
     const slow = dev.slow;
     const model = this.#prof.model;
-    const check = dumpHeaderCheck(model, target);
     const what = target === EDIT_BUFFER ? 'edit buffer' : `slot ${target}`;
     let partial: number[][] = [];
     for (let attempt = 1; attempt <= 3; attempt++) {
-      const frames = await dev.request(
-        this.#codec.buildRequestPresetDump(target),
-        presetDumpOpts(model, target, slow ? 25000 : 5000, slow ? 1500 : 180)
-      );
-      let whole = wholeDumps(frames, model, (h) => check === 'any' || dumpHeaderNumber(h) === target)[0];
-      if (!whole && check === 'prefer') {
+      const plan = this.#dumpHeaderPlan(dev, target);
+      const frames = await dev.request(this.#codec.buildRequestPresetDump(target), presetDumpOpts(model, plan, slow ? 25000 : 5000, slow ? 1500 : 180));
+      let whole = wholeDumps(frames, model, plan.named)[0];
+      if (whole && dumpHeaderNumber(whole[0]!) === target) this.#session(dev).learned.add(target === EDIT_BUFFER ? 'edit' : 'stored');
+      if (!whole && plan.check === 'prefer') {
         whole = wholeDumps(frames, model, () => true).at(-1);
         if (whole) this.#noteDumpHeader(what, dumpHeaderNumber(whole[0]!));
       }
       if (whole && whole.some((f) => f[5] === 0x78)) return whole;
       // keep what started (from the last usable header) for the decoder's error message
       let last = -1;
-      frames.forEach((f, i) => { if (isFrameOf(f, model, 0x77) && (check !== 'strict' || dumpHeaderNumber(f) === target)) last = i; });
+      frames.forEach((f, i) => { if (isFrameOf(f, model, 0x77) && (plan.check !== 'strict' || plan.named(f))) last = i; });
       partial = last < 0 ? [] : dumpFramesOnly(frames.slice(last), model);
       console.log(`[forgefx] presetDump: incomplete ${what} attempt ${attempt}/3 (frames=${frames.length}, header=${last >= 0}, 0x78=${partial.some((f) => f[5] === 0x78)}, 0x79=${partial.some((f) => f[5] === 0x79)}) — retrying`);
     }
@@ -676,6 +679,37 @@ class Gen3Driver implements DeviceDriver {
     console.warn(`[forgefx] presetDump: ${what} read answered by a dump whose header names ${n} — used it (no dump naming the request arrived; header check is lenient for model 0x${this.#prof.model.toString(16)}). Logged once.`);
   }
   #dumpHeaderNoted = new Set<string>();
+
+  /** What the driver learned about THIS connection (reset on reconnect — a new transport — and on re-detect,
+   *  see resetSession): which dump-read kinds the device has proven to name the requested number in their
+   *  header, and the current slot when the driver knows it (set by presetRef / selectPreset). */
+  #sessionState: { transport: Transport; learned: Set<'stored' | 'edit'>; currentSlot: number | null } | null = null;
+  #session(dev: Transport) {
+    if (this.#sessionState?.transport !== dev) this.#sessionState = { transport: dev, learned: new Set(), currentSlot: null };
+    return this.#sessionState;
+  }
+  /** A fresh detect: forget what was learned about the connection. */
+  resetSession(): void {
+    this.#sessionState = null;
+  }
+  /** How a dump read of `target` judges headers on this connection. Starts from DUMP_HEADER_POLICY; a
+   *  'prefer' kind becomes 'strict' once the device has named the requested number in a header (so a late dump
+   *  of another slot can never be used as a fallback again). An edit-buffer read also treats a header naming
+   *  the CURRENT slot as named when the driver knows it (devices may write that instead of 0x3FFF) — that does
+   *  not count as proof, since a front-panel preset change can make the known slot stale. */
+  #dumpHeaderPlan(dev: Transport, target: number): DumpHeaderPlan {
+    const s = this.#session(dev);
+    const base = dumpHeaderCheck(this.#prof.model, target);
+    const kind = target === EDIT_BUFFER ? 'edit' : 'stored';
+    const check: DumpHeaderCheck = base === 'prefer' && s.learned.has(kind) ? 'strict' : base;
+    const current = target === EDIT_BUFFER ? s.currentSlot : null;
+    const named = (h: number[]) => {
+      if (check === 'any') return true;
+      const n = dumpHeaderNumber(h);
+      return n === target || (current !== null && n === current);
+    };
+    return { check, named };
+  }
 
   /** Routing grid of ONE STORED SLOT (GET /presets/:n/grid): the dump the device returns for slot `n`,
    *  decoded exactly like the edit-buffer grid. Deliberately bypasses `#gridCache`/`#gridInflight` —
@@ -1748,6 +1782,8 @@ class Gen3Driver implements DeviceDriver {
   async selectPreset(n: number) {
     this.#gridCache = null;
     const r = await this.#write(this.#codec.buildSwitchPresetSysEx(n));
+    if (r.ok) this.#session(await this.#conn()).currentSlot = n; // the edit buffer now holds slot n
+    else if (this.#sessionState) this.#sessionState.currentSlot = null; // refused: no longer sure
     this.#emit({ type: 'changed', scope: 'preset' });
     return r;
   }

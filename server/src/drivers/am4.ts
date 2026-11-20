@@ -37,6 +37,7 @@ import {
   parseAm4PresetDump,
   parseAm4PresetBank,
   am4DumpLocation,
+  AM4_DUMP_ACTIVE_BANK_SENTINEL,
   decodeAm4PresetNameFromFrame,
   parseAm4Firmware,
   formatLocationCode,
@@ -1115,14 +1116,19 @@ class Am4Driver implements DeviceDriver {
   async backupPreset(location?: number): Promise<{ location: number | null; code: string | null; name: string; bytes: number[]; sceneNames?: string[]; crcValid?: boolean }> {
     const dev = await this.#openTransport();
     const req = location == null ? buildRequestActiveBufferDump() : buildRequestStoredPresetDump(location);
-    // A dump is its 0x77 header, 0x78 chunks and the 0x79 after them: complete only on a terminator that
-    // follows a header (a late tail of an earlier dump does not), own the header and chunks so a dump that
-    // stops short ends one quiet gap after its last chunk instead of the full 5 s, and keep only that dump.
+    // A dump is its 0x77 header, 0x78 chunks and the 0x79 after them. The header names what the dump is
+    // (bank 0x7F = the active buffer, else location bank*4+sub — see am4DumpLocation in the codec), so only a
+    // dump whose header names THIS request completes it: a late dump of another location (a scan reply) is
+    // ignored and this request's own dump that follows is the one used. Its header and chunks are owned, so a
+    // dump that stops short ends one quiet gap after its last chunk instead of the full 5 s.
     const is = (f: number[], fn: number) => f[0] === 0xf0 && f[4] === 0x15 && f[5] === fn;
+    const ours = (h: number[]) => location == null
+      ? h[6] === AM4_DUMP_ACTIVE_BANK_SENTINEL
+      : h[6] !== AM4_DUMP_ACTIVE_BANK_SENTINEL && h[6]! * 4 + h[7]! === location;
     const span = (fs: number[][]): number[][] | null => {
       let start = -1;
       for (let i = 0; i < fs.length; i++) {
-        if (is(fs[i]!, 0x77)) start = i;
+        if (is(fs[i]!, 0x77)) start = ours(fs[i]!) ? i : -1;
         else if (start >= 0 && is(fs[i]!, 0x79)) return fs.slice(start, i + 1);
       }
       return null;
@@ -1132,14 +1138,14 @@ class Am4Driver implements DeviceDriver {
       timeoutMs: 5000,
       quietMs: 200,
       match: (fs) => span(fs) !== null,
-      owns: (f) => (is(f, 0x77) ? (inDump = true) : inDump && is(f, 0x78))
+      owns: (f) => (is(f, 0x77) ? (inDump = ours(f)) : inDump && is(f, 0x78))
     });
+    // no whole dump of ours: parse what did arrive, so the error below says what came back instead
     const dumpMsgs = (span(frames) ?? frames).filter((f) => is(f, 0x77) || is(f, 0x78) || is(f, 0x79));
     const raw = Uint8Array.from(dumpMsgs.flat());
     const dump = parseAm4PresetDump(raw); // validates every envelope + checksum; throws on malformed
     const loc = am4DumpLocation(dump);
-    // The header names what the dump is (capture-documented: bank 0x7F = the active buffer, else bank*4+sub).
-    // A dump of anything else is a late reply to an earlier read (a scan) — never back it up as this one.
+    // Safety net behind the matcher: a dump of anything else is never backed up as this one.
     const wanted = location == null ? 'the active buffer' : formatLocationCode(location);
     const got = loc.active ? 'the active buffer' : (loc.code ?? `location ${loc.index}`);
     if (location == null ? !loc.active : loc.active || loc.index !== location) {
