@@ -116,7 +116,9 @@ export async function buildApp(registry: DeviceRegistry): Promise<FastifyInstanc
   // ── device cache (on-connect self-describe build; capability selfDescribe) ──
   // Status: current key + existence + live build progress + stored-doc meta.
   app.get('/device/cache', () => deviceCache.cacheStatus(store.defaultStore, registry));
-  // Start a background build (501 no selfDescribe, 503 no device/firmware, 409 already building).
+  // Start a background build (501 no selfDescribe / no fullCapture; 501 reason:'firmware' for mode 'full' on a firmware
+  // it has not been verified on — FAIL CLOSED: full mode on unknown/unreadable firmware is 501 too, no longer 503;
+  // 503 no device/firmware for read-only; 409 already building). Read-only is never firmware-gated.
   app.post<{ Body: { force?: boolean; mode?: 'read-only' | 'full' } }>('/device/cache/build', async (req, reply) => {
     const r = await deviceCache.startCacheBuild(store.defaultStore, registry, { force: req.body?.force, mode: req.body?.mode });
     reply.code(r.code);

@@ -15,15 +15,23 @@ export interface TestApp {
   mock: MockTransport;
 }
 
+/** A fn 0x08 firmware-version reply frame (frame[6] = major, frame[7] = minor) — what a gen-3 unit
+ *  answers the registry's best-effort firmware read with. */
+export function firmwareVersionReply(modelId: number, major: number, minor: number): number[] {
+  return [0xf0, 0x00, 0x01, 0x74, modelId, 0x08, major, minor, 0x00, 0x00, 0xf7];
+}
+
 /** Build app + isolated registry with the given model detected (via mocked handshake). An optional
  *  fake driver is seeded into the registry's driver cache BEFORE detection activates it. `opts.firmware`
- *  answers detect's fn 0x08 firmware query (frame[6]=major, frame[7]=minor); omitted → that query is silent. */
+ *  scripts the fn 0x08 firmware reply ([major, minor]); omitted = a silent unit (firmware stays unknown). */
 export async function buildTestApp(modelId: number, fakeDriver?: DeviceDriver, opts: { firmware?: readonly [number, number] } = {}): Promise<TestApp> {
   const mock = new MockTransport('serial', `mock-0x${modelId.toString(16)}`);
   const fw = opts.firmware;
-  mock.reply = (req) => isIdentifyBroadcast(req)
-    ? [handshakeReply(modelId)]
-    : fw && req[0] === 0xf0 && req[5] === 0x08 ? [[0xf0, 0x00, 0x01, 0x74, modelId, 0x08, fw[0], fw[1], 0x00, 0x00, 0xf7]] : [];
+  mock.reply = (req) => {
+    if (isIdentifyBroadcast(req)) return [handshakeReply(modelId)];
+    if (fw && req[0] === 0xf0 && req[5] === 0x08) return [firmwareVersionReply(modelId, fw[0], fw[1])];
+    return [];
+  };
   const registry = __createRegistryForTest({
     resolveConn: async () => ({ transport: 'serial', id: mock.label }),
     openConn: () => mock

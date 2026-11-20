@@ -15,7 +15,7 @@ import { PARAMS as AXE3_PARAMS } from 'forgefx-midi/gen3/axe-fx-iii';
 import { isFractalHeaderFrame } from 'forgefx-midi/shared';
 import { blockRefForEid } from 'forgefx-midi/devices/gen3';
 import { AM4_CACHE_PARAMS, AM4_SEEDS } from 'forgefx-midi/am4';
-import { deviceCacheKey, type DeviceRegistry } from '../drivers/registryCore.js';
+import { deviceCacheKey, fullCaptureAllowedOnFirmware, type DeviceRegistry } from '../drivers/registryCore.js';
 import { PROFILES, SLUG_FAMILY, isByteExactProfile, type DeviceProfile } from '../devices.js';
 import type { Store } from '../runtime/store.js';
 import type { Transport } from '../transport/types.js';
@@ -25,7 +25,8 @@ import type { Transport } from '../transport/types.js';
 export type WalkImpl = (transport: LiveTransport, opts: LiveWalkOptions) => Promise<CacheRecord[]>;
 
 /** Build mode: 'read-only' is the HW-proven default sweep; 'full' adds the CaptureRig-parity write-sweep
- *  that recovers per-float knob tapers (requires the fullCapture capability + write hooks). */
+ *  that recovers per-float knob tapers (requires the fullCapture capability + write hooks, and a firmware
+ *  the model's full capture has been verified on — FULL_CAPTURE_MAX_VERIFIED_FW, see startCacheBuild). */
 export type BuildMode = 'read-only' | 'full';
 
 interface CacheJob {
@@ -339,7 +340,7 @@ export async function cacheStatus(store: Store, registry: DeviceRegistry): Promi
 
 /** POST /device/cache/build — start a background build (or report already-built / gated). Returns
  *  immediately; the build runs detached. `mode` (default 'read-only') selects the HW-proven read-only
- *  sweep or the fullCapture-gated write-sweep. `walkImpl` is a test seam (defaults to the codec's liveWalk). */
+ *  sweep or the fullCapture-gated write-sweep (refused on unverified or unknown firmware). `walkImpl` is a test seam (defaults to the codec's liveWalk). */
 export async function startCacheBuild(store: Store, registry: DeviceRegistry, opts?: { force?: boolean; mode?: BuildMode; walkImpl?: WalkImpl }): Promise<StartResult> {
   await registry.driver(); // ensure detection ran
   const caps = registry.activeCapabilities();
@@ -348,10 +349,36 @@ export async function startCacheBuild(store: Store, registry: DeviceRegistry, op
   // FULL-mode write-sweep is gated on the CaptureRig-proven fullCapture cap (gen-3 trio only). Mirror the
   // selfDescribe 501 shape so Axis handles both gates identically.
   if (mode === 'full' && !caps.fullCapture) return { code: 501, body: { error: 'unsupported', capability: 'fullCapture' } };
+  // A build is already running: refuse BEFORE anything touches the device. The full-mode firmware re-read below
+  // sends fn 0x08 and clears the cached firmware, which must never happen in the middle of a running walk.
+  if (JOBS.has(registry)) return { code: 409, body: { error: 'building' } };
+  // FULL mode WRITES to the device, so it additionally needs a firmware it has been verified on: per model, at
+  // or below FULL_CAPTURE_MAX_VERIFIED_FW (e.g. FM3 firmware 13.0's walk does not stop at a block's end and
+  // would write sweep values to non-existent params). The firmware is RE-READ right before deciding (fn 0x08,
+  // the detect path) so a unit that changed firmware or went quiet since detect() is never judged on a stale
+  // version; a silent unit is unknown and therefore refused (fail closed). Same 501/capability shape as the
+  // gates above, plus additive `reason: 'firmware'` / `firmware` / `message` fields. Read-only mode is
+  // intentionally NOT gated by this rule (the released read-only walk is hardware-proven on FM3 firmware 13.0).
+  if (mode === 'full') {
+    const fwNow = await registry.refreshFirmware();
+    if (!fullCaptureAllowedOnFirmware(registry.detectedModelId, fwNow)) {
+      return {
+        code: 501,
+        body: {
+          error: 'unsupported',
+          capability: 'fullCapture',
+          reason: 'firmware',
+          firmware: fwNow?.version ?? null,
+          message: fwNow
+            ? `full capture is only enabled on firmware versions it has been verified on (this device runs ${fwNow.version}); use read-only`
+            : 'full capture needs a known firmware version and the firmware could not be read from the device; re-detect the device'
+        }
+      };
+    }
+  }
   const model = registry.detectedModelId;
   const fw = registry.firmwareInfo();
   if (model < 0 || !fw) return { code: 503, body: { error: 'no device detected or firmware unknown' } };
-  if (JOBS.has(registry)) return { code: 409, body: { error: 'building' } };
   const key = deviceCacheKey(model, fw.major, fw.minor);
   const existing = store.getDoc('deviceCaches', key);
   if (existing && !existing.deleted && !opts?.force) {
