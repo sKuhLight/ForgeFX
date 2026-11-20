@@ -442,12 +442,26 @@ class Gen3Driver implements DeviceDriver {
   }
 
   /** Write + watch a short window for a 0x64 rejection. For structural ops where a reject matters.
-   *  `rejectOnly`: the device answers an accepted write with silence, so silence until the window closes is
-   *  the success outcome — the transport neither warns nor holds the link for a late reply after it. */
+   *  The device answers an accepted write with silence and a refused one with a 0x64 MULTIPURPOSE_RESPONSE
+   *  `[echoedFn, resultCode]`, so only a 0x64 from this model echoing THIS write's function is its refusal (one
+   *  too short to carry a function counts, conservatively). A foreign 0x64 — a late refusal of another
+   *  operation — neither ends the window nor fails the write.
+   *  `rejectOnly`: silence until the window closes is the success outcome, so the transport neither warns nor
+   *  holds the link for a late reply after it; a browser-direct transport that still reports the silence as
+   *  a typed timeout gets the same answer. */
   async #write(bytes: number[]): Promise<{ ok: boolean }> {
     const dev = await this.#conn();
-    const frames = await dev.request(bytes, { timeoutMs: 120, quietMs: 60, rejectOnly: true, match: (fs) => fs.some((f) => f[5] === 0x64) });
-    return { ok: !frames.some((f) => f[5] === 0x64) };
+    const model = bytes[4]!;
+    const fn = bytes[5];
+    const isOwnRejection = (f: number[]) => isMultipurposeResponse(f, model) && (f.length < 9 || f[6] === fn);
+    let frames: number[][];
+    try {
+      frames = await dev.request(bytes, { timeoutMs: 120, quietMs: 60, rejectOnly: true, match: (fs) => fs.some(isOwnRejection) });
+    } catch (e) {
+      if (isTransportTimeout(e)) return { ok: true }; // silence: accepted
+      throw e;
+    }
+    return { ok: !frames.some(isOwnRejection) };
   }
 
   /** Current preset number + name (one query). */

@@ -4,9 +4,10 @@
 //
 // The failure this guards against: a request times out, its reply arrives late during the NEXT request, that
 // request ends on the wrong frame, and its own reply then poisons the one after it.
-import { RequestQueue, LATE_DRAIN_LIMITS, isResultEcho, type ExchangeLink, type QueueClock } from '../../src/transport/requestQueue.js';
+import { RequestQueue, LATE_DRAIN_LIMITS, isResultEcho } from '../../src/transport/requestQueue.js';
 import { isTransportTimeout, type RequestOpts } from '../../src/transport/types.js';
 import { assert, assertEqual } from '../helpers/mock.js';
+import { VirtualClock, FakeLink, track } from '../helpers/virtualLink.js';
 
 // One case = one executed check() (the suite verifies the count itself at the end).
 export const REQUEST_QUEUE_CASE_COUNT = 87;
@@ -41,81 +42,6 @@ const statusReply = (tag: number) => sysex(0x0d, [0x01, tag]);
 const getReply = (tag: number) => sysex(0x01, [0x01, 0x00, 0x05, 0x00, 0x02, 0x00, tag]);
 const noise = () => sysex(0x13, [0x3a, 0x00, 0x02]); // unsolicited status broadcast
 const result = (echoedFn: number, code: number) => sysex(0x64, [echoedFn, code]);
-
-/** Timers in virtual time: `advanceTo` fires due timers in (time, creation) order and lets promise callbacks
- *  settle between them, so queue hand-offs happen at the virtual instant they would on a link. */
-class VirtualClock implements QueueClock {
-  t = 0;
-  #seq = 0;
-  #timers = new Map<number, { at: number; fn: () => void }>();
-  setTimeout(fn: () => void, ms: number): unknown {
-    const id = ++this.#seq;
-    this.#timers.set(id, { at: this.t + Math.max(0, ms), fn });
-    return id;
-  }
-  clearTimeout(handle: unknown): void {
-    this.#timers.delete(handle as number);
-  }
-  now(): number {
-    return this.t;
-  }
-  /** Run `fn` at absolute virtual time `at`. */
-  at(at: number, fn: () => void): void {
-    this.setTimeout(fn, at - this.t);
-  }
-  async advanceTo(to: number): Promise<void> {
-    await flush();
-    for (;;) {
-      let next: [number, { at: number; fn: () => void }] | null = null;
-      for (const e of this.#timers) if (e[1].at <= to && (!next || e[1].at < next[1].at)) next = e;
-      if (!next) break;
-      this.#timers.delete(next[0]);
-      this.t = next[1].at;
-      next[1].fn();
-      await flush();
-    }
-    this.t = to;
-    await flush();
-  }
-}
-const flush = () => new Promise<void>((r) => setImmediate(r));
-
-/** A device link: records every TX with its virtual time; `emit` delivers an inbound frame. */
-class FakeLink implements ExchangeLink {
-  readonly sent: { at: number; bytes: number[] }[] = [];
-  readonly handlers = new Set<(frame: number[]) => void>();
-  failNextSend: Error | null = null;
-  constructor(readonly clock: VirtualClock) {}
-  send(bytes: readonly number[]): void {
-    if (this.failNextSend) {
-      const e = this.failNextSend;
-      this.failNextSend = null;
-      throw e;
-    }
-    this.sent.push({ at: this.clock.t, bytes: [...bytes] });
-  }
-  onFrame(handler: (frame: number[]) => void): () => void {
-    this.handlers.add(handler);
-    return () => { this.handlers.delete(handler); };
-  }
-  emit(frame: readonly number[]): void {
-    for (const h of [...this.handlers]) h([...frame]);
-  }
-  /** Virtual time the n-th frame went out (undefined while it has not). */
-  sentAt(n: number): number | undefined {
-    return this.sent[n]?.at;
-  }
-}
-
-interface Tracked<T> { done: boolean; at: number; value?: T; error?: unknown }
-function track<T>(clock: VirtualClock, p: Promise<T>): Tracked<T> {
-  const t: Tracked<T> = { done: false, at: -1 };
-  p.then(
-    (v) => { t.done = true; t.at = clock.t; t.value = v; },
-    (e) => { t.done = true; t.at = clock.t; t.error = e; }
-  );
-  return t;
-}
 
 function rig(extra: { silenceError?: (ms: number) => Error } = {}) {
   const clock = new VirtualClock();

@@ -13,6 +13,7 @@ import { runAm4EditWatchTests, AM4_EDITWATCH_CASE_COUNT } from './drivers/am4-ed
 import { runVp4Tests, VP4_CASE_COUNT } from './drivers/vp4.test.js';
 import { runModelByteTests, MODELBYTE_CASE_COUNT } from './drivers/modelbyte.test.js';
 import { runGen3StoreTests, GEN3_STORE_CASE_COUNT } from './drivers/gen3-store.test.js';
+import { runWriteRejectionTests, WRITE_REJECTION_CASE_COUNT } from './drivers/write-rejection.test.js';
 import { runDefinitionCompletenessTests, DEFINITION_COMPLETENESS_CASE_COUNT } from './drivers/definition-completeness.test.js';
 import { runChannelSliceTests, CHANNEL_SLICE_CASE_COUNT } from './drivers/channel-slice.test.js';
 import { runWalkReclassificationTests, WALK_RECLASSIFICATION_CASE_COUNT } from './drivers/walk-reclassification.test.js';
@@ -48,6 +49,7 @@ const tests: Array<{ name: string; run: () => void | Promise<void> }> = [
   { name: `drivers/vp4 (${VP4_CASE_COUNT} cases, VP4 gated writes + structure read + caps)`, run: runVp4Tests },
   { name: `drivers/modelbyte (${MODELBYTE_CASE_COUNT} cases, wrong-model-byte guard)`, run: runModelByteTests },
   { name: `drivers/gen3-store (${GEN3_STORE_CASE_COUNT} cases, store waits for the device ack: ack/late ack/no ack/0x64, virtual-time transport)`, run: runGen3StoreTests },
+  { name: `drivers/write-rejection (${WRITE_REJECTION_CASE_COUNT} cases, 0x64 attributed by echoed function, reject-only write timing over the real queue)`, run: runWriteRejectionTests },
   { name: `drivers/definition-completeness (${DEFINITION_COMPLETENESS_CASE_COUNT} cases, blockParams unit/taper passthrough)`, run: runDefinitionCompletenessTests },
   { name: `drivers/channel-slice (${CHANNEL_SLICE_CASE_COUNT} cases, fn-0x1F channel stride, cache overlay by provenance, channel-less edit diffs)`, run: runChannelSliceTests },
   { name: `drivers/walk-reclassification (${WALK_RECLASSIFICATION_CASE_COUNT} cases, non-byte-exact profiles never reclassify a catalog kind; editor-cache / cloud-from-cache override)`, run: runWalkReclassificationTests },
