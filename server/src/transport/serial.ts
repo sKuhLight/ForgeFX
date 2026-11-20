@@ -5,6 +5,7 @@
 import { SerialPort } from 'serialport';
 import { existsSync, readdirSync, appendFileSync } from 'node:fs';
 import type { Transport, RequestOpts } from './types.js';
+import { RequestQueue } from './requestQueue.js';
 
 const SYSEX_START = 0xf0;
 const SYSEX_END = 0xf7;
@@ -179,86 +180,46 @@ export class FractalSerial implements Transport {
 
   /** Send a large payload (e.g. a full preset dump → edit buffer) in small paced chunks. The FM3's CDC
    *  serial drops bytes if flooded — the editor bridge paces at ~64 B / 3 ms, so we match that. Serialized
-   *  on the request chain so it never interleaves with a read. */
+   *  on the request queue so it never interleaves with a read. */
   sendPaced(bytes: readonly number[], chunk = 64, delayMs = 3): Promise<void> {
-    const task = () =>
-      new Promise<void>((resolve, reject) => {
-        if (!this.#port?.isOpen) return reject(new Error('port not open'));
-        this.#logTap('TX', bytes);
-        const buf = Buffer.from(bytes);
-        let off = 0;
-        const pump = () => {
-          if (off >= buf.length) { setTimeout(resolve, 20); return; } // settle before the next request
-          this.#port!.write(buf.subarray(off, off + chunk));
-          off += chunk;
-          setTimeout(pump, delayMs);
-        };
-        pump();
-      });
-    const p = this.#chain.then(task, task);
-    this.#chain = p.then(() => {}, () => {});
-    return p;
-  }
-
-  // serial is a single shared stream — requests MUST run one at a time, or reply
-  // frames from concurrent requests interleave and corrupt each other.
-  #chain: Promise<unknown> = Promise.resolve();
-
-  /**
-   * Send a request and collect reply frames. Serialized against all other requests.
-   * Resolves once a quiet gap (`quietMs`) passes after the last frame, or `match` is
-   * satisfied, or `timeoutMs` elapses. Handles single-frame replies and multi-frame dumps.
-   */
-  request(bytes: readonly number[], opts: RequestOpts = {}): Promise<number[][]> {
-    const task = () => this.#once(bytes, opts);
-    const p = this.#chain.then(task, task);
-    this.#chain = p.then(
-      () => {},
-      () => {}
+    return this.#queue.serialize(
+      () =>
+        new Promise<void>((resolve, reject) => {
+          if (!this.#port?.isOpen) return reject(new Error('port not open'));
+          this.#logTap('TX', bytes);
+          const buf = Buffer.from(bytes);
+          let off = 0;
+          const pump = () => {
+            if (off >= buf.length) { setTimeout(resolve, 20); return; } // settle before the next request
+            this.#port!.write(buf.subarray(off, off + chunk));
+            off += chunk;
+            setTimeout(pump, delayMs);
+          };
+          pump();
+        })
     );
-    return p;
+  }
+
+  // serial is a single shared stream — requests MUST run one at a time, or reply frames from concurrent
+  // requests interleave and corrupt each other. The queue (shared with the MIDI transport) also decides when
+  // a request is complete — see transport/requestQueue.ts. Each request first drops a stale partial frame.
+  #queue = new RequestQueue(
+    { send: (bytes) => this.send(bytes), onFrame: (handler) => this.onFrame(handler) },
+    { tag: 'serial', beforeRequest: () => { this.#rx = []; } }
+  );
+
+  /** Send a request and collect reply frames, serialized against all other requests (rules: RequestOpts). */
+  request(bytes: readonly number[], opts: RequestOpts = {}): Promise<number[][]> {
+    return this.#queue.request(bytes, opts);
   }
 
   /**
-   * Fire-and-forget write, but SERIALIZED on the request chain so it never injects
+   * Fire-and-forget write, but SERIALIZED on the request queue so it never injects
    * bytes mid-read (which would corrupt a concurrent dump/bulk-read). Resolves after
    * a short settle so any echo is drained before the next request collects.
    */
   sendQueued(bytes: readonly number[], settleMs = 20): Promise<void> {
-    const task = () =>
-      new Promise<void>((resolve) => {
-        this.send(bytes);
-        setTimeout(resolve, settleMs);
-      });
-    const p = this.#chain.then(task, task);
-    this.#chain = p.then(
-      () => {},
-      () => {}
-    );
-    return p;
-  }
-
-  #once(bytes: readonly number[], { timeoutMs = 1500, quietMs = 90, match }: RequestOpts = {}): Promise<number[][]> {
-    this.#rx = []; // drop any stale partial frame before a fresh exchange
-    return new Promise((resolve) => {
-      const frames: number[][] = [];
-      let quietTimer: ReturnType<typeof setTimeout> | null = null;
-      const done = () => {
-        if (quietTimer) clearTimeout(quietTimer);
-        clearTimeout(hardTimer);
-        this.#frameHandlers.delete(handler);
-        resolve(frames);
-      };
-      const handler = (frame: number[]) => {
-        frames.push(frame);
-        if (match?.(frames)) return done();
-        if (quietTimer) clearTimeout(quietTimer);
-        quietTimer = setTimeout(done, quietMs);
-      };
-      const hardTimer = setTimeout(done, timeoutMs);
-      this.#frameHandlers.add(handler);
-      this.send(bytes);
-    });
+    return this.#queue.sendQueued(bytes, settleMs);
   }
 
   onFrame(handler: (frame: number[]) => void): () => void {

@@ -441,10 +441,12 @@ class Gen3Driver implements DeviceDriver {
     return { ok: true };
   }
 
-  /** Write + watch a short window for a 0x64 rejection. For structural ops where a reject matters. */
+  /** Write + watch a short window for a 0x64 rejection. For structural ops where a reject matters.
+   *  `rejectOnly`: the device answers an accepted write with silence, so silence until the window closes is
+   *  the success outcome — the transport neither warns nor holds the link for a late reply after it. */
   async #write(bytes: number[]): Promise<{ ok: boolean }> {
     const dev = await this.#conn();
-    const frames = await dev.request(bytes, { timeoutMs: 120, quietMs: 60, match: (fs) => fs.some((f) => f[5] === 0x64) });
+    const frames = await dev.request(bytes, { timeoutMs: 120, quietMs: 60, rejectOnly: true, match: (fs) => fs.some((f) => f[5] === 0x64) });
     return { ok: !frames.some((f) => f[5] === 0x64) };
   }
 
@@ -487,10 +489,14 @@ class Gen3Driver implements DeviceDriver {
     const slow = dev.slow;
     let frames: number[][] = [];
     for (let attempt = 1; attempt <= 3; attempt++) {
-      frames = await dev.request(this.#codec.buildRequestPresetDump(target), {
+      const req = this.#codec.buildRequestPresetDump(target);
+      frames = await dev.request(req, {
         timeoutMs: slow ? 25000 : 5000,
         quietMs: slow ? 1500 : 180,
-        match: (fs) => fs.some((f) => f[5] === 0x79) // 0x79 = dump terminator
+        match: (fs) => fs.some((f) => f[5] === 0x79), // 0x79 = dump terminator
+        // the 0x77 header and 0x78 chunks are this dump's own frames: a dump whose terminator got lost still
+        // ends one quiet gap after its last chunk (→ the retry below) instead of the full timeout
+        owns: (f) => f[0] === 0xf0 && f[4] === req[4] && (f[5] === 0x77 || f[5] === 0x78)
       });
       const ok = frames.some((f) => f[5] === 0x78) && frames.some((f) => f[5] === 0x79);
       if (ok) return frames;

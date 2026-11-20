@@ -15,6 +15,11 @@ export { createGen3Driver } from '../drivers/gen3.js';
 export { createAm4Driver, type Am4Driver } from '../drivers/am4.js';
 export type { DeviceDriver, DriverCapabilities, DriverCtx, DeviceEvent } from '../drivers/types.js';
 export type { Transport, RequestOpts, Conn, ConnKind } from '../transport/types.js';
+// the request/completion engine of the Node transports, for in-page transports to share (browser-safe)
+export {
+  RequestQueue, LATE_DRAIN_LIMITS, isResultEcho,
+  type ExchangeLink, type LateDrainLimits, type RequestQueueOpts, type QueueClock
+} from '../transport/requestQueue.js';
 export { PROFILES, DEFAULT_PROFILE, profileForModel, profileForKey, SLUG_FAMILY, type DeviceProfile } from '../devices.js';
 
 // ── persistent store (backend-agnostic core + the browser-usable backend) ──
