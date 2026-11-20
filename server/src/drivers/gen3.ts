@@ -372,6 +372,11 @@ class Gen3Driver implements DeviceDriver {
   get key() { return this.#prof.key; }
   get name() { return this.#prof.name; }
   get profile() { return this.#prof; }
+  /** Stored preset slots: 1024 on the Axe-Fx III, 512 on the FM3 / FM9. Slot-addressed routes validate
+   *  against this. These numbers MIRROR the codec's per-model `preset_count` (forgefx-midi
+   *  devices/gen3/configs/*), but that field is not exported — so they are hard-coded here. FOLLOW-UP:
+   *  export `preset_count` from the codec and read it from the profile instead of this model-byte switch. */
+  get presetCount(): number { return this.#prof.model === 0x10 ? 1024 : 512; }
 
   /** Adopt a device-cache-derived runtime profile (device-true rosters / enum labels / ranges). The
    *  model byte is unchanged so the codec bound at construction stays valid; only the data the reads
@@ -492,8 +497,28 @@ class Gen3Driver implements DeviceDriver {
     return frames; // still incomplete → let decodePresetDump throw its clear error
   }
 
+  /** Routing grid of ONE STORED SLOT (GET /presets/:n/grid): the dump the device returns for slot `n`,
+   *  decoded exactly like the edit-buffer grid. Deliberately bypasses `#gridCache`/`#gridInflight` —
+   *  those are keyed on the edit buffer, so routing a slot through them would serve one preset's grid
+   *  for another (the very confusion this method exists to end). */
+  async presetGrid(n: number): Promise<PresetGridDTO> {
+    // Concurrent requests for the SAME slot share one dump (a browser can fire several for one slot);
+    // nothing is kept once the dump settles, so the next call always reads the device again.
+    const inflight = this.#slotGridInflight.get(n);
+    if (inflight) return inflight;
+    const p = this.#gridFromDump(n).finally(() => { this.#slotGridInflight.delete(n); });
+    this.#slotGridInflight.set(n, p);
+    return p;
+  }
+  #slotGridInflight = new Map<number, Promise<PresetGridDTO>>();
+
   async #dumpGrid(): Promise<PresetGridDTO> {
-    const frames = await this.#dumpFrames(EDIT_BUFFER);
+    return this.#gridFromDump(EDIT_BUFFER);
+  }
+
+  /** Decode a preset dump (the edit buffer or a stored slot) into the routing-grid DTO. */
+  async #gridFromDump(target: number): Promise<PresetGridDTO> {
+    const frames = await this.#dumpFrames(target);
     // diagnostic: did the dump arrive? (Windows MIDI large-SysEx debugging) — frame count, the function
     // bytes seen, total bytes, and whether the 0x79 terminator came through.
     const fns = [...new Set(frames.map((f) => f[5]))].map((x) => '0x' + (x ?? 0).toString(16));
@@ -501,7 +526,7 @@ class Gen3Driver implements DeviceDriver {
     console.log(`[forgefx] presetDump: frames=${frames.length} bytes=${bytes} fns=[${fns.join(',')}] terminator=${frames.some((f) => f[5] === 0x79)}`);
     const d = decodeDump(frames, this.#prof).dump;
     return {
-      model: 'fm3',
+      model: this.#prof.key, // 'fm3' | 'fm9' | 'axe3' (was a hard-coded 'fm3' for every gen-3 unit)
       name: d.name,
       crcValid: d.crcValid,
       rows: d.rows,

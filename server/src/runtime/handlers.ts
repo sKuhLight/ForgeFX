@@ -34,6 +34,57 @@ export function createUnifiedHandlers(registry: DeviceRegistry) {
   const gridH = async (reply: StatusSink) => {
     try { return await (await driver()).grid(); } catch (e) { return decodeFail(reply, 'grid decode', e); }
   };
+  // ── slot-addressed routes (GET /presets/:n/{grid,summary,params}) ──
+  // The route's number arrives as a raw string so a malformed one (`abc`, `-1`, `1.5`, `1e2`, `0x10`) is a
+  // clean 400 BEFORE any device access; a well-formed one is then range-checked against the active
+  // driver's slot count (`presetCount`, when it knows it) — also 400.
+  const parseSlot = (raw: string): number | null => (/^\d{1,5}$/.test(raw) ? Number(raw) : null);
+  const slotOutOfRange = (d: { presetCount?: number }, n: number) =>
+    d.presetCount != null && n >= d.presetCount ? { error: 'preset number out of range', max: d.presetCount - 1 } : null;
+
+  // Routing grid of the STORED preset in slot `:n` (GET /presets/:n/grid) — never the edit buffer.
+  //  • a driver that can dump a stored slot (gen-3: `presetGrid`) answers from that dump, i.e. the SAVED
+  //    state of the slot (unsaved edits in the edit buffer are not in it);
+  //  • a driver that cannot but can name its loaded slot (`presetRef` — today only the AM4) answers the LIVE
+  //    grid when `:n` IS the loaded slot — that is the edit buffer, so it includes unsaved edits;
+  //  • everything else (any other slot; gen-1 / gen-2 / VP4, which have neither) answers 501: a named
+  //    refusal, never another preset's grid substituted for the one asked for.
+  const presetGridH = async (reply: StatusSink, raw: string) => {
+    const n = parseSlot(raw);
+    if (n == null) { reply.code(400); return { error: 'invalid preset number' }; }
+    try {
+      const d = await driver();
+      const oob = slotOutOfRange(d, n);
+      if (oob) { reply.code(400); return oob; }
+      if (d.presetGrid) return await d.presetGrid(n);
+      if (d.presetRef && (await d.presetRef()).number === n) return await d.grid();
+      return unsupported(reply, 'presetDump');
+    } catch (e) { return decodeFail(reply, 'preset grid decode', e); }
+  };
+  // Decode any stored preset by number (non-disruptive) → library summary (GET /presets/:n/summary).
+  const presetSummaryH = async (reply: StatusSink, raw: string, full: boolean) => {
+    const n = parseSlot(raw);
+    if (n == null) { reply.code(400); return { error: 'invalid preset number' }; }
+    try {
+      const d = await driver();
+      const oob = slotOutOfRange(d, n);
+      if (oob) { reply.code(400); return oob; }
+      if (!d.presetSummary) return unsupported(reply, 'presetDump');
+      return await d.presetSummary(n, full);
+    } catch (e) { reply.code(503); return { error: (e as Error).message }; }
+  };
+  // Full per-block decoded params of one stored preset (GET /presets/:n/params) — deep search + browser detail.
+  const presetParamsH = async (reply: StatusSink, raw: string) => {
+    const n = parseSlot(raw);
+    if (n == null) { reply.code(400); return { error: 'invalid preset number' }; }
+    try {
+      const d = await driver();
+      const oob = slotOutOfRange(d, n);
+      if (oob) { reply.code(400); return oob; }
+      if (!d.presetParams) return unsupported(reply, 'presetDump');
+      return { blocks: await d.presetParams(n) };
+    } catch (e) { reply.code(503); return { error: (e as Error).message }; }
+  };
   const blocksH = async (reply: StatusSink) => {
     try {
       const d = await driver();
@@ -175,7 +226,7 @@ export function createUnifiedHandlers(registry: DeviceRegistry) {
 
   return {
     driver, unsupported, decodeFail,
-    gridH, blocksH, sceneStateH, blockParamsH, setParamH, bypassH, sceneSetH,
+    gridH, presetGridH, presetSummaryH, presetParamsH, blocksH, sceneStateH, blockParamsH, setParamH, bypassH, sceneSetH,
     presetSelectH, presetStoreH, presetNameH, locationsH,
     backupH, restoreH, fwValidateH, deviceParamH, modModelH,
     telemetryConfigH, telemetrySetH,
