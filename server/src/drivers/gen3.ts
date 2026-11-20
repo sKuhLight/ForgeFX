@@ -53,16 +53,17 @@ const EDIT_BUFFER = 0x3fff; // preset number sentinel = current edit buffer
  *   'verified' — an ack was seen on our OWN hardware: a missing ack is a failure (`ok:false`).
  *   'unknown'  — not seen on our own hardware: a missing ack is only a warning (`ok:true, acked:false,
  *                warning`); a real 0x64 refusal is `ok:false` either way.
- *  The ack (an echo of the request's fn/sub ~1.4 s later) has only been REPORTED by a third party for an
- *  FM3 on fw 13.0. So ALL entries start 'unknown' — flip one only with our own hardware evidence
- *  (FM3 on fw 12 and 13, then FM9 / Axe-Fx III), never on a report. */
+ *  The ack repeats the request's fn/sub envelope (it is not byte-identical to the request). It is VERIFIED
+ *  on our own FM3 (model byte 0x11): it arrives ~0.8–0.9 s after the request on fw 12.0 and ~1.25–1.35 s on
+ *  fw 13.0. FM9 (0x12) and Axe-Fx III (0x10) are still 'unknown' — flip one only with our own hardware
+ *  evidence for that model, never on a report. */
 export type StoreAckEvidence = 'verified' | 'unknown';
-const STORE_ACK_EVIDENCE: Readonly<Record<number, StoreAckEvidence>> = { 0x10: 'unknown', 0x11: 'unknown', 0x12: 'unknown' };
+const STORE_ACK_EVIDENCE: Readonly<Record<number, StoreAckEvidence>> = { 0x10: 'unknown', 0x11: 'verified', 0x12: 'unknown' };
 
 /** How long `store()` waits for the ack, per evidence level and link. The wait ends the instant the ack
- *  arrives, so the cap only costs time when none comes. 'verified': ~2.9x the reported 1.4 s. 'unknown':
- *  shorter, because on a model that never acks EVERY successful save would otherwise pay the full cap. A
- *  slow (5-pin DIN) link gets more. */
+ *  arrives, so the cap only costs time when none comes. 'verified': 4 s is ~3x the slowest FM3 ack measured
+ *  (~1.35 s, fw 13.0). 'unknown': shorter, because on a model that never acks EVERY successful save would
+ *  otherwise pay the full cap. A slow (5-pin DIN) link gets more. */
 const STORE_ACK_TIMEOUT_MS: Readonly<Record<StoreAckEvidence, { fast: number; slow: number }>> = {
   verified: { fast: 4000, slow: 8000 },
   unknown: { fast: 2500, slow: 6000 }
@@ -1385,9 +1386,9 @@ class Gen3Driver implements DeviceDriver {
   /**
    * Persist the working buffer to preset slot `n`.
    *
-   * The device acknowledges a store by echoing the request's envelope (fn 0x01, sub 0x26) — about 1.4 s
-   * after the request on an FM3 (fw 13.0, as reported by the contributor of this change), while the
-   * generic `#write` window is only 120 ms. So the old call could never see its own ack: it returned
+   * The device acknowledges a store by repeating the request's envelope (fn 0x01, sub 0x26) — on our own
+   * FM3 about 0.8–0.9 s after the request on fw 12.0 and about 1.25–1.35 s on fw 13.0, while the generic
+   * `#write` window is only 120 ms. So the old call could never see its own ack: it returned
    * `{ok:true}` by ABSENCE of a refusal, and any foreign `0x64` that happened to land in that window (a
    * refused read while the meter poll was running, say) was misread as the device rejecting the save.
    * Wait for the echo instead.
@@ -1414,8 +1415,9 @@ class Gen3Driver implements DeviceDriver {
     const fn = bytes[5];
     // The ack repeats the request's envelope up to and including the sub-action: Fractal header, model
     // byte, fn 0x01, sub 0x26. A frame BYTE-IDENTICAL to the request is our own request coming back (MIDI
-    // thru / loopback), not the device's answer — it is not an ack. (Hardware question: the real ack is
-    // assumed to differ from the request; if a unit's ack ever turns out byte-identical, revisit this.)
+    // thru / loopback), not the device's answer — it is not an ack. (On our own FM3 the real ack differs
+    // from the request on fw 12.0 and 13.0; for the other models that is still an assumption — if a unit's
+    // ack ever turns out byte-identical, revisit this.)
     const sameAsRequest = (f: number[]) => f.length === bytes.length && f.every((b, i) => b === bytes[i]);
     const isAck = (f: number[]) => f.length > 7 && f[0] === 0xf0 && [1, 2, 3, 4, 5, 6].every((i) => f[i] === bytes[i]) && !sameAsRequest(f);
     // A refusal is a 0x64 MULTIPURPOSE_RESPONSE echoing fn 0x01.

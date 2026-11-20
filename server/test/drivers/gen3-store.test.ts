@@ -1,9 +1,11 @@
 // Gen-3 preset store waits for the device's OWN acknowledgement (Axe-Fx III / FM3 / FM9). Mocked,
-// NO hardware. A device acks a store ~1.4 s after the request (reported on an FM3, fw 13.0 — NOT yet
-// seen on our own hardware), so the old ~120 ms window reported success by ABSENCE of a refusal. What a
-// MISSING ack means depends on the per-model evidence table (`storeAck`):
-//   'verified' (ack seen on our own hardware): no ack → ok:false + a clear error, never silent success
-//   'unknown'  (the default for EVERY model today): no ack → ok:true, acked:false + a warning
+// NO hardware. A device acks a store ~0.8-1.4 s after the request (measured on our own FM3: 808-897 ms
+// on fw 12.0, 1256-1353 ms on fw 13.0), so the old ~120 ms window reported success by ABSENCE of a
+// refusal. What a MISSING ack means depends on the per-model evidence table (`storeAck`):
+//   'verified' (ack seen on our own hardware — the FM3 today): no ack → ok:false + a clear error, never
+//              silent success
+//   'unknown'  (FM9 and Axe-Fx III today; injected for the FM3 where the lenient path is under test):
+//              no ack → ok:true, acked:false + a warning
 //   both: ack → ok:true acked:true (even late / after unrelated frames / next to a stray 0x64);
 //         a real 0x64 refusal without ack → ok:false + the device's result code;
 //         a frame byte-identical to the request (loopback) is NOT an ack.
@@ -79,13 +81,80 @@ function driverOver(model: number, mock: MockTransport, storeAck?: StoreAckEvide
 
 const typedTimeout = () => Object.assign(new Error('request timed out'), { code: 'ETIMEDOUT' });
 
+/** What the shipped evidence table says per model: the FM3's ack is verified on our own unit (fw 12.0 and
+ *  13.0); the FM9 and the Axe-Fx III have not been seen on our own hardware yet. */
+const SHIPPED_EVIDENCE: Readonly<Record<number, StoreAckEvidence>> = { 0x10: 'unknown', 0x11: 'verified', 0x12: 'unknown' };
+
+/** The DEFAULT driver (no injected evidence) per model: the table is what the user gets. */
+async function defaultEvidence(): Promise<void> {
+  for (const model of GEN3_MODELS) {
+    const tag = `0x${model.toString(16)}`;
+    const mock = new TimedTransport('serial', `mock-store-default-${tag}`);
+    const driver = driverOver(model, mock);
+    assertEqual(driver.storeAck, SHIPPED_EVIDENCE[model], `${tag}: default store-ack evidence (FM3 'verified', FM9 / Axe-Fx III 'unknown')`);
+
+    // an ack inside the cap is a plain success on every model
+    mock.script = () => [{ at: 1402, frame: ackFrame(model) }];
+    const acked = await driver.store(SLOT);
+    assertEqual(acked.ok && acked.acked, true, `${tag}/default: ack at 1.4 s → ok + acked`);
+    assertEqual(acked.warning, undefined, `${tag}/default: no warning when acked`);
+    assertEqual(acked.error, undefined, `${tag}/default: no error when acked`);
+
+    // silence: the evidence decides — a verified model fails, an unknown one only warns
+    mock.script = () => [];
+    const quiet = await driver.store(SLOT);
+    if (SHIPPED_EVIDENCE[model] === 'verified') {
+      assertEqual(quiet.ok, false, `${tag}/default (verified): silence → ok:false`);
+      assertEqual(quiet.acked, false, `${tag}/default (verified): silence → acked:false`);
+      assert(/did not acknowledge/.test(quiet.error ?? '') && (quiet.error ?? '').includes(String(SLOT)), `${tag}/default (verified): silence → clear error naming the slot (${quiet.error})`);
+      assertEqual(quiet.warning, undefined, `${tag}/default (verified): silence is an error, not a warning`);
+    } else {
+      assertEqual(quiet.ok, true, `${tag}/default (unknown): silence → ok:true`);
+      assertEqual(quiet.acked, false, `${tag}/default (unknown): silence → acked:false`);
+      assert(/unconfirmed/.test(quiet.warning ?? '') && (quiet.warning ?? '').includes(String(SLOT)), `${tag}/default (unknown): silence → a warning naming the slot (${quiet.warning})`);
+      assertEqual(quiet.error, undefined, `${tag}/default (unknown): silence is not an error`);
+    }
+  }
+}
+
+/** The FM3 acks measured on our own unit (fw 12.0: 808-897 ms; fw 13.0: 1256-1353 ms) through the DEFAULT
+ *  FM3 driver: every one is a success, and the wait leaves ~3x room over the slowest. */
+async function fm3MeasuredAcks(): Promise<void> {
+  const model = 0x11;
+  const mock = new TimedTransport('serial', 'mock-store-fm3-measured');
+  const driver = driverOver(model, mock);
+  assertEqual(driver.storeAck, 'verified', 'fm3: default evidence is verified');
+  for (const [fw, at] of [['12.0', 808], ['12.0', 897], ['13.0', 1256], ['13.0', 1353]] as const) {
+    mock.script = () => [{ at, frame: ackFrame(model) }];
+    const r = await driver.store(SLOT);
+    assertEqual(r.ok && r.acked, true, `fm3 fw ${fw}: ack at ${at} ms → ok + acked`);
+    assertEqual(r.error, undefined, `fm3 fw ${fw}: ack at ${at} ms → no error`);
+    assertEqual(r.warning, undefined, `fm3 fw ${fw}: ack at ${at} ms → no warning`);
+  }
+  const o = mock.lastOpts!;
+  assert((o.timeoutMs ?? 0) >= 2.9 * 1353, `fm3: cap (${o.timeoutMs} ms) leaves ~3x room over the slowest measured ack (1353 ms)`);
+  assert((o.quietMs ?? 0) >= (o.timeoutMs ?? Infinity), 'fm3: a quiet gap can never end the wait before the cap');
+  assert(mock.sent.some((f) => f[5] === 0x01 && f[6] === 0x26), 'fm3: the store request (fn 0x01 sub 0x26) went out');
+
+  // default FM3: a real refusal and our own request coming back are failures, never an ack
+  mock.script = () => [{ at: 30, frame: rejectFrame(model, 0x01, 0x05) }];
+  const rej = await driver.store(SLOT);
+  assertEqual(rej.ok, false, 'fm3 default: a real 0x64 refusal → ok:false');
+  assert(/rejected by the device/.test(rej.error ?? '') && /0x05/.test(rej.error ?? ''), `fm3 default: refusal error carries the result code (${rej.error})`);
+  mock.script = (req) => [{ at: 5, frame: [...req] }];
+  const echoed = await driver.store(SLOT);
+  assertEqual(echoed.ok, false, 'fm3 default: a literal echo of the request is not an ack → ok:false');
+  assertEqual(echoed.acked, false, 'fm3 default: a literal echo of the request → acked:false');
+}
+
 async function perModel(model: number): Promise<void> {
   const tag = `0x${model.toString(16)}`;
 
-  // the evidence table starts 'unknown' for every model (no ack seen on our own hardware yet)
+  // the lenient path is exercised on EVERY model by injecting 'unknown' (the shipped table only leaves
+  // the FM9 / Axe-Fx III there; the default per model is covered by defaultEvidence())
   const mockU = new TimedTransport('serial', `mock-store-unknown-${tag}`);
-  const unknown = driverOver(model, mockU);
-  assertEqual(unknown.storeAck, 'unknown', `${tag}: store-ack evidence defaults to 'unknown'`);
+  const unknown = driverOver(model, mockU, 'unknown');
+  assertEqual(unknown.storeAck, 'unknown', `${tag}: an injected 'unknown' evidence is honoured`);
 
   // 'unknown' + ack at 1402 ms → ok + acked
   mockU.script = () => [{ at: 1402, frame: ackFrame(model) }];
@@ -172,7 +241,7 @@ async function contractEdges(): Promise<void> {
   assertEqual(echoed.ok, false, 'verified: a literal echo of the request is not an ack → ok:false');
   assertEqual(echoed.acked, false, 'verified: a literal echo of the request → acked:false');
   const lenientMock = new TimedTransport('serial', 'mock-store-echo-unknown');
-  const lenient = driverOver(model, lenientMock);
+  const lenient = driverOver(model, lenientMock, 'unknown');
   lenientMock.script = (req) => [{ at: 5, frame: [...req] }];
   const echoedU = await lenient.store(SLOT);
   assertEqual(echoedU.acked, false, 'unknown: a literal echo of the request → acked:false (never a fake ack)');
@@ -261,9 +330,23 @@ async function bothSurfaces(): Promise<void> {
     return JSON.parse(a.payload) as { ok: boolean; acked: boolean; location: number; error?: string; warning?: string };
   };
 
-  // default evidence ('unknown'): ack → ok+acked; silence → ok+warning; text-only timeouts → ok+warning
+  /** The real gen-3 driver with INJECTED evidence behind the app (the registry's cache is seeded before detect). */
+  const appWithEvidence = async (storeAck: StoreAckEvidence) => {
+    let mockRef: MockTransport | null = null;
+    const driver = createGen3Driver(
+      PROFILES[model]!,
+      { transport: async () => mockRef as Transport, emit: () => {}, getCadence: () => cadenceFor(null, 'balanced') },
+      { storeAck }
+    ) as unknown as DeviceDriver;
+    const t = await buildTestApp(model, driver);
+    mockRef = t.mock;
+    return t;
+  };
+
+  // injected 'unknown' (what the FM9 / Axe-Fx III ship with): ack → ok+acked; silence → ok+warning;
+  // text-only timeouts → ok+warning
   {
-    const t = await buildTestApp(model);
+    const t = await appWithEvidence('unknown');
     const router = createRouter({ registry: t.registry, store: store.defaultStore });
     try {
       t.mock.reply = (req) => (isIdentifyBroadcast(req) ? [handshakeReply(model)] : JSON.stringify(req) === storeReq ? [ackFrame(model)] : []);
@@ -287,16 +370,9 @@ async function bothSurfaces(): Promise<void> {
     } finally { await t.app.close(); }
   }
 
-  // a model whose ack is 'verified': silence / browser-direct timeout → ok:false + error
+  // injected 'verified': silence / browser-direct timeout → ok:false + error
   {
-    let mockRef: MockTransport | null = null;
-    const verified = createGen3Driver(
-      PROFILES[model]!,
-      { transport: async () => mockRef as Transport, emit: () => {}, getCadence: () => cadenceFor(null, 'balanced') },
-      { storeAck: 'verified' }
-    ) as unknown as DeviceDriver;
-    const t = await buildTestApp(model, verified);
-    mockRef = t.mock;
+    const t = await appWithEvidence('verified');
     const router = createRouter({ registry: t.registry, store: store.defaultStore });
     try {
       t.mock.reply = (req) => (isIdentifyBroadcast(req) ? [handshakeReply(model)] : []);
@@ -306,6 +382,37 @@ async function bothSurfaces(): Promise<void> {
       t.mock.reply = (req) => { if (isIdentifyBroadcast(req)) return [handshakeReply(model)]; throw new Error('Serial request timed out after 4000ms'); };
       const bd = await post(t, router);
       assert(bd.ok === false && /did not acknowledge/.test(bd.error ?? ''), "app+router: 'verified' model, browser-direct timeout → ok:false + error");
+    } finally { await t.app.close(); }
+  }
+
+  // the DEFAULT FM3 driver (no injection — the shipped table says 'verified'): ack → ok+acked; silence and
+  // browser-direct timeouts → ok:false + error; a real 0x64 → ok:false
+  {
+    const t = await buildTestApp(model);
+    const router = createRouter({ registry: t.registry, store: store.defaultStore });
+    try {
+      t.mock.reply = (req) => (isIdentifyBroadcast(req) ? [handshakeReply(model)] : JSON.stringify(req) === storeReq ? [ackFrame(model)] : []);
+      const acked = await post(t, router);
+      assertEqual(acked.ok && acked.acked, true, 'app+router: default FM3, acknowledged store → ok:true acked:true');
+      assertEqual(acked.error, undefined, 'app+router: default FM3, acknowledged store → no error');
+      assertEqual(acked.warning, undefined, 'app+router: default FM3, acknowledged store → no warning');
+
+      t.mock.reply = (req) => (isIdentifyBroadcast(req) ? [handshakeReply(model)] : []);
+      const quiet = await post(t, router);
+      assertEqual(quiet.ok, false, 'app+router: default FM3, silence → ok:false');
+      assertEqual(quiet.acked, false, 'app+router: default FM3, silence → acked:false');
+      assert(/did not acknowledge/.test(quiet.error ?? ''), `app+router: default FM3, silence → clear error (${quiet.error})`);
+
+      for (const message of ['MIDI request timed out after 4000ms', 'Serial request timed out after 4000ms']) {
+        t.mock.reply = (req) => { if (isIdentifyBroadcast(req)) return [handshakeReply(model)]; throw new Error(message); };
+        const bd = await post(t, router);
+        assert(bd.ok === false && bd.acked === false && /did not acknowledge/.test(bd.error ?? ''), `app+router: default FM3, browser-direct "${message}" → ok:false + error, not a 500`);
+      }
+
+      t.mock.reply = (req) => (isIdentifyBroadcast(req) ? [handshakeReply(model)] : JSON.stringify(req) === storeReq ? [rejectFrame(model, 0x01, 0x05)] : []);
+      const refused = await post(t, router);
+      assertEqual(refused.ok, false, 'app+router: default FM3, real 0x64 → ok:false');
+      assert(/rejected by the device/.test(refused.error ?? ''), `app+router: default FM3, real 0x64 → refusal error (${refused.error})`);
     } finally { await t.app.close(); }
   }
 }
@@ -328,6 +435,8 @@ async function restoreCarriesVerdict(): Promise<void> {
 }
 
 export async function runGen3StoreTests(): Promise<void> {
+  await defaultEvidence();
+  await fm3MeasuredAcks();
   for (const m of GEN3_MODELS) await perModel(m);
   await contractEdges();
   await timeoutNormalisation();
