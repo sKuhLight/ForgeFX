@@ -102,7 +102,7 @@ supervisor never fires gen-3 frames at it and Axis hides the tuner (`hasTuner` f
   registry. The AM4's only supervisor-driven loop today is the **device-edit watch**:
   `#startEditWatch`/`#pollEditWatch` (`registryCore.ts:673-708`), which — while ≥1 SSE
   client listens and `capabilities.deviceEditWatch` is set — calls the driver's
-  `readDeviceEditState()` (`am4.ts:336-358`) every ~1500 ms (4000 ms on a slow link).
+  `readDeviceEditState()` (`am4.ts:336-358`) every ~1500 ms (10-30 s on a slow link, by telemetry mode).
 - Supervisor lifecycle: a subscriber arriving starts meters + edit-watch
   (`registryCore.ts:214-223`); `#activate` re-gates each loop on the new driver's caps
   (`:510-524`) — importantly `:515` stops the tuner timer for a device without

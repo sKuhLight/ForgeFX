@@ -17,7 +17,7 @@ import type { Conn } from '../../src/transport/types.js';
 import type { DeviceDriver, DeviceEvent, DriverCtx, DriverCapabilities } from '../../src/drivers/types.js';
 import { MockTransport, handshakeReply, isIdentifyBroadcast, assert, assertEqual, sleep } from '../helpers/mock.js';
 
-export const REFLECTION_CASE_COUNT = 5;
+export const REFLECTION_CASE_COUNT = 6;
 
 function makeReg(conn: Conn | null, mock: MockTransport): DeviceRegistry {
   return __createRegistryForTest({
@@ -61,7 +61,8 @@ async function slowLinkReflection(): Promise<void> {
     modelId: 0x11, key: 'fm3', name: 'FM3', capabilities: gen3Caps(),
     grid: fakeGrid,
     getScene: async () => ({ index: sceneSeq[Math.min(sceneCalls++, sceneSeq.length - 1)]! }),
-    getActiveChannels: async () => { chanCalls++; return new Map<number, number>([[1, 0]]); }
+    // The same front-panel scene switch also moves the block's active channel (A → B) on the second tick.
+    getActiveChannels: async () => { chanCalls++; return new Map<number, number>([[1, chanCalls >= 2 ? 1 : 0]]); }
   } as unknown as DeviceDriver;
 
   const reg = makeReg(serial(mock), mock);
@@ -74,7 +75,10 @@ async function slowLinkReflection(): Promise<void> {
 
   assert(sceneCalls >= 2, `the scene watch ran on a slow link (getScene calls=${sceneCalls})`);
   assert(events.some((e) => e.type === 'scene' && e.index === 1), 'a slow-link scene change still yields a scene event');
-  assert(chanCalls >= 1, `the channel watch ran on a slow link (getActiveChannels calls=${chanCalls})`);
+  assert(chanCalls >= 2, `the channel watch ran on a slow link (getActiveChannels calls=${chanCalls})`);
+  // Both watches run on the same slow tick; the scene watch goes first and its `scene` event re-primes the
+  // channel baseline, so the scene switch's own channel move is not announced as a separate blockState.
+  assert(!events.some((e) => e.type === 'blockState'), 'a scene change on a slow link does not emit a blockState ahead of the scene');
   assert(!mock.sent.some((f) => f[5] === 0x01), 'meter/CPU reads (fn 0x01) stay skipped on a slow link');
 }
 
@@ -145,6 +149,45 @@ async function am4SetSceneEmitsScene(): Promise<void> {
   assert(events.some((e) => e.type === 'scene' && e.index === 2), 'AM4 setScene emits a scene event (like gen-3)');
 }
 
+/** On a slow link, UI traffic makes the reflection watches back off at the SLOW cadence. Backing off at the
+ *  fast tick would force the status + scene reads through after ~MAX_SKIPS fast ticks (~300 ms here). */
+async function slowLinkYieldBackoff(): Promise<void> {
+  const mock = new MockTransport('serial', '/dev/ttyACM0');
+  (mock as { slow: boolean }).slow = true;
+  let release: (v: number[][]) => void = () => {};
+  const pending = new Promise<number[][]>((r) => { release = r; });
+  mock.reply = (req) => {
+    if (isIdentifyBroadcast(req)) return [handshakeReply(0x11)];
+    if (req[0] === 0x11 && req.length === 3) return pending; // held route-driven (interactive) request
+    return [];
+  };
+  let reads = 0;
+  const fake = {
+    modelId: 0x11, key: 'fm3', name: 'FM3', capabilities: gen3Caps(),
+    grid: fakeGrid,
+    getScene: async () => { reads++; return { index: 0 }; },
+    getActiveChannels: async () => { reads++; return new Map<number, number>([[1, 0]]); }
+  } as unknown as DeviceDriver;
+  const reg = makeReg(serial(mock), mock);
+  reg.__seedDriver(0x11, fake);
+  await reg.detect();
+  reg.setTelemetryMode('performance'); // 60 ms primer tick, so a fast-tick back-off would force a read by ~240 ms
+  const t = await reg.transport();
+  const held = t.request([0x11, 0x22, 0x33]);
+  const unsub = reg.subscribe(() => {});
+  await sleep(700);
+  unsub();
+  release([]);
+  await held;
+  assertEqual(reads, 0, 'no scene/channel read is forced through within 700 ms of UI traffic on a slow link');
+
+  // The FM3 edit-watch read is a multi-KB bulk read: on a slow link it must be rare in every mode.
+  for (const mode of ['performance', 'balanced', 'reduced'] as const) {
+    const cad = cadenceFor(0x11, mode);
+    assert(cad.editWatchSlowMs >= 10000, `${mode}: slow-link edit-watch interval is at least 10 s (got ${cad.editWatchSlowMs} ms)`);
+  }
+}
+
 /** The FM3 device-edit watch poll also still runs on a slow link (throttled). */
 async function slowLinkEditWatch(): Promise<void> {
   const mock = new MockTransport('serial', '/dev/ttyACM0');
@@ -173,6 +216,7 @@ export async function runReflectionTests(): Promise<void> {
   const cases: [string, () => Promise<void>][] = [
     ['slow-link reflection', slowLinkReflection],
     ['empty sceneState is an error', emptySceneStateIsAnError],
+    ['slow-link yield back-off', slowLinkYieldBackoff],
     ['slow-link edit-watch', slowLinkEditWatch],
     ['no duplicate blockState', noDuplicateBlockState],
     ['AM4 setScene emits scene', am4SetSceneEmitsScene]
