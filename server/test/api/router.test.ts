@@ -160,6 +160,7 @@ const ROWS: Row[] = [
   { name: 'diagnostics cancel (idle)', method: 'POST', url: '/diagnostics/capture/cancel' },
   { name: 'diagnostics preflight (501 no diagnosticCapture)', method: 'GET', url: '/diagnostics/capture/preflight' },
   { name: 'diagnostics start with an unknown unsavedEdits (400)', method: 'POST', url: '/diagnostics/capture', body: { acknowledged: true, unsavedEdits: 'keep' } },
+  { name: 'diagnostics start with a decision but no token (400)', method: 'POST', url: '/diagnostics/capture', body: { acknowledged: true, unsavedEdits: 'discard', preset: 3 } },
   { name: 'diagnostics result (404)', method: 'GET', url: '/diagnostics/capture/result' },
   { name: 'diagnostics upload without consent (400)', method: 'POST', url: '/diagnostics/capture/upload', body: {} },
   { name: 'diagnostics upload without a result (404)', method: 'POST', url: '/diagnostics/capture/upload', body: { consent: true } },
