@@ -40,6 +40,7 @@ import { runPresetConvertTests, PRESET_CONVERT_CASE_COUNT } from './api/preset-c
 import { runPresetConvertExportTests, PRESET_CONVERT_EXPORT_CASE_COUNT } from './api/preset-convert-export.test.js';
 import { runEmptySlotTests, EMPTY_SLOT_CASE_COUNT } from './api/empty-slot.test.js';
 import { runPresetGridSlotTests, PRESET_GRID_SLOT_CASE_COUNT } from './api/preset-grid-slot.test.js';
+import { runDiagnosticCaptureTests, DIAGNOSTIC_CAPTURE_CASE_COUNT } from './api/diagnostic-capture.test.js';
 
 const tests: Array<{ name: string; run: () => void | Promise<void> }> = [
   { name: `transport/request-queue (${REQUEST_QUEUE_CASE_COUNT} cases, lost/late/incomplete reply, unrelated frames, quiet gap, bounded drain + floor, reject-only hold-back, guards, close, paced send; fake link, virtual time)`, run: runRequestQueueTests },
@@ -77,7 +78,8 @@ const tests: Array<{ name: string; run: () => void | Promise<void> }> = [
   { name: `api/preset-convert (${PRESET_CONVERT_CASE_COUNT} cases, cross-device convert offline/connected/501/caps, mocked)`, run: runPresetConvertTests },
   { name: `api/preset-convert-export (${PRESET_CONVERT_EXPORT_CASE_COUNT} cases, FM3→FM3 author round-trip + guards, mocked)`, run: runPresetConvertExportTests },
   { name: `api/empty-slot (${EMPTY_SLOT_CASE_COUNT} cases, unused-slot summary/params/decode/backup/convert/local folder on app + router, mocked FM3)`, run: runEmptySlotTests },
-  { name: `api/preset-grid-slot (${PRESET_GRID_SLOT_CASE_COUNT} cases, GET /presets/:n/grid = stored slot never the edit buffer, app↔router, mocked)`, run: runPresetGridSlotTests }
+  { name: `api/preset-grid-slot (${PRESET_GRID_SLOT_CASE_COUNT} cases, GET /presets/:n/grid = stored slot never the edit buffer, app↔router, mocked)`, run: runPresetGridSlotTests },
+  { name: `api/diagnostic-capture (${DIAGNOSTIC_CAPTURE_CASE_COUNT} cases, steps, stop at first silence, dump headers, reload skip on unsaved edits, bundle on cancel/silence/error/query-bound, redaction, 409/400/501/503, upload, telemetry hold, caps; synthetic FM3)`, run: runDiagnosticCaptureTests }
 ];
 
 let failures = 0;

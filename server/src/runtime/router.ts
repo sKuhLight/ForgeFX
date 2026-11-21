@@ -20,6 +20,7 @@ import * as backups from '../services/backups.js';
 import * as deviceCache from '../services/deviceCache.js';
 import * as editorCacheImport from '../services/editorCacheImport.js';
 import * as cloudProfiles from '../services/cloudProfiles.js';
+import * as diagnostics from '../services/diagnosticCapture.js';
 import { blockHelpBySlug, helpIndex } from '../help.js';
 import { createUnifiedHandlers } from './handlers.js';
 import { sendErrorStatus } from '../drivers/sendPolicy.js';
@@ -59,6 +60,9 @@ export interface RuntimeDeps {
   local?: RouterLocalDeps;
   cloud?: CloudService;
   telemetry?: TelemetryService;
+  /** Version stamps for diagnostic-capture bundles (`app` in the bundle): the ForgeFX build this runtime
+   *  bundles, the codec and the hosting Axis, where the host knows them (each `[0-9A-Za-z.+-]{1,32}`). */
+  versions?: { forgefx?: string; codec?: string; axis?: string };
 }
 
 // ── request plumbing ──
@@ -166,6 +170,26 @@ export function createRouter(deps: RuntimeDeps): {
   });
   on('POST', '/device/cache/cloud/publish', async (c) => {
     const r = await cloudProfiles.cloudCachePublish(deps.cloud ?? null, store, registry);
+    c.reply.code(r.code);
+    return r.body;
+  });
+  // ── diagnostic capture (capability diagnosticCapture; shared service, see services/diagnosticCapture.ts).
+  //    No cloud dep → the upload answers the server's 503 cloud-disabled. ──
+  const captureOpts: diagnostics.CaptureOptions = deps.versions ? { versions: deps.versions } : {};
+  on('GET', '/diagnostics/capture', () => diagnostics.captureStatus(registry));
+  on('POST', '/diagnostics/capture', async (c) => {
+    const r = await diagnostics.startCapture(store, registry, c.body, captureOpts);
+    c.reply.code(r.code);
+    return r.body;
+  });
+  on('POST', '/diagnostics/capture/cancel', () => diagnostics.cancelCapture(registry));
+  on('GET', '/diagnostics/capture/result', (c) => {
+    const r = diagnostics.captureResult(registry);
+    c.reply.code(r.code);
+    return r.body;
+  });
+  on('POST', '/diagnostics/capture/upload', async (c) => {
+    const r = await diagnostics.uploadCapture(registry, deps.cloud ?? null, c.body);
     c.reply.code(r.code);
     return r.body;
   });

@@ -71,12 +71,13 @@ export function deviceCacheKey(modelId: number, major: number, minor: number): s
  *  end-marker replies are counted as real records), so it runs for a very long time and would write sweep
  *  values to parameters that do not exist. The bounded walk is verified on FM3 13.0. Fractal numbers firmware per model (the Axe-Fx III is on 32.x while the
  *  FM3/FM9 are on 12.x/13.x), so the table is keyed by model byte. A model without an entry is never
- *  allowed. Raise an entry only after a full capture has been verified on that newer version.
+ *  allowed. Add or raise an entry only after a full capture has completed on that model and version.
+ *  The FM9 has NO entry: no full capture has completed on an FM9 yet (the attempts on firmware 12.0
+ *  stopped responding part-way through the walk), so full mode stays off there until one does.
  *  Read-only mode is intentionally NOT governed by this table. */
 export const FULL_CAPTURE_MAX_VERIFIED_FW: Readonly<Record<number, { readonly major: number; readonly minor: number }>> = {
   0x11: { major: 13, minor: 0 }, // FM3 (13.0 verified with the table-end-bounded walk)
-  0x12: { major: 12, minor: 0 }, // FM9
-  0x10: { major: 32, minor: 6 }  // Axe-Fx III
+  0x10: { major: 32, minor: 6 }  // Axe-Fx III (a complete full capture exists on 32.6)
 };
 
 /** Whether FULL-mode capture is permitted for `modelId` on the given running firmware: only a KNOWN,
@@ -90,6 +91,13 @@ export function fullCaptureAllowedOnFirmware(modelId: number, fw: { major: numbe
   const max = FULL_CAPTURE_MAX_VERIFIED_FW[modelId];
   if (!max) return false;
   return fw.major < max.major || (fw.major === max.major && fw.minor <= max.minor);
+}
+
+/** Whether the in-app diagnostic capture (POST /diagnostics/capture) may run on a device: gen-3 units whose
+ *  driver offers the self-describe walk (its read-only walk, label probe and dump probes are gen-3 wire
+ *  features). Shared by the capabilities DTO (`diagnosticCapture`) and the capture service (the 501 gate). */
+export function diagnosticCaptureSupported(modelId: number, caps: Pick<DriverCapabilities, 'selfDescribe'> | null | undefined): boolean {
+  return !!caps?.selfDescribe && DEVICE_MODELS[modelId]?.gen === 3;
 }
 
 /** The /telemetry/config DTO both surfaces serve: the current mode, its resolved cadence, and the
@@ -541,6 +549,9 @@ export class DeviceRegistry {
       // populates #firmware before any caps DTO is served, so the UI never offers a mode the build route
       // would refuse. (The build route re-reads the firmware itself right before gating.)
       fullCapture: c.fullCapture && fullCaptureAllowedOnFirmware(mid, this.#firmware),
+      // In-app diagnostic capture (POST /diagnostics/capture): gen-3 units with the self-describe walk.
+      // Inserted after fullCapture (additive-only ordering).
+      diagnosticCapture: diagnosticCaptureSupported(mid, c),
       editorLayouts: c.editorLayouts,
       firmwareValidate: !!d.validateFirmware,
       // Cross-device preset conversion (POST /preset/convert with no source): the current preset can be
@@ -761,26 +772,44 @@ export class DeviceRegistry {
   }
 
   /** Pause the telemetry supervisor for the duration of an exclusive operation (the device-cache
-   *  self-describe walk saturates the port). Stops the tuner / meters / edit-watch / edit-push and
-   *  returns a resume fn that restarts exactly what was running (respecting the live subscriber count
-   *  + tuner-enabled state). Idempotent-safe: the resume closure captures the paused state. */
+   *  self-describe walk and the diagnostic capture saturate the port, and the capture records the wire).
+   *  Stops the tuner / meters / edit-watch / edit-push and HOLDS them off until the returned resume fn
+   *  runs: while held, nothing restarts them — not a new SSE subscriber, not a re-activated driver, not
+   *  the tuner switched on (its poll waits for the resume). The last resume restarts what was running
+   *  plus whatever the listeners present by then need. The resume fn is idempotent. */
   pauseTelemetry(): () => void {
-    const hadTuner = !!this.#tunerTimer;
-    const hadMeters = !!this.#metersTimer;
-    const hadEditWatch = !!this.#editWatchTimer;
-    const hadEditPush = !!this.#editPushUnsub;
-    if (this.#tunerTimer) { clearTimeout(this.#tunerTimer); this.#tunerTimer = null; }
+    this.#telemetryHolds++;
+    const held = this.#heldLoops;
+    if (this.#tunerTimer) { held.tuner = true; clearTimeout(this.#tunerTimer); this.#tunerTimer = null; }
+    if (this.#metersTimer) held.meters = true;
+    if (this.#editWatchTimer) held.editWatch = true;
+    if (this.#editPushUnsub) held.editPush = true;
     this.#stopMeters();
     this.#stopEditWatch();
     this.#stopEditPush();
+    let resumed = false;
     return () => {
-      if (hadMeters) this.#startMeters();
-      if (hadEditWatch) this.#startEditWatch();
-      if (hadEditPush) this.#startEditPush();
-      // the tuner page is still open (we only paused the poll) — just restart its poll timer.
-      if (hadTuner && this.#tunerDriver && !this.#tunerTimer) this.#tunerTimer = setTimeout(() => this.#pollTuner(), 30);
+      if (resumed) return;
+      resumed = true;
+      this.#telemetryHolds = Math.max(0, this.#telemetryHolds - 1);
+      if (this.#telemetryHolds > 0) return; // another exclusive operation still holds the supervisor
+      const h = this.#heldLoops;
+      this.#heldLoops = { tuner: false, meters: false, editWatch: false, editPush: false };
+      const listening = this.#subscribers.size > 0;
+      if (h.meters || listening) this.#startMeters();
+      if (h.editWatch || listening) this.#startEditWatch();
+      if (h.editPush || listening) this.#startEditPush();
+      // the tuner page is still open (only its poll was held) — just restart the poll timer.
+      if ((h.tuner || this.#tunerPending) && this.#tunerDriver && !this.#tunerTimer) this.#tunerTimer = setTimeout(() => this.#pollTuner(), 30);
+      this.#tunerPending = false;
     };
   }
+  /** Exclusive operations currently holding the supervisor (see pauseTelemetry). */
+  #telemetryHolds = 0;
+  /** The loops that were running when the first hold began (restarted by the last resume). */
+  #heldLoops = { tuner: false, meters: false, editWatch: false, editPush: false };
+  /** The tuner was switched on while held: its poll starts on the last resume. */
+  #tunerPending = false;
 
   /** DEBUG probe: send ONE raw read-only SysEx frame, return every response frame as hex. The probe
    *  policy (sendPolicy.ts) is enforced HERE, before the transport is opened or written: only a
@@ -873,8 +902,10 @@ export class DeviceRegistry {
       // Gen-3 opens/closes a device tuner PAGE; AM4's tuner block (0x0023) is always live, so a
       // readTuner driver skips the page open/close and just runs the poll timer.
       if (!d.readTuner) await dev.sendQueued(buildTunerPageOpen(d.modelId)); // open the tuner page
-      if (!this.#tunerTimer) this.#tunerTimer = setTimeout(() => this.#pollTuner(), 30);
+      if (this.#telemetryHolds > 0) this.#tunerPending = true; // an exclusive operation runs: poll after it
+      else if (!this.#tunerTimer) this.#tunerTimer = setTimeout(() => this.#pollTuner(), 30);
     } else {
+      this.#tunerPending = false;
       if (this.#tunerTimer) {
         clearTimeout(this.#tunerTimer);
         this.#tunerTimer = null;
@@ -893,7 +924,7 @@ export class DeviceRegistry {
   //     590-byte frame, so we read it only once per round-robin cycle (meters are tiny 23-byte reads).
   // Runs while ≥1 SSE client is subscribed AND the active driver's telemetry capability allows it.
   #startMeters() {
-    if (this.#metersTimer) return;
+    if (this.#metersTimer || this.#telemetryHolds > 0) return; // held by an exclusive operation (pauseTelemetry)
     if (this.#active && !this.#active.capabilities.telemetry.outputMeters) return; // no gen-3 meter frames on this device
     this.#metersTimer = setTimeout(() => this.#pollMeters(), this.#cadence().meterTickMs); // primer at the mode's meter tick
   }
@@ -1023,7 +1054,7 @@ export class DeviceRegistry {
   // (FM9 / Axe-Fx III DO push → they use the RX listener path instead; see #startEditPush.)
   #editWatchTimer: ReturnType<typeof setTimeout> | null = null;
   #startEditWatch() {
-    if (this.#editWatchTimer) return;
+    if (this.#editWatchTimer || this.#telemetryHolds > 0) return; // held by an exclusive operation (pauseTelemetry)
     if (this.#active && !this.#active.capabilities.deviceEditWatch) return; // active device doesn't need it
     this.#editWatchTimer = setTimeout(() => this.#pollEditWatch(), this.#cadence().editWatchMs);
   }
@@ -1100,7 +1131,11 @@ export class DeviceRegistry {
     if (inst[INSTRUMENTED]) return; // already wrapped — never double-wrap (breaks the echo guard)
     inst[INSTRUMENTED] = true;
 
-    const countTx = (bytes: readonly number[]) => { this.#traffic.txMsgs++; this.#traffic.txBytes += bytes.length; };
+    const countTx = (bytes: readonly number[]) => {
+      this.#traffic.txMsgs++;
+      this.#traffic.txBytes += bytes.length;
+      if (this.#frameObservers.size > 0) this.#observeFrame('TX', bytes);
+    };
 
     const origRequest = t.request.bind(t);
     t.request = (bytes, opts) => {
@@ -1123,7 +1158,29 @@ export class DeviceRegistry {
     }
     // RX: one persistent handler for the transport's life (additive — coexists with request() waiters
     // and the edit-push listener, which register their own onFrame handlers).
-    t.onFrame((frame) => { this.#traffic.rxMsgs++; this.#traffic.rxBytes += frame.length; });
+    t.onFrame((frame) => {
+      this.#traffic.rxMsgs++;
+      this.#traffic.rxBytes += frame.length;
+      if (this.#frameObservers.size > 0) this.#observeFrame('RX', frame);
+    });
+  }
+
+  // ── frame observers (the diagnostic capture's wire log) ──
+  // Every frame the instrumented transport sends (request/send/sendQueued/sendPaced, at the moment the
+  // caller hands it over) or receives, while at least one observer is registered. Nothing is recorded
+  // or copied without an observer, so this costs one size check per frame otherwise.
+  #frameObservers = new Set<(dir: 'TX' | 'RX', bytes: readonly number[]) => void>();
+  #observeFrame(dir: 'TX' | 'RX', bytes: readonly number[]): void {
+    for (const fn of this.#frameObservers) {
+      try { fn(dir, bytes); } catch { /* an observer must never break the link */ }
+    }
+  }
+  /** Observe every frame on the device link (TX + RX) until the returned function is called. Used by the
+   *  diagnostic capture to record the wire log of its run only; observers must not keep a reference to
+   *  `bytes` (the transport may reuse it). */
+  addFrameObserver(fn: (dir: 'TX' | 'RX', bytes: readonly number[]) => void): () => void {
+    this.#frameObservers.add(fn);
+    return () => { this.#frameObservers.delete(fn); };
   }
 
   /** Run a supervisor-issued device call while marking it so it doesn't register as INTERACTIVE traffic
@@ -1177,7 +1234,7 @@ export class DeviceRegistry {
   }
 
   #startEditPush() {
-    if (this.#editPushUnsub) return;
+    if (this.#editPushUnsub || this.#telemetryHolds > 0) return; // held by an exclusive operation (pauseTelemetry)
     const t = this.#transport;
     if (!t?.isOpen) return; // not connected yet — #activate re-attaches once detection opens the transport
     if (this.#active && !this.#active.capabilities.deviceEditPush) return; // active device doesn't push

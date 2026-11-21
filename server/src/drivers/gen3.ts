@@ -35,7 +35,7 @@ import { isTransportTimeout, type Transport } from '../transport/types.js';
 import { SLUG_FAMILY, PROFILES, type DeviceProfile, type TypeModel, type DeviceLayout, type SelectorValues } from '../devices.js';
 import { EmptyPresetError } from './types.js';
 import type {
-  DeviceDriver, DriverCapabilities, DriverCtx,
+  DeviceDriver, DriverCapabilities, DriverCtx, DiagnosticDump, SelectPresetOpts,
   PresetGridDTO, PresetBlockDTO, PresetSummary, NamedParam, EnumParam, MeterVal,
   FcSwitchState, FcReadState, StoreReason
 } from './types.js';
@@ -794,6 +794,46 @@ class Gen3Driver implements DeviceDriver {
     const decoded = decodeDump(frames, this.#prof);
     const summary = this.#summarizeDump(decoded.dump, modelsFromBlocks(this.#decodeBlocks(decoded)), n);
     return { bytes: Uint8Array.from(frames.flat()), summary };
+  }
+
+  /** Diagnostic capture: ONE read-only dump request for `target` that accepts ANY whole dump the device
+   *  answers with (header check 'any'), so the caller learns which preset number the 0x77 header names —
+   *  the evidence DUMP_HEADER_POLICY is tightened on. Unlike #dumpFrames it never retries, never falls back
+   *  and does not teach the connection's header strictness. The raw patch is decoded only far enough to
+   *  tell an unused slot and to let the caller compare two dumps in memory. */
+  async diagnosticDump(target: number | 'edit-buffer'): Promise<DiagnosticDump> {
+    const dev = await this.#conn();
+    const model = this.#prof.model;
+    const requested = target === 'edit-buffer' ? EDIT_BUFFER : target;
+    const named = (h: number[]) => headerNamesRequest(dumpHeaderNumber(h), requested);
+    const plan: DumpHeaderPlan = { check: 'any', named, usable: () => true };
+    const t0 = Date.now();
+    const frames = await dev.request(this.#codec.buildRequestPresetDump(requested), presetDumpOpts(model, plan, dev.slow ? 25000 : 5000, dev.slow ? 1500 : 180));
+    const ms = Date.now() - t0;
+    const whole = wholeDumps(frames, model, named)[0] ?? wholeDumps(frames, model, () => true)[0] ?? null;
+    const dumpFrames = whole ?? dumpFramesOnly(frames, model);
+    const headerFrame = dumpFrames.find((f) => isFrameOf(f, model, 0x77));
+    const chunks = dumpFrames.filter((f) => isFrameOf(f, model, 0x78)).length;
+    let patch: DiagnosticDump['patch'] = null;
+    let empty: boolean | null = null;
+    if (whole && chunks > 0) {
+      try {
+        const raw = decodeRawPatch(parsePresetDump(dumpBytesFromFrames(whole), 0, model).chunkPayloads);
+        empty = raw.empty;
+        patch = { raw: raw.rawPatch, body: raw.body };
+      } catch { /* undecodable: header facts only */ }
+    }
+    return {
+      requested,
+      header: headerFrame ? dumpHeaderNumber(headerFrame) : null,
+      complete: !!whole && chunks > 0,
+      frames: dumpFrames.length,
+      chunks,
+      bytes: dumpFrames.reduce((n, f) => n + f.length, 0),
+      ms,
+      empty,
+      patch
+    };
   }
 
   /** Verbatim .syx dump for POST /preset/backup (capability `backupDump`) — the library's
@@ -1797,20 +1837,20 @@ class Gen3Driver implements DeviceDriver {
     this.#emit({ type: 'changed', scope: 'grid' });
     return r;
   }
-  async selectPreset(n: number) {
+  async selectPreset(n: number, opts?: SelectPresetOpts) {
     this.#gridCache = null;
     const r = await this.#write(this.#codec.buildSwitchPresetSysEx(n));
     if (r.ok) this.#session(await this.#conn()).currentSlot = n; // the edit buffer now holds slot n
     else if (this.#sessionState) this.#sessionState.currentSlot = null; // refused: no longer sure
-    this.#emit({ type: 'changed', scope: 'preset' });
+    if (!opts?.silent) this.#emit({ type: 'changed', scope: 'preset' });
     return r;
   }
   /** Reload the CURRENT preset from flash by re-selecting it — the FULL-mode self-describe walk's
    *  non-destructive per-block safety net. Reuses presetRef() (current number) + selectPreset() (the
    *  wire builder), so no new preset-switch bytes are minted here. No-op when no preset is resolvable. */
-  async reloadPreset(): Promise<void> {
+  async reloadPreset(opts?: SelectPresetOpts): Promise<void> {
     const { number } = await this.presetRef();
-    if (number >= 0) await this.selectPreset(number);
+    if (number >= 0) await this.selectPreset(number, opts);
   }
   /** The store-ack evidence in force right now: an injected level wins, else the model's table entry narrowed
    *  to this link (`slow`) and the firmware the registry read at detect time (see `resolveStoreAck`). */

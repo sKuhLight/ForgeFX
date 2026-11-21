@@ -20,7 +20,7 @@
 // shims, SSE, static UI and the Node-gated cloud/remote/telemetry surface.
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
 import cors from '@fastify/cors';
-import { existsSync, statSync, createReadStream } from 'node:fs';
+import { existsSync, statSync, createReadStream, readFileSync } from 'node:fs';
 import { join, resolve, extname } from 'node:path';
 import type { DeviceRegistry } from './drivers/registry.js';
 import { parseHexBytes, sendErrorStatus } from './drivers/sendPolicy.js';
@@ -31,12 +31,23 @@ import * as deviceCache from './services/deviceCache.js';
 import * as editorCacheImport from './services/editorCacheImport.js';
 import * as editorCacheDiscovery from './services/editorCacheDiscovery.js';
 import * as cloudProfiles from './services/cloudProfiles.js';
+import * as diagnostics from './services/diagnosticCapture.js';
 import * as store from './store.js';
 import { createUnifiedHandlers } from './runtime/handlers.js';
 import { putStoreDoc } from './runtime/services.js';
 import { registerLocalRoutes } from './localStore.js';
 import { registerHelpRoutes } from './help.js';
 import { telemetryStatus, uploadDebugReport, type DebugReport } from './telemetry.js';
+
+/** This server's package version (server/package.json — one level above both src/ and dist/), stamped
+ *  into diagnostic-capture bundles. 'unknown' where the file is not shipped next to the build. */
+const FORGEFX_VERSION: string = (() => {
+  try {
+    return (JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as { version?: string }).version ?? 'unknown';
+  } catch {
+    return 'unknown';
+  }
+})();
 
 export async function buildApp(registry: DeviceRegistry): Promise<FastifyInstance> {
   const app = Fastify({ logger: { level: process.env.LOG_LEVEL ?? 'info' } });
@@ -657,9 +668,33 @@ export async function buildApp(registry: DeviceRegistry): Promise<FastifyInstanc
     });
   }
 
+  // ── diagnostic capture (Settings → Debugging → Device diagnostics; capability diagnosticCapture) ──
+  // Shared service (services/diagnosticCapture.ts) — the router twin calls the same functions. The upload
+  // needs the cloud client, which only exists when AXIS_CLOUD=1 (set below); without it → 503 cloud-disabled.
+  const captureOpts: diagnostics.CaptureOptions = { versions: { forgefx: FORGEFX_VERSION } };
+  let diagCloud: diagnostics.DiagnosticCaptureCloud | null = null;
+  app.get('/diagnostics/capture', () => diagnostics.captureStatus(registry));
+  app.post<{ Body: unknown }>('/diagnostics/capture', async (req, reply) => {
+    const r = await diagnostics.startCapture(store.defaultStore, registry, req.body, captureOpts);
+    reply.code(r.code);
+    return r.body;
+  });
+  app.post('/diagnostics/capture/cancel', () => diagnostics.cancelCapture(registry));
+  app.get('/diagnostics/capture/result', (_req, reply) => {
+    const r = diagnostics.captureResult(registry);
+    reply.code(r.code);
+    return r.body;
+  });
+  app.post<{ Body: unknown }>('/diagnostics/capture/upload', async (req, reply) => {
+    const r = await diagnostics.uploadCapture(registry, diagCloud, req.body);
+    reply.code(r.code);
+    return r.body;
+  });
+
   // ── cloud sync (GATED: only when AXIS_CLOUD=1; release builds never load supabase-js) ──
   if (process.env.AXIS_CLOUD === '1') {
     const { cloud } = await import('./cloud.js');
+    diagCloud = cloud;
     type Creds = { email: string; password: string };
     app.get('/cloud/status', async () => cloud.status());
     app.post<{ Body: Creds }>('/cloud/register', async (req, reply) => { try { return await cloud.register(req.body.email, req.body.password); } catch (e) { reply.code(400); return { error: (e as Error).message }; } });

@@ -115,6 +115,32 @@ export interface Am4Slot {
   pidLow: number; // the block's pidLow (its type value)
 }
 
+/** Options of a preset switch. `silent`: a job-internal switch (the diagnostic capture's reload probe and
+ *  its full walk's reloads) — no `changed` event goes to the clients, which would otherwise reload their
+ *  views in the middle of the job. */
+export interface SelectPresetOpts { silent?: boolean }
+
+/** One diagnostic dump request (DeviceDriver.diagnosticDump). `header` is the preset number the first
+ *  whole dump's 0x77 header names (or the first header seen when no dump completed), null when no header
+ *  arrived. `patch` is the decoded raw patch of the whole dump — for an in-memory comparison only (the
+ *  edit buffer against its stored slot); callers must never persist or log it. */
+export interface DiagnosticDump {
+  /** The preset number the request asked for (0x3FFF = the edit buffer). */
+  requested: number;
+  header: number | null;
+  /** A whole dump (0x77 header through its 0x79 terminator, at least one 0x78 chunk) arrived. */
+  complete: boolean;
+  /** Dump frames received (0x77 / 0x78 / 0x79) and their total size in bytes. */
+  frames: number;
+  chunks: number;
+  bytes: number;
+  /** Request round trip in ms. */
+  ms: number;
+  /** The whole dump decodes to an unused (all-zero) slot; null when it could not be decoded. */
+  empty: boolean | null;
+  patch: { raw: Uint8Array; body: Uint8Array } | null;
+}
+
 /** What a device driver can actually do — the single truth the routes gate on (a missing optional
  *  DeviceDriver method always corresponds to a false/absent capability here). No cross-device
  *  `if (isAm4)`-style checks anywhere else. */
@@ -250,6 +276,10 @@ export interface DeviceDriver {
   presetParams?(presetNumber: number): Promise<DecodedBlock[]>;
   /** Raw .syx bytes (the backup blob) + decoded summary for one slot — the backups service's source. */
   dumpRaw?(n: number): Promise<{ bytes: Uint8Array; summary: PresetSummary }>;
+  /** Diagnostic capture: ONE read-only dump request for a stored slot or the edit buffer that accepts
+   *  whatever whole dump the device answers with, so the caller learns which number the dump header
+   *  names. Never retried, never cached. gen-3 (capability presetDump). */
+  diagnosticDump?(target: number | 'edit-buffer'): Promise<DiagnosticDump>;
   decodePresetBytes?(bytes: Uint8Array): PresetSummary;
   presetBodyHex?(): Promise<{ len: number; hex: string }>;
   placedBlocks?(): Promise<PresetBlockDTO[]>;
@@ -303,12 +333,12 @@ export interface DeviceDriver {
   selectCell?(row: number, col: number): Promise<{ ok: boolean }>;
   cable?(srcRow: number, srcCol: number, destRow: number, connect: boolean): Promise<{ ok: boolean }>;
   /** Switch the active preset. `code` is ADDITIVE (AM4 bank-letter location code, e.g. "C02"). */
-  selectPreset?(n: number): Promise<{ ok: boolean; code?: string }>;
+  selectPreset?(n: number, opts?: SelectPresetOpts): Promise<{ ok: boolean; code?: string }>;
   /** Re-select the CURRENT preset to reload it from flash — the non-destructive safety net the codec's
    *  FULL-mode self-describe walk runs after every block whose params it swept, discarding any lingering
    *  sweep write. Reuses the driver's current-preset ref + preset-select machinery; no new wire bytes.
    *  Implemented by gen-3 (capability fullCapture); absent elsewhere. */
-  reloadPreset?(): Promise<void>;
+  reloadPreset?(opts?: SelectPresetOpts): Promise<void>;
   /** Store the edit buffer to slot n. `location`/`code` are ADDITIVE (AM4). `acked`/`reason`/`error`/`warning`
    *  are ADDITIVE (gen-3): `acked` = the device's own acknowledgement was seen. `ok:false` + `error` = a real
    *  refusal (`reason:'rejected'`), or (where the ack is verified for this model, link and firmware) no
