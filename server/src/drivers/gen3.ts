@@ -50,6 +50,8 @@ const BLOCK_META: Record<string, { name: string; page: number }> = (() => {
 })();
 
 const EDIT_BUFFER = 0x3fff; // preset number sentinel = current edit buffer
+/** Gen-3 grid shunt (routing cell) effect-id base: shunt k is `1023 + k`, real blocks sit well below it. */
+export const GEN3_SHUNT_BASE = 1024;
 
 // ── reply shapes of the two multi-frame reads, so a late reply to an EARLIER read can never pass for this
 // one (the transport only holds the link for a short drain after a lost reply; anything later reaches the
@@ -546,9 +548,14 @@ class Gen3Driver implements DeviceDriver {
    *  resolve through (#prof) is swapped. Idempotent — re-applying a fresh profile just replaces it. */
   applyRuntimeProfile(profile: DeviceProfile): void { this.#prof = profile; }
 
-  #gridCache: { grid: PresetGridDTO; at: number } | null = null;
+  #gridCache: { grid: PresetGridDTO; at: number; gen: number } | null = null;
   #gridInflight: Promise<PresetGridDTO> | null = null;
+  /** Bumped by every grid-changing write / preset switch (#invalidateGrid). A cached or in-flight read carries the
+   *  generation it STARTED in, so "was this read taken after the last write?" is a plain comparison. */
+  #gridGen = 0;
+  #gridInflightGen = 0;
   static GRID_TTL_MS = 500; // coalesce the grid()+presetBlocks() burst on a single load
+  #invalidateGrid(): void { this.#gridCache = null; this.#gridGen++; }
 
   #conn() { return this.#ctx.transport(); }
   #emit: DriverCtx['emit'] = (e) => this.#ctx.emit(e);
@@ -680,10 +687,12 @@ class Gen3Driver implements DeviceDriver {
   async grid(): Promise<PresetGridDTO> {
     if (this.#gridInflight) return this.#gridInflight; // coalesce concurrent callers
     if (this.#gridCache && Date.now() - this.#gridCache.at < Gen3Driver.GRID_TTL_MS) return this.#gridCache.grid;
+    const gen = this.#gridGen;
     this.#gridInflight = this.#dumpGrid();
+    this.#gridInflightGen = gen;
     try {
       const g = await this.#gridInflight;
-      this.#gridCache = { grid: g, at: Date.now() };
+      this.#gridCache = { grid: g, at: Date.now(), gen };
       return g;
     } finally {
       this.#gridInflight = null;
@@ -1872,8 +1881,9 @@ class Gen3Driver implements DeviceDriver {
     // placed elsewhere with an echo and then silently ignores it (no 0x64 refusal — hardware, FM3 fw 13), so
     // `ok:true` would report a placement that never happened. Refuse it here, before writing anything. The
     // grid cells are 0-indexed, this method's row/col are 1-indexed. Clearing (blockId 0) and shunts (routing
-    // cells, which may repeat) are not blocks and never reach the guard.
-    if (blockId !== 0) {
+    // cells, effect id >= GEN3_SHUNT_BASE, which may repeat) are not blocks and never reach the guard — and so
+    // never cost a grid read.
+    if (blockId !== 0 && blockId < GEN3_SHUNT_BASE) {
       const held = await this.#placedCellOf(blockId);
       if (held) {
         if (held.row === row - 1 && held.col === col - 1) return { ok: true }; // already exactly there: nothing to write
@@ -1884,17 +1894,42 @@ class Gen3Driver implements DeviceDriver {
     }
     await this.#write(select);
     const r = await this.#write(insert);
-    this.#gridCache = null;
+    this.#invalidateGrid();
     this.#emit({ type: 'changed', scope: 'grid' });
     return r;
   }
-  /** The grid cell that currently holds the (non-shunt) block `blockId`, or null when it is not placed — or
-   *  when the grid cannot be read: an unreadable grid never blocks a placement (today's behaviour).
-   *  Reads through grid() (its 500 ms cache and in-flight coalescing), so no new wire pattern. Such a read
+  /** The grid cell that currently holds the block `blockId`, or null when it is not placed — or when the grid
+   *  cannot be read, or on a slow link has not been read: an unreadable/unread grid never blocks a placement
+   *  (today's behaviour).
+   *  Fast link: reads through grid() (its 500 ms cache and in-flight coalescing), so no new wire pattern. Such a read
    *  can predate a clear the caller just made (a move clears the source, then places at the destination), and
-   *  a refusal or no-op decided on it would be wrong, so a hit is confirmed with one fresh dump before it counts. */
+   *  a refusal or no-op decided on it would be wrong, so a hit is confirmed with one fresh dump before it counts.
+   *  Slow link (5-pin DIN, `Transport.slow` — the flag the dump windows already use): a fresh dump costs ~8 s and a
+   *  failing one several times that, so the guard never starts a read, fresh or confirming. It uses only a grid read
+   *  that already exists (cached, or in flight) AND started after the last grid-changing write (#gridGen) — which is
+   *  exactly what the confirm read establishes on a fast link — and is skipped otherwise. */
   async #placedCellOf(blockId: number): Promise<GridCellDTO | null> {
     const find = (g: PresetGridDTO) => g.cells.find((c) => !c.isShunt && c.effectId === blockId) ?? null;
+    let slow: boolean;
+    try {
+      slow = (await this.#conn()).slow;
+    } catch {
+      return null; // no link: the write below reports it as it always did
+    }
+    if (slow) {
+      const gen = this.#gridGen;
+      const cached = this.#gridCache;
+      try {
+        if (cached && cached.gen === gen && Date.now() - cached.at < Gen3Driver.GRID_TTL_MS) return find(cached.grid);
+        if (this.#gridInflight && this.#gridInflightGen === gen) {
+          const g = await this.#gridInflight;
+          return gen === this.#gridGen ? find(g) : null; // a write landed while it ran: that read is out of date now
+        }
+      } catch {
+        /* the awaited read failed: unread grid */
+      }
+      return null;
+    }
     // grid() starts a fresh dump read itself unless it can reuse a cached or in-flight one (decided synchronously here)
     const reused = this.#gridInflight !== null || (this.#gridCache !== null && Date.now() - this.#gridCache.at < Gen3Driver.GRID_TTL_MS);
     let hit: GridCellDTO | null;
@@ -1905,8 +1940,9 @@ class Gen3Driver implements DeviceDriver {
     }
     if (!hit || !reused) return hit;
     try {
+      const gen = this.#gridGen;
       const g = await this.#dumpGrid();
-      this.#gridCache = { grid: g, at: Date.now() };
+      this.#gridCache = { grid: g, at: Date.now(), gen };
       return find(g);
     } catch {
       return null;
@@ -1919,12 +1955,12 @@ class Gen3Driver implements DeviceDriver {
   }
   async cable(srcRow: number, srcCol: number, destRow: number, connect: boolean) {
     const r = await this.#write(this.#codec.buildSetGridRouting({ srcRow, srcCol, destRow, rows: this.#prof.rows, op: connect ? ROUTING_OP_CONNECT : ROUTING_OP_DISCONNECT }));
-    this.#gridCache = null;
+    this.#invalidateGrid();
     this.#emit({ type: 'changed', scope: 'grid' });
     return r;
   }
   async selectPreset(n: number, opts?: SelectPresetOpts) {
-    this.#gridCache = null;
+    this.#invalidateGrid();
     const r = await this.#write(this.#codec.buildSwitchPresetSysEx(n));
     if (r.ok) this.#session(await this.#conn()).currentSlot = n; // the edit buffer now holds slot n
     else if (this.#sessionState) this.#sessionState.currentSlot = null; // refused: no longer sure
@@ -2050,7 +2086,7 @@ class Gen3Driver implements DeviceDriver {
     retargetPresetDumpToEditBuffer(bytes);
     if (dev.sendPaced) await dev.sendPaced(bytes);
     else await dev.sendQueued(bytes);
-    this.#gridCache = null; // edit buffer changed → next grid/blocks read reflects it
+    this.#invalidateGrid(); // edit buffer changed → next grid/blocks read reflects it
     return { ok: true };
   }
 }

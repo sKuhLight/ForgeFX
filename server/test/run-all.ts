@@ -56,7 +56,7 @@ const tests: Array<{ name: string; run: () => void | Promise<void> }> = [
   { name: `drivers/vp4 (${VP4_CASE_COUNT} cases, VP4 gated writes + structure read + caps)`, run: runVp4Tests },
   { name: `drivers/modelbyte (${MODELBYTE_CASE_COUNT} cases, wrong-model-byte guard)`, run: runModelByteTests },
   { name: `drivers/gen3-store (${GEN3_STORE_CASE_COUNT} cases, store waits for the device ack: ack/late ack/no ack/0x64, virtual-time transport)`, run: runGen3StoreTests },
-  { name: `drivers/gen3-place-guard (${GEN3_PLACE_GUARD_CASE_COUNT} cases, placeCell refuses a block already in the grid: 409 + nothing written, cached hit confirmed fresh, same-cell no-op, Axis move flow, unreadable grid falls back, shunts exempt, III/FM3/FM9, app↔router parity; mocked)`, run: runGen3PlaceGuardTests },
+  { name: `drivers/gen3-place-guard (${GEN3_PLACE_GUARD_CASE_COUNT} cases, placeCell refuses a block already in the grid: 409 + nothing written, cached hit confirmed fresh, same-cell no-op, Axis move flow, unreadable grid falls back, shunts exempt with zero reads, slow link never starts a read, III/FM3/FM9, app↔router parity; mocked)`, run: runGen3PlaceGuardTests },
   { name: `drivers/write-rejection (${WRITE_REJECTION_CASE_COUNT} cases, 0x64 attributed by echoed function, reject-only write timing over the real queue)`, run: runWriteRejectionTests },
   { name: `drivers/definition-completeness (${DEFINITION_COMPLETENESS_CASE_COUNT} cases, blockParams unit/taper passthrough)`, run: runDefinitionCompletenessTests },
   { name: `drivers/channel-slice (${CHANNEL_SLICE_CASE_COUNT} cases, fn-0x1F channel stride, cache overlay by provenance, channel-less edit diffs)`, run: runChannelSliceTests },

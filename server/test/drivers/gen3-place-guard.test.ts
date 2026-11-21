@@ -13,7 +13,11 @@
 //        - same block onto its own cell → ok:true no-op, nothing written; clear (blockId 0) never reads the grid
 //        - move flow (Axis: clear the source, then place at the destination) is allowed
 //        - an unreadable grid (first read, or the confirming read) keeps today's behaviour: the placement goes out
-//        - shunts (routing cells, may repeat) are never guarded; bad coordinates / instances fail before any read
+//        - shunts (routing cells, may repeat) are never guarded AND never start a read (real grid path, zero dump
+//          requests); bad coordinates / instances fail before any read
+//        - slow link (5-pin DIN): the guard never starts a read (fresh or confirming) — it uses only a cached or
+//          in-flight read taken after the last write, and is skipped (today's behaviour) otherwise; a read that
+//          predates a move's clear is ignored so the move is not refused; fast link keeps the read
 //        - the same guard on the Axe-Fx III and FM9 dumps
 //   B  the same real driver end to end through app.inject AND the browser-facing router: 409 / 200 / 400 bodies
 //      are identical on both surfaces.
@@ -31,7 +35,7 @@ import { buildTestApp } from '../helpers/api.js';
 import { MockTransport, handshakeReply, isIdentifyBroadcast, dumpAnswering } from '../helpers/mock.js';
 
 // One case = one executed ok()/eq() in this suite (the run asserts it matches; keep in step when adding).
-export const GEN3_PLACE_GUARD_CASE_COUNT = 82;
+export const GEN3_PLACE_GUARD_CASE_COUNT = 112;
 
 const fixture = (name: string) => readFileSync(fileURLToPath(new URL(`../fixtures/preset-convert/${name}`, import.meta.url)));
 const FM3_DUMP = framesOf(new Uint8Array(fixture('fm3-preset-5.syx')));
@@ -107,6 +111,23 @@ function rig(model: number, serve: number[][] | null): Rig {
  *  (runGen3PlaceGuardTests restores it). */
 const ttlOf = (d: Gen3Driver) => d.constructor as unknown as { GRID_TTL_MS: number };
 const holdCache = (d: Gen3Driver) => { ttlOf(d).GRID_TTL_MS = 60_000; };
+
+/** A link that reports itself slow (a generic 5-pin DIN interface) — `Transport.slow`, the flag the dump windows use. */
+function slowLink(r: Rig): Rig {
+  Object.defineProperty(r.mock, 'slow', { value: true });
+  return r;
+}
+/** A gate a scripted reply can wait on, to hold a dump read in flight. */
+function defer(): { promise: Promise<void>; open: () => void } {
+  let open!: () => void;
+  const promise = new Promise<void>((res) => { open = res; });
+  return { promise, open };
+}
+
+/** Fail (instead of hanging the runner) when `p` waits on a read that is never going to be released. */
+function within<T>(p: Promise<T>, what: string, ms = 3000): Promise<T> {
+  return Promise.race([p, new Promise<T>((_, rej) => setTimeout(() => rej(new Error(`timed out waiting: ${what}`)), ms))]);
+}
 
 interface Rejected { statusCode?: number; message: string }
 async function rejection(p: Promise<unknown>): Promise<Rejected | null> {
@@ -221,20 +242,24 @@ async function driverCases(): Promise<void> {
     eq(placementFrames(flaky.mock).length, 2, 'failed confirming read: select + insert were sent');
   }
 
-  // ── A4: shunts repeat freely; bad input fails before any read ──
+  // ── A4: shunts repeat freely and never cost a read; bad input fails before any read ──
+  // The REAL grid path (no stub): a shunt placement must not start a dump read at all, warm cache or cold.
   const sh = rig(0x11, FM3_DUMP);
-  const shuntGrid = async (): Promise<PresetGridDTO> => ({
-    model: 'fm3', name: 'S', crcValid: true, rows: 4, cols: 12, scenes: [], source: 'dump',
-    cells: [
-      { row: 0, col: 1, effectId: SHUNT_ID, name: 'Shunt', isShunt: true, routeFlag: 0, fromRows: [] },
-      { row: 0, col: 2, effectId: SHUNT_ID, name: 'Shunt', isShunt: true, routeFlag: 0, fromRows: [] }
-    ]
-  });
-  (sh.driver as unknown as { grid: typeof shuntGrid }).grid = shuntGrid;
-  const shunt = await sh.driver.placeCell(1, 4, SHUNT_ID);
-  eq(shunt.ok, true, 'a shunt already in the grid may be placed again');
-  eq(placementFrames(sh.mock).length, 2, 'shunt placement: select + insert were sent');
-  eq(dumpRequests(sh.mock).length, 0, 'shunt placement did not touch the wire for a read (grid was stubbed)');
+  let gridCalls = 0;
+  const realGrid = sh.driver.grid.bind(sh.driver);
+  (sh.driver as unknown as { grid: () => Promise<PresetGridDTO> }).grid = () => { gridCalls++; return realGrid(); };
+  const shunt1 = await sh.driver.placeCell(1, 4, SHUNT_ID);
+  const shunt2 = await sh.driver.placeCell(1, 5, SHUNT_ID); // the same shunt id again: shunts repeat
+  const shunt3 = await sh.driver.placeCell(2, 4, SHUNT_ID + 1);
+  eq(shunt1.ok && shunt2.ok && shunt3.ok, true, 'shunt placements → ok:true');
+  eq(placementFrames(sh.mock).length, 6, 'shunt placements: select + insert each');
+  eq(dumpRequests(sh.mock).length, 0, 'shunt placements start NO dump read (cold cache)');
+  eq(gridCalls, 0, 'shunt placements never consult grid()');
+  await realGrid(); // warm the cache; a shunt placement still must not read or consult it
+  const dumpsWarm = dumpRequests(sh.mock).length;
+  await sh.driver.placeCell(3, 4, SHUNT_ID);
+  eq(dumpRequests(sh.mock).length, dumpsWarm, 'shunt placement with a warm cache: no further read');
+  eq(gridCalls, 0, 'shunt placement with a warm cache never consults grid()');
 
   const bad = rig(0x11, FM3_DUMP);
   const badRow = await rejection(bad.driver.placeCell(0, 1, amp.effectId));
@@ -243,6 +268,88 @@ async function driverCases(): Promise<void> {
   const inst = await rejection(bad.driver.placeCell(1, 1, amp.effectId + 1)); // Amp 2: the FM3 has one amp
   eq(inst?.statusCode, 400, 'a block instance the unit lacks is still a 400');
   eq(bad.mock.sent.length, 0, 'missing instance: nothing was sent');
+
+  // ── A6: slow link (5-pin DIN): the guard never starts a read — only an existing, post-write one counts ──
+  // fast link first: a cold-cache block placement does exactly one dump read, then writes
+  const fast = rig(0x11, FM3_DUMP);
+  await fast.driver.placeCell(1, 1, flanger);
+  eq(dumpRequests(fast.mock).length, 1, 'fast link, cold cache: the guard reads the grid once');
+  eq(placementFrames(fast.mock).length, 2, 'fast link, cold cache: select + insert follow');
+
+  // slow, cold cache: no read of any kind — the placement goes out exactly as before the guard existed,
+  // even for a block that IS already in the grid (the device ignores it; that is today's behaviour)
+  const s1 = slowLink(rig(0x11, FM3_DUMP));
+  const s1r = await s1.driver.placeCell(1, 1, amp.effectId);
+  eq(s1r.ok, true, 'slow link, no read to use: the placement goes out (guard skipped)');
+  eq(dumpRequests(s1.mock).length, 0, 'slow link, no read to use: NO dump request (no fresh read, no confirm read)');
+  eq(placementFrames(s1.mock).length, 2, 'slow link, no read to use: select + insert were sent');
+
+  // slow, a fresh cached read exists: it is used as is — refusal, no-op and valid placement — without any further read
+  const s2 = slowLink(rig(0x11, FM3_DUMP));
+  await s2.driver.grid();
+  holdCache(s2.driver);
+  const s2dumps = dumpRequests(s2.mock).length;
+  const s2dup = await rejection(s2.driver.placeCell(1, 1, amp.effectId));
+  eq(s2dup?.statusCode, 409, 'slow link, cached read: duplicate → 409');
+  eq(s2dup?.message, 'Amp 1 is already placed at row 2 col 5 — move it instead', 'slow link, cached read: same message');
+  eq(placementFrames(s2.mock).length, 0, 'slow link, cached read: duplicate wrote nothing');
+  eq(dumpRequests(s2.mock).length, s2dumps, 'slow link, cached read: no confirm read');
+  const s2same = await s2.driver.placeCell(2, 5, amp.effectId);
+  eq(s2same.ok, true, 'slow link, cached read: same-cell → ok:true no-op');
+  eq(placementFrames(s2.mock).length, 0, 'slow link, cached read: same-cell wrote nothing');
+  await s2.driver.placeCell(1, 1, flanger);
+  eq(placementFrames(s2.mock).length, 2, 'slow link, cached read: a valid placement is written');
+  eq(dumpRequests(s2.mock).length, s2dumps, 'slow link, cached read: the valid placement read nothing either');
+
+  // slow, the cached read is gone (the write above dropped it): back to "no read to use" — no fresh read
+  const s2after = await s2.driver.placeCell(1, 2, amp.effectId);
+  eq(s2after.ok, true, 'slow link, after a write dropped the cache: the placement goes out (guard skipped)');
+  eq(dumpRequests(s2.mock).length, s2dumps, 'slow link, after a write dropped the cache: still no dump request');
+  eq(placementFrames(s2.mock).length, 4, 'slow link, after a write dropped the cache: select + insert were sent');
+
+  // slow, a read IN FLIGHT that started after the last write is awaited and used (no second read)
+  const gate = defer();
+  const s3 = slowLink(rig(0x11, null));
+  s3.mock.reply = (req) => (req[5] === 0x03 ? gate.promise.then(() => dumpAnswering(req, FM3_DUMP)) : []);
+  const inflight = s3.driver.grid(); // GET /preset/grid in progress
+  const s3dup = rejection(s3.driver.placeCell(1, 1, amp.effectId));
+  gate.open();
+  await inflight;
+  const s3res = await s3dup;
+  eq(s3res?.statusCode, 409, 'slow link, in-flight read: duplicate → 409 from that read');
+  eq(dumpRequests(s3.mock).length, 1, 'slow link, in-flight read: the guard started no read of its own');
+  eq(placementFrames(s3.mock).length, 0, 'slow link, in-flight read: nothing written');
+
+  // slow, a read in flight that started BEFORE a write is out of date (a move: its clear lands while it runs)
+  const gate2 = defer();
+  const s4 = slowLink(rig(0x11, null));
+  holdCache(s4.driver);
+  s4.mock.reply = (req) => (req[5] === 0x03 ? gate2.promise.then(() => dumpAnswering(req, FM3_DUMP)) : []);
+  const stale4 = s4.driver.grid(); // reads the pre-clear grid (amp at row 2 col 5)
+  await s4.driver.placeCell(2, 5, 0); // the move's clear: invalidates the grid
+  const s4r = await within(s4.driver.placeCell(1, 1, amp.effectId), 'the move must not wait on a read that predates its clear'); // the move's place: the pre-clear read must not refuse it
+  eq(s4r.ok, true, 'slow link, pre-clear in-flight read: the move is NOT refused');
+  eq(placementFrames(s4.mock).length, 4, 'slow link, pre-clear in-flight read: clear and place were both written');
+  gate2.open();
+  await stale4;
+  eq(dumpRequests(s4.mock).length, 1, 'slow link, pre-clear in-flight read: the guard read nothing itself');
+  // that stale read has now settled into the cache (still inside its window) — it predates the clear, so it is not used either
+  const s4late = await s4.driver.placeCell(1, 2, amp.effectId);
+  eq(s4late.ok, true, 'slow link, cache filled by a pre-clear read: the placement is not refused by it');
+  eq(placementFrames(s4.mock).length, 6, 'slow link, cache filled by a pre-clear read: select + insert were sent');
+  eq(dumpRequests(s4.mock).length, 1, 'slow link, cache filled by a pre-clear read: still no read of its own');
+
+  // slow, a write lands WHILE the guard waits on an in-flight read: that read is out of date by the time it settles
+  const gate3 = defer();
+  const s5 = slowLink(rig(0x11, null));
+  s5.mock.reply = (req) => (req[5] === 0x03 ? gate3.promise.then(() => dumpAnswering(req, FM3_DUMP)) : []);
+  const reading = s5.driver.grid();
+  const waiting = rejection(s5.driver.placeCell(1, 1, amp.effectId)); // the guard is now awaiting that read
+  await s5.driver.cable(2, 5, 2, true); // a grid-changing write completes meanwhile
+  gate3.open();
+  await reading;
+  eq(await waiting, null, 'slow link, a write landed while waiting: the settled (now stale) read does not refuse the placement');
+  eq(placementFrames(s5.mock).length, 2, 'slow link, a write landed while waiting: the placement was written');
 
   // ── A5: the same guard on the Axe-Fx III and the FM9 ──
   for (const [model, dump, label] of [[0x10, III_DUMP, 'Axe-Fx III'], [0x12, FM9_DUMP, 'FM9']] as const) {

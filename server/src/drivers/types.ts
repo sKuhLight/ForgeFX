@@ -331,7 +331,8 @@ export interface DeviceDriver {
   setChannel?(eid: number, channel: string): Promise<WriteResult>;
   /** Place `blockId` at the 1-indexed cell (0 clears it). gen-3 refuses a block that is already placed at ANOTHER
    *  cell with a 409 error (the device would echo the insert and silently ignore it) and answers the same block
-   *  onto its own cell with `ok:true` without writing — move a block by clearing its source first. */
+   *  onto its own cell with `ok:true` without writing — move a block by clearing its source first. Shunts and clears
+   *  are not checked; on a slow link only an already existing grid read is consulted (never a fresh dump). */
   placeCell?(row: number, col: number, blockId: number): Promise<WriteResult>;
   selectCell?(row: number, col: number): Promise<{ ok: boolean }>;
   cable?(srcRow: number, srcCol: number, destRow: number, connect: boolean): Promise<{ ok: boolean }>;
