@@ -8,12 +8,13 @@ import { __createRegistryForTest, __setDriverForTest, type DeviceRegistry } from
 import * as deviceCache from '../../src/services/deviceCache.js';
 import * as store from '../../src/store.js';
 import type { BuiltCache, CacheRecord, LiveWalkOptions } from 'forgefx-midi/cache';
-import { buildDefQuery, VIEW_DEFINITION, CACHE_SCHEMA } from 'forgefx-midi/cache';
+import { buildDefQuery, enumHintsFromRanges, VIEW_DEFINITION, CACHE_SCHEMA } from 'forgefx-midi/cache';
+import { PROFILES } from '../../src/devices.js';
 import { FM3_PARAMS_BY_FAMILY } from 'forgefx-midi/gen3/fm3';
 import type { DeviceEvent, DeviceDriver, DriverCapabilities } from '../../src/drivers/types.js';
 import { MockTransport, handshakeReply, isIdentifyBroadcast, assert, assertEqual, sleep } from '../helpers/mock.js';
 
-export const DEVICE_CACHE_CASE_COUNT = 15;
+export const DEVICE_CACHE_CASE_COUNT = 17;
 
 const FM3 = 0x11;
 const KEY = '11_12p0'; // FM3 fw 12.0
@@ -781,6 +782,118 @@ async function replyMatcher(): Promise<void> {
   assert(eq(await deviceCache.adaptRequest(mockWith([wrongBlockHi, correct]), query), correct), 'matcher picks the correct reply out of a stale-mixed buffer');
 }
 
+// ── 10. walkEnumHints: label-list hints per block from the static catalog or a byte-exact cache ──
+const sameJson = (a: unknown, b: unknown): boolean => JSON.stringify(a) === JSON.stringify(b);
+
+/** A byte-exact (or other) stored profile carrying ENUM rows for one family. */
+function enumRowsDoc(meta: Record<string, unknown>, family: string, rows: Record<number, { enumCount: number; typecode: number }>): BuiltCache {
+  const doc = sectionsDoc({}, meta);
+  const ranges = { [family]: Object.fromEntries(Object.entries(rows).map(([id, r]) => [id, { kind: 'enum', displayMin: 0, displayMax: r.enumCount - 1, typecode: r.typecode, enumCount: r.enumCount }])) };
+  return { ...doc, ranges } as unknown as BuiltCache;
+}
+
+async function enumHintDerivation(): Promise<void> {
+  const catalogOf = (model: number, family: string) => enumHintsFromRanges(PROFILES[model]!.ranges[family] ?? {});
+  const fm3 = deviceCache.walkEnumHints(FM3);
+  // mapped effect blocks carry their family's catalog lists — every instance of the family (base..base+3)
+  const distort = catalogOf(FM3, 'DISTORT');
+  assert(Object.keys(distort).length > 0, 'the FM3 catalog has DISTORT enum rows');
+  for (const eid of [58, 59, 60, 61]) assert(sameJson(fm3[eid], distort), `FM3 eid ${eid} carries the DISTORT catalog hints`);
+  for (const eid of [70, 71, 72, 73]) assert(sameJson(fm3[eid], catalogOf(FM3, 'DELAY')), `FM3 delay instance eid ${eid} keyed through the roster`);
+  assert(sameJson(fm3[66], catalogOf(FM3, 'REVERB')), 'FM3 eid 66 carries the REVERB hints');
+  assert(sameJson(fm3[1], catalogOf(FM3, 'GLOBAL')), 'FM3 virtual eid 1 carries the GLOBAL hints');
+  // every hint has a positive integer count and an integer typecode (the codec ignores anything else)
+  for (const block of Object.values(fm3)) {
+    for (const h of Object.values(block)) assert(Number.isInteger(h.count) && h.count >= 1 && Number.isInteger(h.typecode), `usable hint ${JSON.stringify(h)}`);
+  }
+  // blocks the static roster maps to no family get no hints (system selector, tuner, IR capture, modifier copies)
+  for (const eid of [0, 4, 34, 35, 36, 199, 200, 255]) assertEqual(fm3[eid], undefined, `FM3 eid ${eid}: no hints`);
+  // other models resolve through their own catalog, keyed the same way
+  for (const [model, eids] of [[0x12, [58, 59, 60, 61]], [0x10, [70, 71, 72, 73]]] as const) {
+    const h = deviceCache.walkEnumHints(model);
+    const fam = eids[0] === 58 ? 'DISTORT' : 'DELAY';
+    for (const eid of eids) assert(sameJson(h[eid], catalogOf(model, fam)), `model 0x${model.toString(16)} eid ${eid} carries its catalog's ${fam} hints`);
+  }
+  for (const model of [0x15, 0x14]) assertEqual(Object.keys(deviceCache.walkEnumHints(model)).length, 0, `model 0x${model.toString(16)}: no gen-3 catalog, no hints`);
+
+  // a BYTE-EXACT stored cache supplies the rows of the families it carries (exact for the firmware) ...
+  for (const meta of [{ source: 'editor-cache' }, { source: 'cloud', origin: 'bytes' }]) {
+    const doc = enumRowsDoc(meta, 'DISTORT', { 70: { enumCount: 26, typecode: 16 }, 21: { enumCount: 3, typecode: 16 } });
+    const h = deviceCache.walkEnumHints(FM3, doc);
+    for (const eid of [58, 59, 60, 61]) {
+      assert(sameJson(h[eid], { 21: { count: 3, typecode: 16 }, 70: { count: 26, typecode: 16 } }), `${JSON.stringify(meta)}: eid ${eid} takes the cache's DISTORT rows`);
+    }
+    assert(sameJson(h[66], catalogOf(FM3, 'REVERB')), `${JSON.stringify(meta)}: a family the cache does not carry keeps the catalog hints`);
+  }
+  // ... an empty row set for a family falls back to the catalog ...
+  const empty = { ...sectionsDoc({}, { source: 'editor-cache' }), ranges: { DISTORT: {} } } as unknown as BuiltCache;
+  assert(sameJson(deviceCache.walkEnumHints(FM3, empty)[58], distort), 'empty byte-exact rows fall back to the catalog');
+  // ... but a LIVE-walk profile (or unknown provenance) never supplies hints
+  for (const meta of [{ source: 'live' }, { source: 'cloud', origin: 'live' }, { source: undefined }]) {
+    const doc = enumRowsDoc(meta, 'DISTORT', { 70: { enumCount: 26, typecode: 16 }, 15: { enumCount: 2, typecode: 0 } });
+    assert(sameJson(deviceCache.walkEnumHints(FM3, doc), fm3), `${JSON.stringify(meta)} profile: hints stay the catalog's`);
+  }
+}
+
+// ── 11. the hints reach the walk options (store → walk), both modes ──
+async function enumHintsInWalkOptions(): Promise<void> {
+  const catalog = deviceCache.walkEnumHints(FM3);
+  // read-only, nothing stored: the catalog hints
+  store.defaultStore.delDoc('deviceCaches', KEY);
+  {
+    const { app, registry } = await makeApp(FM3, { fw: [12, 0] });
+    try {
+      let seen: LiveWalkOptions | null = null;
+      const spy = async (_t: unknown, opts: LiveWalkOptions): Promise<CacheRecord[]> => { seen = opts; return seedRecords(); };
+      await deviceCache.startCacheBuild(store.defaultStore, registry, { walkImpl: spy });
+      await deviceCache.cacheBuildPromise(registry);
+      assert(seen != null, 'walk invoked');
+      assertEqual(seen!.mode, undefined, 'read-only walk');
+      assert(sameJson(seen!.enumHintByBlock, catalog), 'read-only walk gets the catalog hints');
+    } finally {
+      store.defaultStore.delDoc('deviceCaches', KEY);
+      await app.close();
+    }
+  }
+  // force-rebuild over a stored byte-exact cache: its rows; over a stored LIVE profile: still the catalog
+  for (const [meta, want] of [
+    [{ source: 'editor-cache' }, { 70: { count: 26, typecode: 16 } }],
+    [{ source: 'live' }, catalog[58]],
+  ] as const) {
+    store.defaultStore.putDoc('deviceCaches', KEY, enumRowsDoc(meta, 'DISTORT', { 70: { enumCount: 26, typecode: 16 } }));
+    const { app, registry } = await makeApp(FM3, { fw: [12, 0] });
+    try {
+      let seen: LiveWalkOptions | null = null;
+      const spy = async (_t: unknown, opts: LiveWalkOptions): Promise<CacheRecord[]> => { seen = opts; return seedRecords(); };
+      await deviceCache.startCacheBuild(store.defaultStore, registry, { force: true, walkImpl: spy });
+      await deviceCache.cacheBuildPromise(registry);
+      assert(seen != null, `walk invoked (${meta.source})`);
+      assert(sameJson(seen!.enumHintByBlock?.[58], want), `stored ${meta.source} profile: eid 58 hints ${JSON.stringify(seen!.enumHintByBlock?.[58])}`);
+      assert(sameJson(seen!.enumHintByBlock?.[66], catalog[66]), `stored ${meta.source} profile: other families keep the catalog hints`);
+    } finally {
+      store.defaultStore.delDoc('deviceCaches', KEY);
+      await app.close();
+    }
+  }
+  // full mode carries the same hints
+  {
+    const fake = makeGen3Fake(gen3FakeCaps({ fullCapture: true }), []);
+    const { app, registry } = await makeAppWithFake(FM3, fake, [12, 0]);
+    try {
+      let seen: LiveWalkOptions | null = null;
+      const spy = async (_t: unknown, opts: LiveWalkOptions): Promise<CacheRecord[]> => { seen = opts; return seedRecords(); };
+      const r = await deviceCache.startCacheBuild(store.defaultStore, registry, { mode: 'full', walkImpl: spy });
+      assertEqual((r.body as { started?: boolean }).started, true, 'full build started');
+      await deviceCache.cacheBuildPromise(registry);
+      assertEqual(seen!.mode, 'full', 'full walk');
+      assert(sameJson(seen!.enumHintByBlock, catalog), 'full walk gets the catalog hints');
+    } finally {
+      store.defaultStore.delDoc('deviceCaches', KEY);
+      await app.close();
+    }
+  }
+}
+
 export async function runDeviceCacheTests(): Promise<void> {
   await firmwarePresent();
   await firmwareSilent();
@@ -793,6 +906,8 @@ export async function runDeviceCacheTests(): Promise<void> {
   await fullWithoutCapability();
   await walkBoundDerivation();
   await walkBoundFromStoredCache();
+  await enumHintDerivation();
+  await enumHintsInWalkOptions();
   await fullFirmwareGate();
   await fullFirmwareFreshness();
   await fullFirmwareGateHttp();

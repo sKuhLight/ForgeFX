@@ -8,7 +8,7 @@
 // Browser-safe: the store + registry are type-only imports (a browser runtime supplies its own), and
 // the codec's cache subpath is itself browser-safe. NO node:/fastify/transport VALUE imports — this
 // module is in the runtime router's import graph (check-browser-safe.ts enforces it).
-import { buildCache, HW_SEEDS, liveWalk, type BuiltCache, type CacheRecord, type DeviceParam, type LiveTransport, type LiveWalkOptions, type LiveWalkWriteHooks } from 'forgefx-midi/cache';
+import { buildCache, enumHintsFromRanges, HW_SEEDS, liveWalk, type BuiltCache, type CacheRecord, type DeviceParam, type LiveEnumHint, type LiveTransport, type LiveWalkOptions, type LiveWalkWriteHooks } from 'forgefx-midi/cache';
 import { FM3_PARAMS } from 'forgefx-midi/gen3/fm3';
 import { FM9_PARAMS } from 'forgefx-midi/gen3/fm9';
 import { PARAMS as AXE3_PARAMS } from 'forgefx-midi/gen3/axe-fx-iii';
@@ -140,6 +140,16 @@ function lastLowContiguousId(sortedIds: readonly number[]): number {
   return last;
 }
 
+/** The catalog family of a block address through the STATIC roster only — the mapping the driver uses
+ *  everywhere: the codec's effect-id base table (`blockRefForEid`: every instance base..base+3 of a family)
+ *  to the slug's family (`SLUG_FAMILY`), else the profile's virtual effect ids (GLOBAL / CONTROLLERS / MOD /
+ *  ...). Never a section→family vote of a walk: per-block walk options keyed through a vote would land on
+ *  the wrong block whenever the vote is wrong. */
+function staticFamilyOf(profile: DeviceProfile, block: number): string | undefined {
+  const ref = blockRefForEid(block);
+  return (ref ? SLUG_FAMILY[ref.slug] : undefined) ?? profile.familyForEffectId(block);
+}
+
 /** Known table size and hard ceiling per block for the live walk (see `WalkBlockLimits`).
  *
  *  Table size: the family's `stride` in `rangeSections`, the wire slot count (a table of N slots holds
@@ -193,7 +203,7 @@ export function walkBlockLimits(model: number, mode: BuildMode, byteExact?: Buil
   };
   for (let block = 0; block <= WALK_BOUND_MAX_BLOCK; block++) {
     const ref = blockRefForEid(block);
-    const family = (ref ? SLUG_FAMILY[ref.slug] : undefined) ?? profile.familyForEffectId(block);
+    const family = staticFamilyOf(profile, block);
     const stride = family ? strides[family] : undefined;
     if (family === undefined || stride === undefined) {
       if (mode === 'full') limits.bound[block] = WALK_MAX_PARAM_ID; // unknown block: the HW-proven envelope
@@ -209,6 +219,43 @@ export function walkBlockLimits(model: number, mode: BuildMode, byteExact?: Buil
     if (present) limits.knownSize[block] = stride;
   }
   return limits;
+}
+
+/** The label lists the live walk may rely on, per block (the codec's `enumHintByBlock`): for every block
+ *  the STATIC roster maps to a family (`staticFamilyOf` — every instance of the family, base..base+3, and
+ *  the virtual GLOBAL / CONTROLLERS / MOD blocks), the enum rows of that family as `{ count, typecode }`
+ *  (`enumHintsFromRanges`). The codec label-walks a definition whose default slot is non-zero ONLY on such
+ *  a hint (type lists, tempo divisions, foot-controller assignments: otherwise they come back as floats).
+ *
+ *  Source per family: the byte-exact stored cache of the attached firmware when it carries rows for the
+ *  family (editor-cache import / byte-origin cloud profile, `isByteExactProfile`; the caller passes only a
+ *  usable-schema doc) — exact data for this firmware — else the static catalog's ranges. NEVER a stored
+ *  live-walk profile (or unknown provenance): a hint is a promise that the param HAS a label list, and a
+ *  label query to a param without one is out of contract for the device, so it must not come from a
+ *  walk's own heuristics. Models without a gen-3 catalog get no hints. */
+export function walkEnumHints(model: number, byteExact?: BuiltCache | null): Record<number, Record<number, LiveEnumHint>> {
+  const hints: Record<number, Record<number, LiveEnumHint>> = {};
+  const profile: DeviceProfile | undefined = PROFILES[model];
+  if (!profile) return hints;
+  const exact = byteExact && isByteExactProfile(byteExact.meta) ? byteExact : null;
+  const byFamily = new Map<string, Record<number, LiveEnumHint>>();
+  const hintsOf = (family: string): Record<number, LiveEnumHint> => {
+    let h = byFamily.get(family);
+    if (!h) {
+      const exactRows = exact?.ranges?.[family];
+      const rows = exactRows && Object.keys(exactRows).length > 0 ? exactRows : profile.ranges[family];
+      h = rows ? enumHintsFromRanges(rows) : {};
+      byFamily.set(family, h);
+    }
+    return h;
+  };
+  for (let block = 0; block <= WALK_BOUND_MAX_BLOCK; block++) {
+    const family = staticFamilyOf(profile, block);
+    if (family === undefined) continue;
+    const h = hintsOf(family);
+    if (Object.keys(h).length > 0) hints[block] = h;
+  }
+  return hints;
 }
 
 /** Adapt the registry's shared Transport to the codec's minimal LiveTransport: one query → the first
@@ -265,7 +312,8 @@ async function runBuild(store: Store, registry: DeviceRegistry, job: CacheJob, w
     // firmware (force-rebuild over an editor-cache import) is exact device data and refines the catalog;
     // a stale one (outdated schema) is not trusted for that either.
     const stored = loadStoredProfile(store, key);
-    const limits = walkBlockLimits(model, mode, stored.state === 'usable' ? stored.profile : null);
+    const usable = stored.state === 'usable' ? stored.profile : null;
+    const limits = walkBlockLimits(model, mode, usable);
     const walkOpts: LiveWalkOptions = {
       model,
       ...(full ? { mode: 'full' as const, write } : {}),
@@ -274,6 +322,8 @@ async function runBuild(store: Store, registry: DeviceRegistry, job: CacheJob, w
       maxParamId: full ? WALK_MAX_PARAM_ID_FULL : WALK_MAX_PARAM_ID,
       paramKnownSizeByBlock: limits.knownSize,
       paramBoundByBlock: limits.bound,
+      // Label lists per block (see walkEnumHints) — the same byte-exact-or-catalog source, both modes.
+      enumHintByBlock: walkEnumHints(model, usable),
       signal: controller.signal,
       onProgress: (p) => {
         if (controller.signal.aborted) return;
