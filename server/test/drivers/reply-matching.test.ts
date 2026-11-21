@@ -25,7 +25,7 @@ import { dumpAnswering, assert, assertEqual } from '../helpers/mock.js';
 import { VirtualClock, FakeLink, QueueTransport, track } from '../helpers/virtualLink.js';
 
 // One case = one executed check() (the suite verifies the count itself at the end).
-export const REPLY_MATCHING_CASE_COUNT = 59;
+export const REPLY_MATCHING_CASE_COUNT = 63;
 let executed = 0;
 function check(cond: unknown, msg: string): void {
   executed++;
@@ -168,6 +168,33 @@ async function stalledDumpNeverShiftsSlots(): Promise<void> {
       check(q.done && !q.error && sent.length === 2 && sent[1] === p.at, `dump (FM9 prefer): one request per read, and the next read goes out the moment it ends — no retry, no drain (sent ${sent.join(',')})`);
       check(logged.filter((l) => /header names slot 4/.test(l)).length === 1, `dump (FM9 prefer): the fallback is logged once (${logged.filter((l) => /header names/.test(l)).length})`);
     });
+  }
+
+  // FM9 'prefer' never falls back to an EDIT-BUFFER dump for a stored slot: a late grid() dump (header 0x3FFF or
+  // 7F 00) is not backed up as slot 7 — alone it fails the backup; followed by slot 7's own dump, that one is used
+  for (const n of [0x3fff, 0x3f80]) {
+    for (const ownFollows of [false, true]) {
+      const { clock, link, transport } = rig();
+      const driver = gen3Over(transport, null, FM9);
+      link.device = (bytes, at) => {
+        if (bytes[5] !== 0x03) return;
+        dumpNaming(FM9_FIXTURE, n).forEach((f, i) => link.emitAt(at + 10 + i, f)); // the late grid() dump
+        if (ownFollows) dumpNaming(FM9_FIXTURE, 7).forEach((f, i) => link.emitAt(at + 100 + i, f));
+      };
+      await quietly(async (logged) => {
+        const p = track(clock, driver.backupPreset(7));
+        await clock.advanceTo(40_000);
+        const tag = `0x${n.toString(16)}${ownFollows ? ', then slot 7' : ' only'}`;
+        check(
+          ownFollows
+            ? p.done && !p.error && headerSlot(p.value!.bytes) === 7 && p.at === 100 + FM9_FIXTURE.length - 1
+            : p.done && !!p.error && !logged.some((l) => /header names the edit buffer/.test(l)),
+          ownFollows
+            ? `dump (FM9 prefer): a late edit-buffer dump (${tag}) is skipped and slot 7's own dump is backed up (at ${p.at})`
+            : `dump (FM9 prefer): a late edit-buffer dump (${tag}) is never backed up as slot 7 — the backup fails instead`
+        );
+      });
+    }
   }
 
   // a late WHOLE dump of slot 5 arrives first, then slot 6's own dump: slot 6 on both policies

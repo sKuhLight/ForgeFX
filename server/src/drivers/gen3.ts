@@ -87,7 +87,11 @@ const DUMP_HEADER_POLICY: Readonly<Record<number, readonly [stored: DumpHeaderCh
 };
 /** Header numbers that name the EDIT BUFFER in a dump answering an edit-buffer (0x3FFF) request: the 0x3FFF
  *  sentinel itself, and 0x3F80 (`7F 00`) — what the FM3 sends on fw 13.0 and what the Axe-Fx III fixture
- *  carries. */
+ *  carries. A stored-slot read never uses a dump with one of these headers, not even as a 'prefer' fallback
+ *  (a late grid() dump must not be backed up as slot n).
+ *  Limit: two edit-buffer dumps are indistinguishable (same header, no request id). An edit-buffer read whose
+ *  dump arrives only after its request gave up and the drain released the link (> ~5 s late, rare) can
+ *  therefore answer the NEXT edit-buffer read — with the older contents of the edit buffer. */
 const EDIT_BUFFER_HEADERS: readonly number[] = [EDIT_BUFFER, 0x3f80];
 const dumpHeaderCheck = (model: number, target: number): DumpHeaderCheck =>
   (DUMP_HEADER_POLICY[model] ?? ['prefer', 'prefer'])[target === EDIT_BUFFER ? 1 : 0];
@@ -112,15 +116,15 @@ function wholeDumps(frames: number[][], model: number, want: (header: number[]) 
   }
   return out;
 }
-/** How one dump read judges headers: the effective check, and which headers NAME the request. */
-interface DumpHeaderPlan { check: DumpHeaderCheck; named: (header: number[]) => boolean }
+/** How one dump read judges headers: the effective check, which headers NAME the request, and which ones the
+ *  read may use at all (named ones, plus — under 'prefer' — fallback candidates). */
+interface DumpHeaderPlan { check: DumpHeaderCheck; named: (header: number[]) => boolean; usable: (header: number[]) => boolean }
 /** Request options for one dump: complete at once on a whole dump whose header the plan calls named; own the
- *  headers the check may use and the chunks after them, so a dump that stops short ends one quiet gap after
+ *  headers the plan may use and the chunks after them, so a dump that stops short ends one quiet gap after
  *  its last chunk (the transport drains the rest), and a whole dump under 'prefer' ends one quiet gap after its
  *  terminator without a drain (`settles`). */
 function presetDumpOpts(model: number, plan: DumpHeaderPlan, timeoutMs: number, quietMs: number) {
-  const { check, named } = plan;
-  const usable = (f: number[]) => check !== 'strict' || named(f);
+  const { named, usable } = plan;
   let inOurs = false;
   return {
     timeoutMs,
@@ -666,13 +670,13 @@ class Gen3Driver implements DeviceDriver {
       let whole = wholeDumps(frames, model, plan.named)[0];
       if (whole && headerNamesRequest(dumpHeaderNumber(whole[0]!), target)) this.#session(dev).learned.add(target === EDIT_BUFFER ? 'edit' : 'stored');
       if (!whole && plan.check === 'prefer') {
-        whole = wholeDumps(frames, model, () => true).at(-1);
+        whole = wholeDumps(frames, model, plan.usable).at(-1);
         if (whole) this.#noteDumpHeader(what, dumpHeaderNumber(whole[0]!));
       }
       if (whole && whole.some((f) => f[5] === 0x78)) return whole;
       // keep what started (from the last usable header) for the decoder's error message
       let last = -1;
-      frames.forEach((f, i) => { if (isFrameOf(f, model, 0x77) && (plan.check !== 'strict' || plan.named(f))) last = i; });
+      frames.forEach((f, i) => { if (isFrameOf(f, model, 0x77) && plan.usable(f)) last = i; });
       partial = last < 0 ? [] : dumpFramesOnly(frames.slice(last), model);
       console.log(`[forgefx] presetDump: incomplete ${what} attempt ${attempt}/3 (frames=${frames.length}, header=${last >= 0}, 0x78=${partial.some((f) => f[5] === 0x78)}, 0x79=${partial.some((f) => f[5] === 0x79)}) — retrying`);
     }
@@ -718,7 +722,11 @@ class Gen3Driver implements DeviceDriver {
       const n = dumpHeaderNumber(h);
       return headerNamesRequest(n, target) || (current !== null && n === current);
     };
-    return { check, named };
+    // Fallback candidates under 'prefer': any other header — except that a stored-slot read never takes a dump
+    // whose header is an edit-buffer value (a late grid() dump is not slot n).
+    const usable = (h: number[]) =>
+      named(h) || (check === 'prefer' && (target === EDIT_BUFFER || !EDIT_BUFFER_HEADERS.includes(dumpHeaderNumber(h))));
+    return { check, named, usable };
   }
 
   /** Routing grid of ONE STORED SLOT (GET /presets/:n/grid): the dump the device returns for slot `n`,
