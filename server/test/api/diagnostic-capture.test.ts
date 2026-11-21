@@ -22,7 +22,7 @@ import { MockTransport, handshakeReply, isIdentifyBroadcast, assert, assertEqual
 import { fakeCacheDoc, seedRecords } from './device-cache.test.js';
 import { runDiagnosticUpload, type DiagnosticUploadTransport } from '../../src/runtime/cloud.js';
 
-export const DIAGNOSTIC_CAPTURE_CASE_COUNT = 22;
+export const DIAGNOSTIC_CAPTURE_CASE_COUNT = 25;
 
 const FM3 = 0x11;
 const NAME = 'Secret Name';
@@ -70,15 +70,18 @@ function defRaw(d: { tc: number; min: number; max: number; scale?: number; def?:
 }
 const ascii = (s: string) => Uint8Array.from(s, (c) => c.charCodeAt(0));
 
-/** A one-chunk synthetic raw patch (2048 bytes): a name and a 4-byte body behind a tiny Huffman stream. */
-function rawPatch(name: string, variant = 0): Uint8Array {
+/** A one-chunk synthetic raw patch (2048 bytes): a name and a short body (4 bytes, or `len`) behind a tiny
+ *  Huffman stream. `variant` 1 changes the body's values, `len` its length (what a firmware conversion does). */
+function rawPatch(name: string, variant = 0, len = 4, headerWord = 0): Uint8Array {
   const raw = new Uint8Array(2048);
+  raw[0] = headerWord & 0xff; raw[1] = (headerWord >> 8) & 0xff;
   for (let i = 0; i < name.length; i++) raw[0x08 + i] = name.charCodeAt(i);
-  raw[0x48] = 4; raw[0x4a] = 3; // decomp 4, comp 3
-  // tree: internal(0) → leaf(1)'A', leaf(1)'B'; then 4 symbols
-  const sym = variant === 0 ? [0, 1, 0, 1] : [1, 1, 0, 0];
-  const bits = [0, 1, ...[0, 1, 0, 0, 0, 0, 0, 1], 1, ...[0, 1, 0, 0, 0, 0, 1, 0], ...sym, 0];
-  for (let i = 0; i < 3; i++) raw[0x4c + i] = bits.slice(i * 8, i * 8 + 8).reduce((a, b) => (a << 1) | b, 0);
+  // tree: internal(0) → leaf(1)'A', leaf(1)'B'; then one bit per body byte
+  const sym = Array.from({ length: len }, (_, i) => (variant === 0 ? i % 2 : i < 2 ? 1 : 0));
+  const bits = [0, 1, ...[0, 1, 0, 0, 0, 0, 0, 1], 1, ...[0, 1, 0, 0, 0, 0, 1, 0], ...sym];
+  while (bits.length % 8) bits.push(0);
+  raw[0x48] = len; raw[0x4a] = bits.length / 8; // decompressed, compressed size
+  for (let i = 0; i < bits.length / 8; i++) raw[0x4c + i] = bits.slice(i * 8, i * 8 + 8).reduce((a, b) => (a << 1) | b, 0);
   return raw;
 }
 function encode16to3(raw: Uint8Array): number[] {
@@ -123,12 +126,24 @@ interface FakeState {
   zeroDefaultAt?: { block: number; param: number };
   /** Print per-frame RX/TX trace lines and a multi-line warning with a path, like a chatty transport. */
   trace?: boolean;
+  /** How a store (fn 0x01 sub 0x26) is answered: acknowledged + written (default), refused, or acknowledged
+   *  without the slot changing. */
+  storeMode?: 'ack' | 'reject' | 'ack-no-write' | 'silent' | 'silent-write';
+  stores?: number[];
+  /** Answer stores / dumps only after this many ms (a slow device: lets a test act mid-request). */
+  storeDelayMs?: number;
+  dumpDelayMs?: number;
+  /** Every dump request fails at the transport. */
+  dumpThrows?: boolean;
 }
 
 class FakeFm3 extends MockTransport {
   constructor(readonly state: FakeState) {
     super('serial', 'COM7');
-    this.reply = (req) => this.#answer(req);
+    this.reply = (req) => {
+      const late = req[5] === 0x03 ? this.state.dumpDelayMs : req[5] === 0x01 && req[6] === 0x26 ? this.state.storeDelayMs : undefined;
+      return late ? sleep(late).then(() => this.#answer(req)) : this.#answer(req);
+    };
   }
   override async request(bytes: readonly number[], opts?: RequestOpts): Promise<number[][]> {
     const r = await super.request(bytes, opts);
@@ -152,11 +167,22 @@ class FakeFm3 extends MockTransport {
       return [msg(0x0d, [n & 0x7f, (n >> 7) & 0x7f, ...Array.from(NAME.padEnd(32, ' '), (c) => c.charCodeAt(0))])];
     }
     if (fn === 0x03) {
+      if (s.dumpThrows) throw new Error('port closed during the dump');
       const requested = ((req[6]! & 0x7f) << 7) | (req[7]! & 0x7f);
       const raw = requested === 0x3fff ? (s.editBuffer ?? s.slots.get(s.current) ?? new Uint8Array(2048)) : (s.slots.get(requested) ?? new Uint8Array(2048));
       const header = s.headerFor?.(requested) ?? (requested === 0x3fff ? 0x3f80 : requested);
       const frames = dumpFrames(header, raw);
       return requested === s.incompleteSlot ? frames.slice(0, 2) : frames;
+    }
+    if (fn === 0x01 && req[6] === 0x26) { // store the edit buffer to a slot
+      const n = (req[12]! & 0x7f) | ((req[13]! & 0x7f) << 7);
+      (s.stores ??= []).push(n);
+      if (s.storeMode === 'reject') return [msg(0x64, [0x01, 0x05])];
+      if (s.storeMode !== 'ack-no-write' && s.storeMode !== 'silent') {
+        s.slots.set(n, s.editBuffer ?? s.slots.get(s.current) ?? new Uint8Array(2048));
+        if (n === s.current) s.editBuffer = null;
+      }
+      return s.storeMode === 'silent' || s.storeMode === 'silent-write' ? [] : [msg(0x01, [0x26, 0x00])];
     }
     if (fn === 0x01 && req[6] === 0x27) { // SysEx preset switch
       const n = (req[12]! & 0x7f) | ((req[13]! & 0x7f) << 7);
@@ -487,6 +513,233 @@ async function reloadProbe(): Promise<void> {
     const b = await run(registry, { steps: ['reloadProbe'] });
     assertEqual(stepOf(b, 'reloadProbe').status, 'skipped', 'unknown edit buffer → skipped');
     assertEqual(state.switches.length, 0, 'no switch when unknown');
+  }
+}
+
+// ── 5b. unsaved edits: preflight + token, and the user's decision (save / discard) instead of a skip ──
+const preflightOf = async (registry: DeviceRegistry): Promise<diag.CapturePreflight> => {
+  const r = await diag.capturePreflight(registry);
+  assertEqual(r.code, 200, `preflight 200 (${JSON.stringify(r.body)})`);
+  return r.body as diag.CapturePreflight;
+};
+/** Preflight, then a run with the decision bound to the preflight's token. */
+async function decided(registry: DeviceRegistry, decision: 'save' | 'discard', body: Record<string, unknown> = { steps: ['reloadProbe'] }, opts: diag.CaptureOptions = {}) {
+  const p = await preflightOf(registry);
+  assert(typeof p.token === 'string', 'a not-clean preflight carries a token');
+  return run(registry, { ...body, unsavedEdits: decision, token: p.token }, opts);
+}
+type UnsavedRecord = { decision: string; outcome: string; save?: { slot: number; ok?: boolean; acked?: boolean | null; ms?: number; reason?: string; pending?: boolean }; afterSave?: { editBuffer: string }; bodyLengths?: { editBuffer: number; slot: number } };
+const unsavedOf = (b: diag.CaptureBundle, step: diag.StepName = 'reloadProbe') => (stepOf(b, step).result as { unsavedEdits: UnsavedRecord }).unsavedEdits;
+
+async function unsavedEditsPreflight(): Promise<void> {
+  {
+    const { registry } = await makeRig();
+    assertEqual(JSON.stringify(await preflightOf(registry)), JSON.stringify({ preset: 12, presetName: NAME, editBuffer: 'clean', canSave: false }), 'clean: nothing to decide, no token');
+  }
+  {
+    const { registry } = await makeRig(fakeState({ editBuffer: rawPatch('Current', 1) }));
+    const p = await preflightOf(registry);
+    assert(p.editBuffer === 'dirty' && p.likelyCause === 'unsaved-edits' && p.canSave === true, 'dirty, same format → unsaved edits, can save');
+    assert(/^12\.dirty\.[0-9a-z]+\.[0-9a-f]+$/.test(p.token ?? '') && typeof p.tokenExpiresAt === 'string', `token + expiry (${p.token})`);
+    assert(Date.parse(p.tokenExpiresAt!) - Date.now() > 14 * 60_000, 'the token lives ~15 minutes');
+  }
+  {
+    const { registry } = await makeRig(fakeState({ editBuffer: rawPatch('Current', 1, 6) }));
+    assertEqual((await preflightOf(registry)).likelyCause, 'older-firmware', 'a body of another length → converted from an older firmware');
+  }
+  {
+    const { registry } = await makeRig(fakeState({ editBuffer: rawPatch('Current', 1, 4, 0x0101) }));
+    assertEqual((await preflightOf(registry)).likelyCause, 'older-firmware', 'another leading header word (same length) → converted');
+  }
+  {
+    const { registry } = await makeRig(fakeState({ headerFor: (n) => (n === 0x3fff ? 12 : n) }));
+    const p = await preflightOf(registry);
+    assert(p.editBuffer === 'unknown' && p.likelyCause === 'unknown' && typeof p.reason === 'string', 'unprovable edit buffer → unknown, with a reason');
+    assertEqual(p.canSave, false, 'unknown → cannot save (discard only)');
+    assert(/^12\.unknown\./.test(p.token ?? ''), 'unknown still gets a token (for discard)');
+    const r = await diag.startCapture(store.defaultStore, registry, { acknowledged: true, steps: ['reloadProbe'], unsavedEdits: 'save', token: p.token }, QUICK);
+    assertEqual((r.body as { error: string }).error, 'cannot-save', 'save with an unknown-state token → 400 cannot-save');
+  }
+  // the preflight holds the device like a run (claim + telemetry hold) and reports a failing device apart
+  {
+    const { registry, mock } = await makeRig(fakeState({ editBuffer: rawPatch('Current', 1), dumpDelayMs: 150 }));
+    const unsub = registry.subscribe(() => {});
+    try {
+      const p = diag.capturePreflight(registry);
+      await sleep(40);
+      assertEqual(deviceBusy(registry), 'capture', 'the device is claimed during the preflight');
+      const build = await deviceCache.startCacheBuild(store.defaultStore, registry, { walkImpl: seedWalk });
+      assertEqual(build.code, 409, 'a cache build waits for the preflight');
+      assertEqual((await diag.capturePreflight(registry)).code, 409, 'a second preflight → 409');
+      const before = mock.sent.length;
+      await sleep(60);
+      assert(mock.sent.slice(before).every((f) => f[5] === 0x03), 'no telemetry polls during the preflight');
+      assertEqual((await p).code, 200, 'preflight done');
+      assertEqual(deviceBusy(registry), null, 'released afterwards');
+    } finally {
+      unsub();
+    }
+    const { registry: r2 } = await makeRig(fakeState({ dumpThrows: true }));
+    const failed = await diag.capturePreflight(r2);
+    assertEqual(failed.code, 503, 'a failing dump → 503');
+    assertEqual((failed.body as { error: string }).error, 'device', '… reported as a device error, not no-device');
+    assertEqual(deviceBusy(r2), null, 'released after a failure too');
+    const none = __createRegistryForTest({ resolveConn: async () => null, openConn: () => new MockTransport() });
+    assertEqual(JSON.stringify((await diag.capturePreflight(none)).body), JSON.stringify({ error: 'no-device' }), 'no device → 503 no-device');
+  }
+  // start: a decision needs a valid, fresh token
+  {
+    const { registry } = await makeRig(fakeState({ editBuffer: rawPatch('Current', 1) }));
+    const start = (body: Record<string, unknown>, opts: diag.CaptureOptions = QUICK) => diag.startCapture(store.defaultStore, registry, { acknowledged: true, steps: ['reloadProbe'], ...body }, opts);
+    assertEqual(((await start({ unsavedEdits: 'keep' })).body as { error: string }).error, 'bad-unsaved-edits', 'unknown decision → 400');
+    assertEqual(((await start({ unsavedEdits: 'discard', preset: 12 })).body as { error: string }).error, 'missing-token', 'decision without token → 400 missing-token');
+    assertEqual(((await start({ unsavedEdits: 'discard', token: 'nope' })).body as { error: string }).error, 'bad-token', 'malformed token → 400');
+    const p = await preflightOf(registry);
+    const later = Date.now() + 16 * 60_000;
+    assertEqual(((await start({ unsavedEdits: 'discard', token: p.token }, { ...QUICK, now: () => later })).body as { error: string }).error, 'token-expired', 'an old token → 400 token-expired');
+  }
+}
+
+async function unsavedEditsSave(): Promise<void> {
+  // saved: stored to the current slot with the device's ack, re-checked clean, then switched
+  {
+    const { registry, state } = await makeRig(fakeState({ editBuffer: rawPatch('Current', 1, 6) }));
+    const events: DeviceEvent[] = [];
+    const unsub = registry.subscribe((e) => events.push(e));
+    const b = await decided(registry, 'save');
+    unsub();
+    assertEqual(stepOf(b, 'reloadProbe').status, 'ok', 'save → reload probe runs');
+    const u = unsavedOf(b);
+    assert(u.decision === 'save' && u.outcome === 'saved', 'decision + outcome recorded');
+    assert(u.save!.slot === 12 && u.save!.ok === true && u.save!.acked === true && typeof u.save!.ms === 'number' && u.save!.pending === undefined, 'save: slot, ack, ms recorded (no longer pending)');
+    assertEqual(u.afterSave!.editBuffer, 'clean', 'clean after the save');
+    assertEqual((stepOf(b, 'reloadProbe').result as { likelyCause: string }).likelyCause, 'older-firmware', 'likely cause recorded');
+    assertEqual((state.stores ?? []).join(','), '12', 'stored to the current slot');
+    assertEqual(state.switches.join(','), '12', 'then switched');
+    assert(b.logs.some((l) => /unsaved edits: 'save' for preset 12/.test(l.msg)) && b.logs.some((l) => /preset 12: stored \(acknowledged: yes/.test(l.msg)), 'decision and save in the job log');
+    assertEqual(events.filter((e) => e.type === 'changed').length, 1, 'one changed event at the end');
+    assert(!JSON.stringify(b).includes('Secret'), 'the preset name stays out of the bundle');
+  }
+  // BLOCKER: the current preset changes between the dumps and the store → nothing is stored, nothing switched
+  {
+    const { registry, state } = await makeRig(fakeState({ editBuffer: rawPatch('Current', 1) }));
+    const p = await preflightOf(registry);
+    state.presetRefs = [12, 13]; // the gate's check still sees 12, the read right before the store sees 13
+    const b = await run(registry, { steps: ['reloadProbe'], unsavedEdits: 'save', token: p.token });
+    assertEqual(stepOf(b, 'reloadProbe').status, 'skipped', 'preset moved before the store → skipped');
+    assertEqual(unsavedOf(b).outcome, 'preset-changed', 'outcome preset-changed');
+    assertEqual((state.stores ?? []).length, 0, 'nothing stored into the old slot');
+    assertEqual(state.switches.length, 0, 'nothing switched');
+  }
+  // the edits changed after the question → not honoured
+  {
+    const { registry, state } = await makeRig(fakeState({ editBuffer: rawPatch('Current', 1) }));
+    const p = await preflightOf(registry);
+    state.editBuffer = rawPatch('Current', 1, 5); // the user kept editing
+    const b = await run(registry, { steps: ['reloadProbe'], unsavedEdits: 'save', token: p.token });
+    assertEqual(stepOf(b, 'reloadProbe').note, 'the unsaved edits changed', 'skip note');
+    assertEqual(unsavedOf(b).outcome, 'edits-changed', 'outcome edits-changed');
+    assertEqual((state.stores ?? []).length + state.switches.length, 0, 'nothing stored, nothing switched');
+  }
+  // another preset than the one decided for
+  {
+    const { registry, state } = await makeRig(fakeState({ editBuffer: rawPatch('Current', 1) }));
+    const p = await preflightOf(registry);
+    state.slots.set(13, rawPatch('Other'));
+    state.current = 13;
+    const b = await run(registry, { steps: ['reloadProbe'], unsavedEdits: 'save', token: p.token });
+    assertEqual(unsavedOf(b).outcome, 'preset-changed', 'other preset → preset-changed');
+    assertEqual((state.stores ?? []).length + state.switches.length, 0, 'nothing stored, nothing switched');
+  }
+  // rejected: the stored preset is untouched; the full walk does not switch either
+  {
+    const { registry, state } = await makeRig(fakeState({ editBuffer: rawPatch('Current', 1), storeMode: 'reject' }));
+    let walks = 0;
+    const b = await decided(registry, 'save', { steps: ['reloadProbe'], includeFullWalk: true }, { walkImpl: async () => { walks++; return seedRecords(); } });
+    assertEqual(stepOf(b, 'reloadProbe').status, 'failed', 'rejected → failed');
+    assertEqual(unsavedOf(b).outcome, 'save-rejected', 'outcome save-rejected');
+    assert(/refused .* unchanged/.test(stepOf(b, 'reloadProbe').error ?? ''), 'error says the stored preset is unchanged');
+    assertEqual(stepOf(b, 'fullWalk').status, 'failed', 'full walk failed too');
+    assertEqual(unsavedOf(b, 'fullWalk').outcome, 'save-rejected', 'same outcome on the full walk');
+    assertEqual(walks + state.switches.length, 0, 'no walk, no switch');
+  }
+  // FM3 (ack expected): no acknowledgement → unconfirmed, no switch
+  {
+    const { registry, state } = await makeRig(fakeState({ editBuffer: rawPatch('Current', 1), storeMode: 'silent' }));
+    const b = await decided(registry, 'save');
+    assertEqual(unsavedOf(b).outcome, 'save-unconfirmed', 'no ack on the FM3 → save-unconfirmed');
+    assertEqual(unsavedOf(b).save!.reason, 'no-ack', 'reason recorded');
+    assertEqual(state.switches.length, 0, 'no switch');
+  }
+  // no ack to expect (older firmware: lenient store) — unconfirmed if the edit buffer still differs, saved if clean
+  {
+    const { registry, state } = await makeRig(fakeState({ fw: [11, 0], editBuffer: rawPatch('Current', 1), storeMode: 'silent' }));
+    const b = await decided(registry, 'save');
+    assertEqual(unsavedOf(b).outcome, 'save-unconfirmed', 'no ack, still dirty → save-unconfirmed');
+    assertEqual(unsavedOf(b).save!.ok, true, 'the store itself reported ok (unconfirmed)');
+    assertEqual(state.switches.length, 0, 'no switch');
+  }
+  {
+    const { registry, state } = await makeRig(fakeState({ fw: [11, 0], editBuffer: rawPatch('Current', 1), storeMode: 'silent-write' }));
+    const b = await decided(registry, 'save');
+    assertEqual(unsavedOf(b).outcome, 'saved', 'no ack but clean afterwards → saved');
+    assertEqual(unsavedOf(b).save!.acked, false, 'recorded as not acknowledged');
+    assertEqual(state.switches.join(','), '12', 'switched');
+  }
+  // acknowledged but still different: the stored preset WAS overwritten
+  {
+    const { registry, state } = await makeRig(fakeState({ editBuffer: rawPatch('Current', 1, 6), storeMode: 'ack-no-write' }));
+    const b = await decided(registry, 'save');
+    const u = unsavedOf(b);
+    assertEqual(u.outcome, 'saved-check-failed', 'acked but different → saved-check-failed');
+    assertEqual(JSON.stringify(u.bodyLengths), JSON.stringify({ editBuffer: 6, slot: 4 }), 'edit buffer vs slot body lengths recorded');
+    assertEqual(u.afterSave!.editBuffer, 'dirty', 're-check recorded');
+    assertEqual(state.switches.length, 0, 'no switch');
+  }
+  // cancel while the store is on the link: the bundle shows it pending; the device stays held until it settles
+  {
+    const { registry, state, mock } = await makeRig(fakeState({ editBuffer: rawPatch('Current', 1), storeDelayMs: 250 }));
+    const p = await preflightOf(registry);
+    const r = await diag.startCapture(store.defaultStore, registry, { acknowledged: true, steps: ['reloadProbe'], unsavedEdits: 'save', token: p.token }, QUICK);
+    assertEqual(r.code, 202, 'started');
+    const isStore = (f: readonly number[]) => f[5] === 0x01 && f[6] === 0x26;
+    for (let i = 0; i < 50 && !mock.sent.some(isStore); i++) await sleep(5);
+    assert(mock.sent.some(isStore), 'the store is on its way');
+    diag.cancelCapture(registry);
+    await sleep(20);
+    const b = diag.captureResult(registry).body as diag.CaptureBundle;
+    assertEqual(b.state, 'cancelled', 'cancelled');
+    assertEqual(stepOf(b, 'reloadProbe').status, 'aborted', 'step aborted');
+    assertEqual(JSON.stringify(unsavedOf(b).save), JSON.stringify({ slot: 12, pending: true }), 'the save is recorded as pending at the cancel');
+    assertEqual(deviceBusy(registry), 'capture', 'held while the store is still on the link');
+    await diag.capturePromise(registry);
+    assertEqual(deviceBusy(registry), null, 'released once it settled');
+    assertEqual((state.stores ?? []).length, 1, 'the store completed on the device');
+    assertEqual(state.switches.length, 0, 'never switched after the cancel');
+  }
+}
+
+async function unsavedEditsDiscard(): Promise<void> {
+  {
+    const { registry, state } = await makeRig(fakeState({ editBuffer: rawPatch('Current', 1) }));
+    let walks = 0;
+    const b = await decided(registry, 'discard', { steps: ['reloadProbe'], includeFullWalk: true }, { walkImpl: async () => { walks++; return seedRecords(); } });
+    const r = stepOf(b, 'reloadProbe');
+    assertEqual(r.status, 'ok', 'discard → reload probe runs');
+    assertEqual((r.result as { discardedUnsavedEdits: boolean }).discardedUnsavedEdits, true, 'discardedUnsavedEdits recorded');
+    assertEqual(unsavedOf(b).outcome, 'discarded', 'outcome recorded');
+    assertEqual(stepOf(b, 'fullWalk').status, 'ok', 'the full walk runs too');
+    assertEqual(walks, 1, 'one full walk');
+    assertEqual(state.switches.join(','), '12', 'the reload switched (the edits are gone)');
+    assertEqual((state.stores ?? []).length, 0, 'nothing saved');
+    assert(b.logs.some((l) => /preset 12: discarded/.test(l.msg)), 'discard in the job log');
+  }
+  {
+    // unknown state: discard is possible
+    const { registry, state } = await makeRig(fakeState({ headerFor: (n) => (n === 0x3fff ? 12 : n) }));
+    const b = await decided(registry, 'discard');
+    assertEqual(stepOf(b, 'reloadProbe').status, 'ok', 'discard over an unknown edit buffer runs');
+    assertEqual(state.switches.join(','), '12', 'switched');
   }
 }
 
@@ -989,6 +1242,9 @@ export async function runDiagnosticCaptureTests(): Promise<void> {
   await labelProbeNeedsWalk();
   await dumpHeaderProbe();
   await reloadProbe();
+  await unsavedEditsPreflight();
+  await unsavedEditsSave();
+  await unsavedEditsDiscard();
   await fullWalkGate();
   await bundleOnCancel();
   await cancelDuringFullWalk();
