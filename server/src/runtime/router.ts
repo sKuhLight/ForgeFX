@@ -183,6 +183,11 @@ export function createRouter(deps: RuntimeDeps): {
     return r.body;
   });
   on('POST', '/diagnostics/capture/cancel', () => diagnostics.cancelCapture(registry));
+  on('GET', '/diagnostics/capture/preflight', async (c) => {
+    const r = await diagnostics.capturePreflight(registry);
+    c.reply.code(r.code);
+    return r.body;
+  });
   on('GET', '/diagnostics/capture/result', (c) => {
     const r = diagnostics.captureResult(registry);
     c.reply.code(r.code);

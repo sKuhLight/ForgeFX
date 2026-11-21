@@ -13,9 +13,10 @@
 //   dumpHeaderProbe stored-slot dumps (0, 127, 128, last, up to three unused slots) + the edit buffer: which
 //                   preset number each 0x77 header names (dump payloads are never kept)
 //   reloadProbe     re-select the current preset by SysEx and verify the preset number — only when the edit
-//                   buffer provably equals its stored slot (never over unsaved edits)
+//                   buffer provably equals its stored slot, or the user decided what happens to its unsaved
+//                   edits (`unsavedEdits: 'save' | 'discard'`, see GET /diagnostics/capture/preflight)
 //   fullWalk        opt-in; the full walk under every existing gate (fullCapture + verified firmware), and
-//                   only with the same provably clean edit buffer (it reloads the preset after each block)
+//                   under the same edit-buffer rule (it reloads the preset after each block)
 //
 // Mutually exclusive with the device-cache build (services/deviceJobs.ts). A watchdog aborts the run when a
 // walk query would exceed the walk's hard bound or when nothing is received for 60 s while a step runs; an
@@ -99,6 +100,25 @@ export interface CaptureBundle {
 
 /** An HTTP status + JSON body for the (thin) route wrappers. */
 export interface CaptureResult { code: number; body: unknown }
+
+/** What happens to unsaved edits of the edit buffer before a step switches presets (reloadProbe, fullWalk):
+ *  'save' stores them to the current slot first, 'discard' lets the switch throw them away. */
+export type UnsavedEditsDecision = 'save' | 'discard';
+
+/** GET /diagnostics/capture/preflight — the edit-buffer state the run would meet (the same check the steps
+ *  use), so the client can ask the user before a run whose steps switch presets. `presetName` is for that
+ *  question only; it never reaches a bundle. */
+export interface CapturePreflight {
+  preset: number | null;
+  presetName?: string;
+  editBuffer: 'clean' | 'dirty' | 'unknown';
+  reason?: string;
+  /** Only when not clean: 'older-firmware' = the edit buffer's body has another length than the stored slot's
+   *  (the device converted a preset saved under an older firmware when it loaded it). */
+  likelyCause?: 'unsaved-edits' | 'older-firmware' | 'unknown';
+  /** The driver can store to the current slot and the current preset is known. */
+  canSave: boolean;
+}
 
 /** Injectable walk (defaults to the codec's `liveWalkDetailed`, so the bundle carries its reply stats). */
 export type CaptureWalkImpl = (transport: LiveTransport, opts: LiveWalkOptions) => Promise<CacheRecord[] | LiveWalkResult>;
@@ -209,12 +229,17 @@ interface Job {
   finished: boolean;
   /** Work raced against the abort that has not settled yet (a step or liveness check still on the link). */
   inflight: Set<Promise<void>>;
-  /** The run switched presets (reload probe, full-walk reloads): the clients get one 'changed' at the end. */
+  /** The run switched presets (reload probe, full-walk reloads) or stored the edit buffer: the clients get one
+   *  'changed' at the end. */
   switchedPreset: boolean;
+  /** The user's decision on unsaved edits, the preset it was made for, and what came of it. */
+  unsaved: { decision: UnsavedEditsDecision | null; expectedPreset: number | null; outcome: 'saved' | 'discarded' | 'save-failed' | null; error?: string };
   promise: Promise<void>;
 }
 
 const RUNNING = new WeakMap<DeviceRegistry, Job>();
+/** The last preflight's preset per registry: a start's `unsavedEdits` decision is honoured only for it. */
+const PREFLIGHTS = new WeakMap<DeviceRegistry, { preset: number | null }>();
 const LAST = new WeakMap<DeviceRegistry, { bundle: CaptureBundle; status: CaptureStatus }>();
 const TEST_OPTIONS = new WeakMap<DeviceRegistry, CaptureOptions>();
 
@@ -250,8 +275,12 @@ export function captureStatus(registry: DeviceRegistry): CaptureStatus {
 /** POST /diagnostics/capture — body `{ acknowledged: true, steps?, includeFullWalk? }`. 202 started; 400 not
  *  acknowledged / bad steps; 409 busy (a capture or a cache build runs); 503 no device; 501 not a gen-3 unit. */
 export async function startCapture(store: Store, registry: DeviceRegistry, body: unknown, opts: CaptureOptions = {}): Promise<CaptureResult> {
-  const b = (body && typeof body === 'object' ? body : {}) as { acknowledged?: unknown; steps?: unknown; includeFullWalk?: unknown };
+  const b = (body && typeof body === 'object' ? body : {}) as { acknowledged?: unknown; steps?: unknown; includeFullWalk?: unknown; unsavedEdits?: unknown; preset?: unknown };
   if (b.acknowledged !== true) return { code: 400, body: { error: 'not-acknowledged' } };
+  if (b.unsavedEdits !== undefined && b.unsavedEdits !== 'save' && b.unsavedEdits !== 'discard') {
+    return { code: 400, body: { error: 'bad-unsaved-edits', message: "unsavedEdits must be 'save' or 'discard'" } };
+  }
+  const decision: UnsavedEditsDecision | null = b.unsavedEdits === 'save' || b.unsavedEdits === 'discard' ? b.unsavedEdits : null;
   const includeFullWalk = b.includeFullWalk === true;
   const steps = resolveSteps(b.steps, includeFullWalk);
   if (!steps.ok) return { code: 400, body: { error: 'bad-steps', message: steps.message } };
@@ -264,6 +293,9 @@ export async function startCapture(store: Store, registry: DeviceRegistry, body:
   if (!claimDevice(registry, 'capture')) return { code: 409, body: { error: 'busy', what: deviceBusy(registry) ?? 'capture' } };
 
   const merged: CaptureOptions = { ...TEST_OPTIONS.get(registry), ...opts };
+  // the preset the decision was made for: the body's, else the last preflight's (used once)
+  const expectedPreset = typeof b.preset === 'number' && Number.isInteger(b.preset) && b.preset >= 0 ? b.preset : (PREFLIGHTS.get(registry)?.preset ?? null);
+  PREFLIGHTS.delete(registry);
   const now = merged.now ?? Date.now;
   const t0 = now();
   const fw = registry.firmwareInfo();
@@ -292,6 +324,7 @@ export async function startCapture(store: Store, registry: DeviceRegistry, body:
     finished: false,
     inflight: new Set(),
     switchedPreset: false,
+    unsaved: { decision, expectedPreset, outcome: null },
     promise: Promise.resolve()
   };
   job.aborted.catch(() => {}); // raced, never awaited alone
@@ -316,6 +349,34 @@ export function cancelCapture(registry: DeviceRegistry): { ok: true } {
 export function captureResult(registry: DeviceRegistry): CaptureResult {
   const last = LAST.get(registry);
   return last ? { code: 200, body: last.bundle } : { code: 404, body: { error: 'no-result' } };
+}
+
+/** GET /diagnostics/capture/preflight — the edit-buffer state a run would meet (read-only: the current-preset
+ *  read and two dumps). 200 CapturePreflight; 409 busy (a capture or a cache build runs); 503 no device; 501
+ *  not a gen-3 unit. Remembers the preset for the next start's `unsavedEdits` decision. */
+export async function capturePreflight(registry: DeviceRegistry): Promise<CaptureResult> {
+  const busy = RUNNING.has(registry) ? 'capture' : deviceBusy(registry);
+  if (busy) return { code: 409, body: { error: 'busy', what: busy } };
+  const driver = await registry.driver(); // ensure detection ran
+  const model = registry.detectedModelId;
+  if (model < 0) return { code: 503, body: { error: 'no-device' } };
+  if (!diagnosticCaptureSupported(model, registry.activeCapabilities())) return { code: 501, body: { error: 'unsupported', capability: 'diagnosticCapture' } };
+  let eb: EditBufferState;
+  try {
+    eb = await editBufferState(null, driver);
+  } catch (e) {
+    return { code: 503, body: { error: 'device', message: scrub((e as Error).message, null, hostIdentity()) } };
+  }
+  PREFLIGHTS.set(registry, { preset: eb.preset });
+  const out: CapturePreflight = {
+    preset: eb.preset,
+    ...(eb.presetName ? { presetName: eb.presetName } : {}),
+    editBuffer: eb.state,
+    ...(eb.reason ? { reason: eb.reason } : {}),
+    ...(eb.state !== 'clean' ? { likelyCause: eb.likelyCause ?? 'unknown' } : {}),
+    canSave: !!driver.store && eb.preset !== null
+  };
+  return { code: 200, body: out };
 }
 
 export type { DiagnosticUploadMeta } from '../runtime/cloud.js';
@@ -449,6 +510,7 @@ async function runCapture(job: Job): Promise<void> {
     // Not unref'd: while a step hangs on a dead link this timer is what ends the run (cleared in finally).
     watchdog = setInterval(() => checkSilence(job), job.opts.watchdogTickMs ?? DEFAULT_WATCHDOG_TICK_MS);
     log(job, 'info', `capture ${job.id} started: model 0x${job.model.toString(16)}, steps ${job.steps.map((s) => s.name).join(', ')}`);
+    if (job.unsaved.decision) log(job, 'info', `unsaved edits: '${job.unsaved.decision}' for preset ${job.unsaved.expectedPreset ?? 'unknown'} (user decision)`);
     try {
       const t = await raceAbort(job, registry.transport());
       job.transportKind = t.kind;
@@ -736,21 +798,25 @@ async function stepFullWalk(job: Job, step: StepRecord): Promise<StepOutcome> {
   if (!fullCaptureAllowedOnFirmware(job.model, fw)) {
     return { status: 'skipped', note: fw ? `full capture is not verified on firmware ${fw.version}` : 'full capture needs a known firmware version' };
   }
-  // the full walk reloads the current preset after every swept block: never over unsaved edits
-  const eb = await editBufferState(job, driver);
-  if (eb.state !== 'clean') {
-    step.result = { editBuffer: eb.state, ...(eb.reason ? { reason: eb.reason } : {}) };
-    return { status: 'skipped', note: 'unsaved edits' };
-  }
+  // the full walk reloads the current preset after every swept block: never over unsaved edits the user
+  // did not decide about (see switchGate)
+  const gateResult: Record<string, unknown> = {};
+  step.result = gateResult;
+  const gate = await switchGate(job, driver, gateResult);
+  if (!gate.proceed) return gate.outcome;
   throwIfAborted(job);
   // the current preset once more, right before the walk starts reloading it
   const again = await driver.presetRef!();
-  if (again.number !== eb.preset) {
-    step.result = { editBuffer: 'unknown', reason: 'the current preset changed after the check' };
+  if (again.number !== gate.preset) {
+    step.result = { ...gateResult, editBuffer: 'unknown', reason: 'the current preset changed after the check' };
     return { status: 'skipped', note: 'unsaved edits' };
   }
   throwIfAborted(job);
-  return stepWalk(job, step, 'full');
+  try {
+    return await stepWalk(job, step, 'full');
+  } finally {
+    step.result = { editBufferCheck: gateResult, ...((step.result as Record<string, unknown> | undefined) ?? {}) };
+  }
 }
 
 // ── step: labelProbe ──
@@ -956,38 +1022,146 @@ const bytesEqual = (a: Uint8Array, b: Uint8Array) => a.length === b.length && a.
  *  identical body + name). A difference is 'dirty'; anything else (an unknown current preset, a dump named
  *  otherwise, an incomplete or undecodable dump) is 'unknown'. Callers re-check the current preset right
  *  before they switch. */
-async function editBufferState(job: Job, driver: DeviceDriver): Promise<{ state: 'clean' | 'dirty' | 'unknown'; preset: number | null; match?: 'raw' | 'content' | 'none'; reason?: string }> {
-  if (!driver.presetRef || !driver.diagnosticDump) return { state: 'unknown', preset: null, reason: 'no current-preset read or dump on this device' };
+interface EditBufferState {
+  state: 'clean' | 'dirty' | 'unknown';
+  preset: number | null;
+  /** The current preset's name (preflight question only — never put into a bundle). */
+  presetName?: string;
+  match?: 'raw' | 'content' | 'none';
+  reason?: string;
+  /** Not clean: why it likely is not (see CapturePreflight.likelyCause). */
+  likelyCause?: 'unsaved-edits' | 'older-firmware' | 'unknown';
+}
+
+/** Does the edit buffer hold exactly its stored slot (no unsaved edits)? Read-only. 'clean' ONLY when the
+ *  edit-buffer dump arrived whole under an edit-buffer header, the dump of the current slot arrived whole under
+ *  exactly that slot's number, and the two decode to the same patch ('raw' = identical raw patch, 'content' =
+ *  identical body + name). A difference is 'dirty' — likely caused by an older firmware when the two bodies
+ *  differ in length (the device converts such a preset when it loads it), else by unsaved edits; anything
+ *  else (an unknown current preset, a dump named otherwise, an incomplete or undecodable dump) is 'unknown'.
+ *  Callers re-check the current preset right before they switch. `job` null = outside a run (preflight). */
+async function editBufferState(job: Job | null, driver: DeviceDriver): Promise<EditBufferState> {
+  const unknown = (preset: number | null, reason: string, presetName?: string): EditBufferState =>
+    ({ state: 'unknown', preset, ...(presetName ? { presetName } : {}), reason, likelyCause: 'unknown' });
+  if (!driver.presetRef || !driver.diagnosticDump) return unknown(null, 'no current-preset read or dump on this device');
   const ref = await driver.presetRef();
-  if (ref.number < 0) return { state: 'unknown', preset: null, reason: 'current preset unknown' };
-  throwIfAborted(job);
+  if (ref.number < 0) return unknown(null, 'current preset unknown');
+  const presetName = ref.name?.trim() || undefined;
+  if (job) throwIfAborted(job);
   const eb = await driver.diagnosticDump('edit-buffer');
   if (!eb.complete || eb.header === null || !EDIT_BUFFER_HEADERS.includes(eb.header)) {
-    return { state: 'unknown', preset: ref.number, reason: 'the edit-buffer dump did not arrive whole under an edit-buffer header' };
+    return unknown(ref.number, 'the edit-buffer dump did not arrive whole under an edit-buffer header', presetName);
   }
-  throwIfAborted(job);
+  if (job) throwIfAborted(job);
   const slot = await driver.diagnosticDump(ref.number);
   if (!slot.complete || slot.header !== ref.number) {
-    return { state: 'unknown', preset: ref.number, reason: 'the dump of the current slot did not arrive whole under its own number' };
+    return unknown(ref.number, 'the dump of the current slot did not arrive whole under its own number', presetName);
   }
-  if (!eb.patch || !slot.patch) return { state: 'unknown', preset: ref.number, reason: 'a dump could not be decoded' };
-  if (bytesEqual(eb.patch.raw, slot.patch.raw)) return { state: 'clean', preset: ref.number, match: 'raw' };
+  if (!eb.patch || !slot.patch) return unknown(ref.number, 'a dump could not be decoded', presetName);
+  const base = { preset: ref.number, ...(presetName ? { presetName } : {}) };
+  if (bytesEqual(eb.patch.raw, slot.patch.raw)) return { state: 'clean', ...base, match: 'raw' };
   const name = (p: { raw: Uint8Array }) => p.raw.subarray(0x08, 0x28);
-  if (bytesEqual(eb.patch.body, slot.patch.body) && bytesEqual(name(eb.patch), name(slot.patch))) return { state: 'clean', preset: ref.number, match: 'content' };
-  return { state: 'dirty', preset: ref.number, match: 'none' };
+  if (bytesEqual(eb.patch.body, slot.patch.body) && bytesEqual(name(eb.patch), name(slot.patch))) return { state: 'clean', ...base, match: 'content' };
+  return { state: 'dirty', ...base, match: 'none', likelyCause: eb.patch.body.length !== slot.patch.body.length ? 'older-firmware' : 'unsaved-edits' };
+}
+
+/** The edit-buffer facts a step records (never the preset name). */
+function editBufferFacts(eb: EditBufferState): Record<string, unknown> {
+  return {
+    preset: eb.preset, editBuffer: eb.state,
+    ...(eb.match ? { match: eb.match } : {}),
+    ...(eb.reason ? { reason: eb.reason } : {}),
+    ...(eb.likelyCause ? { likelyCause: eb.likelyCause } : {})
+  };
+}
+
+/** Before a step that switches presets (reloadProbe, fullWalk): may the edit buffer be replaced? A clean
+ *  edit buffer may. Otherwise the user's decision applies — only for the preset it was made for (a fresh
+ *  read): 'discard' goes ahead (recorded), 'save' stores the edit buffer to the current slot (the driver's
+ *  store, device acknowledgement included) and the edit buffer must then check clean; a save that fails
+ *  stops every later switching step too (never switch after a failed save). No decision: skipped, as ever.
+ *  Records the facts, the decision and its outcome into `result`. */
+async function switchGate(job: Job, driver: DeviceDriver, result: Record<string, unknown>): Promise<{ proceed: true; preset: number } | { proceed: false; outcome: StepOutcome }> {
+  const eb = await editBufferState(job, driver);
+  Object.assign(result, editBufferFacts(eb));
+  if (eb.state === 'clean' && eb.preset !== null) return { proceed: true, preset: eb.preset };
+  const u = job.unsaved;
+  if (!u.decision) return { proceed: false, outcome: { status: 'skipped', note: 'unsaved edits' } };
+  const rec: Record<string, unknown> = { decision: u.decision };
+  result.unsavedEdits = rec;
+  const stop = (outcome: string, out: StepOutcome) => { rec.outcome = outcome; return { proceed: false as const, outcome: out }; };
+  if (u.outcome === 'save-failed') return stop('save-failed', { status: 'failed', error: u.error ?? 'saving the edit buffer failed earlier in this run' });
+  if (eb.preset === null || u.expectedPreset === null || eb.preset !== u.expectedPreset) {
+    result.reason = 'the current preset changed';
+    log(job, 'warn', `unsaved edits: decision '${u.decision}' was made for preset ${u.expectedPreset ?? 'unknown'}, the current preset is ${eb.preset ?? 'unknown'} — not honoured`);
+    return stop('preset-changed', { status: 'skipped', note: 'the current preset changed' });
+  }
+  if (u.decision === 'discard') {
+    u.outcome = 'discarded';
+    rec.outcome = 'discarded';
+    result.discardedUnsavedEdits = true;
+    log(job, 'info', `unsaved edits on preset ${eb.preset}: discarded (user decision)`);
+    return { proceed: true, preset: eb.preset };
+  }
+  if (u.outcome === 'saved') {
+    u.outcome = 'save-failed';
+    u.error = 'the edit buffer differs from its slot again after saving';
+    return stop('save-failed', { status: 'failed', error: u.error });
+  }
+  if (!driver.store) {
+    u.outcome = 'save-failed';
+    u.error = 'this device cannot save the edit buffer';
+    return stop('save-failed', { status: 'failed', error: u.error });
+  }
+  throwIfAborted(job);
+  const t0 = job.now();
+  let r: { ok: boolean; acked?: boolean; reason?: string; error?: string; warning?: string };
+  try {
+    r = await driver.store(eb.preset);
+  } catch (e) {
+    r = { ok: false, error: (e as Error).message };
+  }
+  job.switchedPreset = true; // a stored slot: the clients refresh once at the end
+  const save = {
+    slot: eb.preset, ok: r.ok, acked: r.acked ?? null, ms: job.now() - t0,
+    ...(r.reason ? { reason: r.reason } : {}),
+    ...(r.error ? { error: scrub(r.error, job.label, job.identity) } : {}),
+    ...(r.warning ? { warning: scrub(r.warning, job.label, job.identity) } : {})
+  };
+  rec.save = save;
+  result.save = save;
+  log(job, r.ok ? 'info' : 'warn', `unsaved edits on preset ${eb.preset}: save ${r.ok ? 'done' : 'failed'} (acknowledged: ${r.acked ?? 'unknown'}, ${save.ms} ms)${r.error ? ` — ${r.error}` : ''}`);
+  if (!r.ok) {
+    u.outcome = 'save-failed';
+    u.error = `saving preset ${eb.preset} failed: ${save.error ?? r.reason ?? 'not confirmed'}`;
+    return stop('save-failed', { status: 'failed', error: u.error });
+  }
+  throwIfAborted(job);
+  const after = await editBufferState(job, driver);
+  rec.afterSave = editBufferFacts(after);
+  if (after.state !== 'clean' || after.preset !== eb.preset) {
+    u.outcome = 'save-failed';
+    u.error = 'the edit buffer does not match its slot after saving';
+    log(job, 'warn', `unsaved edits on preset ${eb.preset}: ${u.error} (${after.state}) — no preset switch`);
+    return stop('save-failed', { status: 'failed', error: u.error });
+  }
+  u.outcome = 'saved';
+  rec.outcome = 'saved';
+  return { proceed: true, preset: eb.preset };
 }
 
 async function stepReloadProbe(job: Job, step: StepRecord): Promise<StepOutcome> {
   const driver = await job.registry.driver();
   if (!driver.selectPreset || !driver.presetRef || !driver.diagnosticDump) return { status: 'skipped', note: 'this device cannot switch presets by SysEx' };
-  const eb = await editBufferState(job, driver);
-  const result: Record<string, unknown> = { preset: eb.preset, editBuffer: eb.state, ...(eb.match ? { match: eb.match } : {}), ...(eb.reason ? { reason: eb.reason } : {}) };
+  const result: Record<string, unknown> = {};
   step.result = result;
-  if (eb.state !== 'clean' || eb.preset === null) return { status: 'skipped', note: 'unsaved edits' };
+  const gate = await switchGate(job, driver, result);
+  if (!gate.proceed) return gate.outcome;
+  const preset = gate.preset;
   throwIfAborted(job);
   // the current preset once more, right before the switch: a front-panel change since the check voids it
   const again = await driver.presetRef();
-  if (again.number !== eb.preset) {
+  if (again.number !== preset) {
     result.editBuffer = 'unknown';
     result.reason = 'the current preset changed after the check';
     return { status: 'skipped', note: 'unsaved edits' };
@@ -995,16 +1169,16 @@ async function stepReloadProbe(job: Job, step: StepRecord): Promise<StepOutcome>
   throwIfAborted(job);
   const t0 = job.now();
   job.switchedPreset = true; // silent here; one 'changed' when the run ends
-  const sw = await driver.selectPreset(eb.preset, { silent: true });
+  const sw = await driver.selectPreset(preset, { silent: true });
   const t1 = job.now();
   const after = await driver.presetRef();
   const t2 = job.now();
   result.switch = { ok: sw.ok, ms: t1 - t0 };
   result.verify = { preset: after.number, ms: t2 - t1 };
-  result.verified = sw.ok && after.number === eb.preset;
+  result.verified = sw.ok && after.number === preset;
   result.totalMs = t2 - t0;
   if (!result.verified) {
-    return { status: 'failed', error: sw.ok ? `the preset number after the switch is ${after.number}, expected ${eb.preset}` : 'the device refused the preset switch' };
+    return { status: 'failed', error: sw.ok ? `the preset number after the switch is ${after.number}, expected ${preset}` : 'the device refused the preset switch' };
   }
   return {};
 }

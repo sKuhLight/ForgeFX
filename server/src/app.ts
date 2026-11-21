@@ -680,6 +680,12 @@ export async function buildApp(registry: DeviceRegistry): Promise<FastifyInstanc
     return r.body;
   });
   app.post('/diagnostics/capture/cancel', () => diagnostics.cancelCapture(registry));
+  // the edit-buffer state a run would meet, so the client can ask about unsaved edits before starting
+  app.get('/diagnostics/capture/preflight', async (_req, reply) => {
+    const r = await diagnostics.capturePreflight(registry);
+    reply.code(r.code);
+    return r.body;
+  });
   app.get('/diagnostics/capture/result', (_req, reply) => {
     const r = diagnostics.captureResult(registry);
     reply.code(r.code);

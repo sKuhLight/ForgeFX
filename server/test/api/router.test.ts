@@ -158,6 +158,8 @@ const ROWS: Row[] = [
   { name: 'diagnostics start with unknown steps (400)', method: 'POST', url: '/diagnostics/capture', body: { acknowledged: true, steps: ['nope'] } },
   { name: 'diagnostics start (501 no diagnosticCapture)', method: 'POST', url: '/diagnostics/capture', body: { acknowledged: true } },
   { name: 'diagnostics cancel (idle)', method: 'POST', url: '/diagnostics/capture/cancel' },
+  { name: 'diagnostics preflight (501 no diagnosticCapture)', method: 'GET', url: '/diagnostics/capture/preflight' },
+  { name: 'diagnostics start with an unknown unsavedEdits (400)', method: 'POST', url: '/diagnostics/capture', body: { acknowledged: true, unsavedEdits: 'keep' } },
   { name: 'diagnostics result (404)', method: 'GET', url: '/diagnostics/capture/result' },
   { name: 'diagnostics upload without consent (400)', method: 'POST', url: '/diagnostics/capture/upload', body: {} },
   { name: 'diagnostics upload without a result (404)', method: 'POST', url: '/diagnostics/capture/upload', body: { consent: true } },
@@ -182,7 +184,7 @@ const ROWS: Row[] = [
 ];
 
 // A capture on a self-describe unit through both surfaces (see diagnosticCaptureRunParity).
-const DIAGNOSTICS_RUN_CASES = 7;
+const DIAGNOSTICS_RUN_CASES = 10;
 // dynamic follow-ups (need the version id from the backup row) + local rows + subscribe + the two
 // firmware-gate twins (full capture on fw 14.0 / unknown firmware) + the running-capture twins = extra cases
 export const ROUTER_PARITY_CASE_COUNT = ROWS.length + 10 + DIAGNOSTICS_RUN_CASES;
@@ -256,10 +258,12 @@ async function diagnosticCaptureRunParity(): Promise<void> {
       assert(started.json.started === true && typeof started.json.id === 'string', `start via ${starter}: { started, id }`);
       same(`busy while running (started via ${starter})`, await both('POST', '/diagnostics/capture', body), 409);
       same(`status while running (started via ${starter})`, await both('GET', '/diagnostics/capture'), 200);
+      same(`preflight while running (started via ${starter})`, await both('GET', '/diagnostics/capture/preflight'), 409);
       same(`cancel (started via ${starter})`, await both('POST', '/diagnostics/capture/cancel'), 200);
       await diagnostics.capturePromise(registry);
     }
     same('status after the run', await both('GET', '/diagnostics/capture'), 200);
+    same('preflight when idle', await both('GET', '/diagnostics/capture/preflight'), 200);
     const result = await both('GET', '/diagnostics/capture/result');
     same('result bundle', result, 200);
     assertEqual((result.app.json as { state: string }).state, 'cancelled', 'the result is the cancelled run');
