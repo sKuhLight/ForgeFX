@@ -20,6 +20,14 @@ below are byte-confirmed against FM3-Edit captures (via the mcp-midi-control cod
 | Switch preset | fn `0x01` sub `0x27` | `preset14 @ pos 6` |
 | Store preset | fn `0x01` sub `0x26` | `preset14 @ pos 6` |
 
+A block can sit in the grid only once. gen-3 `placeCell` reads the grid first and answers **409** (`<block> is already
+placed at row r col c — move it instead`, nothing written) for a block that is already placed at another cell: the device
+echoes such an insert and silently ignores it (no `0x64`), which `ok:true` would have reported as a placement. The same
+block onto its own cell is an `ok:true` no-op; shunts (effect id >= 1024) and clears are not guarded and never read the grid;
+an unreadable grid keeps the old behaviour. On a slow (5-pin DIN) link the guard never starts a dump read of its own: it uses a
+grid read that is already cached or in flight (and taken after the last write), and is skipped otherwise.
+To move a block, clear the source cell first, then place it at the destination.
+
 `eid` = effect id (the block's base id + instance-1). `pid` = parameter index. The value is a
 5-septet float32 — for a knob it's the normalized 0..1 value; for a model/type select it's the
 roster ordinal as a float.

@@ -47,7 +47,7 @@ import { AXEFXGEN1_DESCRIPTOR } from 'forgefx-midi/devices/gen1';
 import { TRANSPORT_TIMEOUT_CODE, isTransportTimeout, type Transport, type Conn, type ConnKind } from '../transport/types.js';
 import { DEFAULT_PROFILE, PROFILES, profileForModel, profileForKey, runtimeProfileFrom, type DeviceProfile } from '../devices.js';
 import { checkProfileSchema } from '../profileSchema.js';
-import { createGen3Driver } from './gen3.js';
+import { createGen3Driver, GEN3_SHUNT_BASE } from './gen3.js';
 import { createAm4Driver, type Am4Driver } from './am4.js';
 import { createGen2Driver } from './gen2.js';
 import { createGen1Driver } from './gen1.js';
@@ -122,8 +122,7 @@ const GEN3_VIRTUAL_EFFECTS: readonly { eid: number; slug: string; name: string }
   { eid: 3, slug: 'modifier', name: 'Modifier' },
   { eid: 199, slug: 'fc', name: 'Footswitches' }
 ];
-// gen-3 grid shunt effect-id base (shunt eids = 1024+); the AM4's linear chain has no shunts.
-const GEN3_SHUNT_BASE = 1024;
+// gen-3 grid shunt effect-id base (GEN3_SHUNT_BASE, shunt eids = 1024+); the AM4's linear chain has no shunts.
 
 // Per-transport-instance idempotency flag for #instrumentTransport (double-wrapping would double-count
 // the fn-0x1F echo guard and silently break front-panel edit reflection).
