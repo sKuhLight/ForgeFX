@@ -27,6 +27,9 @@ function midi(): MidiMod | null {
 export const midiAvailable = (): boolean => midi() !== null;
 
 const SYSEX_START = 0xf0;
+/** Per-frame console trace of every RX/TX frame (hex) — a debugging aid, OFF by default: it floods the log
+ *  and carries frame contents (preset names, dump data) into it. FORGEFX_MIDI_TRACE=1 turns it on. */
+const midiTrace = (): boolean => process.env.FORGEFX_MIDI_TRACE === '1';
 // Fractal-looking MIDI port names (CoreMIDI/ALSA expose the unit by name).
 const FRACTAL_RE = /fractal|axe[ -]?fx|fm[ -]?3|fm[ -]?9|ax8|am[ -]?4|vp4/i;
 
@@ -154,7 +157,7 @@ export class MidiTransport implements Transport {
       if (msg[0] === SYSEX_START) {
         const frame = msg as number[];
         this.#logTap('RX', frame);
-        console.log(`[forgefx][midi] RX ${frame.length}B: ${frame.slice(0, 64).map((b) => b.toString(16).padStart(2, '0')).join(' ')}${frame.length > 64 ? '…' : ''}`);
+        if (midiTrace()) console.log(`[forgefx][midi] RX ${frame.length}B: ${frame.slice(0, 64).map((b) => b.toString(16).padStart(2, '0')).join(' ')}${frame.length > 64 ? '…' : ''}`);
         for (const h of this.#handlers) h(frame);
       }
     });
@@ -197,7 +200,7 @@ export class MidiTransport implements Transport {
   send(bytes: readonly number[]): void {
     if (!this.#out) throw new Error('midi port not open');
     this.#logTap('TX', bytes);
-    console.log(`[forgefx][midi] TX ${bytes.length}B: ${bytes.slice(0, 64).map((b) => b.toString(16).padStart(2, '0')).join(' ')}${bytes.length > 64 ? '…' : ''}`);
+    if (midiTrace()) console.log(`[forgefx][midi] TX ${bytes.length}B: ${bytes.slice(0, 64).map((b) => b.toString(16).padStart(2, '0')).join(' ')}${bytes.length > 64 ? '…' : ''}`);
     this.#out.send([...bytes]);
   }
 
