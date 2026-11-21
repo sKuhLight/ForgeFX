@@ -762,26 +762,44 @@ export class DeviceRegistry {
   }
 
   /** Pause the telemetry supervisor for the duration of an exclusive operation (the device-cache
-   *  self-describe walk saturates the port). Stops the tuner / meters / edit-watch / edit-push and
-   *  returns a resume fn that restarts exactly what was running (respecting the live subscriber count
-   *  + tuner-enabled state). Idempotent-safe: the resume closure captures the paused state. */
+   *  self-describe walk and the diagnostic capture saturate the port, and the capture records the wire).
+   *  Stops the tuner / meters / edit-watch / edit-push and HOLDS them off until the returned resume fn
+   *  runs: while held, nothing restarts them — not a new SSE subscriber, not a re-activated driver, not
+   *  the tuner switched on (its poll waits for the resume). The last resume restarts what was running
+   *  plus whatever the listeners present by then need. The resume fn is idempotent. */
   pauseTelemetry(): () => void {
-    const hadTuner = !!this.#tunerTimer;
-    const hadMeters = !!this.#metersTimer;
-    const hadEditWatch = !!this.#editWatchTimer;
-    const hadEditPush = !!this.#editPushUnsub;
-    if (this.#tunerTimer) { clearTimeout(this.#tunerTimer); this.#tunerTimer = null; }
+    this.#telemetryHolds++;
+    const held = this.#heldLoops;
+    if (this.#tunerTimer) { held.tuner = true; clearTimeout(this.#tunerTimer); this.#tunerTimer = null; }
+    if (this.#metersTimer) held.meters = true;
+    if (this.#editWatchTimer) held.editWatch = true;
+    if (this.#editPushUnsub) held.editPush = true;
     this.#stopMeters();
     this.#stopEditWatch();
     this.#stopEditPush();
+    let resumed = false;
     return () => {
-      if (hadMeters) this.#startMeters();
-      if (hadEditWatch) this.#startEditWatch();
-      if (hadEditPush) this.#startEditPush();
-      // the tuner page is still open (we only paused the poll) — just restart its poll timer.
-      if (hadTuner && this.#tunerDriver && !this.#tunerTimer) this.#tunerTimer = setTimeout(() => this.#pollTuner(), 30);
+      if (resumed) return;
+      resumed = true;
+      this.#telemetryHolds = Math.max(0, this.#telemetryHolds - 1);
+      if (this.#telemetryHolds > 0) return; // another exclusive operation still holds the supervisor
+      const h = this.#heldLoops;
+      this.#heldLoops = { tuner: false, meters: false, editWatch: false, editPush: false };
+      const listening = this.#subscribers.size > 0;
+      if (h.meters || listening) this.#startMeters();
+      if (h.editWatch || listening) this.#startEditWatch();
+      if (h.editPush || listening) this.#startEditPush();
+      // the tuner page is still open (only its poll was held) — just restart the poll timer.
+      if ((h.tuner || this.#tunerPending) && this.#tunerDriver && !this.#tunerTimer) this.#tunerTimer = setTimeout(() => this.#pollTuner(), 30);
+      this.#tunerPending = false;
     };
   }
+  /** Exclusive operations currently holding the supervisor (see pauseTelemetry). */
+  #telemetryHolds = 0;
+  /** The loops that were running when the first hold began (restarted by the last resume). */
+  #heldLoops = { tuner: false, meters: false, editWatch: false, editPush: false };
+  /** The tuner was switched on while held: its poll starts on the last resume. */
+  #tunerPending = false;
 
   /** DEBUG probe: send ONE raw read-only SysEx frame, return every response frame as hex. The probe
    *  policy (sendPolicy.ts) is enforced HERE, before the transport is opened or written: only a
@@ -874,8 +892,10 @@ export class DeviceRegistry {
       // Gen-3 opens/closes a device tuner PAGE; AM4's tuner block (0x0023) is always live, so a
       // readTuner driver skips the page open/close and just runs the poll timer.
       if (!d.readTuner) await dev.sendQueued(buildTunerPageOpen(d.modelId)); // open the tuner page
-      if (!this.#tunerTimer) this.#tunerTimer = setTimeout(() => this.#pollTuner(), 30);
+      if (this.#telemetryHolds > 0) this.#tunerPending = true; // an exclusive operation runs: poll after it
+      else if (!this.#tunerTimer) this.#tunerTimer = setTimeout(() => this.#pollTuner(), 30);
     } else {
+      this.#tunerPending = false;
       if (this.#tunerTimer) {
         clearTimeout(this.#tunerTimer);
         this.#tunerTimer = null;
@@ -894,7 +914,7 @@ export class DeviceRegistry {
   //     590-byte frame, so we read it only once per round-robin cycle (meters are tiny 23-byte reads).
   // Runs while ≥1 SSE client is subscribed AND the active driver's telemetry capability allows it.
   #startMeters() {
-    if (this.#metersTimer) return;
+    if (this.#metersTimer || this.#telemetryHolds > 0) return; // held by an exclusive operation (pauseTelemetry)
     if (this.#active && !this.#active.capabilities.telemetry.outputMeters) return; // no gen-3 meter frames on this device
     this.#metersTimer = setTimeout(() => this.#pollMeters(), this.#cadence().meterTickMs); // primer at the mode's meter tick
   }
@@ -1024,7 +1044,7 @@ export class DeviceRegistry {
   // (FM9 / Axe-Fx III DO push → they use the RX listener path instead; see #startEditPush.)
   #editWatchTimer: ReturnType<typeof setTimeout> | null = null;
   #startEditWatch() {
-    if (this.#editWatchTimer) return;
+    if (this.#editWatchTimer || this.#telemetryHolds > 0) return; // held by an exclusive operation (pauseTelemetry)
     if (this.#active && !this.#active.capabilities.deviceEditWatch) return; // active device doesn't need it
     this.#editWatchTimer = setTimeout(() => this.#pollEditWatch(), this.#cadence().editWatchMs);
   }
@@ -1178,7 +1198,7 @@ export class DeviceRegistry {
   }
 
   #startEditPush() {
-    if (this.#editPushUnsub) return;
+    if (this.#editPushUnsub || this.#telemetryHolds > 0) return; // held by an exclusive operation (pauseTelemetry)
     const t = this.#transport;
     if (!t?.isOpen) return; // not connected yet — #activate re-attaches once detection opens the transport
     if (this.#active && !this.#active.capabilities.deviceEditPush) return; // active device doesn't push
