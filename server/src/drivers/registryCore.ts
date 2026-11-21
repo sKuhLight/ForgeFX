@@ -71,12 +71,13 @@ export function deviceCacheKey(modelId: number, major: number, minor: number): s
  *  end-marker replies are counted as real records), so it runs for a very long time and would write sweep
  *  values to parameters that do not exist. The bounded walk is verified on FM3 13.0. Fractal numbers firmware per model (the Axe-Fx III is on 32.x while the
  *  FM3/FM9 are on 12.x/13.x), so the table is keyed by model byte. A model without an entry is never
- *  allowed. Raise an entry only after a full capture has been verified on that newer version.
+ *  allowed. Add or raise an entry only after a full capture has completed on that model and version.
+ *  The FM9 has NO entry: no full capture has completed on an FM9 yet (the attempts on firmware 12.0
+ *  stopped responding part-way through the walk), so full mode stays off there until one does.
  *  Read-only mode is intentionally NOT governed by this table. */
 export const FULL_CAPTURE_MAX_VERIFIED_FW: Readonly<Record<number, { readonly major: number; readonly minor: number }>> = {
   0x11: { major: 13, minor: 0 }, // FM3 (13.0 verified with the table-end-bounded walk)
-  0x12: { major: 12, minor: 0 }, // FM9
-  0x10: { major: 32, minor: 6 }  // Axe-Fx III
+  0x10: { major: 32, minor: 6 }  // Axe-Fx III (a complete full capture exists on 32.6)
 };
 
 /** Whether FULL-mode capture is permitted for `modelId` on the given running firmware: only a KNOWN,
