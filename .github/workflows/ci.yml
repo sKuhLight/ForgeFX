@@ -38,6 +38,9 @@ jobs:
           cache-dependency-path: |
             ForgeFX/server/package-lock.json
             forgefx-midi/package-lock.json
+      # release.yml stamps pinned siblings with their tag version via this helper — keep it covered.
+      - name: Version-stamp helper self-test
+        run: node ForgeFX/.github/scripts/stamp-sibling-version.mjs --self-test
       - name: Build + test forgefx-midi (golden SysEx suites)
         working-directory: forgefx-midi
         # build BEFORE test: the devices-smoke suite loads the descriptors from dist/
