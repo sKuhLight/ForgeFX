@@ -19,7 +19,9 @@
 //
 // Mutually exclusive with the device-cache build (services/deviceJobs.ts). A watchdog aborts the run when a
 // walk query would exceed the walk's hard bound or when nothing is received for 60 s while a step runs; an
-// abort (or a cancel) ends the run at once, even while a step still waits on the link.
+// abort (or a cancel) publishes the bundle at once, even while a step still waits on the link, but the
+// device (claim + telemetry hold) is released only once that step has let go of it (at most 30 s). The
+// job's own preset switches are silent; a run that switched presets sends the clients one 'changed' at the end.
 // Redaction happens as frames are recorded: preset/scene names are blanked, dump chunks cut to a prefix.
 // Log lines are scrubbed (port, paths, home directory, user and host names, e-mail addresses) and frame
 // dumps are never copied into the job log.
@@ -120,6 +122,8 @@ export interface CaptureOptions {
   emptySearchBudget?: number;
   /** Largest bundle JSON (bytes) before the wire log is trimmed. */
   maxBundleJsonBytes?: number;
+  /** How long an aborted run keeps the device (claim + telemetry hold) for a step still on the link. */
+  releaseGraceMs?: number;
   /** Scrubbed from log lines (defaults to this process's home directory, user and host name). */
   identity?: HostIdentity;
   /** Clock (ms). */
@@ -135,6 +139,9 @@ export const MAX_BUNDLE_JSON_BYTES = 64 * 1024 * 1024;
 const BUNDLE_JSON_MARGIN = 256 * 1024;
 const DEFAULT_SILENCE_MS = 60_000;
 const DEFAULT_WATCHDOG_TICK_MS = 1000;
+/** After an abort the bundle is published at once, but the device stays the job's until the interrupted
+ *  step lets go of the link (a full walk's own closing preset reload included) — at most this long. */
+const DEFAULT_RELEASE_GRACE_MS = 30_000;
 /** Stored slots the header probe may dump looking for unused ones, and how many unused slots it wants. */
 const MAX_EMPTY_SEARCH = 6;
 const EMPTY_SLOTS_WANTED = 3;
@@ -200,6 +207,10 @@ interface Job {
   walk: WalkFindings | null;
   /** The bundle is built: late writes of a step that was still running are ignored. */
   finished: boolean;
+  /** Work raced against the abort that has not settled yet (a step or liveness check still on the link). */
+  inflight: Set<Promise<void>>;
+  /** The run switched presets (reload probe, full-walk reloads): the clients get one 'changed' at the end. */
+  switchedPreset: boolean;
   promise: Promise<void>;
 }
 
@@ -279,6 +290,8 @@ export async function startCapture(store: Store, registry: DeviceRegistry, body:
     identity: merged.identity ?? hostIdentity(),
     walk: null,
     finished: false,
+    inflight: new Set(),
+    switchedPreset: false,
     promise: Promise.resolve()
   };
   job.aborted.catch(() => {}); // raced, never awaited alone
@@ -414,9 +427,12 @@ function abortJob(job: Job, reason: string): void {
 }
 
 /** `p`, or the run's abort — whichever comes first. A step that still waits on the link after an abort
- *  settles on its own later; its result is ignored (the bundle is built from a copy). */
+ *  settles on its own later; its result is ignored (the bundle is built from a copy), but the run keeps the
+ *  device until it has (see `job.inflight`). */
 function raceAbort<T>(job: Job, p: Promise<T>): Promise<T> {
-  p.catch(() => {});
+  const settled: Promise<void> = p.then(() => {}, () => {});
+  job.inflight.add(settled);
+  void settled.then(() => job.inflight.delete(settled));
   return Promise.race([p, job.aborted]);
 }
 
@@ -453,11 +469,32 @@ async function runCapture(job: Job): Promise<void> {
     if (!job.abortReason) abortJob(job, `error: ${(e as Error).message}`);
   } finally {
     if (watchdog) clearInterval(watchdog);
-    for (const stop of [untap, unobserve, resume]) {
+    for (const stop of [untap, unobserve]) {
       try { stop(); } catch { /* one failing cleanup must not keep the bundle from being built */ }
     }
-    finish(job);
+    finish(job); // the result is available now …
+    // … but the device stays the job's (claim + telemetry hold) while an interrupted step is still on the
+    // link — a full walk cancelled mid-sweep restores the preset with its own closing reload — bounded.
+    await releaseWhenIdle(job);
+    try { resume(); } catch { /* the claim is released by the caller regardless */ }
+    if (job.switchedPreset) {
+      // the job's own switches were silent: one refresh for every client, now that the preset is final
+      try { registry.emitEvent({ type: 'changed', scope: 'preset' }); } catch { /* a dead subscriber */ }
+    }
   }
+}
+
+/** Wait until no work of the run is left on the link, at most `releaseGraceMs`; past it, release anyway
+ *  and say so (the console — the job log is closed). */
+async function releaseWhenIdle(job: Job): Promise<void> {
+  if (job.inflight.size === 0) return;
+  const grace = job.opts.releaseGraceMs ?? DEFAULT_RELEASE_GRACE_MS;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const idle = Promise.all([...job.inflight]).then(() => true);
+  const late = new Promise<false>((r) => { timer = setTimeout(() => r(false), grace); });
+  const done = await Promise.race([idle, late]);
+  if (timer) clearTimeout(timer);
+  if (!done) console.warn(`[forgefx] diagnostic capture ${job.id}: an interrupted step still held the link after ${grace} ms; releasing the device`);
 }
 
 type StepOutcome = { status?: 'ok' | 'skipped' | 'failed'; note?: string; error?: string };
@@ -605,7 +642,10 @@ async function stepWalk(job: Job, step: StepRecord, mode: BuildMode): Promise<St
     write = {
       send: (frame) => transport.sendQueued(Array.from(frame)),
       // the job's own reloads stay silent: clients must not reload their views in the middle of the run
-      reloadPreset: () => driver.reloadPreset?.({ silent: true }) ?? Promise.resolve()
+      reloadPreset: () => {
+        job.switchedPreset = true;
+        return driver.reloadPreset?.({ silent: true }) ?? Promise.resolve();
+      }
     };
   }
   const { opts, limits, hinted } = walkSetup(job.store, model, job.fw, mode, {
@@ -954,7 +994,8 @@ async function stepReloadProbe(job: Job, step: StepRecord): Promise<StepOutcome>
   }
   throwIfAborted(job);
   const t0 = job.now();
-  const sw = await driver.selectPreset(eb.preset, { silent: true }); // job-internal: no 'changed' to the clients
+  job.switchedPreset = true; // silent here; one 'changed' when the run ends
+  const sw = await driver.selectPreset(eb.preset, { silent: true });
   const t1 = job.now();
   const after = await driver.presetRef();
   const t2 = job.now();

@@ -12,6 +12,7 @@ import { buildApp } from '../../src/app.js';
 import { __createRegistryForTest, type DeviceRegistry } from '../../src/drivers/registry.js';
 import * as diag from '../../src/services/diagnosticCapture.js';
 import * as deviceCache from '../../src/services/deviceCache.js';
+import { deviceBusy } from '../../src/services/deviceJobs.js';
 import * as store from '../../src/store.js';
 import { buildDefQuery, buildValueQuery, decodeReply, CACHE_SCHEMA, VIEW_DEFINITION, VIEW_ENUM_LABEL, VIEW_VALUE, type CacheRecord, type LiveTransport, type LiveWalkOptions } from 'forgefx-midi/cache';
 import type { DeviceEvent } from '../../src/drivers/types.js';
@@ -21,7 +22,7 @@ import { MockTransport, handshakeReply, isIdentifyBroadcast, assert, assertEqual
 import { fakeCacheDoc, seedRecords } from './device-cache.test.js';
 import { runDiagnosticUpload, type DiagnosticUploadTransport } from '../../src/runtime/cloud.js';
 
-export const DIAGNOSTIC_CAPTURE_CASE_COUNT = 21;
+export const DIAGNOSTIC_CAPTURE_CASE_COUNT = 22;
 
 const FM3 = 0x11;
 const NAME = 'Secret Name';
@@ -430,7 +431,9 @@ async function reloadProbe(): Promise<void> {
     const unsub = registry.subscribe((e) => events.push(e));
     const b = await run(registry, { steps: ['reloadProbe'] });
     unsub();
-    assert(!events.some((e) => e.type === 'changed'), 'the job\'s own preset switch emits no changed event');
+    const changed = events.filter((e) => e.type === 'changed');
+    assertEqual(changed.length, 1, 'the job\'s own switch is silent; ONE changed event when the run ends');
+    assertEqual(JSON.stringify(changed[0]), JSON.stringify({ type: 'changed', scope: 'preset' }), 'a preset refresh');
     const step = stepOf(b, 'reloadProbe');
     assertEqual(step.status, 'ok', 'reload probe ok on a clean edit buffer');
     const r = step.result as { preset: number; editBuffer: string; match: string; verified: boolean; switch: { ok: boolean; ms: number }; totalMs: number };
@@ -442,7 +445,11 @@ async function reloadProbe(): Promise<void> {
   }
   {
     const { registry, state } = await makeRig(fakeState({ editBuffer: rawPatch('Current', 1) }));
+    const events: DeviceEvent[] = [];
+    const unsub = registry.subscribe((e) => events.push(e));
     const b = await run(registry, { steps: ['reloadProbe'] });
+    unsub();
+    assert(!events.some((e) => e.type === 'changed'), 'a run that switched nothing sends no changed event');
     const step = stepOf(b, 'reloadProbe');
     assertEqual(step.status, 'skipped', 'unsaved edits → skipped');
     assertEqual(step.note, 'unsaved edits', 'skip note');
@@ -516,14 +523,14 @@ async function fullWalkGate(): Promise<void> {
     unsub();
     assertEqual(stepOf(b, 'fullWalk').status, 'ok', 'full walk runs on FM3 13.0 with a clean edit buffer');
     assertEqual(mode, 'full', 'the walk ran in full mode');
-    assert(!events.some((e) => e.type === 'changed'), 'the full walk\'s preset reloads emit no changed event');
+    assertEqual(events.filter((e) => e.type === 'changed').length, 1, 'the full walk\'s reloads are silent; ONE changed event at the end');
   }
 }
 
 // ── 7. bundle on cancel ──
 async function bundleOnCancel(): Promise<void> {
   const { registry } = await makeRig();
-  const r = await diag.startCapture(store.defaultStore, registry, { acknowledged: true }, { ...QUICK, walkImpl: stuckWalk });
+  const r = await diag.startCapture(store.defaultStore, registry, { acknowledged: true }, { ...QUICK, walkImpl: stuckWalk, releaseGraceMs: 300 });
   assertEqual(r.code, 202, 'started');
   await sleep(30);
   const st = diag.captureStatus(registry);
@@ -531,8 +538,21 @@ async function bundleOnCancel(): Promise<void> {
   assertEqual(st.steps!.find((s) => s.name === 'readonlyWalk')!.status, 'running', 'walk step running');
   assertEqual(diag.cancelCapture(registry).ok, true, 'cancel ok');
   assertEqual(diag.cancelCapture(registry).ok, true, 'cancel idempotent');
-  const ended = await Promise.race([diag.capturePromise(registry)!.then(() => true), sleep(1000).then(() => false)]);
-  assert(ended, 'a cancel ends the run at once, even while a step is stuck on the link');
+  const released = diag.capturePromise(registry)!;
+  await sleep(20);
+  assertEqual(diag.captureResult(registry).code, 200, 'a cancel publishes the bundle at once, even while a step is stuck on the link');
+  assertEqual(diag.captureStatus(registry).state, 'cancelled', 'status reports the ended run');
+  assertEqual(deviceBusy(registry), 'capture', 'the device stays claimed while the stuck step may still use the link');
+  const warned: string[] = [];
+  const warn = console.warn;
+  console.warn = (...a: unknown[]) => { warned.push(String(a[0])); };
+  try {
+    await released;
+  } finally {
+    console.warn = warn;
+  }
+  assertEqual(deviceBusy(registry), null, 'released after the grace period');
+  assert(warned.some((w) => /still held the link after 300 ms; releasing the device/.test(w)), 'the forced release is logged');
   const b = diag.captureResult(registry).body as diag.CaptureBundle;
   assertEqual(b.state, 'cancelled', 'bundle state cancelled');
   assertEqual(b.abortReason, 'cancelled', 'abort reason cancelled');
@@ -543,6 +563,48 @@ async function bundleOnCancel(): Promise<void> {
   const st2 = diag.captureStatus(registry);
   assertEqual(st2.state, 'cancelled', 'status cancelled');
   assertEqual(st2.resultAvailable, true, 'result available');
+}
+
+// ── 7b. cancel mid full walk: the walk's own closing reload runs after the abort — the device stays the job's
+//     (no build, capture or telemetry in between) until it is done, then ONE changed event ──
+async function cancelDuringFullWalk(): Promise<void> {
+  const { registry, mock, state } = await makeRig(fakeState({ fw: [13, 0] }));
+  const events: DeviceEvent[] = [];
+  const unsub = registry.subscribe((e) => events.push(e)); // would run meters + edit watch once released
+  let reloaded = false;
+  const walk: diag.CaptureWalkImpl = async (_t, o) => {
+    await new Promise<void>((r) => o.signal!.addEventListener('abort', () => r(), { once: true }));
+    await sleep(150); // the codec restores the preset after an abort, too — late
+    await o.write!.reloadPreset();
+    reloaded = true;
+    throw new Error('live walk aborted');
+  };
+  try {
+    const r = await diag.startCapture(store.defaultStore, registry, { acknowledged: true, steps: [], includeFullWalk: true }, { ...QUICK, walkImpl: walk });
+    assertEqual(r.code, 202, 'started');
+    await sleep(40);
+    diag.cancelCapture(registry);
+    await sleep(20);
+    assertEqual(diag.captureResult(registry).code, 200, 'bundle published at once');
+    assertEqual((diag.captureResult(registry).body as diag.CaptureBundle).state, 'cancelled', 'cancelled bundle');
+    assertEqual(reloaded, false, 'the walk is still restoring the preset');
+    const build = await deviceCache.startCacheBuild(store.defaultStore, registry, { walkImpl: seedWalk });
+    assertEqual(JSON.stringify(build.body), JSON.stringify({ error: 'busy', what: 'capture' }), 'no cache build before the preset is restored');
+    assertEqual((await diag.startCapture(store.defaultStore, registry, { acknowledged: true }, QUICK)).code, 409, 'no new capture before the preset is restored');
+    assert(!events.some((e) => e.type === 'changed'), 'no changed event yet');
+    const before = mock.sent.length;
+    await diag.capturePromise(registry);
+    assertEqual(reloaded, true, 'the closing reload ran before the release');
+    const between = mock.sent.slice(before);
+    assert(between.every((f) => f[5] === 0x0d || (f[5] === 0x01 && f[6] === 0x27)), 'only the walk\'s own reload used the link until the release (no telemetry)');
+    assertEqual(state.switches.join(','), '12', 'the preset was restored by its own reload');
+    assertEqual(events.filter((e) => e.type === 'changed').length, 1, 'ONE changed event once the preset is final');
+    assertEqual(deviceBusy(registry), null, 'device released');
+    await sleep(250);
+    assert(mock.sent.length > before + between.length, 'telemetry resumes after the release');
+  } finally {
+    unsub();
+  }
 }
 
 // ── 8. bundle when the device goes silent (liveness check after a failed step) ──
@@ -560,7 +622,7 @@ async function bundleOnSilence(): Promise<void> {
 // ── 9. silence watchdog: no RX for the window while a step runs ──
 async function silenceWatchdog(): Promise<void> {
   const { registry } = await makeRig();
-  const b = await run(registry, { steps: ['readonlyWalk', 'labelProbe'] }, { walkImpl: stuckWalk, silenceMs: 60, watchdogTickMs: 10 });
+  const b = await run(registry, { steps: ['readonlyWalk', 'labelProbe'] }, { walkImpl: stuckWalk, silenceMs: 60, watchdogTickMs: 10, releaseGraceMs: 50 });
   assertEqual(b.abortReason, 'device-silent', 'watchdog aborts on silence, also when the step never returns');
   assertEqual(stepOf(b, 'readonlyWalk').status, 'aborted', 'the waiting step aborted');
   assertEqual(b.state, 'failed', 'state failed');
@@ -929,6 +991,7 @@ export async function runDiagnosticCaptureTests(): Promise<void> {
   await reloadProbe();
   await fullWalkGate();
   await bundleOnCancel();
+  await cancelDuringFullWalk();
   await bundleOnSilence();
   await silenceWatchdog();
   await bundleOnError();
