@@ -3,8 +3,9 @@
 // device answers them.
 //   - gen-3 preset dump: only a whole dump counts (a stalled first attempt's tail never reaches the retry, and
 //     a library scan never shifts slot N's preset into slot N+1); which header is acceptable follows the
-//     per-model DUMP_HEADER_POLICY (FM3 stored slots strict; FM9 / Axe-Fx III and every edit-buffer read prefer
-//     the requested number but fall back, logged once, instead of failing).
+//     per-model DUMP_HEADER_POLICY (FM3 stored slots strict; otherwise prefer the requested number — for the
+//     edit buffer 0x3FFF, 7F 00 or the known current slot — and fall back, logged once, instead of failing,
+//     until a named header has made the connection strict).
 //   - gen-3 block bulk read: only the burst whose 0x74 head names the block counts (another block's late burst
 //     is ignored); a burst whose 0x76 is lost ends after the quiet gap, not the timeout.
 //   - gen-3 preset store: the store-ack wait keeps its timing and outcome on the real queue.
@@ -24,7 +25,7 @@ import { dumpAnswering, assert, assertEqual } from '../helpers/mock.js';
 import { VirtualClock, FakeLink, QueueTransport, track } from '../helpers/virtualLink.js';
 
 // One case = one executed check() (the suite verifies the count itself at the end).
-export const REPLY_MATCHING_CASE_COUNT = 51;
+export const REPLY_MATCHING_CASE_COUNT = 63;
 let executed = 0;
 function check(cond: unknown, msg: string): void {
   executed++;
@@ -169,6 +170,33 @@ async function stalledDumpNeverShiftsSlots(): Promise<void> {
     });
   }
 
+  // FM9 'prefer' never falls back to an EDIT-BUFFER dump for a stored slot: a late grid() dump (header 0x3FFF or
+  // 7F 00) is not backed up as slot 7 — alone it fails the backup; followed by slot 7's own dump, that one is used
+  for (const n of [0x3fff, 0x3f80]) {
+    for (const ownFollows of [false, true]) {
+      const { clock, link, transport } = rig();
+      const driver = gen3Over(transport, null, FM9);
+      link.device = (bytes, at) => {
+        if (bytes[5] !== 0x03) return;
+        dumpNaming(FM9_FIXTURE, n).forEach((f, i) => link.emitAt(at + 10 + i, f)); // the late grid() dump
+        if (ownFollows) dumpNaming(FM9_FIXTURE, 7).forEach((f, i) => link.emitAt(at + 100 + i, f));
+      };
+      await quietly(async (logged) => {
+        const p = track(clock, driver.backupPreset(7));
+        await clock.advanceTo(40_000);
+        const tag = `0x${n.toString(16)}${ownFollows ? ', then slot 7' : ' only'}`;
+        check(
+          ownFollows
+            ? p.done && !p.error && headerSlot(p.value!.bytes) === 7 && p.at === 100 + FM9_FIXTURE.length - 1
+            : p.done && !!p.error && !logged.some((l) => /header names the edit buffer/.test(l)),
+          ownFollows
+            ? `dump (FM9 prefer): a late edit-buffer dump (${tag}) is skipped and slot 7's own dump is backed up (at ${p.at})`
+            : `dump (FM9 prefer): a late edit-buffer dump (${tag}) is never backed up as slot 7 — the backup fails instead`
+        );
+      });
+    }
+  }
+
   // a late WHOLE dump of slot 5 arrives first, then slot 6's own dump: slot 6 on both policies
   for (const [model, frames, label] of [[FM3, FIXTURE, 'FM3 strict'], [FM9, FM9_FIXTURE, 'FM9 prefer']] as const) {
     const { clock, link, transport } = rig();
@@ -185,34 +213,75 @@ async function stalledDumpNeverShiftsSlots(): Promise<void> {
     });
   }
 
-  // edit-buffer reads (grid(), presetBodyHex): a late stored-slot dump never answers them by itself
-  {
-    const { clock, link, transport } = rig();
-    const driver = gen3Over(transport);
-    link.device = (bytes, at) => {
-      if (bytes[5] !== 0x03) return;
-      dumpNaming(FIXTURE, 5).forEach((f, i) => link.emitAt(at + 10 + i, f)); // a late scan reply
-      dumpNaming(FIXTURE, 0x3fff).forEach((f, i) => link.emitAt(at + 100 + i, f)); // the edit buffer
-    };
-    await quietly(async () => {
-      const p = track(clock, driver.dumpRaw(0x3fff)); // the same reader grid() uses
-      await clock.advanceTo(3000);
-      check(p.done && !p.error && headerSlot(p.value!.bytes) === 0x3fff, 'edit buffer: the dump naming the edit buffer wins over a late stored-slot dump');
-    });
+  // edit-buffer reads (grid(), presetBodyHex): the header names the edit buffer as 0x3FFF or 7F 00 (0x3F80 —
+  // what the FM3 sends on fw 13.0); either completes the read at its terminator, on every model, and a late
+  // stored-slot dump never answers the read by itself
+  for (const [model, frames, label] of [[FM3, FIXTURE, 'FM3'], [FM9, FM9_FIXTURE, 'FM9']] as const) {
+    for (const n of [0x3fff, 0x3f80]) {
+      const { clock, link, transport } = rig();
+      const driver = gen3Over(transport, null, model);
+      link.device = (bytes, at) => {
+        if (bytes[5] !== 0x03) return;
+        dumpNaming(frames, 5).forEach((f, i) => link.emitAt(at + 10 + i, f)); // a late scan reply
+        dumpNaming(frames, n).forEach((f, i) => link.emitAt(at + 100 + i, f)); // the edit buffer
+      };
+      await quietly(async (logged) => {
+        const p = track(clock, driver.dumpRaw(0x3fff)); // the same reader grid() uses
+        await clock.advanceTo(3000);
+        check(
+          p.done && !p.error && headerSlot(p.value!.bytes) === n && p.at === 100 + frames.length - 1 && !logged.some((l) => /header names/.test(l)),
+          `edit buffer (${label}): a header of 0x${n.toString(16)} names the edit buffer — used at its terminator, no quiet-gap wait, no log (at ${p.at})`
+        );
+      });
+    }
   }
   {
-    // ... but when the device's edit-buffer reply names a stored slot, the read still works (after the quiet
-    // gap, logged once) instead of failing
+    // FM3: the real 7F 00 reply through grid() — no +180 ms
     const { clock, link, transport } = rig();
     const driver = gen3Over(transport);
     link.device = (bytes, at) => {
-      if (bytes[5] === 0x03) dumpNaming(FIXTURE, 5).forEach((f, i) => link.emitAt(at + 10 + i, f));
+      if (bytes[5] === 0x03) dumpAnswering(bytes, FIXTURE).forEach((f, i) => link.emitAt(at + 10 + i, f)); // 7F 00
+    };
+    await quietly(async () => {
+      const p = track(clock, driver.grid());
+      await clock.advanceTo(3000);
+      check(p.done && !p.error && (p.value?.cells.length ?? 0) > 0 && p.at === 10 + FIXTURE.length - 1, `edit buffer (FM3): grid() decodes the 7F 00 reply at its terminator (at ${p.at})`);
+    });
+  }
+  for (const [model, frames, label] of [[FM3, FIXTURE, 'FM3'], [FM9, FM9_FIXTURE, 'FM9']] as const) {
+    // an edit-buffer reply naming only a stored slot (current slot unknown) — another firmware's convention, say:
+    // used after one quiet gap and logged, never a failed read
+    const { clock, link, transport } = rig();
+    const driver = gen3Over(transport, null, model);
+    link.device = (bytes, at) => {
+      if (bytes[5] === 0x03) dumpNaming(frames, 5).forEach((f, i) => link.emitAt(at + 10 + i, f));
     };
     await quietly(async (logged) => {
       const p = track(clock, driver.grid());
+      await clock.advanceTo(30_000);
+      check(
+        p.done && !p.error && p.at === 10 + frames.length - 1 + 180 && logged.some((l) => /edit buffer read answered by a dump whose header names slot 5/.test(l)),
+        `edit buffer (${label} prefer): a reply naming only stored slot 5 is used after the quiet gap and logged, not failed (at ${p.at})`
+      );
+    });
+  }
+  {
+    // FM3: once the device has answered an edit-buffer read with 7F 00 on this connection, edit-buffer reads
+    // are strict there — a later reply naming only a stored slot is no longer used
+    const { clock, link, transport } = rig();
+    const driver = gen3Over(transport);
+    let reads = 0;
+    link.device = (bytes, at) => {
+      if (bytes[5] !== 0x03) return;
+      const n = reads++ === 0 ? 0x3f80 : 5;
+      dumpNaming(FIXTURE, n).forEach((f, i) => link.emitAt(at + 10 + i, f));
+    };
+    await quietly(async () => {
+      const first = track(clock, driver.dumpRaw(0x3fff));
       await clock.advanceTo(3000);
-      check(p.done && !p.error && (p.value?.cells.length ?? 0) > 0 && p.at === 10 + FIXTURE.length - 1 + 180, `edit buffer: a stored-slot header is used after the quiet gap if nothing names the edit buffer (at ${p.at})`);
-      check(logged.some((l) => /edit buffer read answered by a dump whose header names slot 5/.test(l)), 'edit buffer: and logged, as evidence for the header policy');
+      const second = track(clock, driver.dumpRaw(0x3fff));
+      await clock.advanceTo(40_000);
+      check(first.done && !first.error && second.done && !!second.error, 'edit buffer (FM3): a 7F 00 header promotes the connection to strict — a later stored-slot-only reply is refused');
     });
   }
 }
@@ -451,30 +520,31 @@ async function headerPolicyAdapts(): Promise<void> {
 
   // edit buffer: once the driver knows the current slot, a header naming it is the edit buffer's own (no
   // quiet-gap wait); a stored-slot header naming anything else still is not
-  for (const knows of [false, true]) {
+  for (const [model, frames, knows] of [[FM9, FM9_FIXTURE, false], [FM9, FM9_FIXTURE, true], [FM3, FIXTURE, true], [FM3, FIXTURE, false]] as const) {
+    const label = model === FM3 ? 'FM3' : 'FM9';
     const { clock, link, transport } = rig();
-    const driver3 = gen3Over(transport);
+    const driver3 = gen3Over(transport, null, model);
     let dumpAt = -1;
     link.device = (bytes, at) => {
       if (bytes[5] !== 0x03) return;
       dumpAt = at;
-      dumpNaming(FIXTURE, 9).forEach((f, i) => link.emitAt(at + 10 + i, f)); // a late scan reply
-      dumpNaming(FIXTURE, 5).forEach((f, i) => link.emitAt(at + 60 + i, f)); // the edit buffer, naming slot 5
+      dumpNaming(frames, 9).forEach((f, i) => link.emitAt(at + 10 + i, f)); // a late scan reply
+      dumpNaming(frames, 5).forEach((f, i) => link.emitAt(at + 60 + i, f)); // the edit buffer, naming slot 5
     };
     await quietly(async () => {
       if (knows) {
         const sel = track(clock, driver3.selectPreset(5)); // silent accept → current slot 5
         await clock.advanceTo(clock.t + 500);
-        check(sel.done && sel.value?.ok === true, 'edit buffer: selectPreset(5) accepted');
+        check(sel.done && sel.value?.ok === true, `edit buffer (${label}): selectPreset(5) accepted`);
       }
       const p = track(clock, driver3.dumpRaw(0x3fff)); // the reader grid() uses
-      await clock.advanceTo(clock.t + 5000);
-      const terminatorAt = dumpAt + 60 + FIXTURE.length - 1;
+      await clock.advanceTo(clock.t + 30_000);
+      const terminatorAt = dumpAt + 60 + frames.length - 1;
       check(
         p.done && !p.error && headerSlot(p.value!.bytes) === 5 && p.at === (knows ? terminatorAt : terminatorAt + 180),
         knows
-          ? `edit buffer: with the current slot known (5), its header is accepted at the terminator — no +180 ms (at ${p.at - dumpAt})`
-          : `edit buffer: without it, today's behaviour — the last whole dump after the quiet gap (at ${p.at - dumpAt})`
+          ? `edit buffer (${label}): with the current slot known (5), its header is accepted at the terminator — no +180 ms (at ${p.at - dumpAt})`
+          : `edit buffer (${label}): without it, the last whole dump after the quiet gap (at ${p.at - dumpAt})`
       );
     });
   }
