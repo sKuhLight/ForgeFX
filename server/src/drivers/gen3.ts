@@ -35,7 +35,7 @@ import { isTransportTimeout, type Transport } from '../transport/types.js';
 import { SLUG_FAMILY, PROFILES, type DeviceProfile, type TypeModel, type DeviceLayout, type SelectorValues } from '../devices.js';
 import { EmptyPresetError } from './types.js';
 import type {
-  DeviceDriver, DriverCapabilities, DriverCtx, DiagnosticDump,
+  DeviceDriver, DriverCapabilities, DriverCtx, DiagnosticDump, SelectPresetOpts,
   PresetGridDTO, PresetBlockDTO, PresetSummary, NamedParam, EnumParam, MeterVal,
   FcSwitchState, FcReadState, StoreReason
 } from './types.js';
@@ -1837,20 +1837,20 @@ class Gen3Driver implements DeviceDriver {
     this.#emit({ type: 'changed', scope: 'grid' });
     return r;
   }
-  async selectPreset(n: number) {
+  async selectPreset(n: number, opts?: SelectPresetOpts) {
     this.#gridCache = null;
     const r = await this.#write(this.#codec.buildSwitchPresetSysEx(n));
     if (r.ok) this.#session(await this.#conn()).currentSlot = n; // the edit buffer now holds slot n
     else if (this.#sessionState) this.#sessionState.currentSlot = null; // refused: no longer sure
-    this.#emit({ type: 'changed', scope: 'preset' });
+    if (!opts?.silent) this.#emit({ type: 'changed', scope: 'preset' });
     return r;
   }
   /** Reload the CURRENT preset from flash by re-selecting it — the FULL-mode self-describe walk's
    *  non-destructive per-block safety net. Reuses presetRef() (current number) + selectPreset() (the
    *  wire builder), so no new preset-switch bytes are minted here. No-op when no preset is resolvable. */
-  async reloadPreset(): Promise<void> {
+  async reloadPreset(opts?: SelectPresetOpts): Promise<void> {
     const { number } = await this.presetRef();
-    if (number >= 0) await this.selectPreset(number);
+    if (number >= 0) await this.selectPreset(number, opts);
   }
   /** The store-ack evidence in force right now: an injected level wins, else the model's table entry narrowed
    *  to this link (`slow`) and the firmware the registry read at detect time (see `resolveStoreAck`). */
