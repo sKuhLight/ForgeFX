@@ -1,13 +1,19 @@
 // The REAL serial and USB-MIDI transports wired to the shared request queue — with fake ports (no hardware,
 // no native port opened): the serial transport drops a stale partial frame before each request, a paced send
 // that loses its port mid-pump fails instead of hanging the queue, and MIDI requests run on the same queue
-// (a late reply is swallowed, not handed to the next request). Real timers, short windows.
+// (a late reply is swallowed, not handed to the next request), and the registry wrapped around them counts
+// and records every frame exactly once (traffic counters, the diagnostic capture's wire log). Real timers,
+// short windows.
 import { FractalSerial, type SerialPortLike } from '../../src/transport/serial.js';
 import { MidiTransport, type MidiMod } from '../../src/transport/midi.js';
-import { assert, assertEqual } from '../helpers/mock.js';
+import { assert, assertEqual, handshakeReply } from '../helpers/mock.js';
+import { __createRegistryForTest, type DeviceRegistry } from '../../src/drivers/registry.js';
+import type { Transport } from '../../src/transport/types.js';
+import * as diag from '../../src/services/diagnosticCapture.js';
+import * as store from '../../src/store.js';
 
 // One case = one executed check() (the suite verifies the count itself at the end).
-export const TRANSPORT_WIRING_CASE_COUNT = 10;
+export const TRANSPORT_WIRING_CASE_COUNT = 24;
 let executed = 0;
 function check(cond: unknown, msg: string): void {
   executed++;
@@ -54,8 +60,11 @@ class FakeSerialPort implements SerialPortLike {
     if (event === 'data') this.#onData = listener as (buf: Buffer) => void;
     return this;
   }
+  /** Plays the device: sees every write (one whole frame per send on this transport). */
+  onWrite?: (bytes: number[]) => void;
   write(data: Buffer): boolean {
     this.written.push([...data]);
+    this.onWrite?.([...data]);
     return true;
   }
   close(callback: () => void): void {
@@ -158,6 +167,101 @@ async function midiUsesTheQueue(): Promise<void> {
   check(closed.error instanceof Error, 'midi: a request on a closed port fails fast');
 }
 
+// ── the registry over the REAL transports: each frame counted and recorded exactly once ──
+
+/** The replies of a synthetic FM3 (identify, firmware, current-preset name, a no-payload definition reply). */
+function fm3Reply(b: readonly number[]): number[] | null {
+  if (b[4] === 0x7f && b[5] === 0x00) return handshakeReply(MODEL);
+  if (b[5] === 0x08) return sysex(0x08, [13, 0, 0, 0]);
+  if (b[5] === 0x0d) return sysex(0x0d, [12, 0, ...new Array<number>(32).fill(0x20)]);
+  if (b[5] === 0x01 && b[6] === 0x1c) return sysex(0x01, [0x1c, 0, 0x01, b[9]!, b[10]!, b[11]!, 0x40, 0, 0, 0, 0, 0, 0, 0, 0]);
+  return null;
+}
+
+/** A test registry over `t` that never enumerates real ports. */
+function registryOver(t: Transport): DeviceRegistry {
+  return __createRegistryForTest({
+    resolveConn: async () => ({ transport: t.kind, id: t.label }),
+    openConn: () => t,
+    listConnections: async () => [],
+    midiAvailable: () => false,
+    getConnOverride: () => null,
+    getProfileOverride: () => null,
+    autoDetectPath: () => null
+  });
+}
+
+async function observe(reg: DeviceRegistry, run: () => Promise<unknown>): Promise<{ tx: number; rx: number; traffic: { tx: number; rx: number } }> {
+  const seen = { tx: 0, rx: 0 };
+  const before = (await reg.diagnostics()).traffic as { txMsgs: number; rxMsgs: number };
+  const stop = reg.addFrameObserver((dir) => { if (dir === 'TX') seen.tx++; else seen.rx++; });
+  try { await run(); } finally { stop(); }
+  const after = (await reg.diagnostics()).traffic as { txMsgs: number; rxMsgs: number };
+  return { ...seen, traffic: { tx: after.txMsgs - before.txMsgs, rx: after.rxMsgs - before.rxMsgs } };
+}
+
+async function serialRegistryCountsOnce(): Promise<void> {
+  let port: FakeSerialPort | null = null;
+  const serial = new FractalSerial({ path: 'FAKE-SERIAL', openPort: (_o, onOpen) => (port = new FakeSerialPort(onOpen)) });
+  const reg = registryOver(serial);
+  const t = await reg.transport();
+  port!.onWrite = (b) => { const r = fm3Reply(b); if (r) setImmediate(() => port!.feed(r)); };
+  const written = port!.written.length;
+  const req = await observe(reg, () => t.request(REQ_STATUS, { timeoutMs: 500, quietMs: 20, match: byFn(0x0d) }));
+  check(req.tx === 1 && req.rx === 1, `serial: a request is recorded once each way (TX ${req.tx}, RX ${req.rx})`);
+  check(req.traffic.tx === 1 && req.traffic.rx === 1, `serial: and counted once each way (TX ${req.traffic.tx}, RX ${req.traffic.rx})`);
+  const q = await observe(reg, () => t.sendQueued(sysex(0x0a, [1, 0, 1]), 5));
+  check(q.tx === 1 && q.traffic.tx === 1, `serial: a queued send is recorded and counted once (${q.tx}/${q.traffic.tx})`);
+  const s = await observe(reg, async () => { t.send(sysex(0x0a, [1, 0, 0])); });
+  check(s.tx === 1 && s.traffic.tx === 1, 'serial: a direct send is recorded and counted once');
+  const two = await observe(reg, () => Promise.all([
+    t.request(REQ_STATUS, { timeoutMs: 500, quietMs: 20, match: byFn(0x0d) }),
+    t.request(REQ_STATUS, { timeoutMs: 500, quietMs: 20, match: byFn(0x0d) })
+  ]));
+  check(two.tx === 2 && two.traffic.tx === 2, `serial: two identical queued requests are two frames, not four (${two.tx})`);
+  check(port!.written.length - written === 5, 'serial: five frames reached the port');
+  await serial.close();
+}
+
+async function midiRegistryCountsOnce(): Promise<void> {
+  const { mod, inst } = fakeMidi();
+  const midi = new MidiTransport('Fractal FM3 MIDI In', 'Fractal FM3 MIDI Out', mod);
+  const reg = registryOver(midi);
+  const t = await reg.transport();
+  inst.out!.onSend = (m) => { const r = fm3Reply(m); if (r) setImmediate(() => inst.in!.emit(r)); };
+  const req = await observe(reg, () => t.request(REQ_STATUS, { timeoutMs: 500, quietMs: 20, match: byFn(0x0d) }));
+  check(req.tx === 1 && req.rx === 1, `midi: a request is recorded once each way (TX ${req.tx}, RX ${req.rx})`);
+  check(req.traffic.tx === 1 && req.traffic.rx === 1, 'midi: and counted once each way');
+  const q = await observe(reg, () => t.sendQueued(sysex(0x0a, [1, 0, 1]), 5));
+  check(q.tx === 1 && q.traffic.tx === 1, 'midi: a queued send is recorded and counted once');
+  check(inst.out!.sent.length === 2, 'midi: two frames reached the port');
+  await midi.close();
+}
+
+/** A diagnostic capture over the real serial transport: its wire log holds each frame exactly once. */
+async function captureLogsEachFrameOnce(): Promise<void> {
+  let port: FakeSerialPort | null = null;
+  const serial = new FractalSerial({ path: 'FAKE-SERIAL', openPort: (_o, onOpen) => (port = new FakeSerialPort(onOpen)) });
+  const reg = registryOver(serial);
+  await reg.transport();
+  let fed = 0;
+  port!.onWrite = (b) => { const r = fm3Reply(b); if (r) { fed++; setImmediate(() => port!.feed(r)); } };
+  await reg.detect();
+  const written = port!.written.length;
+  fed = 0;
+  const r = await diag.startCapture(store.defaultStore, reg, { acknowledged: true, steps: ['info'] }, { versions: { forgefx: 'wiring' } });
+  check(r.code === 202, 'capture: started over the real serial transport');
+  await diag.capturePromise(reg);
+  const b = diag.captureResult(reg).body as diag.CaptureBundle;
+  const tx = b.frames.filter((f) => f.dir === 'TX');
+  const rx = b.frames.filter((f) => f.dir === 'RX');
+  const wire = port!.written.length - written;
+  check(wire > 0 && tx.length === wire, `capture: one TX entry per frame on the wire (TX ${tx.length}, wire ${wire})`);
+  check(rx.length === fed, `capture: one RX entry per reply (RX ${rx.length}, replies ${fed})`);
+  check(tx.every((f, i) => i === 0 || f.hex !== tx[i - 1]!.hex), 'capture: no doubled TX entries');
+  await serial.close();
+}
+
 export async function runTransportWiringTests(): Promise<void> {
   executed = 0;
   const log = console.log;
@@ -168,6 +272,9 @@ export async function runTransportWiringTests(): Promise<void> {
     await serialDropsStalePartialFrame();
     await serialPacedSendCloses();
     await midiUsesTheQueue();
+    await serialRegistryCountsOnce();
+    await midiRegistryCountsOnce();
+    await captureLogsEachFrameOnce();
   } finally {
     console.log = log;
     console.warn = warn;

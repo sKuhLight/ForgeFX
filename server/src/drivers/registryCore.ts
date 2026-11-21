@@ -1122,7 +1122,8 @@ export class DeviceRegistry {
 
   /** Wrap a freshly-opened transport with: (1) the edit-push ECHO GUARD — each in-flight fn-0x1F
    *  bulk-read (bytes[5]===0x1f) bumps #pendingBulkReads so the edit-push listener drops our own poll
-   *  replies; (2) TX traffic counting on every outgoing frame (send/sendQueued/sendPaced/request);
+   *  replies; (2) TX traffic counting (and frame observing) on every outgoing frame, exactly once each
+   *  (send/sendQueued/sendPaced/request — a request's own send() is not counted again);
    *  (3) ONE persistent onFrame handler for RX counting; (4) an all-requests in-flight counter for the
    *  interactive-yield logic. IDEMPOTENT per transport instance (a Symbol flag) so a re-wrap is a
    *  no-op — double-wrapping would double-count the echo guard and silently break edit reflection. */
@@ -1137,21 +1138,60 @@ export class DeviceRegistry {
       if (this.#frameObservers.size > 0) this.#observeFrame('TX', bytes);
     };
 
+    // A frame handed to request()/sendQueued() is counted ONCE, when it is handed over. The serial and MIDI
+    // transports put it on the wire later through their own send() — the wrapped one below, since their
+    // queues call `this.send` — so the hand-over leaves a token per frame and the wrapped send consumes a
+    // matching token instead of counting the frame again. A token the transport never consumed (it wrote to
+    // its port another way, as the mocks do) is dropped when the call settles.
+    const handedOver = new Map<string, { consumed: boolean }[]>();
+    const keyOf = (bytes: readonly number[]) => bytes.join(',');
+    const handOver = (bytes: readonly number[]): (() => void) => {
+      countTx(bytes);
+      const key = keyOf(bytes);
+      const token = { consumed: false };
+      const list = handedOver.get(key);
+      if (list) list.push(token);
+      else handedOver.set(key, [token]);
+      return () => {
+        if (token.consumed) return;
+        const l = handedOver.get(key);
+        const i = l ? l.indexOf(token) : -1;
+        if (i >= 0) l!.splice(i, 1);
+        if (l && l.length === 0) handedOver.delete(key);
+      };
+    };
+    const consumeHandedOver = (bytes: readonly number[]): boolean => {
+      if (handedOver.size === 0) return false;
+      const key = keyOf(bytes);
+      const l = handedOver.get(key);
+      if (!l?.length) return false;
+      l.shift()!.consumed = true;
+      if (l.length === 0) handedOver.delete(key);
+      return true;
+    };
+
     const origRequest = t.request.bind(t);
     t.request = (bytes, opts) => {
-      countTx(bytes);
+      const settle = handOver(bytes);
       this.#inFlightRequests++;
       const bulk = bytes[5] === 0x1f; // only a bulk read can elicit a 0x74 burst → echo guard counts it
       if (bulk) this.#pendingBulkReads++;
       return origRequest(bytes, opts).catch((e: unknown) => { throw withTimeoutCode(e); }).finally(() => {
+        settle();
         this.#inFlightRequests = Math.max(0, this.#inFlightRequests - 1);
         if (bulk) this.#pendingBulkReads = Math.max(0, this.#pendingBulkReads - 1);
       });
     };
     const origSend = t.send.bind(t);
-    t.send = (bytes) => { countTx(bytes); return origSend(bytes); };
+    t.send = (bytes) => {
+      if (!consumeHandedOver(bytes)) countTx(bytes); // a request's / queued send's own frame is counted already
+      return origSend(bytes);
+    };
     const origSendQueued = t.sendQueued.bind(t);
-    t.sendQueued = (bytes, settleMs) => { countTx(bytes); return origSendQueued(bytes, settleMs); };
+    t.sendQueued = (bytes, settleMs) => {
+      const settle = handOver(bytes);
+      return origSendQueued(bytes, settleMs).finally(settle);
+    };
     if (t.sendPaced) {
       const origSendPaced = t.sendPaced.bind(t);
       t.sendPaced = (bytes, chunk, delayMs) => { countTx(bytes); return origSendPaced(bytes, chunk, delayMs); };
