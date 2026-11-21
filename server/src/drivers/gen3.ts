@@ -419,6 +419,48 @@ export function knobParams(profile: DeviceProfile, family: string): FamilyParam[
   });
 }
 
+/** Selectors whose range row is a FLOAT row although the device ships a label list for them. The codec
+ *  reports these under unit 'enum' (a device label list makes a param a selector), which keeps them out of
+ *  the knobs (isKnobParam) while the enum list only looked at enum-kind rows: they listed nowhere and the
+ *  block editor lost the control. Today that is the Axe-Fx III's 13 `*_GLOBALMIX` toggles (OFF / ON over a
+ *  0..1 float row; they were dials while the catalog still read them as 'percent').
+ *
+ *  Deliberately a narrow, named class and not "every float row with labels": that wider set also holds
+ *  selectors that were never shown (KILLDRY, GLOBAL_IRCAPTURE_PROCESS, the bypass flags) and admitting them
+ *  is a separate decision. The structural guards below make sure a later catalog change cannot turn a
+ *  non-selector into an enum through this name alone. */
+const FLOAT_ROW_SELECTOR_NAME = /_GLOBALMIX$/;
+
+/** Is this catalog param a float-row selector (see FLOAT_ROW_SELECTOR_NAME): the 'enum' unit, a named
+ *  class member, and a device label list that covers the row's integral span exactly (0..1 -> 2 labels).
+ *  The writes are the existing discrete path: float32(ordinal), which is also how the codec routes a
+ *  param that carries a label list. */
+function isFloatRowSelector(profile: DeviceProfile, family: string, p: FamilyParam): boolean {
+  if (p.unit !== 'enum' || !FLOAT_ROW_SELECTOR_NAME.test(p.name)) return false;
+  const range = profile.ranges[family]?.[p.paramId];
+  if (range?.kind !== 'float') return false;
+  if (!Number.isInteger(range.displayMin) || !Number.isInteger(range.displayMax) || range.displayMax <= range.displayMin) return false;
+  const labels = profile.enumLabelsFor(family, p.paramId);
+  return !!labels?.length && labels.length === range.displayMax - range.displayMin + 1;
+}
+
+/** The family's enum (selector) params for the block editor: every param whose device range row is an
+ *  enum with a usable span, plus the float-row selectors (isFloatRowSelector, one per wire paramId, first
+ *  wins like knobParams). The family TYPE selector (`typeId`, shown by the header retype palette) and the
+ *  raw bypass flag are left out. Exported for the per-device classification test. */
+export function enumParams(profile: DeviceProfile, family: string, typeId?: number): FamilyParam[] {
+  const floatSelectorIds = new Set<number>();
+  return (profile.params[family] ?? []).filter((p) => {
+    const range = profile.ranges[family]?.[p.paramId];
+    if (p.paramId === typeId) return false;
+    if (/^bypass$/i.test(p.displayLabel ?? p.name)) return false;
+    if (range?.kind === 'enum') return range.displayMax > range.displayMin;
+    if (!isFloatRowSelector(profile, family, p) || floatSelectorIds.has(p.paramId)) return false;
+    floatSelectorIds.add(p.paramId);
+    return true;
+  });
+}
+
 /** Append 1/2/3… to labels that repeat within a list (e.g. the cab's four "Low Cut" mic params),
  * so the UI can tell otherwise-identical controls apart. Mutates the items' `name`. */
 function dedupeLabels(items: { name: string }[]): void {
@@ -1038,15 +1080,10 @@ class Gen3Driver implements DeviceDriver {
     // params are dropped: no range (min===max) or the bypass flag.
     const knobs = knobParams(this.#prof, family);
     // enums = every discrete selector. The family TYPE selector is excluded (header retype palette),
-    // plus the raw bypass flag; everything else (modes, slopes, mics, mic/cab pickers…) is shown.
+    // plus the raw bypass flag; everything else (modes, slopes, mics, mic/cab pickers…) is shown, and so
+    // are the float-row selectors (enumParams: the III's GLOBALMIX toggles).
     const typeId = this.#paramId(family, 'type');
-    const enumDefs = defs.filter((p) => {
-      const range = this.#prof.ranges[family]?.[p.paramId];
-      if (range?.kind !== 'enum' || p.paramId === typeId) return false;
-      if (range.displayMax <= range.displayMin) return false;
-      if (/^bypass$/i.test(p.displayLabel ?? p.name)) return false;
-      return true;
-    });
+    const enumDefs = enumParams(this.#prof, family, typeId);
     const named: NamedParam[] = [];
     const enums: EnumParam[] = [];
     let type: { value: number; name: string } | null = null;
