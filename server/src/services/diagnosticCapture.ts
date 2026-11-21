@@ -6,24 +6,29 @@
 //   info            model, firmware (fresh fn 0x08 read), transport kind, current preset number, versions
 //   readonlyWalk    the device-cache read-only walk (same options, limits and hints as a build) — into
 //                   the bundle only; the stored device profile is never written or swapped
-//   labelProbe      per hinted label list of the mapped blocks: definition, ONE label query at its first
-//                   ordinal (sub = min) where the definition fits the hint, then a liveness query; Global last;
-//                   stops at the first missing reply. This is the evidence the per-firmware hint gate needs.
-//   dumpHeaderProbe stored-slot dumps (0, 127, 128, last, a few unused slots) + the edit buffer: which preset
-//                   number each 0x77 header names (dump payloads are never kept)
-//   reloadProbe     re-select the current preset by SysEx and verify the preset number (only when the edit
-//                   buffer provably equals its stored slot — never over unsaved edits)
-//   fullWalk        opt-in; the full walk under every existing gate (fullCapture + verified firmware)
+//   labelProbe      only the label lists THIS run's read-only walk found as real definitions that fit a hint
+//                   and that only a hinted walk would label-walk (a non-zero default ordinal): ONE label query at
+//                   the first ordinal (sub = min), then a liveness query; effect blocks first, Controllers,
+//                   Modifier, Global last; stops at the first missing reply. No walk in the run → skipped.
+//   dumpHeaderProbe stored-slot dumps (0, 127, 128, last, up to three unused slots) + the edit buffer: which
+//                   preset number each 0x77 header names (dump payloads are never kept)
+//   reloadProbe     re-select the current preset by SysEx and verify the preset number — only when the edit
+//                   buffer provably equals its stored slot (never over unsaved edits)
+//   fullWalk        opt-in; the full walk under every existing gate (fullCapture + verified firmware), and
+//                   only with the same provably clean edit buffer (it reloads the preset after each block)
 //
 // Mutually exclusive with the device-cache build (services/deviceJobs.ts). A watchdog aborts the run when a
-// walk query would exceed the walk's hard bound or when nothing is received for 60 s while a step runs.
+// walk query would exceed the walk's hard bound or when nothing is received for 60 s while a step runs; an
+// abort (or a cancel) ends the run at once, even while a step still waits on the link.
 // Redaction happens as frames are recorded: preset/scene names are blanked, dump chunks cut to a prefix.
+// Log lines are scrubbed (port, paths, home directory, user and host names, e-mail addresses) and frame
+// dumps are never copied into the job log.
 //
 // Browser-safe: registry/store/driver are type-only or structural imports, gzip uses CompressionStream and
 // the upload goes through an injected cloud client. NO node:/fastify/transport VALUE imports beyond the
 // browser-safe transport types (check-browser-safe.ts enforces it).
 import {
-  buildCache, buildDefQuery, buildEnumQuery, buildValueQuery, decodeReply, parseDisplayValue, HW_SEEDS, liveWalkDetailed,
+  buildCache, buildDefQuery, buildEnumQuery, decodeReply, parseDisplayValue, HW_SEEDS, liveWalkDetailed, VIEW_DEFINITION, VIEW_VALUE,
   type BuiltCache, type CacheRecord, type LiveDefinition, type LiveEnumHint, type LiveTransport, type LiveWalkOptions, type LiveWalkResult
 } from 'forgefx-midi/cache';
 import { DEVICE_MODELS } from 'forgefx-midi/shared';
@@ -96,22 +101,27 @@ export interface CaptureResult { code: number; body: unknown }
 /** Injectable walk (defaults to the codec's `liveWalkDetailed`, so the bundle carries its reply stats). */
 export type CaptureWalkImpl = (transport: LiveTransport, opts: LiveWalkOptions) => Promise<CacheRecord[] | LiveWalkResult>;
 
+/** Who runs this process — only to scrub it out of log lines (never stored). */
+export interface HostIdentity { home?: string; user?: string; host?: string }
+
 /** Host bindings and test seams. Everything is optional; the defaults are the production behaviour. */
 export interface CaptureOptions {
   /** The walk both walk steps run (test seam). */
   walkImpl?: CaptureWalkImpl;
-  /** Version stamps the host knows (the server reads its package version; a browser runtime may pass one). */
-  versions?: { forgefx?: string };
+  /** Version stamps the host knows (the server reads its package version; a browser runtime passes its own). */
+  versions?: { forgefx?: string; codec?: string; axis?: string };
   /** No frame received for this long while a step runs → the run aborts as 'device-silent'. */
   silenceMs?: number;
   /** Watchdog check interval. */
   watchdogTickMs?: number;
   /** Pacing of the label probe (defaults to the walk's own: WALK_PACING). */
   pacing?: { interQueryMs: number; blockPauseMs: number };
-  /** Extra stored-slot dumps the header probe may spend looking for unused slots. */
+  /** Stored slots the header probe may dump while looking for unused slots (at most 6). */
   emptySearchBudget?: number;
-  /** Largest bundle JSON (bytes) before the wire log is trimmed (the upload endpoint refuses more). */
+  /** Largest bundle JSON (bytes) before the wire log is trimmed. */
   maxBundleJsonBytes?: number;
+  /** Scrubbed from log lines (defaults to this process's home directory, user and host name). */
+  identity?: HostIdentity;
   /** Clock (ms). */
   now?: () => number;
 }
@@ -120,28 +130,41 @@ export interface CaptureOptions {
 
 /** The upload endpoint's limit on the gzip body (25 MiB). */
 export const UPLOAD_LIMIT_BYTES = 25 * 1024 * 1024;
-/** The upload endpoint's limit on the decompressed bundle JSON (64 MiB) — a bundle is trimmed below it. */
+/** Largest bundle JSON kept (64 MiB): the wire log is trimmed below it. */
 export const MAX_BUNDLE_JSON_BYTES = 64 * 1024 * 1024;
 const BUNDLE_JSON_MARGIN = 256 * 1024;
 const DEFAULT_SILENCE_MS = 60_000;
 const DEFAULT_WATCHDOG_TICK_MS = 1000;
-const DEFAULT_EMPTY_SEARCH_BUDGET = 12;
-/** Unused slots the dump-header probe looks for besides the fixed ones. */
+/** Stored slots the header probe may dump looking for unused ones, and how many unused slots it wants. */
+const MAX_EMPTY_SEARCH = 6;
 const EMPTY_SLOTS_WANTED = 3;
+/** The walk's block range: the codec's default sweep (0..160) — the label probe never leaves it. */
+const WALK_MAX_BLOCK = 160;
 /** Frames kept on each side of a failure / abort when the wire log is trimmed. */
 const TRIM_WINDOW = 200;
-/** Job log entries kept (the console tap can be chatty). */
-const MAX_LOGS = 5000;
+/** Log lines mirrored from the console (the job's own lines are not capped). */
+const MAX_TAPPED_LOGS = 2000;
 /** Label count cap of a list (the codec's default `enumCountCap`). */
 const ENUM_COUNT_CAP = 1024;
 /** How many labels a list may have grown past its hint (the codec's HINT_GROWTH_LIMIT). */
 const HINT_GROWTH_LIMIT = 4;
 const EDIT_BUFFER = 0x3fff;
+/** Header numbers that name the edit buffer in a dump (the 0x3FFF request itself, and `7F 00`). */
 const EDIT_BUFFER_HEADERS: readonly number[] = [EDIT_BUFFER, 0x3f80];
+/** The order of the label probe after the effect blocks: Controllers, Modifier, Global last. */
+const LATE_FAMILIES: readonly string[] = ['CONTROLLERS', 'MOD', 'GLOBAL'];
 
 // ── job state (module-level, per registry — like the cache build) ──
 
 interface StepRecord extends CaptureStep { progress?: { done: number; total: number } }
+
+/** What this run's read-only walk saw: its decoded definitions + formatted values per `block:param`, and the
+ *  addresses that became real records (no placeholder, no end marker / pseudo definition). */
+interface WalkFindings {
+  defs: Map<string, LiveDefinition>;
+  displays: Map<string, string>;
+  real: Set<string>;
+}
 
 interface Job {
   id: string;
@@ -153,10 +176,13 @@ interface Job {
   startedAt: string;
   includeFullWalk: boolean;
   controller: AbortController;
+  /** Rejects when the run is aborted (cancel, watchdog): every step and liveness check races it. */
+  aborted: Promise<never>;
   abortReason: string | null;
   steps: StepRecord[];
   frames: CaptureFrame[];
   logs: CaptureLog[];
+  tappedLogs: number;
   redaction: { presetNames: number; dumpPayloadFrames: number };
   /** Frame indices of failures / aborts (kept when the log is trimmed). */
   marks: number[];
@@ -169,6 +195,11 @@ interface Job {
   transportKind: string;
   /** The transport's label (a port path or name) — only to scrub it from log lines; never stored. */
   label: string | null;
+  identity: HostIdentity;
+  /** The completed read-only walk of this run (the label probe's only source), or null. */
+  walk: WalkFindings | null;
+  /** The bundle is built: late writes of a step that was still running are ignored. */
+  finished: boolean;
   promise: Promise<void>;
 }
 
@@ -192,7 +223,7 @@ export function capturePromise(registry: DeviceRegistry): Promise<void> | null {
 export function captureStatus(registry: DeviceRegistry): CaptureStatus {
   const job = RUNNING.get(registry);
   const last = LAST.get(registry);
-  if (job) {
+  if (job && !job.finished) {
     return {
       state: 'running',
       id: job.id,
@@ -225,15 +256,19 @@ export async function startCapture(store: Store, registry: DeviceRegistry, body:
   const now = merged.now ?? Date.now;
   const t0 = now();
   const fw = registry.firmwareInfo();
+  const controller = new AbortController();
   const job: Job = {
     id: newCaptureId(t0),
     store, registry, opts: merged, now, t0,
     startedAt: new Date(t0).toISOString(),
     includeFullWalk,
-    controller: new AbortController(),
+    controller,
+    aborted: new Promise<never>((_res, rej) => {
+      controller.signal.addEventListener('abort', () => rej(new AbortedError(`run aborted: ${job.abortReason ?? 'aborted'}`)), { once: true });
+    }),
     abortReason: null,
     steps: steps.steps.map((name) => ({ name, status: 'pending' as StepStatus })),
-    frames: [], logs: [], redaction: { presetNames: 0, dumpPayloadFrames: 0 }, marks: [],
+    frames: [], logs: [], tappedLogs: 0, redaction: { presetNames: 0, dumpPayloadFrames: 0 }, marks: [],
     lastRx: t0, stepStartedAt: null,
     model,
     modelName: DEVICE_MODELS[model]?.name ?? `0x${model.toString(16)}`,
@@ -241,13 +276,19 @@ export async function startCapture(store: Store, registry: DeviceRegistry, body:
     fw: fw ? { major: fw.major, minor: fw.minor } : null,
     transportKind: 'unknown',
     label: null,
+    identity: merged.identity ?? hostIdentity(),
+    walk: null,
+    finished: false,
     promise: Promise.resolve()
   };
+  job.aborted.catch(() => {}); // raced, never awaited alone
   RUNNING.set(registry, job);
-  job.promise = runCapture(job).finally(() => {
-    if (RUNNING.get(registry) === job) RUNNING.delete(registry);
-    releaseDevice(registry, 'capture');
-  });
+  job.promise = runCapture(job)
+    .catch(() => { /* runCapture publishes its own bundle; nothing may escape */ })
+    .finally(() => {
+      if (RUNNING.get(registry) === job) RUNNING.delete(registry);
+      releaseDevice(registry, 'capture');
+    });
   return { code: 202, body: { started: true, id: job.id } };
 }
 
@@ -274,6 +315,8 @@ export interface DiagnosticCaptureCloud {
   diagnosticCaptureUpload(gz: Uint8Array, meta: DiagnosticUploadMeta): Promise<{ code: number; body: unknown; retryAfter?: string | null; disabled?: boolean }>;
 }
 
+const VERSION_RE = /^[0-9A-Za-z.+-]{1,32}$/;
+
 /** POST /diagnostics/capture/upload — body `{ consent: true, axisVersion? }`: gzip the last bundle and hand it to
  *  the cloud client (axis-cloud `diagnostic-captures`) under the signed-in user. 200 `{ ok, captureId (the cloud's
  *  row id), bytes, deduped? }`; 400 no consent; 404 no result; 413 too large (here or in the cloud); 401
@@ -291,7 +334,7 @@ export async function uploadCapture(
   if (!last) return { code: 404, body: { error: 'no-result' } };
   if (!cloud) return { code: 503, body: { error: 'cloud-disabled' } };
   // the client's own version, stamped into the uploaded copy only (the stored result stays as it was)
-  const axis = typeof b.axisVersion === 'string' && /^[0-9A-Za-z.+-]{1,32}$/.test(b.axisVersion) ? b.axisVersion : undefined;
+  const axis = typeof b.axisVersion === 'string' && VERSION_RE.test(b.axisVersion) ? b.axisVersion : undefined;
   const bundle: CaptureBundle = axis ? { ...last.bundle, app: { ...last.bundle.app, axis } } : last.bundle;
   const gz = await (opts.gzip ?? gzipBytes)(new TextEncoder().encode(JSON.stringify(bundle)));
   const limit = opts.limitBytes ?? UPLOAD_LIMIT_BYTES;
@@ -363,29 +406,39 @@ function throwIfAborted(job: Job): void {
 }
 
 function abortJob(job: Job, reason: string): void {
-  if (job.abortReason) return;
-  job.abortReason = reason;
+  if (job.abortReason || job.finished) return;
+  job.abortReason = scrub(reason, job.label, job.identity);
   job.marks.push(job.frames.length);
-  log(job, reason === 'cancelled' ? 'info' : 'warn', `run aborted: ${reason}`);
+  log(job, reason === 'cancelled' ? 'info' : 'warn', `run aborted: ${job.abortReason}`);
   job.controller.abort();
+}
+
+/** `p`, or the run's abort — whichever comes first. A step that still waits on the link after an abort
+ *  settles on its own later; its result is ignored (the bundle is built from a copy). */
+function raceAbort<T>(job: Job, p: Promise<T>): Promise<T> {
+  p.catch(() => {});
+  return Promise.race([p, job.aborted]);
 }
 
 async function runCapture(job: Job): Promise<void> {
   const { registry } = job;
-  const resume = registry.pauseTelemetry(); // synchronous — telemetry is off before the first await
-  const unobserve = registry.addFrameObserver((dir, bytes) => recordFrame(job, dir, bytes));
-  const untap = tapConsole(job);
-  const tick = job.opts.watchdogTickMs ?? DEFAULT_WATCHDOG_TICK_MS;
-  // Not unref'd: while a step hangs on a dead link this timer is what ends the run (cleared in finally).
-  const watchdog = setInterval(() => checkSilence(job), tick);
-  log(job, 'info', `capture ${job.id} started: model 0x${job.model.toString(16)}, steps ${job.steps.map((s) => s.name).join(', ')}`);
+  let resume: () => void = () => {};
+  let unobserve: () => void = () => {};
+  let untap: () => void = () => {};
+  let watchdog: ReturnType<typeof setInterval> | null = null;
   try {
+    resume = registry.pauseTelemetry(); // synchronous — telemetry is off before the first await
+    unobserve = registry.addFrameObserver((dir, bytes) => recordFrame(job, dir, bytes));
+    untap = tapConsole(job);
+    // Not unref'd: while a step hangs on a dead link this timer is what ends the run (cleared in finally).
+    watchdog = setInterval(() => checkSilence(job), job.opts.watchdogTickMs ?? DEFAULT_WATCHDOG_TICK_MS);
+    log(job, 'info', `capture ${job.id} started: model 0x${job.model.toString(16)}, steps ${job.steps.map((s) => s.name).join(', ')}`);
     try {
-      const t = await registry.transport();
+      const t = await raceAbort(job, registry.transport());
       job.transportKind = t.kind;
       job.label = t.label || null;
     } catch (e) {
-      log(job, 'warn', `transport unavailable: ${(e as Error).message}`);
+      if (!job.abortReason) log(job, 'warn', `transport unavailable: ${(e as Error).message}`);
     }
     for (const step of job.steps) {
       if (job.abortReason) {
@@ -399,10 +452,10 @@ async function runCapture(job: Job): Promise<void> {
     // a fault of the runner itself — still end with a bundle
     if (!job.abortReason) abortJob(job, `error: ${(e as Error).message}`);
   } finally {
-    clearInterval(watchdog);
-    untap();
-    unobserve();
-    resume();
+    if (watchdog) clearInterval(watchdog);
+    for (const stop of [untap, unobserve, resume]) {
+      try { stop(); } catch { /* one failing cleanup must not keep the bundle from being built */ }
+    }
     finish(job);
   }
 }
@@ -425,13 +478,13 @@ async function runStep(job: Job, step: StepRecord): Promise<void> {
   job.stepStartedAt = job.now();
   log(job, 'info', `step ${step.name}: start`);
   try {
-    const out = await STEPS[step.name](job, step);
+    const out = await raceAbort(job, STEPS[step.name](job, step));
     step.status = out.status ?? 'ok';
-    if (out.note) step.note = scrub(out.note, job.label);
-    if (out.error) step.error = scrub(out.error, job.label);
+    if (out.note) step.note = scrub(out.note, job.label, job.identity);
+    if (out.error) step.error = scrub(out.error, job.label, job.identity);
   } catch (e) {
     step.status = job.abortReason ? 'aborted' : 'failed';
-    step.error = scrub((e as Error).message, job.label);
+    step.error = scrub((e as Error).message, job.label, job.identity);
   } finally {
     step.endedAt = new Date(job.now()).toISOString();
     job.stepStartedAt = null;
@@ -440,7 +493,9 @@ async function runStep(job: Job, step: StepRecord): Promise<void> {
   if (step.status === 'failed' && !job.abortReason) {
     job.marks.push(job.frames.length);
     // carry on only while the device still answers
-    if (!(await deviceAlive(job))) abortJob(job, 'device-silent');
+    let alive = false;
+    try { alive = await raceAbort(job, deviceAlive(job)); } catch { /* aborted meanwhile */ }
+    if (!alive) abortJob(job, 'device-silent');
   }
 }
 
@@ -463,12 +518,14 @@ async function sdQuery(transport: Transport, query: Uint8Array): Promise<Uint8Ar
   }
 }
 
+/** Block and param a fn-0x01 self-describe query addresses. */
+const queryAddress = (q: Uint8Array) => ({ block: (q[8]! & 0x7f) | ((q[9]! & 0x7f) << 7), param: (q[10]! & 0x7f) | ((q[11]! & 0x7f) << 7) });
+
 /** The query-bound watchdog: a fn-0x01 query whose param lies above the walk's hard bound for its block is
  *  never sent — the run aborts as 'query-bound'. */
 function guardQuery(job: Job, bounds: Pick<LiveWalkOptions, 'paramBoundByBlock' | 'maxParamId' | 'mode'>, query: Uint8Array): void {
   if (query.length < 13 || query[5] !== 0x01) return;
-  const block = (query[8]! & 0x7f) | ((query[9]! & 0x7f) << 7);
-  const param = (query[10]! & 0x7f) | ((query[11]! & 0x7f) << 7);
+  const { block, param } = queryAddress(query);
   const bound = walkQueryBound(bounds, block);
   if (param > bound) {
     abortJob(job, 'query-bound');
@@ -534,8 +591,11 @@ async function stepInfo(job: Job, step: StepRecord): Promise<StepOutcome> {
 
 // ── steps: readonlyWalk / fullWalk ──
 
+const addrKey = (block: number, param: number) => `${block}:${param}`;
+
 /** Run the device-cache walk (same options, limits and hints as a build) into the bundle: the derived
- *  profile is summarised in the step result and NEVER stored or applied. */
+ *  profile is summarised in the step result and NEVER stored or applied. The read-only walk also keeps
+ *  what it saw for the label probe (`job.walk`), only when it completes. */
 async function stepWalk(job: Job, step: StepRecord, mode: BuildMode): Promise<StepOutcome> {
   const { registry, model } = job;
   const transport = await registry.transport();
@@ -544,7 +604,8 @@ async function stepWalk(job: Job, step: StepRecord, mode: BuildMode): Promise<St
     const driver = await registry.driver();
     write = {
       send: (frame) => transport.sendQueued(Array.from(frame)),
-      reloadPreset: () => driver.reloadPreset?.() ?? Promise.resolve()
+      // the job's own reloads stay silent: clients must not reload their views in the middle of the run
+      reloadPreset: () => driver.reloadPreset?.({ silent: true }) ?? Promise.resolve()
     };
   }
   const { opts, limits, hinted } = walkSetup(job.store, model, job.fw, mode, {
@@ -554,10 +615,18 @@ async function stepWalk(job: Job, step: StepRecord, mode: BuildMode): Promise<St
       step.progress = p.phase === 'done' ? { done: p.blockCount, total: p.blockCount } : { done: p.blockIndex, total: p.blockCount };
     }
   });
+  const seen: WalkFindings = { defs: new Map(), displays: new Map(), real: new Set() };
   const adapter: LiveTransport = {
     request: async (q) => {
       guardQuery(job, opts, q);
-      return sdQuery(transport, q);
+      const reply = await sdQuery(transport, q);
+      if (reply && mode === 'read-only' && q[5] === 0x01 && (q[6] === VIEW_DEFINITION || q[6] === VIEW_VALUE)) {
+        const { block, param } = queryAddress(q);
+        const r = decodeReply(reply);
+        if (r?.view === 'definition') seen.defs.set(addrKey(block, param), r);
+        else if (r?.view === 'value') seen.displays.set(addrKey(block, param), r.value);
+      }
+      return reply;
     }
   };
   const result: Record<string, unknown> = {
@@ -575,13 +644,26 @@ async function stepWalk(job: Job, step: StepRecord, mode: BuildMode): Promise<St
   };
   step.result = result;
   const walkImpl = job.opts.walkImpl ?? liveWalkDetailed;
-  const built = await buildCache({ kind: 'live', walk: () => walkImpl(adapter, opts) }, paramsForModel(model), HW_SEEDS, {
+  let records: CacheRecord[] = [];
+  const built = await buildCache({
+    kind: 'live',
+    walk: async () => {
+      const r = await walkImpl(adapter, opts);
+      records = Array.isArray(r) ? r : r.records;
+      return r;
+    }
+  }, paramsForModel(model), HW_SEEDS, {
     model,
     ...(job.firmware ? { firmware: job.firmware } : {}),
     builtAt: new Date(job.now()).toISOString()
   });
   throwIfAborted(job);
   result.profile = profileSummary(built);
+  if (mode === 'read-only') {
+    // real records only: a placeholder slot or a pseudo definition (end marker, copy, junk) never became one
+    for (const r of records) if (!(r as { placeholder?: boolean }).placeholder && r.id < 0xff00) seen.real.add(addrKey(r.section, r.id));
+    job.walk = seen;
+  }
   return {};
 }
 
@@ -617,7 +699,14 @@ async function stepFullWalk(job: Job, step: StepRecord): Promise<StepOutcome> {
   // the full walk reloads the current preset after every swept block: never over unsaved edits
   const eb = await editBufferState(job, driver);
   if (eb.state !== 'clean') {
-    step.result = { editBuffer: eb.state };
+    step.result = { editBuffer: eb.state, ...(eb.reason ? { reason: eb.reason } : {}) };
+    return { status: 'skipped', note: 'unsaved edits' };
+  }
+  throwIfAborted(job);
+  // the current preset once more, right before the walk starts reloading it
+  const again = await driver.presetRef!();
+  if (again.number !== eb.preset) {
+    step.result = { editBuffer: 'unknown', reason: 'the current preset changed after the check' };
     return { status: 'skipped', note: 'unsaved edits' };
   }
   throwIfAborted(job);
@@ -641,25 +730,30 @@ function hintFit(d: LiveDefinition, hint: LiveEnumHint): 'exact' | 'grown' | fal
   return span > hint.count && span <= hint.count + HINT_GROWTH_LIMIT ? 'grown' : false;
 }
 
+/** The empty-slot body (typecode 0, all-zero numbers): an unused slot or a table's end marker, never a list. */
+const isFillerDefinition = (d: LiveDefinition) => d.tc === 0 && d.min === 0 && d.max === 0 && d.def === 0 && d.step === 0;
+
 interface LabelProbeEntry {
   block: number;
   param: number;
   family: string;
   expected: { count: number; typecode: number };
-  got?: { typecode: number; min: number; max: number; default: number; step: number };
-  fit?: 'exact' | 'grown' | 'mismatch' | 'no-definition';
-  labelReply?: 'label' | 'empty' | 'none' | 'not-sent';
+  got: { typecode: number; min: number; max: number; default: number; step: number };
+  fit: 'exact' | 'grown' | 'mismatch';
+  labelReply: 'label' | 'empty' | 'none' | 'not-sent';
   label?: string;
 }
 
 async function stepLabelProbe(job: Job, step: StepRecord): Promise<StepOutcome> {
+  const walk = job.walk;
+  if (!walk) return { status: 'skipped', note: 'needs a completed read-only walk in this run' };
   const { registry, model, store } = job;
   const transport = await registry.transport();
   const key = job.fw ? deviceCacheKey(model, job.fw.major, job.fw.minor) : null;
   const stored = key ? loadStoredProfile(store, key) : null;
   const usable = stored?.state === 'usable' ? stored.profile : null;
-  // The walk's own hint source and roster keying (walkEnumHints), WITHOUT the per-firmware gate — this
-  // step is the verification. The walk's read-only bounds still hold: a hint above them is never probed.
+  // The walk's own hint source and roster keying (walkEnumHints), WITHOUT the per-firmware gate — this step
+  // is the verification. Targets are only what THIS run's walk found (see WalkFindings).
   const hints = walkEnumHints(model, usable);
   const limits = walkBlockLimits(model, 'read-only', usable);
   const bounds = { paramBoundByBlock: limits.bound, maxParamId: 127 };
@@ -667,21 +761,37 @@ async function stepLabelProbe(job: Job, step: StepRecord): Promise<StepOutcome> 
   const byteExactFamilies = usable && isLocalByteProfile(usable.meta)
     ? Object.keys(usable.ranges ?? {}).filter((f) => Object.keys(usable.ranges[f] ?? {}).length > 0).sort()
     : [];
-  const isGlobal = (b: number) => roster.get(b)?.family === 'GLOBAL';
-  const blocks = Object.keys(hints).map(Number).sort((a, b) => a - b);
-  const ordered = [...blocks.filter((b) => !isGlobal(b)), ...blocks.filter(isGlobal)];
-  const work: { block: number; param: number; family: string; hint: LiveEnumHint }[] = [];
-  let beyondBound = 0;
-  for (const block of ordered) {
-    const family = roster.get(block)?.family ?? '?';
-    for (const p of Object.keys(hints[block]!).map(Number).sort((a, b) => a - b)) {
-      if (p > walkQueryBound(bounds, block)) { beyondBound++; continue; }
-      work.push({ block, param: p, family, hint: hints[block]![p]! });
-    }
-  }
-  const live = livenessAddress(model);
-  const counts = { hints: work.length + beyondBound, beyondBound, probed: 0, noDefinition: 0, mismatch: 0, grownNotLabel: 0, labelQueries: 0, labels: 0, emptyLabels: 0 };
+  const counts = { walkDefinitions: walk.real.size, hinted: 0, defaultZero: 0, mismatch: 0, grownNotLabel: 0, targets: 0, labels: 0, emptyLabels: 0 };
   const entries: LabelProbeEntry[] = [];
+  const candidates: { entry: LabelProbeEntry; min: number }[] = [];
+  for (const k of walk.real) {
+    const [block, param] = k.split(':').map(Number) as [number, number];
+    if (block > WALK_MAX_BLOCK || param > walkQueryBound(bounds, block)) continue;
+    const hint = hints[block]?.[param];
+    const d = walk.defs.get(k);
+    if (!hint || !d || isFillerDefinition(d)) continue;
+    counts.hinted++;
+    // a list with a zero default is label-walked by the walk's numeric rule anyway: nothing to verify here
+    if (d.scale === 0) { counts.defaultZero++; continue; }
+    const entry: LabelProbeEntry = {
+      block, param, family: roster.get(block)?.family ?? '?',
+      expected: { count: hint.count, typecode: hint.typecode },
+      got: { typecode: d.tc, min: d.min, max: d.max, default: d.scale, step: d.step },
+      fit: 'mismatch', labelReply: 'not-sent'
+    };
+    const fit = hintFit(d, hint);
+    if (!fit) { counts.mismatch++; entries.push(entry); continue; }
+    entry.fit = fit;
+    // like the walk: a grown list is label-queried only when its formatted value is a label
+    const display = walk.displays.get(k) ?? '';
+    if (fit === 'grown' && !(display.trim() !== '' && parseDisplayValue(display) === null)) { counts.grownNotLabel++; entries.push(entry); continue; }
+    candidates.push({ entry, min: Math.round(d.min) });
+  }
+  // effect blocks first, then Controllers, Modifier, Global last
+  const rank = (e: LabelProbeEntry) => { const i = LATE_FAMILIES.indexOf(e.family); return i < 0 ? 0 : i + 1; };
+  candidates.sort((a, b) => rank(a.entry) - rank(b.entry) || a.entry.block - b.entry.block || a.entry.param - b.entry.param);
+  counts.targets = candidates.length;
+  const live = livenessAddress(model);
   const result: Record<string, unknown> = {
     firmware: job.firmware,
     hintsVerifiedOnFirmware: enumHintsVerifiedOn(model, job.fw),
@@ -691,7 +801,7 @@ async function stepLabelProbe(job: Job, step: StepRecord): Promise<StepOutcome> 
     entries
   };
   step.result = result;
-  step.progress = { done: 0, total: work.length };
+  step.progress = { done: 0, total: candidates.length };
   const pacing = job.opts.pacing ?? WALK_PACING;
   const query = async (q: Uint8Array): Promise<Uint8Array | null> => {
     throwIfAborted(job);
@@ -700,44 +810,22 @@ async function stepLabelProbe(job: Job, step: StepRecord): Promise<StepOutcome> 
     await pause(pacing.interQueryMs);
     return r;
   };
-  let stop: { block: number; param: number; query: 'definition' | 'value' | 'label' | 'liveness' } | null = null;
+  let stop: { block: number; param: number; query: 'label' | 'liveness' } | null = null;
   let prevBlock = -1;
-  for (const w of work) {
+  for (const [i, c] of candidates.entries()) {
     throwIfAborted(job);
-    if (prevBlock !== -1 && w.block !== prevBlock) await pause(pacing.blockPauseMs);
-    prevBlock = w.block;
-    const entry: LabelProbeEntry = { block: w.block, param: w.param, family: w.family, expected: { count: w.hint.count, typecode: w.hint.typecode } };
-    entries.push(entry);
-    counts.probed++;
-    step.progress = { done: counts.probed, total: work.length };
-    const defFrame = await query(buildDefQuery(model, w.block, w.param));
-    if (!defFrame) { stop = { block: w.block, param: w.param, query: 'definition' }; break; }
-    const d = decodeReply(defFrame);
-    if (!d || d.view !== 'definition') { entry.fit = 'no-definition'; counts.noDefinition++; continue; }
-    entry.got = { typecode: d.tc, min: d.min, max: d.max, default: d.scale, step: d.step };
-    const fit = hintFit(d, w.hint);
-    if (!fit) { entry.fit = 'mismatch'; counts.mismatch++; continue; }
-    entry.fit = fit;
-    if (fit === 'grown') {
-      // like the walk: a grown list is label-queried only when its formatted value is a label
-      const v = await query(buildValueQuery(model, w.block, w.param));
-      if (!v) { stop = { block: w.block, param: w.param, query: 'value' }; break; }
-      const vr = decodeReply(v);
-      const display = vr?.view === 'value' ? vr.value : '';
-      if (!(display.trim() !== '' && parseDisplayValue(display) === null)) {
-        entry.labelReply = 'not-sent';
-        counts.grownNotLabel++;
-        continue;
-      }
-    }
-    counts.labelQueries++;
-    const lab = await query(buildEnumQuery(model, w.block, w.param, Math.round(d.min)));
-    if (!lab) { entry.labelReply = 'none'; stop = { block: w.block, param: w.param, query: 'label' }; break; }
+    const e = c.entry;
+    if (prevBlock !== -1 && e.block !== prevBlock) await pause(pacing.blockPauseMs);
+    prevBlock = e.block;
+    entries.push(e);
+    step.progress = { done: i + 1, total: candidates.length };
+    const lab = await query(buildEnumQuery(model, e.block, e.param, c.min));
+    if (!lab) { e.labelReply = 'none'; stop = { block: e.block, param: e.param, query: 'label' }; break; }
     const lr = decodeReply(lab);
-    if (lr?.view === 'enum_label') { entry.labelReply = 'label'; entry.label = lr.label; counts.labels++; }
-    else { entry.labelReply = 'empty'; counts.emptyLabels++; }
+    if (lr?.view === 'enum_label') { e.labelReply = 'label'; e.label = lr.label; counts.labels++; }
+    else { e.labelReply = 'empty'; counts.emptyLabels++; }
     const alive = await query(buildDefQuery(model, live.block, live.param));
-    if (!alive) { stop = { block: w.block, param: w.param, query: 'liveness' }; break; }
+    if (!alive) { stop = { block: e.block, param: e.param, query: 'liveness' }; break; }
   }
   if (stop) {
     result.stoppedAt = stop;
@@ -779,9 +867,9 @@ async function stepDumpHeaderProbe(job: Job, step: StepRecord): Promise<StepOutc
   const emptySlots: number[] = [];
   const result: Record<string, unknown> = { presetCount: count, requests, emptySlots };
   step.result = result;
-  const budget = Math.max(0, job.opts.emptySearchBudget ?? DEFAULT_EMPTY_SEARCH_BUDGET);
   step.progress = { done: 0, total: fixed.length + 1 };
-  let missing: number | 'edit-buffer' | null = null;
+  let stopped: number | 'edit-buffer' | null = null;
+  /** One dump; null (and the step stops) when the dump did not arrive whole. */
   const probe = async (target: number | 'edit-buffer', purpose: DumpProbeEntry['purpose']): Promise<DiagnosticDump | null> => {
     throwIfAborted(job);
     const d = await driver.diagnosticDump!(target);
@@ -790,30 +878,30 @@ async function stepDumpHeaderProbe(job: Job, step: StepRecord): Promise<StepOutc
       frames: d.frames, chunks: d.chunks, bytes: d.bytes, empty: d.empty, ms: d.ms
     });
     step.progress = { done: requests.length, total: Math.max(step.progress?.total ?? 0, requests.length) };
-    if (d.frames === 0) { missing = target; return null; } // no answer at all: stop here
+    if (!d.complete) { stopped = target; return null; }
     if (d.empty === true && typeof target === 'number') emptySlots.push(target);
     return d;
   };
   for (const n of fixed) {
     if (!(await probe(n, 'fixed'))) break;
   }
-  if (missing === null) {
-    // look for unused slots from the top down (where a unit's free slots usually are)
-    let found = 0;
+  if (stopped === null) {
+    // unused slots: the fixed dumps' own flags count first; then a few slots from the top down (where a
+    // unit's free slots usually are), at most MAX_EMPTY_SEARCH dumps
+    const budget = Math.min(MAX_EMPTY_SEARCH, Math.max(0, job.opts.emptySearchBudget ?? MAX_EMPTY_SEARCH));
     let spent = 0;
-    for (let n = last - 1; n >= 0 && found < EMPTY_SLOTS_WANTED && spent < budget; n--) {
+    for (let n = last - 1; n >= 0 && emptySlots.length < EMPTY_SLOTS_WANTED && spent < budget; n--) {
       if (fixed.includes(n)) continue;
       spent++;
-      const d = await probe(n, 'empty-search');
-      if (!d) break;
-      if (d.empty === true) found++;
+      if (!(await probe(n, 'empty-search'))) break;
     }
-    if (found === 0 && spent > 0) result.emptySearch = { searched: spent, found: 0 };
+    result.emptySearch = { searched: spent, found: emptySlots.filter((n) => !fixed.includes(n)).length };
   }
-  if (missing === null) await probe('edit-buffer', 'edit-buffer');
-  if (missing !== null) {
-    result.stoppedAt = missing;
-    return { status: 'failed', note: 'stopped at the first missing reply', error: `no reply to the dump request for ${missing === 'edit-buffer' ? 'the edit buffer' : `slot ${missing}`}` };
+  if (stopped === null) await probe('edit-buffer', 'edit-buffer');
+  if (stopped !== null) {
+    const what: number | 'edit-buffer' = stopped;
+    result.stoppedAt = what;
+    return { status: 'failed', note: 'stopped after an incomplete dump', error: `the dump for ${what === 'edit-buffer' ? 'the edit buffer' : `slot ${what}`} did not arrive whole` };
   }
   return {};
 }
@@ -822,19 +910,27 @@ async function stepDumpHeaderProbe(job: Job, step: StepRecord): Promise<StepOutc
 
 const bytesEqual = (a: Uint8Array, b: Uint8Array) => a.length === b.length && a.every((v, i) => v === b[i]);
 
-/** Does the edit buffer hold exactly its stored slot (no unsaved edits)? Read-only: dumps the edit buffer
- *  and the current slot and compares them in memory ('raw' = identical raw patch, 'content' = identical
- *  body + name). Anything else — a difference, an undecodable dump, an unknown current preset — is not
- *  'clean'. */
-async function editBufferState(job: Job, driver: DeviceDriver): Promise<{ state: 'clean' | 'dirty' | 'unknown'; preset: number | null; match?: 'raw' | 'content' | 'none' }> {
-  if (!driver.presetRef || !driver.diagnosticDump) return { state: 'unknown', preset: null };
+/** Does the edit buffer hold exactly its stored slot (no unsaved edits)? Read-only. 'clean' ONLY when the
+ *  edit-buffer dump arrived whole under an edit-buffer header, the dump of the current slot arrived whole under
+ *  exactly that slot's number, and the two decode to the same patch ('raw' = identical raw patch, 'content' =
+ *  identical body + name). A difference is 'dirty'; anything else (an unknown current preset, a dump named
+ *  otherwise, an incomplete or undecodable dump) is 'unknown'. Callers re-check the current preset right
+ *  before they switch. */
+async function editBufferState(job: Job, driver: DeviceDriver): Promise<{ state: 'clean' | 'dirty' | 'unknown'; preset: number | null; match?: 'raw' | 'content' | 'none'; reason?: string }> {
+  if (!driver.presetRef || !driver.diagnosticDump) return { state: 'unknown', preset: null, reason: 'no current-preset read or dump on this device' };
   const ref = await driver.presetRef();
-  if (ref.number < 0) return { state: 'unknown', preset: null };
+  if (ref.number < 0) return { state: 'unknown', preset: null, reason: 'current preset unknown' };
   throwIfAborted(job);
   const eb = await driver.diagnosticDump('edit-buffer');
+  if (!eb.complete || eb.header === null || !EDIT_BUFFER_HEADERS.includes(eb.header)) {
+    return { state: 'unknown', preset: ref.number, reason: 'the edit-buffer dump did not arrive whole under an edit-buffer header' };
+  }
   throwIfAborted(job);
   const slot = await driver.diagnosticDump(ref.number);
-  if (!eb.patch || !slot.patch) return { state: 'unknown', preset: ref.number };
+  if (!slot.complete || slot.header !== ref.number) {
+    return { state: 'unknown', preset: ref.number, reason: 'the dump of the current slot did not arrive whole under its own number' };
+  }
+  if (!eb.patch || !slot.patch) return { state: 'unknown', preset: ref.number, reason: 'a dump could not be decoded' };
   if (bytesEqual(eb.patch.raw, slot.patch.raw)) return { state: 'clean', preset: ref.number, match: 'raw' };
   const name = (p: { raw: Uint8Array }) => p.raw.subarray(0x08, 0x28);
   if (bytesEqual(eb.patch.body, slot.patch.body) && bytesEqual(name(eb.patch), name(slot.patch))) return { state: 'clean', preset: ref.number, match: 'content' };
@@ -845,12 +941,20 @@ async function stepReloadProbe(job: Job, step: StepRecord): Promise<StepOutcome>
   const driver = await job.registry.driver();
   if (!driver.selectPreset || !driver.presetRef || !driver.diagnosticDump) return { status: 'skipped', note: 'this device cannot switch presets by SysEx' };
   const eb = await editBufferState(job, driver);
-  const result: Record<string, unknown> = { preset: eb.preset, editBuffer: eb.state, ...(eb.match ? { match: eb.match } : {}) };
+  const result: Record<string, unknown> = { preset: eb.preset, editBuffer: eb.state, ...(eb.match ? { match: eb.match } : {}), ...(eb.reason ? { reason: eb.reason } : {}) };
   step.result = result;
   if (eb.state !== 'clean' || eb.preset === null) return { status: 'skipped', note: 'unsaved edits' };
   throwIfAborted(job);
+  // the current preset once more, right before the switch: a front-panel change since the check voids it
+  const again = await driver.presetRef();
+  if (again.number !== eb.preset) {
+    result.editBuffer = 'unknown';
+    result.reason = 'the current preset changed after the check';
+    return { status: 'skipped', note: 'unsaved edits' };
+  }
+  throwIfAborted(job);
   const t0 = job.now();
-  const sw = await driver.selectPreset(eb.preset);
+  const sw = await driver.selectPreset(eb.preset, { silent: true }); // job-internal: no 'changed' to the clients
   const t1 = job.now();
   const after = await driver.presetRef();
   const t2 = job.now();
@@ -917,6 +1021,7 @@ export function redactFrame(frame: readonly number[]): { bytes: number[]; len?: 
 }
 
 function recordFrame(job: Job, dir: 'TX' | 'RX', bytes: readonly number[]): void {
+  if (job.finished) return;
   const t = job.now();
   if (dir === 'RX') job.lastRx = t;
   for (const f of splitFrames(bytes)) {
@@ -927,27 +1032,57 @@ function recordFrame(job: Job, dir: 'TX' | 'RX', bytes: readonly number[]): void
   }
 }
 
-/** Strip what must never reach a bundle from a log line: the port label, file-system paths, e-mail
- *  addresses, serial port names. */
-export function scrub(msg: string, label: string | null): string {
-  let s = msg;
-  if (label) s = s.split(label).join('<port>');
+// ── log scrubbing ──
+
+/** This process's home directory, user and host name, where the runtime exposes them (Node: env; a browser
+ *  has none). Only ever used to remove them from log lines. */
+function hostIdentity(): HostIdentity {
+  const env = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env ?? {};
+  const home = env.USERPROFILE || env.HOME || undefined;
+  const user = env.USERNAME || env.USER || env.LOGNAME || (home ? home.split(/[\\/]/).filter(Boolean).pop() : undefined);
+  const host = env.COMPUTERNAME || env.HOSTNAME || undefined;
+  return { ...(home ? { home } : {}), ...(user ? { user } : {}), ...(host ? { host } : {}) };
+}
+
+const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+/** Strip what must never reach a bundle from a log line: everything after its first line, the port label,
+ *  the home directory, file-system paths (Windows paths with spaces included), e-mail addresses, serial port
+ *  names, and the user and host name. */
+export function scrub(msg: string, label: string | null, identity: HostIdentity = {}): string {
+  let s = String(msg).split(/\r?\n/, 1)[0] ?? '';
+  const swap = (needle: string | undefined, by: string, minLen: number, word = false) => {
+    if (!needle || needle.length < minLen) return;
+    const body = escapeRe(needle);
+    s = s.replace(new RegExp(word ? `(?<![A-Za-z0-9])${body}(?![A-Za-z0-9])` : body, 'gi'), by);
+  };
+  swap(label ?? undefined, '<port>', 2);
+  swap(identity.home, '<home>', 3);
   s = s
-    .replace(/\\\\[^\s"'`,;)]+/g, '<path>')
-    .replace(/\b[A-Za-z]:[\\/][^\s"'`,;)]*/g, '<path>')
-    .replace(/(?:~|\/(?:Users|home|dev|tmp|var|private|Volumes|mnt|media|opt|root|etc|Applications|Library))\/[^\s"'`,;)]*/g, '<path>')
+    .replace(/\\\\[^\s"'`,;)]+/g, '<path>') // UNC
+    .replace(/\b[A-Za-z]:\\(?:[^\\\r\n"'<>|?*:]+\\)*[^\\\s"'<>|?*:,;)]*/g, '<path>') // Windows, segments may hold spaces
+    .replace(/\b[A-Za-z]:\/[^\s"'<>|?*,;)]*/g, '<path>')
+    .replace(/\/(?:Users|home)\/[^/\r\n"'<>|]+(?:\/[^/\s"'<>|,;)]*)*/g, '<path>') // a home dir (with spaces), then the rest
+    .replace(/(?:~|\/(?:dev|tmp|var|private|Volumes|mnt|media|opt|root|etc|Applications|Library))\/[^\s"'`,;)]*/g, '<path>')
     .replace(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g, '<email>')
     .replace(/\bCOM\d+\b/gi, '<port>');
+  swap(identity.user, '<user>', 3, true);
+  swap(identity.host, '<host>', 3, true);
   return s.length > 2000 ? `${s.slice(0, 2000)}…` : s;
 }
 
+/** A per-frame wire trace line (a transport debugging aid): never copied into the job log — the frames
+ *  already are, redacted. Catches a RX/TX trace, any Fractal SysEx header in hex, and long hex runs. */
+const FRAME_DUMP_RE = /\b(?:RX|TX)\b[^\n]*\b[0-9a-f]{2}(?:[ ,:][0-9a-f]{2}){3}|f0[ ,:]?00[ ,:]?01[ ,:]?74|(?:\b[0-9a-f]{2}[ ,:]){12}|[0-9a-f]{24}/i;
+
 function log(job: Job, level: CaptureLog['level'], msg: string): void {
-  if (job.logs.length >= MAX_LOGS) return;
-  job.logs.push({ t: job.now() - job.t0, level, msg: scrub(msg, job.label) });
+  if (job.finished) return;
+  job.logs.push({ t: job.now() - job.t0, level, msg: scrub(msg, job.label, job.identity) });
 }
 
 /** Mirror the ForgeFX log lines written while the run is active (transport and driver warnings) into the
- *  job log. Pass-through: the console still prints them. */
+ *  job log — first line only, scrubbed, never a frame dump, at most MAX_TAPPED_LOGS. Pass-through: the
+ *  console still prints them. */
 function tapConsole(job: Job): () => void {
   const c = console as unknown as Record<'log' | 'warn' | 'error', (...args: unknown[]) => void>;
   const orig = { log: c.log, warn: c.warn, error: c.error };
@@ -957,8 +1092,12 @@ function tapConsole(job: Job): () => void {
     wrapped[k] = (...args: unknown[]) => {
       try {
         const first = args[0];
-        if (typeof first === 'string' && first.startsWith('[forgefx]')) {
-          log(job, levels[k], args.map((a) => (typeof a === 'string' ? a : a instanceof Error ? a.message : String(a))).join(' '));
+        if (typeof first === 'string' && first.startsWith('[forgefx]') && job.tappedLogs < MAX_TAPPED_LOGS) {
+          const line = args.map((a) => (typeof a === 'string' ? a : a instanceof Error ? a.message : String(a))).join(' ').split(/\r?\n/, 1)[0] ?? '';
+          if (!FRAME_DUMP_RE.test(line)) {
+            job.tappedLogs++;
+            log(job, levels[k], line);
+          }
         }
       } catch { /* never break logging */ }
       orig[k].apply(console, args);
@@ -972,8 +1111,11 @@ function tapConsole(job: Job): () => void {
 
 // ── the bundle ──
 
-function appVersions(job: Job): { forgefx: string; codec: string } {
-  return { forgefx: job.opts.versions?.forgefx || 'unknown', codec: CODEC_VERSION || 'unknown' };
+function appVersions(job: Job): { forgefx: string; codec: string; axis?: string } {
+  const v = job.opts.versions ?? {};
+  const pick = (x: string | undefined) => (x && VERSION_RE.test(x) ? x : undefined);
+  const axis = pick(v.axis);
+  return { forgefx: pick(v.forgefx) ?? 'unknown', codec: pick(v.codec) ?? (CODEC_VERSION || 'unknown'), ...(axis ? { axis } : {}) };
 }
 
 function stepView(s: StepRecord): NonNullable<CaptureStatus['steps']>[number] {
@@ -1020,18 +1162,26 @@ export function trimFrames(frames: CaptureFrame[], marks: readonly number[], bud
   return { frames: kept, truncated: { kept: kept.length, dropped: frames.length - kept.length } };
 }
 
+/** A JSON-safe deep copy (a step that still runs after an abort must not change the bundle afterwards). */
+function snapshot(v: unknown): unknown {
+  if (v === undefined) return undefined;
+  try { return JSON.parse(JSON.stringify(v)) as unknown; } catch { return undefined; }
+}
+
 /** End of a run (from the runner's finally): settle step states, build the redacted bundle, publish it as
  *  the last result. Never throws — a fallback bundle is published if building the real one fails. */
 function finish(job: Job): void {
+  if (job.finished) return;
   const endedAt = new Date(job.now()).toISOString();
-  for (const s of job.steps) {
-    if (s.status === 'running') s.status = 'aborted';
-    else if (s.status === 'pending') { s.status = 'skipped'; s.note = `not run: ${job.abortReason ?? 'run ended'}`; }
-  }
-  const state: CaptureBundle['state'] = job.abortReason === 'cancelled' ? 'cancelled' : job.abortReason ? 'failed' : 'done';
-  log(job, 'info', `capture ${job.id} ended: ${state}${job.abortReason ? ` (${job.abortReason})` : ''}`);
-  let bundle: CaptureBundle;
+  let bundle: CaptureBundle | null = null;
   try {
+    for (const s of job.steps) {
+      if (s.status === 'running') s.status = 'aborted';
+      else if (s.status === 'pending') { s.status = 'skipped'; s.note = `not run: ${job.abortReason ?? 'run ended'}`; }
+    }
+    const state: CaptureBundle['state'] = job.abortReason === 'cancelled' ? 'cancelled' : job.abortReason ? 'failed' : 'done';
+    log(job, 'info', `capture ${job.id} ended: ${state}${job.abortReason ? ` (${job.abortReason})` : ''}`);
+    job.finished = true;
     const base: CaptureBundle = {
       schema: 1,
       id: job.id,
@@ -1041,16 +1191,19 @@ function finish(job: Job): void {
       ...(job.abortReason ? { abortReason: job.abortReason } : {}),
       app: appVersions(job),
       device: { model: job.model, modelName: job.modelName, firmware: job.firmware, transport: job.transportKind },
-      steps: job.steps.map((s) => ({
-        name: s.name, status: s.status,
-        ...(s.startedAt ? { startedAt: s.startedAt } : {}),
-        ...(s.endedAt ? { endedAt: s.endedAt } : {}),
-        ...(s.result !== undefined ? { result: s.result } : {}),
-        ...(s.error ? { error: s.error } : {}),
-        ...(s.note ? { note: s.note } : {})
-      })),
+      steps: job.steps.map((s) => {
+        const result = snapshot(s.result);
+        return {
+          name: s.name, status: s.status,
+          ...(s.startedAt ? { startedAt: s.startedAt } : {}),
+          ...(s.endedAt ? { endedAt: s.endedAt } : {}),
+          ...(result !== undefined ? { result } : {}),
+          ...(s.error ? { error: s.error } : {}),
+          ...(s.note ? { note: s.note } : {})
+        };
+      }),
       frames: [],
-      logs: job.logs,
+      logs: job.logs.slice(),
       redaction: { ...job.redaction }
     };
     const rest = JSON.stringify(base).length;
@@ -1058,9 +1211,11 @@ function finish(job: Job): void {
     const trimmed = trimFrames(job.frames, job.marks, Math.max(0, max - BUNDLE_JSON_MARGIN - rest));
     bundle = { ...base, frames: trimmed.frames, ...(trimmed.truncated ? { framesTruncated: trimmed.truncated } : {}) };
   } catch (e) {
+    job.finished = true;
     bundle = {
-      schema: 1, id: job.id, createdAt: job.startedAt, endedAt, state: 'failed', abortReason: job.abortReason ?? `error: ${(e as Error).message}`,
-      app: { forgefx: job.opts.versions?.forgefx || 'unknown', codec: CODEC_VERSION || 'unknown' },
+      schema: 1, id: job.id, createdAt: job.startedAt, endedAt, state: 'failed',
+      abortReason: job.abortReason ?? scrub(`error: ${(e as Error).message}`, job.label, job.identity),
+      app: { forgefx: 'unknown', codec: CODEC_VERSION || 'unknown' },
       device: { model: job.model, modelName: job.modelName, firmware: job.firmware, transport: job.transportKind },
       steps: job.steps.map((s) => ({ name: s.name, status: s.status })),
       frames: [], logs: [], redaction: { ...job.redaction }

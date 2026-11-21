@@ -13,13 +13,15 @@ import { __createRegistryForTest, type DeviceRegistry } from '../../src/drivers/
 import * as diag from '../../src/services/diagnosticCapture.js';
 import * as deviceCache from '../../src/services/deviceCache.js';
 import * as store from '../../src/store.js';
-import { buildDefQuery, CACHE_SCHEMA, VIEW_DEFINITION, VIEW_ENUM_LABEL, VIEW_VALUE, type CacheRecord, type LiveTransport, type LiveWalkOptions } from 'forgefx-midi/cache';
+import { buildDefQuery, buildValueQuery, decodeReply, CACHE_SCHEMA, VIEW_DEFINITION, VIEW_ENUM_LABEL, VIEW_VALUE, type CacheRecord, type LiveTransport, type LiveWalkOptions } from 'forgefx-midi/cache';
+import type { DeviceEvent } from '../../src/drivers/types.js';
+import { createRouter } from '../../src/runtime/router.js';
 import type { RequestOpts } from '../../src/transport/types.js';
 import { MockTransport, handshakeReply, isIdentifyBroadcast, assert, assertEqual, sleep } from '../helpers/mock.js';
 import { fakeCacheDoc, seedRecords } from './device-cache.test.js';
 import { runDiagnosticUpload, type DiagnosticUploadTransport } from '../../src/runtime/cloud.js';
 
-export const DIAGNOSTIC_CAPTURE_CASE_COUNT = 19;
+export const DIAGNOSTIC_CAPTURE_CASE_COUNT = 21;
 
 const FM3 = 0x11;
 const NAME = 'Secret Name';
@@ -110,6 +112,16 @@ interface FakeState {
   /** Everything goes unanswered. */
   silent: boolean;
   switches: number[];
+  /** Successive current-preset answers (then `current`). */
+  presetRefs?: number[];
+  /** A stored slot whose dump stops short (no terminator). */
+  incompleteSlot?: number;
+  /** A hinted address that answers the empty-slot definition (typecode 0, all zero). */
+  fillerAt?: { block: number; param: number };
+  /** A hinted address whose definition carries a zero default (the walk's numeric rule label-walks it anyway). */
+  zeroDefaultAt?: { block: number; param: number };
+  /** Print per-frame RX/TX trace lines and a multi-line warning with a path, like a chatty transport. */
+  trace?: boolean;
 }
 
 class FakeFm3 extends MockTransport {
@@ -119,6 +131,12 @@ class FakeFm3 extends MockTransport {
   }
   override async request(bytes: readonly number[], opts?: RequestOpts): Promise<number[][]> {
     const r = await super.request(bytes, opts);
+    if (this.state.trace) {
+      const spaced = (f: readonly number[]) => f.map((b) => b.toString(16).padStart(2, '0')).join(' ');
+      console.log(`[forgefx][midi] TX ${bytes.length}B: ${spaced(bytes)}`);
+      for (const f of r) console.log(`[forgefx][midi] RX ${f.length}B: ${spaced(f)}`);
+      console.warn('[forgefx][serial] late reply swallowed, log at C:\\Users\\John Smith\\AppData\\x.log\nsecond line with more detail');
+    }
     for (const f of r) this.emitFrame(f); // a real transport hands every inbound frame to onFrame too
     return r;
   }
@@ -128,12 +146,16 @@ class FakeFm3 extends MockTransport {
     if (s.silent) return [];
     const fn = req[5];
     if (fn === 0x08) return s.fw ? [msg(0x08, [s.fw[0], s.fw[1], 0, 0])] : [];
-    if (fn === 0x0d) return [msg(0x0d, [s.current & 0x7f, (s.current >> 7) & 0x7f, ...Array.from(NAME.padEnd(32, ' '), (c) => c.charCodeAt(0))])];
+    if (fn === 0x0d) {
+      const n = s.presetRefs?.length ? s.presetRefs.shift()! : s.current;
+      return [msg(0x0d, [n & 0x7f, (n >> 7) & 0x7f, ...Array.from(NAME.padEnd(32, ' '), (c) => c.charCodeAt(0))])];
+    }
     if (fn === 0x03) {
       const requested = ((req[6]! & 0x7f) << 7) | (req[7]! & 0x7f);
       const raw = requested === 0x3fff ? (s.editBuffer ?? s.slots.get(s.current) ?? new Uint8Array(2048)) : (s.slots.get(requested) ?? new Uint8Array(2048));
       const header = s.headerFor?.(requested) ?? (requested === 0x3fff ? 0x3f80 : requested);
-      return dumpFrames(header, raw);
+      const frames = dumpFrames(header, raw);
+      return requested === s.incompleteSlot ? frames.slice(0, 2) : frames;
     }
     if (fn === 0x01 && req[6] === 0x27) { // SysEx preset switch
       const n = (req[12]! & 0x7f) | ((req[13]! & 0x7f) << 7);
@@ -149,7 +171,10 @@ class FakeFm3 extends MockTransport {
       const live = diag.livenessAddress(FM3);
       if (view === VIEW_DEFINITION) {
         const hint = HINTS[block]?.[param];
-        if (hint && s.fitBlocks.has(block)) return [sdReply(view, block, param, defRaw({ tc: hint.typecode, min: 0, max: hint.count - 1 }))];
+        if (s.fillerAt && s.fillerAt.block === block && s.fillerAt.param === param) return [sdReply(view, block, param, defRaw({ tc: 0, min: 0, max: 0, id: 0 }))];
+        // a list with a non-zero default ordinal (what only a hinted walk label-walks); a one-entry list keeps 0
+        const zero = s.zeroDefaultAt?.block === block && s.zeroDefaultAt.param === param;
+        if (hint && s.fitBlocks.has(block)) return [sdReply(view, block, param, defRaw({ tc: hint.typecode, min: 0, max: hint.count - 1, scale: hint.count >= 2 && !zero ? 1 : 0 }))];
         if (block === live.block && param === live.param) return [sdReply(view, block, param, defRaw({ tc: 1, min: 0, max: 10, def: 1 }))];
         return [sdReply(view, block, param, null)];
       }
@@ -164,6 +189,36 @@ class FakeFm3 extends MockTransport {
 }
 
 const HINTS = deviceCache.walkEnumHints(FM3);
+const BOUND = deviceCache.walkBlockLimits(FM3, 'read-only').bound;
+/** Hinted params of a block inside the read-only walk bound. */
+const hinted = (block: number) => Object.keys(HINTS[block] ?? {}).map(Number).filter((p) => p <= (BOUND[block] ?? 127)).sort((a, b) => a - b);
+/** Hinted params the label probe should target: lists of two or more labels (a non-zero default). */
+const targetsOf = (block: number) => hinted(block).filter((p) => HINTS[block]![p]!.count >= 2);
+
+/** A walk that queries `addrs` through the capture's adapter (definition, then the formatted value) like the
+ *  real walk, and returns a record for every real definition, plus the seed records a build needs. */
+function addressWalk(addrs: Array<[number, number]>, placeholders: ReadonlySet<string> = new Set()): diag.CaptureWalkImpl {
+  return async (t) => {
+    const recs: CacheRecord[] = [...seedRecords()];
+    for (const [block, param] of addrs) {
+      const reply = await t.request(buildDefQuery(FM3, block, param));
+      const d = reply ? decodeReply(reply) : null;
+      if (d?.view !== 'definition') continue;
+      if (placeholders.has(`${block}:${param}`)) { // the walk kept this slot as a placeholder row, not a real param
+        recs.push({ kind: 'float', section: block, offset: 0, id: param, tc: 0, min: 0, max: 0, def: 0, step: 0, t1: 0, t2: 0, placeholder: true } as CacheRecord);
+        continue;
+      }
+      await t.request(buildValueQuery(FM3, block, param));
+      // the record only marks the address as a real param (the probe reads the definition the walk received);
+      // neutral numbers keep these synthetic rows out of the section→family vote of the build
+      recs.push({ kind: 'float', section: block, offset: 0, id: param, tc: d.tc, min: 0, max: 0.123, def: 0, step: 0, t1: 0, t2: 0 } as CacheRecord);
+    }
+    return recs;
+  };
+}
+/** The hinted addresses of `blocks` (at most `max` per block: a handful of synthetic rows per section keeps the
+ *  build's section→family vote on the seed sections). */
+const addrsOf = (blocks: number[], max = 4): Array<[number, number]> => blocks.flatMap((b) => hinted(b).slice(0, max).map((p) => [b, p] as [number, number]));
 
 function fakeState(over: Partial<FakeState> = {}): FakeState {
   return {
@@ -186,6 +241,8 @@ const seedWalk = async (): Promise<CacheRecord[]> => seedRecords();
 /** A walk that never returns until the run's signal aborts it. */
 const blockingWalk = (_t: LiveTransport, o: LiveWalkOptions): Promise<CacheRecord[]> =>
   new Promise((_res, rej) => { o.signal?.addEventListener('abort', () => rej(new Error('live walk aborted'))); });
+/** A walk stuck on a dead link: it never settles, not even on abort. */
+const stuckWalk = (): Promise<CacheRecord[]> => new Promise(() => {});
 
 async function run(registry: DeviceRegistry, body: Record<string, unknown>, opts: diag.CaptureOptions = {}): Promise<diag.CaptureBundle> {
   const r = await diag.startCapture(store.defaultStore, registry, { acknowledged: true, ...body }, { ...QUICK, ...opts });
@@ -254,67 +311,72 @@ async function infoAndReadonlyWalk(): Promise<void> {
   }
 }
 
-// ── 2. label probe: Global last, liveness after each label, bounds respected ──
+// ── 2. label probe: only what this run's walk found; effect blocks, Controllers, Modifier, Global last ──
 async function labelProbeHappy(): Promise<void> {
-  const { registry, mock } = await makeRig(fakeState({ fitBlocks: new Set([66, 1]) }));
+  const far = Object.keys(HINTS).map(Number).find((b) => b > 160 && hinted(b).length > 0)!;
+  const placeholderAt = targetsOf(66)[0]!;
+  const fillerAt = targetsOf(66)[1]!;
+  const zeroAt = targetsOf(66)[2]!;
+  const { registry, mock } = await makeRig(fakeState({ fitBlocks: new Set([66, 1, 2, 3, far]), fillerAt: { block: 66, param: fillerAt }, zeroDefaultAt: { block: 66, param: zeroAt } }));
   const start = mock.sent.length;
-  const b = await run(registry, { steps: ['labelProbe'] });
+  const b = await run(registry, { steps: ['readonlyWalk', 'labelProbe'] }, { walkImpl: addressWalk(addrsOf([1, 2, 3, 66, far]), new Set([`66:${placeholderAt}`])) });
   const step = stepOf(b, 'labelProbe');
+  assertEqual(stepOf(b, 'readonlyWalk').status, 'ok', `walk ok (${stepOf(b, 'readonlyWalk').error})`);
   assertEqual(step.status, 'ok', 'label probe ok');
-  const r = step.result as { counts: Record<string, number>; entries: { block: number; param: number; fit: string; labelReply?: string; label?: string; expected: { count: number; typecode: number }; got?: { typecode: number; max: number } }[]; hintsVerifiedOnFirmware: boolean; liveness: { block: number; param: number } };
-  const bound = (blk: number) => deviceCache.walkBlockLimits(FM3, 'read-only').bound[blk] ?? 127;
-  const inBound = (blk: number) => Object.keys(HINTS[blk] ?? {}).map(Number).filter((p) => p <= bound(blk)).length;
-  const expectedLabels = inBound(66) + inBound(1);
-  assertEqual(r.counts.labels, expectedLabels, 'one label query per fitting hint of the answering blocks');
-  assert((r.counts.beyondBound ?? 0) > 0, 'GLOBAL far ids are counted as beyond the walk bound, never probed');
-  assertEqual(r.hintsVerifiedOnFirmware, true, 'FM3 13.0 is a verified firmware (recorded)');
+  const r = step.result as { counts: Record<string, number>; entries: { block: number; param: number; fit: string; labelReply: string; label?: string; family: string; expected: { count: number; typecode: number }; got: { typecode: number; max: number; default: number } }[]; liveness: { block: number; param: number } };
+  const walkedAt = new Set(addrsOf([1, 2, 3, 66, far]).map(([blk, p]) => `${blk}:${p}`));
+  const want = [66, 2, 3, 1].flatMap((blk) => targetsOf(blk).filter((p) => walkedAt.has(`${blk}:${p}`) && !(blk === 66 && (p === placeholderAt || p === fillerAt || p === zeroAt))).map((p) => `${blk}:${p}`));
   const labelled = r.entries.filter((e) => e.labelReply === 'label');
-  assert(labelled.every((e) => e.label === 'LBL' && e.fit === 'exact'), 'labels recorded with their fit');
-  assert(labelled.every((e) => e.got!.typecode === e.expected.typecode && e.got!.max === e.expected.count - 1), 'expected vs got recorded');
-  // Global (block 1) entries come last
-  const firstGlobal = r.entries.findIndex((e) => e.block === 1);
-  assert(firstGlobal > 0 && r.entries.slice(firstGlobal).every((e) => e.block === 1), 'the Global block is probed last');
-  // on the wire: each label query (sub = min = 0) is followed by the liveness definition query
+  assertEqual(labelled.map((e) => `${e.block}:${e.param}`).join(','), want.join(','), 'targets: the walk\'s fitting non-zero-default lists, effect blocks → Controllers → Modifier → Global');
+  assertEqual(r.counts.labels, want.length, 'one label per target');
+  assertEqual(r.counts.defaultZero, 1, 'a zero-default list is left to the numeric rule (counted, not probed)');
+  assert(labelled.every((e) => e.label === 'LBL' && e.fit === 'exact' && e.got.default === 1), 'labels with fit and default recorded');
+  assert(labelled.every((e) => e.got.typecode === e.expected.typecode && e.got.max === e.expected.count - 1), 'expected vs got recorded');
   const sent = mock.sent.slice(start);
-  const live = r.liveness;
-  let labels = 0;
-  for (let i = 0; i < sent.length; i++) {
-    const f = sent[i]!;
-    if (f[5] !== 0x01 || f[6] !== VIEW_ENUM_LABEL) continue;
-    labels++;
+  const labelQueries = sent.map((f, i) => ({ f, i })).filter(({ f }) => f[5] === 0x01 && f[6] === VIEW_ENUM_LABEL);
+  assertEqual(labelQueries.length, want.length, 'label queries on the wire = targets');
+  assert(!labelQueries.some(({ f }) => (f[8]! | (f[9]! << 7)) === far), 'nothing probed beyond the walk range (block > 160)');
+  assert(!labelQueries.some(({ f }) => f[8] === 66 && (f[10] === placeholderAt || f[10] === fillerAt)), 'placeholder slot and empty-slot definition never probed');
+  for (const { f, i } of labelQueries) {
     assertEqual((f[12]! | (f[13]! << 7)), 0, 'label query at sub = min');
-    assert(isQueryOf(sent[i + 1]!, VIEW_DEFINITION, live.block, live.param), `label query ${labels} is followed by a liveness definition query`);
+    assert(isQueryOf(sent[i + 1]!, VIEW_DEFINITION, r.liveness.block, r.liveness.param), 'each label query is followed by a liveness query');
   }
-  assertEqual(labels, expectedLabels, 'label queries on the wire');
-  for (const f of sent) {
-    if (f[5] !== 0x01) continue;
-    const blk = f[8]! | (f[9]! << 7);
-    const p = f[10]! | (f[11]! << 7);
-    assert(p <= bound(blk), `no probe query above the walk bound (block ${blk} param ${p})`);
-  }
-  const lastLabel = [...sent].reverse().find((f) => f[5] === 0x01 && f[6] === VIEW_ENUM_LABEL)!;
-  assertEqual(lastLabel[8], 1, 'the last label query goes to the Global block');
+  // the probe sends no definition queries of its own: only label + liveness after the walk
+  const probeStart = labelQueries[0]!.i;
+  assert(sent.slice(probeStart).every((f) => f[6] === VIEW_ENUM_LABEL || isQueryOf(f, VIEW_DEFINITION, r.liveness.block, r.liveness.param)), 'probe traffic = label + liveness only');
 }
 
 // ── 3. label probe stops at the first missing reply; the run carries on while the device answers ──
 async function labelProbeStops(): Promise<void> {
-  const params66 = Object.keys(HINTS[66]!).map(Number).sort((a, b) => a - b);
-  const stopAt = params66[1]!;
+  const stopAt = targetsOf(66)[1]!;
   const { registry, mock } = await makeRig(fakeState({ fitBlocks: new Set([66, 1]), silentLabel: { block: 66, param: stopAt } }));
   const start = mock.sent.length;
-  const b = await run(registry, { steps: ['labelProbe', 'dumpHeaderProbe'] });
+  const b = await run(registry, { steps: ['readonlyWalk', 'labelProbe', 'dumpHeaderProbe'] }, { walkImpl: addressWalk(addrsOf([66, 1])) });
   const step = stepOf(b, 'labelProbe');
   assertEqual(step.status, 'failed', 'label probe failed at the silent label');
   const r = step.result as { stoppedAt: { block: number; param: number; query: string }; counts: { labels: number } };
-  assertEqual(r.stoppedAt.block, 66, 'stopped at block 66');
-  assertEqual(r.stoppedAt.param, stopAt, 'stopped at the silent param');
-  assertEqual(r.stoppedAt.query, 'label', 'stopped on the label query');
+  assertEqual(JSON.stringify(r.stoppedAt), JSON.stringify({ block: 66, param: stopAt, query: 'label' }), 'stopped at the silent label query');
   assertEqual(r.counts.labels, 1, 'only the labels before the silence');
   const sent = mock.sent.slice(start);
   assert(!sent.some((f) => f[5] === 0x01 && f[6] === VIEW_ENUM_LABEL && f[8] === 1), 'the Global block was never label-probed after the stop');
   assert(/no reply to the label query/.test(step.error ?? ''), 'error names the missing reply');
   assertEqual(stepOf(b, 'dumpHeaderProbe').status, 'ok', 'device still answers → the next step ran');
   assertEqual(b.state, 'done', 'run done (one step failed)');
+}
+
+// ── 3b. no completed read-only walk in the run → no label probe at all ──
+async function labelProbeNeedsWalk(): Promise<void> {
+  const { registry, mock } = await makeRig(fakeState({ fitBlocks: new Set([66, 1]) }));
+  let start = mock.sent.length;
+  let b = await run(registry, { steps: ['labelProbe'] });
+  assertEqual(stepOf(b, 'labelProbe').status, 'skipped', 'no walk in the run → skipped');
+  assertEqual(stepOf(b, 'labelProbe').note, 'needs a completed read-only walk in this run', 'skip note');
+  assert(!mock.sent.slice(start).some((f) => f[5] === 0x01 && f[6] === VIEW_ENUM_LABEL), 'no label query without a walk');
+  start = mock.sent.length;
+  b = await run(registry, { steps: ['readonlyWalk', 'labelProbe'] }, { walkImpl: async () => { throw new Error('walk broke'); } });
+  assertEqual(stepOf(b, 'readonlyWalk').status, 'failed', 'the walk failed');
+  assertEqual(stepOf(b, 'labelProbe').status, 'skipped', 'failed walk → label probe skipped (no roster fallback)');
+  assert(!mock.sent.slice(start).some((f) => f[5] === 0x01 && f[6] === VIEW_ENUM_LABEL), 'no label query after a failed walk');
 }
 
 // ── 4. dump header probe: named numbers per request, unused slots, payloads cut ──
@@ -334,9 +396,8 @@ async function dumpHeaderProbe(): Promise<void> {
   assertEqual(byTarget(511).empty, true, 'the last slot is unused');
   assertEqual(byTarget('edit-buffer').header, 0x3f80, 'edit buffer header recorded');
   assertEqual(byTarget('edit-buffer').names, 'edit-buffer', 'edit buffer header classified');
-  assertEqual(r.requests.filter((x) => x.purpose === 'empty-search').filter((x) => x.empty).length, 3, 'up to three extra unused slots');
-  assert(r.emptySlots.includes(511) && r.emptySlots.length === 4, `unused slots recorded (${r.emptySlots.join(',')})`);
-  assert(!r.requests.some((x) => x.target === 508 && x.purpose === 'empty-search' && x.empty), 'populated slot not counted as unused');
+  assertEqual(r.emptySlots.join(','), '511,510,509', 'three unused slots in all: the last slot (already known) + two searched');
+  assertEqual(r.requests.filter((x) => x.purpose === 'empty-search').length, 2, 'the search stops once three are known');
   // no dump payload kept: chunk + footer frames cut to 8 bytes with their length, headers whole
   const chunks = b.frames.filter((f) => f.dir === 'RX' && f.hex.slice(10, 12) === '78');
   const footers = b.frames.filter((f) => f.dir === 'RX' && f.hex.slice(10, 12) === '79');
@@ -346,13 +407,30 @@ async function dumpHeaderProbe(): Promise<void> {
   assert(headers.every((f) => f.hex.length === 26 && f.len === undefined), 'dump headers kept whole');
   assertEqual(b.redaction.dumpPayloadFrames, chunks.length + footers.length, 'redaction counts the cut dump frames');
   assert(!JSON.stringify(b).includes(hexOf(ascii('P128'))), 'no preset content in the bundle');
+  // a unit without free slots near the top: at most six search dumps
+  const full = fakeState();
+  for (let n = 500; n <= 511; n++) full.slots.set(n, rawPatch(`S${n}`));
+  const r2 = (stepOf(await run((await makeRig(full)).registry, { steps: ['dumpHeaderProbe'] }), 'dumpHeaderProbe').result as { requests: { purpose: string }[] });
+  assertEqual(r2.requests.filter((x) => x.purpose === 'empty-search').length, 6, 'at most six search dumps');
+  // an incomplete dump stops the step
+  const { registry: rg, mock } = await makeRig(fakeState({ incompleteSlot: 127 }));
+  const start = mock.sent.length;
+  const b3 = await run(rg, { steps: ['dumpHeaderProbe'] });
+  const s3 = stepOf(b3, 'dumpHeaderProbe');
+  assertEqual(s3.status, 'failed', 'incomplete dump → failed');
+  assertEqual((s3.result as { stoppedAt: number }).stoppedAt, 127, 'stopped at slot 127');
+  assertEqual(mock.sent.slice(start).filter((f) => f[5] === 0x03).length, 2, 'no dump requested after the incomplete one');
 }
 
 // ── 5. reload probe: clean → switch + verify; unsaved edits → skipped, nothing switched ──
 async function reloadProbe(): Promise<void> {
   {
     const { registry, state } = await makeRig();
+    const events: DeviceEvent[] = [];
+    const unsub = registry.subscribe((e) => events.push(e));
     const b = await run(registry, { steps: ['reloadProbe'] });
+    unsub();
+    assert(!events.some((e) => e.type === 'changed'), 'the job\'s own preset switch emits no changed event');
     const step = stepOf(b, 'reloadProbe');
     assertEqual(step.status, 'ok', 'reload probe ok on a clean edit buffer');
     const r = step.result as { preset: number; editBuffer: string; match: string; verified: boolean; switch: { ok: boolean; ms: number }; totalMs: number };
@@ -370,6 +448,29 @@ async function reloadProbe(): Promise<void> {
     assertEqual(step.note, 'unsaved edits', 'skip note');
     assertEqual((step.result as { editBuffer: string }).editBuffer, 'dirty', 'edit buffer differs from its slot');
     assertEqual(state.switches.length, 0, 'no preset switch was sent');
+  }
+  {
+    // the edit-buffer request answered by a dump headed with the slot number: not provably the edit buffer
+    const { registry, state } = await makeRig(fakeState({ headerFor: (n) => (n === 0x3fff ? 12 : n) }));
+    const b = await run(registry, { steps: ['reloadProbe'] });
+    const step = stepOf(b, 'reloadProbe');
+    assertEqual(step.status, 'skipped', 'edit buffer dump under a slot header → skipped');
+    assertEqual((step.result as { editBuffer: string }).editBuffer, 'unknown', 'reported unknown, not clean');
+    assertEqual(state.switches.length, 0, 'no switch');
+  }
+  {
+    // the slot dump named another slot
+    const { registry, state } = await makeRig(fakeState({ headerFor: (n) => (n === 12 ? 13 : n === 0x3fff ? 0x3f80 : n) }));
+    assertEqual(stepOf(await run(registry, { steps: ['reloadProbe'] }), 'reloadProbe').status, 'skipped', 'slot dump under another number → skipped');
+    assertEqual(state.switches.length, 0, 'no switch');
+  }
+  {
+    // the current preset changes between the check and the switch
+    const { registry, state } = await makeRig(fakeState({ presetRefs: [12, 13] }));
+    const step = stepOf(await run(registry, { steps: ['reloadProbe'] }), 'reloadProbe');
+    assertEqual(step.status, 'skipped', 'preset changed before the switch → skipped');
+    assertEqual((step.result as { reason: string }).reason, 'the current preset changed after the check', 'reason recorded');
+    assertEqual(state.switches.length, 0, 'no switch');
   }
   {
     // an undecodable edit buffer (unknown state) is not clean either
@@ -399,18 +500,30 @@ async function fullWalkGate(): Promise<void> {
     assertEqual(stepOf(b, 'fullWalk').note, 'includeFullWalk not set', 'fullWalk without includeFullWalk is skipped');
   }
   {
+    // the current preset moves between the edit-buffer check and the start of the walk
+    const { registry } = await makeRig(fakeState({ fw: [13, 0], presetRefs: [12, 14] }));
+    let walks = 0;
+    const b = await run(registry, { steps: [], includeFullWalk: true }, { walkImpl: async () => { walks++; return seedRecords(); } });
+    assertEqual(stepOf(b, 'fullWalk').status, 'skipped', 'preset changed → full walk skipped');
+    assertEqual(walks, 0, 'no full walk ran');
+  }
+  {
     const { registry } = await makeRig(fakeState({ fw: [13, 0] }));
     let mode: string | undefined;
-    const b = await run(registry, { steps: [], includeFullWalk: true }, { walkImpl: async (_t, o) => { mode = o.mode; return seedRecords(); } });
+    const events: DeviceEvent[] = [];
+    const unsub = registry.subscribe((e) => events.push(e));
+    const b = await run(registry, { steps: [], includeFullWalk: true }, { walkImpl: async (_t, o) => { mode = o.mode; await o.write!.reloadPreset(); return seedRecords(); } });
+    unsub();
     assertEqual(stepOf(b, 'fullWalk').status, 'ok', 'full walk runs on FM3 13.0 with a clean edit buffer');
     assertEqual(mode, 'full', 'the walk ran in full mode');
+    assert(!events.some((e) => e.type === 'changed'), 'the full walk\'s preset reloads emit no changed event');
   }
 }
 
 // ── 7. bundle on cancel ──
 async function bundleOnCancel(): Promise<void> {
   const { registry } = await makeRig();
-  const r = await diag.startCapture(store.defaultStore, registry, { acknowledged: true }, { ...QUICK, walkImpl: blockingWalk });
+  const r = await diag.startCapture(store.defaultStore, registry, { acknowledged: true }, { ...QUICK, walkImpl: stuckWalk });
   assertEqual(r.code, 202, 'started');
   await sleep(30);
   const st = diag.captureStatus(registry);
@@ -418,7 +531,8 @@ async function bundleOnCancel(): Promise<void> {
   assertEqual(st.steps!.find((s) => s.name === 'readonlyWalk')!.status, 'running', 'walk step running');
   assertEqual(diag.cancelCapture(registry).ok, true, 'cancel ok');
   assertEqual(diag.cancelCapture(registry).ok, true, 'cancel idempotent');
-  await diag.capturePromise(registry);
+  const ended = await Promise.race([diag.capturePromise(registry)!.then(() => true), sleep(1000).then(() => false)]);
+  assert(ended, 'a cancel ends the run at once, even while a step is stuck on the link');
   const b = diag.captureResult(registry).body as diag.CaptureBundle;
   assertEqual(b.state, 'cancelled', 'bundle state cancelled');
   assertEqual(b.abortReason, 'cancelled', 'abort reason cancelled');
@@ -446,8 +560,8 @@ async function bundleOnSilence(): Promise<void> {
 // ── 9. silence watchdog: no RX for the window while a step runs ──
 async function silenceWatchdog(): Promise<void> {
   const { registry } = await makeRig();
-  const b = await run(registry, { steps: ['readonlyWalk', 'labelProbe'] }, { walkImpl: blockingWalk, silenceMs: 60, watchdogTickMs: 10 });
-  assertEqual(b.abortReason, 'device-silent', 'watchdog aborts on silence');
+  const b = await run(registry, { steps: ['readonlyWalk', 'labelProbe'] }, { walkImpl: stuckWalk, silenceMs: 60, watchdogTickMs: 10 });
+  assertEqual(b.abortReason, 'device-silent', 'watchdog aborts on silence, also when the step never returns');
   assertEqual(stepOf(b, 'readonlyWalk').status, 'aborted', 'the waiting step aborted');
   assertEqual(b.state, 'failed', 'state failed');
 }
@@ -461,6 +575,15 @@ async function bundleOnError(): Promise<void> {
   assertEqual(stepOf(b, 'dumpHeaderProbe').status, 'ok', 'device alive → next step ran');
   assertEqual(b.state, 'done', 'run done');
   assert(b.logs.some((l) => l.level === 'warn' && /readonlyWalk: failed/.test(l.msg)), 'job log carries the failure');
+  // a cleanup that throws (the telemetry resume) still leaves a bundle behind
+  const pause = registry.pauseTelemetry.bind(registry);
+  registry.pauseTelemetry = () => { const resume = pause(); return () => { resume(); throw new Error('resume broke'); }; };
+  try {
+    const b2 = await run(registry, { steps: ['info'] });
+    assertEqual(b2.state, 'done', 'bundle built although the resume threw');
+  } finally {
+    registry.pauseTelemetry = pause;
+  }
 }
 
 // ── 11. query-bound watchdog: a query above the walk bound is never sent ──
@@ -506,6 +629,21 @@ async function redaction(): Promise<void> {
   assert(!json.includes(NAME_HEX) && !json.includes('Secret'), 'no preset name anywhere in the bundle');
   assert(!json.includes('COM7'), 'no port name in the bundle');
   assertEqual(diag.scrub('open failed on COM7 at C:\\Users\\someone\\x and /dev/cu.usbmodem1 for a@b.io', 'COM7'), 'open failed on <port> at <path> and <path> for <email>', 'log scrub');
+  const id = { home: 'C:\\Users\\John Smith', user: 'jsmith', host: 'HOSTX' };
+  const scrubbed = diag.scrub('fail at D:\\Some Dir\\John Smith\\x.log, home C:\\Users\\John Smith\\AppData\\y, /home/jsmith/a b by jsmith on HOSTX\nsecond line', null, id);
+  assert(!/John|Smith|jsmith|HOSTX|second line|Some Dir/.test(scrubbed), `identity, paths with spaces and later lines scrubbed (${scrubbed})`);
+}
+
+// ── 12b. the job log: no frame dumps, no names, first lines only, scrubbed ──
+async function logPrivacy(): Promise<void> {
+  const { registry } = await makeRig(fakeState({ trace: true }));
+  const b = await run(registry, { steps: ['info', 'dumpHeaderProbe'] }, { identity: { user: 'jsmith', host: 'HOSTX' } });
+  const text = JSON.stringify(b.logs);
+  assert(!b.logs.some((l) => /\b(RX|TX)\b/.test(l.msg)), 'no per-frame RX/TX line in the job log');
+  assert(!text.includes(NAME_HEX) && !text.includes('53 65 63 72 65 74') && !text.includes('Secret'), 'no preset name in the job log');
+  assert(!text.includes('second line') && !text.includes('John Smith'), 'first lines only, paths with spaces scrubbed');
+  assert(b.logs.some((l) => l.level === 'warn' && l.msg.includes('late reply swallowed') && l.msg.includes('<path>')), 'the transport warning itself is kept, scrubbed');
+  assert(b.logs.some((l) => /step dumpHeaderProbe: ok/.test(l.msg)), 'step ends are always logged');
 }
 
 // ── 13. the wire log is trimmed, never the run failed, when the bundle would be too large ──
@@ -515,8 +653,9 @@ async function trimming(): Promise<void> {
   assert(t.truncated !== undefined && t.truncated.kept + t.truncated.dropped === 1000, 'counts kept + dropped');
   assert(t.frames.some((f) => f.t === 500) && t.frames.some((f) => f.t === 0) && t.frames.some((f) => f.t === 999), 'around the mark, first and last frames kept');
   assertEqual(diag.trimFrames(frames, [], 1e9).truncated, undefined, 'no trim under the budget');
-  const { registry } = await makeRig(fakeState({ fitBlocks: new Set([66]) }));
-  const b = await run(registry, { steps: ['labelProbe'] }, { maxBundleJsonBytes: 400 * 1024 });
+  const { registry } = await makeRig();
+  const chatty: diag.CaptureWalkImpl = async (t) => { for (let i = 0; i < 4000; i++) await t.request(buildDefQuery(FM3, 58, i % 100)); return seedRecords(); };
+  const b = await run(registry, { steps: ['readonlyWalk'] }, { walkImpl: chatty, maxBundleJsonBytes: 400 * 1024 });
   assert(b.framesTruncated !== undefined && b.framesTruncated.dropped > 0, 'framesTruncated recorded');
   assertEqual(b.frames.length, b.framesTruncated!.kept, 'kept frames match');
   assert(JSON.stringify(b).length <= 400 * 1024, 'bundle under the limit');
@@ -768,6 +907,13 @@ async function httpRoutes(): Promise<void> {
     const up = await app.inject({ method: 'POST', url: '/diagnostics/capture/upload', payload: { consent: true } });
     assertEqual(up.statusCode, 503, 'upload without AXIS_CLOUD → 503');
     assertEqual((up.json() as { error: string }).error, 'cloud-disabled', 'cloud-disabled body');
+    // the Browser-Direct router takes the host's versions
+    diag.__setCaptureOptionsForTest(registry, { ...QUICK, versions: undefined, walkImpl: seedWalk });
+    const router = createRouter({ registry, store: store.defaultStore, versions: { forgefx: '1.2.3', codec: '4.5.6', axis: '7.8.9-beta' } });
+    assertEqual((await router.handle('POST', '/diagnostics/capture', JSON.stringify({ acknowledged: true, steps: ['info'] }))).status, 202, 'router start 202');
+    await diag.capturePromise(registry);
+    const viaRouter = JSON.parse((await router.handle('GET', '/diagnostics/capture/result')).body as string) as diag.CaptureBundle;
+    assertEqual(JSON.stringify(viaRouter.app), JSON.stringify({ forgefx: '1.2.3', codec: '4.5.6', axis: '7.8.9-beta' }), 'bundle app versions from RuntimeDeps');
   } finally {
     diag.__setCaptureOptionsForTest(registry, null);
     await app.close();
@@ -778,6 +924,7 @@ export async function runDiagnosticCaptureTests(): Promise<void> {
   await infoAndReadonlyWalk();
   await labelProbeHappy();
   await labelProbeStops();
+  await labelProbeNeedsWalk();
   await dumpHeaderProbe();
   await reloadProbe();
   await fullWalkGate();
@@ -787,6 +934,7 @@ export async function runDiagnosticCaptureTests(): Promise<void> {
   await bundleOnError();
   await queryBound();
   await redaction();
+  await logPrivacy();
   await trimming();
   await gates();
   await upload();

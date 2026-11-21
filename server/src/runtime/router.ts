@@ -60,8 +60,9 @@ export interface RuntimeDeps {
   local?: RouterLocalDeps;
   cloud?: CloudService;
   telemetry?: TelemetryService;
-  /** Version stamps for diagnostic-capture bundles (the host's ForgeFX build, when it knows it). */
-  versions?: { forgefx?: string };
+  /** Version stamps for diagnostic-capture bundles (`app` in the bundle): the ForgeFX build this runtime
+   *  bundles, the codec and the hosting Axis, where the host knows them (each `[0-9A-Za-z.+-]{1,32}`). */
+  versions?: { forgefx?: string; codec?: string; axis?: string };
 }
 
 // ── request plumbing ──
