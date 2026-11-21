@@ -36,7 +36,7 @@ import { SLUG_FAMILY, PROFILES, type DeviceProfile, type TypeModel, type DeviceL
 import { EmptyPresetError } from './types.js';
 import type {
   DeviceDriver, DriverCapabilities, DriverCtx, DiagnosticDump, SelectPresetOpts,
-  PresetGridDTO, PresetBlockDTO, PresetSummary, NamedParam, EnumParam, MeterVal,
+  PresetGridDTO, GridCellDTO, PresetBlockDTO, PresetSummary, NamedParam, EnumParam, MeterVal,
   FcSwitchState, FcReadState, StoreReason
 } from './types.js';
 import { validatedPresetDump } from './sendPolicy.js';
@@ -1864,11 +1864,53 @@ class Gen3Driver implements DeviceDriver {
     // FM3 needs a cell-select (sub 0x30) before the insert (sub 0x32), or the block
     // lands at the default cell. buildClearBlock IS that select frame (no-op on an
     // empty cell). For blockId 0 this becomes select + insert-0 = clear, like the C#.
-    await this.#write(this.#codec.buildClearBlock({ row, col, rows: this.#prof.rows }));
-    const r = await this.#write(this.#codec.buildSetGridCell({ row, col, blockId, rows: this.#prof.rows }));
+    // Both frames are built up front so a bad row/col/blockId throws before any wire traffic
+    // (the duplicate guard below reads the grid, which must not happen for a request that cannot be sent).
+    const select = this.#codec.buildClearBlock({ row, col, rows: this.#prof.rows });
+    const insert = this.#codec.buildSetGridCell({ row, col, blockId, rows: this.#prof.rows });
+    // A block can sit in the grid only once, but the device answers an insert of a block that is already
+    // placed elsewhere with an echo and then silently ignores it (no 0x64 refusal — hardware, FM3 fw 13), so
+    // `ok:true` would report a placement that never happened. Refuse it here, before writing anything. The
+    // grid cells are 0-indexed, this method's row/col are 1-indexed. Clearing (blockId 0) and shunts (routing
+    // cells, which may repeat) are not blocks and never reach the guard.
+    if (blockId !== 0) {
+      const held = await this.#placedCellOf(blockId);
+      if (held) {
+        if (held.row === row - 1 && held.col === col - 1) return { ok: true }; // already exactly there: nothing to write
+        const err = new Error(`${held.name} is already placed at row ${held.row + 1} col ${held.col + 1} — move it instead`);
+        (err as Error & { statusCode?: number }).statusCode = 409; // conflict with the current grid, not a server fault
+        throw err;
+      }
+    }
+    await this.#write(select);
+    const r = await this.#write(insert);
     this.#gridCache = null;
     this.#emit({ type: 'changed', scope: 'grid' });
     return r;
+  }
+  /** The grid cell that currently holds the (non-shunt) block `blockId`, or null when it is not placed — or
+   *  when the grid cannot be read: an unreadable grid never blocks a placement (today's behaviour).
+   *  Reads through grid() (its 500 ms cache and in-flight coalescing), so no new wire pattern. Such a read
+   *  can predate a clear the caller just made (a move clears the source, then places at the destination), and
+   *  a refusal or no-op decided on it would be wrong, so a hit is confirmed with one fresh dump before it counts. */
+  async #placedCellOf(blockId: number): Promise<GridCellDTO | null> {
+    const find = (g: PresetGridDTO) => g.cells.find((c) => !c.isShunt && c.effectId === blockId) ?? null;
+    // grid() starts a fresh dump read itself unless it can reuse a cached or in-flight one (decided synchronously here)
+    const reused = this.#gridInflight !== null || (this.#gridCache !== null && Date.now() - this.#gridCache.at < Gen3Driver.GRID_TTL_MS);
+    let hit: GridCellDTO | null;
+    try {
+      hit = find(await this.grid());
+    } catch {
+      return null;
+    }
+    if (!hit || !reused) return hit;
+    try {
+      const g = await this.#dumpGrid();
+      this.#gridCache = { grid: g, at: Date.now() };
+      return find(g);
+    } catch {
+      return null;
+    }
   }
   /** Move the device's edit cursor to a cell (sub 0x30) so the FM3 screen follows the UI.
    * Non-destructive: this is the cursor-select frame (no companion = no clear). */

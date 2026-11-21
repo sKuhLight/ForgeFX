@@ -329,6 +329,9 @@ export interface DeviceDriver {
   setType?(eid: number, value: number): Promise<WriteResult>;
   setBypass?(eid: number, bypassed: boolean): Promise<{ ok: boolean }>;
   setChannel?(eid: number, channel: string): Promise<WriteResult>;
+  /** Place `blockId` at the 1-indexed cell (0 clears it). gen-3 refuses a block that is already placed at ANOTHER
+   *  cell with a 409 error (the device would echo the insert and silently ignore it) and answers the same block
+   *  onto its own cell with `ok:true` without writing — move a block by clearing its source first. */
   placeCell?(row: number, col: number, blockId: number): Promise<WriteResult>;
   selectCell?(row: number, col: number): Promise<{ ok: boolean }>;
   cable?(srcRow: number, srcCol: number, destRow: number, connect: boolean): Promise<{ ok: boolean }>;

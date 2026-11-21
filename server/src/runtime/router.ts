@@ -87,6 +87,12 @@ interface Route { method: string; segs: string[]; octet: boolean; handler: Handl
 
 const JSON_TYPE = 'application/json; charset=utf-8';
 const OCTET_TYPE = 'application/octet-stream';
+/** Reason phrases for the error envelope (Fastify uses node:http's table, which the browser runtime cannot import). */
+const STATUS_TEXT: Record<number, string> = {
+  400: 'Bad Request', 401: 'Unauthorized', 403: 'Forbidden', 404: 'Not Found', 405: 'Method Not Allowed',
+  409: 'Conflict', 413: 'Payload Too Large', 415: 'Unsupported Media Type', 422: 'Unprocessable Entity',
+  500: 'Internal Server Error', 501: 'Not Implemented', 502: 'Bad Gateway', 503: 'Service Unavailable', 504: 'Gateway Timeout'
+};
 
 export function createRouter(deps: RuntimeDeps): {
   handle(method: string, path: string, body?: string | Uint8Array): Promise<RouterResponse>;
@@ -613,8 +619,11 @@ export function createRouter(deps: RuntimeDeps): {
         const out = await route.handler(ctx);
         return respond(ctx.reply.statusCode, out);
       } catch (e) {
-        // uncaught handler error → Fastify's default 500 envelope
-        return respond(500, { statusCode: 500, error: 'Internal Server Error', message: (e as Error).message });
+        // uncaught handler error → Fastify's default error envelope: a thrown error carrying a 4xx/5xx
+        // `statusCode` (a driver's 400 "no such instance" / 409 "already placed") keeps it, anything else is a 500
+        const code = (e as { statusCode?: unknown }).statusCode;
+        const status = typeof code === 'number' && Number.isInteger(code) && code >= 400 && code <= 599 ? code : 500;
+        return respond(status, { statusCode: status, error: STATUS_TEXT[status] ?? (status >= 500 ? 'Internal Server Error' : 'Bad Request'), message: (e as Error).message });
       }
     }
     // Fastify's default not-found body, verbatim
