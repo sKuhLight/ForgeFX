@@ -164,6 +164,49 @@ export class Cloud {
     } catch (e) { return { code: 503, body: { error: (e as Error).message } }; }
   }
 
+  // ── diagnostic capture upload (axis-cloud `diagnostic-captures`; private bucket, maintainer-read only) ──
+  /** Upload a gzip'd diagnostic-capture bundle under the signed-in user — the ONE place that knows the
+   *  cloud's upload transport:
+   *    1. POST `diagnostic-captures` with the small metadata JSON → a signed upload slot
+   *       (`{ captureId, uploadUrl, token, path, expiresIn }`), or `{ captureId, deduped: true }` when this
+   *       bundle id is already stored (done — nothing is uploaded again);
+   *    2. upload the gzip bytes straight to storage through that signed slot (`application/gzip`);
+   *    3. POST `diagnostic-captures/finalize` `{ captureId }` → `{ captureId, status: 'complete' }`.
+   *  Returns the HTTP outcome of the step that ended the flow (`code` 0 = network failure, `retryAfter` = a
+   *  Retry-After header), with `body.captureId` on success; `disabled` when cloud is off, 401 when nobody is
+   *  signed in. */
+  async diagnosticCaptureUpload(gz: Uint8Array, meta: { captureId: string; model: number; firmware: string | null; app: Record<string, string>; bytes: number }): Promise<{ code: number; body: unknown; retryAfter?: string | null; disabled?: boolean }> {
+    if (!this.#enabled()) return { code: 503, body: { error: 'cloud-disabled' }, disabled: true };
+    const c = this.#c();
+    const { data: s } = await c.auth.getSession();
+    const token = s.session?.access_token;
+    if (!token) return { code: 401, body: { error: 'not signed in' } };
+    const fn = `${this.#cfg.url}/functions/v1/diagnostic-captures`;
+    const post = async (url: string, body: unknown) => {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}`, apikey: this.#cfg.anonKey, 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(30000)
+      });
+      return { code: res.status, body: (await res.json().catch(() => ({}))) as Record<string, unknown>, retryAfter: res.headers.get('retry-after') };
+    };
+    try {
+      const slot = await post(fn, meta);
+      if (slot.code < 200 || slot.code >= 300) return slot;
+      if (slot.body.deduped === true) return { code: 200, body: { captureId: slot.body.captureId, deduped: true } };
+      const path = slot.body.path;
+      const uploadToken = slot.body.token;
+      if (typeof path !== 'string' || typeof uploadToken !== 'string') return { code: 502, body: { error: 'cloud', message: 'no upload slot in the answer' } };
+      const up = await withTimeout(c.storage.from('diagnostic-captures').uploadToSignedUrl(path, uploadToken, gz, { contentType: 'application/gzip' }), 120000, 'capture upload');
+      if (up.error) {
+        const status = Number((up.error as { statusCode?: unknown; status?: unknown }).statusCode ?? (up.error as { status?: unknown }).status);
+        return { code: Number.isFinite(status) && status > 0 ? status : 0, body: { error: 'storage', message: up.error.message } };
+      }
+      return await post(`${fn}/finalize`, { captureId: slot.body.captureId ?? meta.captureId });
+    } catch (e) { return { code: 0, body: { error: (e as Error).message } }; }
+  }
+
   /** For Axis Cloud Remote: the authed Supabase client + current user id (for the Realtime host channel),
    *  or null when cloud is off / signed out. The client carries the user's session, so its Realtime
    *  connection is authorized for that user's private channel. */

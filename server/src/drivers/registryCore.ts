@@ -93,6 +93,13 @@ export function fullCaptureAllowedOnFirmware(modelId: number, fw: { major: numbe
   return fw.major < max.major || (fw.major === max.major && fw.minor <= max.minor);
 }
 
+/** Whether the in-app diagnostic capture (POST /diagnostics/capture) may run on a device: gen-3 units whose
+ *  driver offers the self-describe walk (its read-only walk, label probe and dump probes are gen-3 wire
+ *  features). Shared by the capabilities DTO (`diagnosticCapture`) and the capture service (the 501 gate). */
+export function diagnosticCaptureSupported(modelId: number, caps: Pick<DriverCapabilities, 'selfDescribe'> | null | undefined): boolean {
+  return !!caps?.selfDescribe && DEVICE_MODELS[modelId]?.gen === 3;
+}
+
 /** The /telemetry/config DTO both surfaces serve: the current mode, its resolved cadence, and the
  *  full mode list. Cumulative-counter-free — traffic rides the SSE `traffic` event + /diag. */
 export interface TelemetryConfigDto { mode: TelemetryMode; effective: CadenceProfile; modes: readonly TelemetryMode[]; }
@@ -542,6 +549,9 @@ export class DeviceRegistry {
       // populates #firmware before any caps DTO is served, so the UI never offers a mode the build route
       // would refuse. (The build route re-reads the firmware itself right before gating.)
       fullCapture: c.fullCapture && fullCaptureAllowedOnFirmware(mid, this.#firmware),
+      // In-app diagnostic capture (POST /diagnostics/capture): gen-3 units with the self-describe walk.
+      // Inserted after fullCapture (additive-only ordering).
+      diagnosticCapture: diagnosticCaptureSupported(mid, c),
       editorLayouts: c.editorLayouts,
       firmwareValidate: !!d.validateFirmware,
       // Cross-device preset conversion (POST /preset/convert with no source): the current preset can be
@@ -1121,7 +1131,11 @@ export class DeviceRegistry {
     if (inst[INSTRUMENTED]) return; // already wrapped — never double-wrap (breaks the echo guard)
     inst[INSTRUMENTED] = true;
 
-    const countTx = (bytes: readonly number[]) => { this.#traffic.txMsgs++; this.#traffic.txBytes += bytes.length; };
+    const countTx = (bytes: readonly number[]) => {
+      this.#traffic.txMsgs++;
+      this.#traffic.txBytes += bytes.length;
+      if (this.#frameObservers.size > 0) this.#observeFrame('TX', bytes);
+    };
 
     const origRequest = t.request.bind(t);
     t.request = (bytes, opts) => {
@@ -1144,7 +1158,29 @@ export class DeviceRegistry {
     }
     // RX: one persistent handler for the transport's life (additive — coexists with request() waiters
     // and the edit-push listener, which register their own onFrame handlers).
-    t.onFrame((frame) => { this.#traffic.rxMsgs++; this.#traffic.rxBytes += frame.length; });
+    t.onFrame((frame) => {
+      this.#traffic.rxMsgs++;
+      this.#traffic.rxBytes += frame.length;
+      if (this.#frameObservers.size > 0) this.#observeFrame('RX', frame);
+    });
+  }
+
+  // ── frame observers (the diagnostic capture's wire log) ──
+  // Every frame the instrumented transport sends (request/send/sendQueued/sendPaced, at the moment the
+  // caller hands it over) or receives, while at least one observer is registered. Nothing is recorded
+  // or copied without an observer, so this costs one size check per frame otherwise.
+  #frameObservers = new Set<(dir: 'TX' | 'RX', bytes: readonly number[]) => void>();
+  #observeFrame(dir: 'TX' | 'RX', bytes: readonly number[]): void {
+    for (const fn of this.#frameObservers) {
+      try { fn(dir, bytes); } catch { /* an observer must never break the link */ }
+    }
+  }
+  /** Observe every frame on the device link (TX + RX) until the returned function is called. Used by the
+   *  diagnostic capture to record the wire log of its run only; observers must not keep a reference to
+   *  `bytes` (the transport may reuse it). */
+  addFrameObserver(fn: (dir: 'TX' | 'RX', bytes: readonly number[]) => void): () => void {
+    this.#frameObservers.add(fn);
+    return () => { this.#frameObservers.delete(fn); };
   }
 
   /** Run a supervisor-issued device call while marking it so it doesn't register as INTERACTIVE traffic

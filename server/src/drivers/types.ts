@@ -115,6 +115,27 @@ export interface Am4Slot {
   pidLow: number; // the block's pidLow (its type value)
 }
 
+/** One diagnostic dump request (DeviceDriver.diagnosticDump). `header` is the preset number the first
+ *  whole dump's 0x77 header names (or the first header seen when no dump completed), null when no header
+ *  arrived. `patch` is the decoded raw patch of the whole dump — for an in-memory comparison only (the
+ *  edit buffer against its stored slot); callers must never persist or log it. */
+export interface DiagnosticDump {
+  /** The preset number the request asked for (0x3FFF = the edit buffer). */
+  requested: number;
+  header: number | null;
+  /** A whole dump (0x77 header through its 0x79 terminator, at least one 0x78 chunk) arrived. */
+  complete: boolean;
+  /** Dump frames received (0x77 / 0x78 / 0x79) and their total size in bytes. */
+  frames: number;
+  chunks: number;
+  bytes: number;
+  /** Request round trip in ms. */
+  ms: number;
+  /** The whole dump decodes to an unused (all-zero) slot; null when it could not be decoded. */
+  empty: boolean | null;
+  patch: { raw: Uint8Array; body: Uint8Array } | null;
+}
+
 /** What a device driver can actually do — the single truth the routes gate on (a missing optional
  *  DeviceDriver method always corresponds to a false/absent capability here). No cross-device
  *  `if (isAm4)`-style checks anywhere else. */
@@ -250,6 +271,10 @@ export interface DeviceDriver {
   presetParams?(presetNumber: number): Promise<DecodedBlock[]>;
   /** Raw .syx bytes (the backup blob) + decoded summary for one slot — the backups service's source. */
   dumpRaw?(n: number): Promise<{ bytes: Uint8Array; summary: PresetSummary }>;
+  /** Diagnostic capture: ONE read-only dump request for a stored slot or the edit buffer that accepts
+   *  whatever whole dump the device answers with, so the caller learns which number the dump header
+   *  names. Never retried, never cached. gen-3 (capability presetDump). */
+  diagnosticDump?(target: number | 'edit-buffer'): Promise<DiagnosticDump>;
   decodePresetBytes?(bytes: Uint8Array): PresetSummary;
   presetBodyHex?(): Promise<{ len: number; hex: string }>;
   placedBlocks?(): Promise<PresetBlockDTO[]>;
