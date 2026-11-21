@@ -15,6 +15,7 @@ import { AXE_FX_III_BLOCKS, PARAMS as AXE3_PARAMS } from 'forgefx-midi/gen3/axe-
 import { isFractalHeaderFrame } from 'forgefx-midi/shared';
 import { AM4_CACHE_PARAMS, AM4_SEEDS } from 'forgefx-midi/am4';
 import { deviceCacheKey, fullCaptureAllowedOnFirmware, type DeviceRegistry } from '../drivers/registryCore.js';
+import { claimDevice, deviceBusy, releaseDevice } from './deviceJobs.js';
 import { PROFILES, SLUG_FAMILY, isByteExactProfile, type DeviceProfile } from '../devices.js';
 import { CURRENT_CACHE_SCHEMA, loadStoredProfile, type StaleReason } from '../profileSchema.js';
 import type { Store } from '../runtime/store.js';
@@ -350,6 +351,63 @@ export function adaptRequest(transport: Transport, query: Uint8Array): Promise<U
     });
 }
 
+/** Pacing the walk always runs with (see WALK_PACE_MS / WALK_BLOCK_PAUSE_MS) — exported so other read-only
+ *  query sequences over the same link (the diagnostic label probe) keep exactly the same pace. */
+export const WALK_PACING: Readonly<{ interQueryMs: number; blockPauseMs: number }> = { interQueryMs: WALK_PACE_MS, blockPauseMs: WALK_BLOCK_PAUSE_MS };
+
+/** The walk options of one live walk besides the transport, and the limits they carry. */
+export interface WalkSetup {
+  opts: LiveWalkOptions;
+  limits: WalkBlockLimits;
+  /** The walk got label-list hints (`enumHintsVerifiedOn` the firmware). */
+  hinted: boolean;
+}
+
+/** Build the live walk's options exactly as the cache build runs it — pacing, the 7-bit (read-only) or
+ *  511 (full) ceiling, the per-block limits (`walkBlockLimits`) and the label-list hints, gated by firmware
+ *  (`enumHintsVerifiedOn`) — for `model` on the running firmware `fw` (null = unknown: no hints, catalog
+ *  limits). A USABLE stored profile of that firmware refines the limits / hints exactly as in a build; it
+ *  is only read, never written. Shared by the cache build and the diagnostic capture, so both walk alike. */
+export function walkSetup(
+  store: Store,
+  model: number,
+  fw: { major: number; minor: number } | null,
+  mode: BuildMode,
+  extra: { signal?: AbortSignal; onProgress?: LiveWalkOptions['onProgress']; write?: LiveWalkWriteHooks } = {}
+): WalkSetup {
+  const full = mode === 'full';
+  // Per-block known table size + hard ceiling (see walkBlockLimits). A byte-exact stored cache for this
+  // firmware (force-rebuild over an editor-cache import) is exact device data and refines the catalog;
+  // a stale one (outdated schema) is not trusted for that either.
+  const stored = fw ? loadStoredProfile(store, deviceCacheKey(model, fw.major, fw.minor)) : null;
+  const usable = stored?.state === 'usable' ? stored.profile : null;
+  const limits = walkBlockLimits(model, mode, usable);
+  const hinted = enumHintsVerifiedOn(model, fw);
+  const opts: LiveWalkOptions = {
+    model,
+    ...(full ? { mode: 'full' as const, write: extra.write } : {}),
+    interQueryMs: WALK_PACE_MS,
+    blockPauseMs: WALK_BLOCK_PAUSE_MS,
+    maxParamId: full ? WALK_MAX_PARAM_ID_FULL : WALK_MAX_PARAM_ID,
+    paramKnownSizeByBlock: limits.knownSize,
+    paramBoundByBlock: limits.bound,
+    // Label lists per block (see walkEnumHints), both modes — only on a (model, firmware) the hints are
+    // verified on (enumHintsVerifiedOn); elsewhere the walk gets none and keeps its numeric rule.
+    ...(hinted ? { enumHintByBlock: walkEnumHints(model, usable) } : {}),
+    ...(extra.signal ? { signal: extra.signal } : {}),
+    ...(extra.onProgress ? { onProgress: extra.onProgress } : {})
+  };
+  return { opts, limits, hinted };
+}
+
+/** The highest param id the walk queries in `block` under `opts`: the block's hard bound, else the
+ *  walk's `maxParamId` (the mode default when unset). The diagnostic capture's query-bound watchdog. */
+export function walkQueryBound(opts: Pick<LiveWalkOptions, 'paramBoundByBlock' | 'maxParamId' | 'mode'>, block: number): number {
+  const b = opts.paramBoundByBlock?.[block];
+  if (b !== undefined && Number.isInteger(b)) return b;
+  return opts.maxParamId ?? (opts.mode === 'full' ? WALK_MAX_PARAM_ID_FULL : WALK_MAX_PARAM_ID);
+}
+
 /** The detached build task: pause telemetry, walk → build → persist → swap profile, emit terminal
  *  event, resume telemetry. Never rejects (all outcomes are emitted, not thrown). */
 async function runBuild(store: Store, registry: DeviceRegistry, job: CacheJob, walkImpl: WalkImpl): Promise<void> {
@@ -373,24 +431,9 @@ async function runBuild(store: Store, registry: DeviceRegistry, job: CacheJob, w
         reloadPreset: () => driver.reloadPreset?.() ?? Promise.resolve()
       };
     }
-    // Per-block known table size + hard ceiling (see walkBlockLimits). A byte-exact stored cache for this
-    // firmware (force-rebuild over an editor-cache import) is exact device data and refines the catalog;
-    // a stale one (outdated schema) is not trusted for that either.
-    const stored = loadStoredProfile(store, key);
-    const usable = stored.state === 'usable' ? stored.profile : null;
-    const limits = walkBlockLimits(model, mode, usable);
-    const walkOpts: LiveWalkOptions = {
-      model,
-      ...(full ? { mode: 'full' as const, write } : {}),
-      interQueryMs: WALK_PACE_MS,
-      blockPauseMs: WALK_BLOCK_PAUSE_MS,
-      maxParamId: full ? WALK_MAX_PARAM_ID_FULL : WALK_MAX_PARAM_ID,
-      paramKnownSizeByBlock: limits.knownSize,
-      paramBoundByBlock: limits.bound,
-      // Label lists per block (see walkEnumHints), both modes — only on a (model, firmware) the hints are
-      // verified on (enumHintsVerifiedOn); elsewhere the walk gets none and keeps its numeric rule.
-      ...(enumHintsVerifiedOn(model, fw) ? { enumHintByBlock: walkEnumHints(model, usable) } : {}),
+    const { opts: walkOpts } = walkSetup(store, model, fw, mode, {
       signal: controller.signal,
+      write,
       onProgress: (p) => {
         if (controller.signal.aborted) return;
         if (p.phase === 'done') {
@@ -401,7 +444,7 @@ async function runBuild(store: Store, registry: DeviceRegistry, job: CacheJob, w
           registry.emitEvent({ type: 'cacheBuild', phase: 'walking', done: p.blockIndex, total: p.blockCount, key, model, firmware });
         }
       }
-    };
+    });
     const built = await buildCache(
       { kind: 'live', walk: () => walkImpl(adapter, walkOpts) },
       paramsForModel(model),
@@ -485,6 +528,26 @@ export async function startCacheBuild(store: Store, registry: DeviceRegistry, op
   // A build is already running: refuse BEFORE anything touches the device. The full-mode firmware re-read below
   // sends fn 0x08 and clears the cached firmware, which must never happen in the middle of a running walk.
   if (JOBS.has(registry)) return { code: 409, body: { error: 'building' } };
+  // The device is exclusive between this build and the diagnostic capture: claim it before the first await
+  // (a running capture answers 409 busy, a concurrent build start the usual 'building').
+  if (!claimDevice(registry, 'cache-build')) {
+    return deviceBusy(registry) === 'capture' ? { code: 409, body: { error: 'busy', what: 'capture' } } : { code: 409, body: { error: 'building' } };
+  }
+  let started = false;
+  try {
+    const r = await startClaimedBuild(store, registry, opts);
+    started = r.started;
+    return r.result;
+  } finally {
+    if (!started) releaseDevice(registry, 'cache-build');
+  }
+}
+
+/** The rest of startCacheBuild, with the device claimed. `started` = a job now owns the claim (its task
+ *  releases it when it settles); otherwise the caller releases it. */
+async function startClaimedBuild(store: Store, registry: DeviceRegistry, opts: { force?: boolean; mode?: BuildMode; walkImpl?: WalkImpl } | undefined): Promise<{ started: boolean; result: StartResult }> {
+  const mode: BuildMode = opts?.mode === 'full' ? 'full' : 'read-only';
+  const done = (result: StartResult) => ({ started: false, result });
   // FULL mode WRITES to the device, so it additionally needs a firmware it has been verified on: per model, at
   // or below FULL_CAPTURE_MAX_VERIFIED_FW (a firmware can move the table ends the walk relies on: on FM3 13.0 a walk
   // without the table-end bound did not stop at a block's end and would have written sweep values to
@@ -496,7 +559,7 @@ export async function startCacheBuild(store: Store, registry: DeviceRegistry, op
   if (mode === 'full') {
     const fwNow = await registry.refreshFirmware();
     if (!fullCaptureAllowedOnFirmware(registry.detectedModelId, fwNow)) {
-      return {
+      return done({
         code: 501,
         body: {
           error: 'unsupported',
@@ -507,18 +570,18 @@ export async function startCacheBuild(store: Store, registry: DeviceRegistry, op
             ? `full capture is only enabled on firmware versions it has been verified on (this device runs ${fwNow.version}); use read-only`
             : 'full capture needs a known firmware version and the firmware could not be read from the device; re-detect the device'
         }
-      };
+      });
     }
   }
   const model = registry.detectedModelId;
   const fw = registry.firmwareInfo();
-  if (model < 0 || !fw) return { code: 503, body: { error: 'no device detected or firmware unknown' } };
+  if (model < 0 || !fw) return done({ code: 503, body: { error: 'no device detected or firmware unknown' } });
   const key = deviceCacheKey(model, fw.major, fw.minor);
   // Only a USABLE profile counts as "already built": a stale one (outdated schema) is rebuilt without
   // `force` and overwritten by the new build (it is never deleted up front, a cancelled/failed build leaves it).
   if (loadStoredProfile(store, key).state === 'usable' && !opts?.force) {
     registry.emitEvent({ type: 'cacheBuild', phase: 'already-built', done: 0, total: 0, key, model, firmware: fw.version });
-    return { code: 200, body: { ok: true, already: true } };
+    return done({ code: 200, body: { ok: true, already: true } });
   }
   const job: CacheJob = {
     key, model, firmware: fw.version, fw: { major: fw.major, minor: fw.minor }, mode,
@@ -529,8 +592,9 @@ export async function startCacheBuild(store: Store, registry: DeviceRegistry, op
   JOBS.set(registry, job);
   job.promise = runBuild(store, registry, job, opts?.walkImpl ?? liveWalk).finally(() => {
     if (JOBS.get(registry) === job) JOBS.delete(registry);
+    releaseDevice(registry, 'cache-build');
   });
-  return { code: 200, body: { ok: true, key, started: true } };
+  return { started: true, result: { code: 200, body: { ok: true, key, started: true } } };
 }
 
 /** POST /device/cache/cancel — abort a running build (idempotent when none runs). */
