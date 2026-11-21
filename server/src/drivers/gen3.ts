@@ -73,19 +73,28 @@ type DumpHeaderCheck =
 /** Per model: [stored-slot reads, edit-buffer reads] — the STARTING policy of a connection; tighten as tester
  *  evidence comes in. Within a connection a 'prefer' kind turns 'strict' as soon as the device has sent one
  *  header naming the requested number (the driver's per-connection session, see #dumpHeaderPlan).
- *   FM3 stored slots: strict (being verified on hardware, incl. empty slots and slots >= 128).
- *   FM9 / Axe-Fx III stored slots: prefer — the header is not verified on these yet.
- *   Edit buffer, every model: prefer the 0x3FFF sentinel (or the CURRENT slot, when the driver knows it) —
- *   what a device writes there is not verified, and another stored-slot header there may be a late scan reply,
- *   so it never completes the read by itself. */
+ *   FM3 stored slots: strict — the header names exactly the requested slot (hardware, fw 13.0: populated and
+ *   empty slots, slots >= 128).
+ *   Edit buffer, every model: prefer. A read counts EDIT_BUFFER_HEADERS (the FM3 answers a 0x3FFF request
+ *   with 7F 00 on fw 13.0) and the known CURRENT slot as named, so only a header naming another stored slot (a
+ *   late scan reply, or a convention not seen yet — 7F 00 is proven on one firmware only) falls back: one quiet
+ *   gap and a log line, never failed reads. The connection turns strict once a named header has been seen.
+ *   FM9 / Axe-Fx III stored slots: prefer — not verified on these yet. */
 const DUMP_HEADER_POLICY: Readonly<Record<number, readonly [stored: DumpHeaderCheck, editBuffer: DumpHeaderCheck]>> = {
   0x11: ['strict', 'prefer'], // FM3
   0x12: ['prefer', 'prefer'], // FM9
   0x10: ['prefer', 'prefer'] // Axe-Fx III
 };
+/** Header numbers that name the EDIT BUFFER in a dump answering an edit-buffer (0x3FFF) request: the 0x3FFF
+ *  sentinel itself, and 0x3F80 (`7F 00`) — what the FM3 sends on fw 13.0 and what the Axe-Fx III fixture
+ *  carries. */
+const EDIT_BUFFER_HEADERS: readonly number[] = [EDIT_BUFFER, 0x3f80];
 const dumpHeaderCheck = (model: number, target: number): DumpHeaderCheck =>
   (DUMP_HEADER_POLICY[model] ?? ['prefer', 'prefer'])[target === EDIT_BUFFER ? 1 : 0];
 const dumpHeaderNumber = (f: readonly number[]) => ((f[6]! & 0x7f) << 7) | (f[7]! & 0x7f);
+/** Does header number `n` name the request for `target` itself (proof of the device's convention)? */
+const headerNamesRequest = (n: number, target: number): boolean =>
+  n === target || (target === EDIT_BUFFER && EDIT_BUFFER_HEADERS.includes(n));
 const dumpFramesOnly = (fs: number[][], model: number) => fs.filter((f) => isFrameOf(f, model, 0x77) || isFrameOf(f, model, 0x78) || isFrameOf(f, model, 0x79));
 /** Every WHOLE dump in `frames` whose header passes `want` — each its header through the 0x79 after it, that
  *  dump's frames only. A terminator without a wanted header before it (the tail of an earlier dump) is never
@@ -655,7 +664,7 @@ class Gen3Driver implements DeviceDriver {
       const plan = this.#dumpHeaderPlan(dev, target);
       const frames = await dev.request(this.#codec.buildRequestPresetDump(target), presetDumpOpts(model, plan, slow ? 25000 : 5000, slow ? 1500 : 180));
       let whole = wholeDumps(frames, model, plan.named)[0];
-      if (whole && dumpHeaderNumber(whole[0]!) === target) this.#session(dev).learned.add(target === EDIT_BUFFER ? 'edit' : 'stored');
+      if (whole && headerNamesRequest(dumpHeaderNumber(whole[0]!), target)) this.#session(dev).learned.add(target === EDIT_BUFFER ? 'edit' : 'stored');
       if (!whole && plan.check === 'prefer') {
         whole = wholeDumps(frames, model, () => true).at(-1);
         if (whole) this.#noteDumpHeader(what, dumpHeaderNumber(whole[0]!));
@@ -675,7 +684,7 @@ class Gen3Driver implements DeviceDriver {
     const kind = what === 'edit buffer' ? what : 'stored slot';
     if (this.#dumpHeaderNoted.has(kind)) return;
     this.#dumpHeaderNoted.add(kind);
-    const n = named === EDIT_BUFFER ? 'the edit buffer (0x3FFF)' : `slot ${named}`;
+    const n = EDIT_BUFFER_HEADERS.includes(named) ? `the edit buffer (0x${named.toString(16)})` : `slot ${named}`;
     console.warn(`[forgefx] presetDump: ${what} read answered by a dump whose header names ${n} — used it (no dump naming the request arrived; header check is lenient for model 0x${this.#prof.model.toString(16)}). Logged once.`);
   }
   #dumpHeaderNoted = new Set<string>();
@@ -694,9 +703,10 @@ class Gen3Driver implements DeviceDriver {
   }
   /** How a dump read of `target` judges headers on this connection. Starts from DUMP_HEADER_POLICY; a
    *  'prefer' kind becomes 'strict' once the device has named the requested number in a header (so a late dump
-   *  of another slot can never be used as a fallback again). An edit-buffer read also treats a header naming
-   *  the CURRENT slot as named when the driver knows it (devices may write that instead of 0x3FFF) — that does
-   *  not count as proof, since a front-panel preset change can make the known slot stale. */
+   *  of another slot can never be used as a fallback again). An edit-buffer read is named by any of
+   *  EDIT_BUFFER_HEADERS (0x3FFF, 0x3F80) — proof of the convention — and also by a header naming the CURRENT
+   *  slot when the driver knows it, which does not count as proof (a front-panel preset change can make the
+   *  known slot stale). */
   #dumpHeaderPlan(dev: Transport, target: number): DumpHeaderPlan {
     const s = this.#session(dev);
     const base = dumpHeaderCheck(this.#prof.model, target);
@@ -706,7 +716,7 @@ class Gen3Driver implements DeviceDriver {
     const named = (h: number[]) => {
       if (check === 'any') return true;
       const n = dumpHeaderNumber(h);
-      return n === target || (current !== null && n === current);
+      return headerNamesRequest(n, target) || (current !== null && n === current);
     };
     return { check, named };
   }

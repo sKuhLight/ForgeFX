@@ -60,16 +60,16 @@ export function handshakeReply(modelId: number): number[] {
   return [...body, cs & 0x7f, 0xf7];
 }
 
-/** What a device sends for a gen-3 stored-slot dump request: a dump whose 0x77 header names the requested
- *  slot. Rewrites a fixture dump's header (bytes 6-7, MSB-first 7-bit pair, copied from the request) and its
- *  checksum. An edit-buffer request (7F 7F) gets the fixture unchanged. */
+/** What a gen-3 device sends for a dump request: a dump whose 0x77 header (bytes 6-7, MSB-first 7-bit pair)
+ *  names the requested slot, or — for an edit-buffer request (7F 7F) — `7F 00`, as the FM3 does (fw 13.0).
+ *  Rewrites a fixture dump's header and its checksum. */
 export function dumpAnswering(req: readonly number[], frames: number[][]): number[][] {
-  if (req[6] === 0x7f && req[7] === 0x7f) return frames;
+  const editBuffer = req[6] === 0x7f && req[7] === 0x7f;
   return frames.map((f) => {
     if (f[5] !== 0x77) return f;
     const g = [...f];
-    g[6] = req[6]!;
-    g[7] = req[7]!;
+    g[6] = editBuffer ? 0x7f : req[6]!;
+    g[7] = editBuffer ? 0x00 : req[7]!;
     let cs = 0;
     for (let i = 0; i < g.length - 2; i++) cs ^= g[i]!;
     g[g.length - 2] = cs & 0x7f;
