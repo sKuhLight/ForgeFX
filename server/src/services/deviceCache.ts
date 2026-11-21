@@ -8,12 +8,11 @@
 // Browser-safe: the store + registry are type-only imports (a browser runtime supplies its own), and
 // the codec's cache subpath is itself browser-safe. NO node:/fastify/transport VALUE imports — this
 // module is in the runtime router's import graph (check-browser-safe.ts enforces it).
-import { buildCache, HW_SEEDS, liveWalk, type BuiltCache, type CacheRecord, type DeviceParam, type LiveTransport, type LiveWalkOptions, type LiveWalkWriteHooks } from 'forgefx-midi/cache';
-import { FM3_PARAMS } from 'forgefx-midi/gen3/fm3';
-import { FM9_PARAMS } from 'forgefx-midi/gen3/fm9';
-import { PARAMS as AXE3_PARAMS } from 'forgefx-midi/gen3/axe-fx-iii';
+import { buildCache, enumHintsFromRanges, HW_SEEDS, liveWalk, type BuiltCache, type CacheRecord, type DeviceParam, type LiveEnumHint, type LiveTransport, type LiveWalkOptions, type LiveWalkWriteHooks } from 'forgefx-midi/cache';
+import { FM3_EFFECT_ID_TABLE, FM3_PARAMS } from 'forgefx-midi/gen3/fm3';
+import { FM9_EFFECT_ID_TABLE, FM9_PARAMS } from 'forgefx-midi/gen3/fm9';
+import { AXE_FX_III_BLOCKS, PARAMS as AXE3_PARAMS } from 'forgefx-midi/gen3/axe-fx-iii';
 import { isFractalHeaderFrame } from 'forgefx-midi/shared';
-import { blockRefForEid } from 'forgefx-midi/devices/gen3';
 import { AM4_CACHE_PARAMS, AM4_SEEDS } from 'forgefx-midi/am4';
 import { deviceCacheKey, fullCaptureAllowedOnFirmware, type DeviceRegistry } from '../drivers/registryCore.js';
 import { PROFILES, SLUG_FAMILY, isByteExactProfile, type DeviceProfile } from '../devices.js';
@@ -34,6 +33,8 @@ interface CacheJob {
   key: string;
   model: number;
   firmware: string;
+  /** The running firmware the job was started on (gates the enum hints, see `enumHintsVerifiedOn`). */
+  fw: { major: number; minor: number };
   mode: BuildMode;
   controller: AbortController;
   progress: { done: number; total: number; phase: 'walking' | 'building' };
@@ -140,6 +141,57 @@ function lastLowContiguousId(sortedIds: readonly number[]): number {
   return last;
 }
 
+/** A block address of the model's static roster: its catalog family, which instance of the family it is
+ *  (1-based) and the family's editor slug (undefined for families without one, e.g. GLOBAL). */
+export interface StaticBlockRef { family: string; instance: number; slug?: string }
+
+/** Catalog family -> editor slug (the inverse of `SLUG_FAMILY`). */
+const FAMILY_SLUG: Record<string, string> = Object.fromEntries(Object.entries(SLUG_FAMILY).map(([slug, family]) => [family, slug]));
+
+/** Number of reserved effect ids per first id in the shared gen-3 roster (the Axe-Fx III block table). */
+const GEN3_RESERVED_IDS: ReadonlyMap<number, number> = new Map(
+  AXE_FX_III_BLOCKS.filter((b) => b.firstId !== null).map((b) => [b.firstId as number, b.instances] as const)
+);
+
+const STATIC_ROSTERS = new Map<number, ReadonlyMap<number, StaticBlockRef>>();
+
+/** Block address -> family through the model's STATIC roster only, never a section→family vote of a walk
+ *  (per-block walk options keyed through a vote would land on the wrong block whenever the vote is wrong).
+ *  Shared by `walkBlockLimits` and `walkEnumHints`.
+ *   - Placeable blocks: every family the model's family table classifies as a block (FM3 / FM9: their own
+ *     tables; Axe-Fx III: the shared gen-3 families) maps its ids first..first+n-1, where n is the model's
+ *     instance count for the family: the roster's (FM3/FM9 table, or the III block table on the III),
+ *     raised to the unit's device-true count (`instanceLimits`) where the table lists fewer (the FM3/FM9
+ *     table lists one Input and one Output; the units have more), never past the ids the gen-3 roster
+ *     reserves for the family. So an Axe-Fx III fifth Input (41) is mapped, a fourth FM3/FM9 multiplexer
+ *     (194) is not.
+ *   - Everything else: the profile's virtual effect ids (GLOBAL 1, CONTROLLERS 2, MOD 3, ...). */
+export function staticRoster(model: number): ReadonlyMap<number, StaticBlockRef> {
+  const cached = STATIC_ROSTERS.get(model);
+  if (cached) return cached;
+  const out = new Map<number, StaticBlockRef>();
+  const profile: DeviceProfile | undefined = PROFILES[model];
+  const table = model === 0x11 ? FM3_EFFECT_ID_TABLE : model === 0x12 ? FM9_EFFECT_ID_TABLE : model === 0x10 ? FM3_EFFECT_ID_TABLE : undefined;
+  if (profile && table) {
+    for (const e of table) {
+      if (e.addressing !== 'block' || e.firstId === null) continue;
+      const slug = FAMILY_SLUG[e.family];
+      const reserved = GEN3_RESERVED_IDS.get(e.firstId) ?? e.instances;
+      const rosterCount = model === 0x10 ? reserved : e.instances;
+      const deviceCount = slug ? (profile.instanceLimits[slug] ?? profile.defaultInstances) : 0;
+      const n = Math.min(Math.max(rosterCount, deviceCount), reserved);
+      for (let i = 0; i < n; i++) out.set(e.firstId + i, { family: e.family, instance: i + 1, ...(slug ? { slug } : {}) });
+    }
+    for (let block = 0; block <= WALK_BOUND_MAX_BLOCK; block++) {
+      if (out.has(block)) continue;
+      const family = profile.familyForEffectId(block);
+      if (family !== undefined) out.set(block, { family, instance: 1 });
+    }
+  }
+  STATIC_ROSTERS.set(model, out);
+  return out;
+}
+
 /** Known table size and hard ceiling per block for the live walk (see `WalkBlockLimits`).
  *
  *  Table size: the family's `stride` in `rangeSections`, the wire slot count (a table of N slots holds
@@ -152,8 +204,8 @@ function lastLowContiguousId(sortedIds: readonly number[]): number {
  *  walk may have counted junk past the table end), and a bound must never come from the very junk it
  *  exists to stop.
  *
- *  Block to family is the mapping the driver uses everywhere (`blockRefForEid` slug, then `SLUG_FAMILY`,
- *  else the profile's virtual effect ids GLOBAL/CONTROLLERS/MOD). Per block:
+ *  Block to family is the model's static roster (`staticRoster`: each family's ids by the model's instance
+ *  count, else the profile's virtual effect ids GLOBAL/CONTROLLERS/MOD). Per block:
  *   - Contiguous table (every catalog id below 0xff00 fits below the stride): hard bound
  *     `min(stride - 1 + WALK_BOUND_MARGIN, mode cap)`, plus the known size when the unit HAS that
  *     instance (`instanceLimits[slug] ?? defaultInstances`: FM3 amp instance 1 yes, 2..4 no). The known
@@ -191,9 +243,10 @@ export function walkBlockLimits(model: number, mode: BuildMode, byteExact?: Buil
       : [...(profile.params[family] ?? []).map((d) => d.paramId), ...Object.keys(profile.ranges[family] ?? {}).map(Number)];
     return [...new Set(ids)].filter((i) => Number.isInteger(i) && i >= 0 && i < 0xff00).sort((x, y) => x - y);
   };
+  const roster = staticRoster(model);
   for (let block = 0; block <= WALK_BOUND_MAX_BLOCK; block++) {
-    const ref = blockRefForEid(block);
-    const family = (ref ? SLUG_FAMILY[ref.slug] : undefined) ?? profile.familyForEffectId(block);
+    const ref = roster.get(block);
+    const family = ref?.family;
     const stride = family ? strides[family] : undefined;
     if (family === undefined || stride === undefined) {
       if (mode === 'full') limits.bound[block] = WALK_MAX_PARAM_ID; // unknown block: the HW-proven envelope
@@ -205,10 +258,69 @@ export function walkBlockLimits(model: number, mode: BuildMode, byteExact?: Buil
       continue;
     }
     limits.bound[block] = Math.min(stride - 1 + WALK_BOUND_MARGIN, cap);
-    const present = !ref || ref.instance <= (profile.instanceLimits[ref.slug] ?? profile.defaultInstances);
+    const present = !ref?.slug || ref.instance <= (profile.instanceLimits[ref.slug] ?? profile.defaultInstances);
     if (present) limits.knownSize[block] = stride;
   }
   return limits;
+}
+
+/** A stored profile decoded from editor-cache bytes BY THIS INSTALL: `meta.source` 'editor-cache' (an
+ *  editor-cache import) or 'bytes' (the codec's byte-source value). Unlike `isByteExactProfile` it refuses
+ *  cloud profiles, whatever `meta.origin` claims. */
+export function isLocalByteProfile(meta: { source?: unknown } | undefined): boolean {
+  return meta?.source === 'editor-cache' || meta?.source === 'bytes';
+}
+
+/** The (model, firmware) pairs the walk's enum hints are verified on: a hinted label walk opens label
+ *  queries the device never received before (lists with a non-zero default), so hints are passed only where
+ *  a staged hardware probe showed every hinted list answering its first label query — FM3 13.0 (all 118
+ *  first-label probes answered). EXACT major.minor, not "at or below": another firmware can renumber or
+ *  reshape a table. Extend only after the same staged probe on that model and firmware. */
+export const ENUM_HINTS_VERIFIED_FW: Readonly<Record<number, ReadonlyArray<{ readonly major: number; readonly minor: number }>>> = {
+  0x11: [{ major: 13, minor: 0 }] // FM3
+};
+
+/** Whether the live walk may get enum hints for `model` on firmware `fw`: an exact match in
+ *  {@link ENUM_HINTS_VERIFIED_FW}. Unknown or malformed firmware and unlisted models: no (fail closed). */
+export function enumHintsVerifiedOn(model: number, fw: { major: number; minor: number } | null | undefined): boolean {
+  if (fw == null || !Number.isInteger(fw.major) || !Number.isInteger(fw.minor) || fw.major < 1 || fw.minor < 0) return false;
+  return (ENUM_HINTS_VERIFIED_FW[model] ?? []).some((v) => v.major === fw.major && v.minor === fw.minor);
+}
+
+/** The label lists the live walk may rely on, per block (the codec's `enumHintByBlock`): for every block
+ *  the model's STATIC roster maps to a family (`staticRoster` — every instance of the family by the model's
+ *  instance count, and the virtual GLOBAL / CONTROLLERS / MOD blocks), the enum rows of that family as `{ count, typecode }`
+ *  (`enumHintsFromRanges`). The codec label-walks a definition whose default slot is non-zero ONLY on such
+ *  a hint (type lists, tempo divisions, foot-controller assignments: otherwise they come back as floats).
+ *
+ *  Source per family: a LOCAL byte-exact stored cache of the attached firmware when it carries rows for the
+ *  family (`isLocalByteProfile`: an editor-cache import made by this install; the caller passes only a
+ *  usable-schema doc) — exact data for this firmware — else the static catalog's ranges. NEVER a cloud
+ *  profile (not even one of byte origin: its provenance is a claim of another install) and never a stored
+ *  live-walk profile or one of unknown provenance: a hint is a promise that the param HAS a label list, and
+ *  a label query to a param without one is out of contract for the device. Models without a gen-3 catalog
+ *  get no hints. Whether a build passes hints at all is gated by firmware (`enumHintsVerifiedOn`). */
+export function walkEnumHints(model: number, byteExact?: BuiltCache | null): Record<number, Record<number, LiveEnumHint>> {
+  const hints: Record<number, Record<number, LiveEnumHint>> = {};
+  const profile: DeviceProfile | undefined = PROFILES[model];
+  if (!profile) return hints;
+  const exact = byteExact && isLocalByteProfile(byteExact.meta) ? byteExact : null;
+  const byFamily = new Map<string, Record<number, LiveEnumHint>>();
+  const hintsOf = (family: string): Record<number, LiveEnumHint> => {
+    let h = byFamily.get(family);
+    if (!h) {
+      const exactRows = exact?.ranges?.[family];
+      const rows = exactRows && Object.keys(exactRows).length > 0 ? exactRows : profile.ranges[family];
+      h = rows ? enumHintsFromRanges(rows) : {};
+      byFamily.set(family, h);
+    }
+    return h;
+  };
+  for (const [block, ref] of staticRoster(model)) {
+    const h = hintsOf(ref.family);
+    if (Object.keys(h).length > 0) hints[block] = h;
+  }
+  return hints;
 }
 
 /** Adapt the registry's shared Transport to the codec's minimal LiveTransport: one query → the first
@@ -241,7 +353,7 @@ export function adaptRequest(transport: Transport, query: Uint8Array): Promise<U
 /** The detached build task: pause telemetry, walk → build → persist → swap profile, emit terminal
  *  event, resume telemetry. Never rejects (all outcomes are emitted, not thrown). */
 async function runBuild(store: Store, registry: DeviceRegistry, job: CacheJob, walkImpl: WalkImpl): Promise<void> {
-  const { key, model, firmware, mode, controller } = job;
+  const { key, model, firmware, fw, mode, controller } = job;
   const full = mode === 'full';
   const resume = registry.pauseTelemetry(); // synchronous — telemetry is off before the first await
   registry.emitEvent({ type: 'cacheBuild', phase: 'walking', done: 0, total: 0, key, model, firmware });
@@ -265,7 +377,8 @@ async function runBuild(store: Store, registry: DeviceRegistry, job: CacheJob, w
     // firmware (force-rebuild over an editor-cache import) is exact device data and refines the catalog;
     // a stale one (outdated schema) is not trusted for that either.
     const stored = loadStoredProfile(store, key);
-    const limits = walkBlockLimits(model, mode, stored.state === 'usable' ? stored.profile : null);
+    const usable = stored.state === 'usable' ? stored.profile : null;
+    const limits = walkBlockLimits(model, mode, usable);
     const walkOpts: LiveWalkOptions = {
       model,
       ...(full ? { mode: 'full' as const, write } : {}),
@@ -274,6 +387,9 @@ async function runBuild(store: Store, registry: DeviceRegistry, job: CacheJob, w
       maxParamId: full ? WALK_MAX_PARAM_ID_FULL : WALK_MAX_PARAM_ID,
       paramKnownSizeByBlock: limits.knownSize,
       paramBoundByBlock: limits.bound,
+      // Label lists per block (see walkEnumHints), both modes — only on a (model, firmware) the hints are
+      // verified on (enumHintsVerifiedOn); elsewhere the walk gets none and keeps its numeric rule.
+      ...(enumHintsVerifiedOn(model, fw) ? { enumHintByBlock: walkEnumHints(model, usable) } : {}),
       signal: controller.signal,
       onProgress: (p) => {
         if (controller.signal.aborted) return;
@@ -405,7 +521,7 @@ export async function startCacheBuild(store: Store, registry: DeviceRegistry, op
     return { code: 200, body: { ok: true, already: true } };
   }
   const job: CacheJob = {
-    key, model, firmware: fw.version, mode,
+    key, model, firmware: fw.version, fw: { major: fw.major, minor: fw.minor }, mode,
     controller: new AbortController(),
     progress: { done: 0, total: 0, phase: 'walking' },
     promise: Promise.resolve()
