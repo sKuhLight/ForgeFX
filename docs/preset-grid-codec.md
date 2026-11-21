@@ -55,6 +55,12 @@ leaf, emitting `decompSize` bytes.
 > save on the device, so an edited-but-unsaved buffer reports `crcValid: false` — the grid
 > still decodes correctly (the decode does not depend on the CRC).
 
+> An **unused preset slot** reads back as a normal full-length dump whose `raw_patch` is entirely
+> zero (stored CRC 0, no name, no code tree). There is nothing to decompress, so it is reported as
+> an empty preset: `empty: true`, blank name, no grid/scenes/blocks, `crcValid: false`. An all-zero
+> dump is not a restorable preset, so exporting it (`POST /preset/backup`) or using it as a
+> conversion source is refused with HTTP 422, and the local Presets folder scan skips it.
+
 ### 4. The grid
 
 In the decompressed body, the grid table starts at offset `0x104`. It is **column-major**,
@@ -75,8 +81,20 @@ cell = (effect_id, route_flag)
 
 FM3 is a 4×12 grid; FM9 and the Axe-Fx III are 6×14.
 
-ForgeFX exposes the decoded grid at `GET /preset/grid` (and `GET /presets/{n}/grid`), with each
-cell's `effectId`, `name`, `isShunt`, `routeFlag`, and the decoded `fromRows`.
+ForgeFX exposes the decoded grid of the edit buffer at `GET /preset/grid` and the grid of the stored
+preset in slot `n` at `GET /presets/{n}/grid`, with each cell's `effectId`, `name`, `isShunt`,
+`routeFlag`, and the decoded `fromRows`.
+
+`GET /presets/{n}/grid` never answers with the edit buffer's grid for another slot:
+
+- **Gen-3 (Axe-Fx III / FM3 / FM9):** a non-disruptive dump decode of slot `n` — the *saved* state of the
+  slot (unsaved edits in the edit buffer are not in it). `n` must be an integer in `0..presetCount-1`
+  (512 slots on FM3 / FM9, 1024 on the Axe-Fx III), otherwise `400`. The same validation guards
+  `/presets/{n}/summary` and `/presets/{n}/params`.
+- **AM4:** no stored-slot read; the *live* grid when `n` is the loaded slot (so it includes unsaved
+  edits), `501` for any other slot.
+- **Axe-Fx II (gen-2), gen-1, VP4:** neither a stored-slot read nor a way to name the loaded slot —
+  `501` for every slot (use `GET /preset/grid` for the edit buffer).
 
 ## Provenance & credits
 

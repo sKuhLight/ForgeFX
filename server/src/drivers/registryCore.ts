@@ -44,14 +44,16 @@ import { FM3_DESCRIPTOR, FM9_DESCRIPTOR, AXEFX3_DESCRIPTOR, VP4_DESCRIPTOR } fro
 import { AM4_DESCRIPTOR } from 'forgefx-midi/devices/am4';
 import { AXEFX2_DESCRIPTOR } from 'forgefx-midi/devices/gen2';
 import { AXEFXGEN1_DESCRIPTOR } from 'forgefx-midi/devices/gen1';
-import type { Transport, Conn, ConnKind } from '../transport/types.js';
+import { TRANSPORT_TIMEOUT_CODE, isTransportTimeout, type Transport, type Conn, type ConnKind } from '../transport/types.js';
 import { DEFAULT_PROFILE, PROFILES, profileForModel, profileForKey, runtimeProfileFrom, type DeviceProfile } from '../devices.js';
+import { checkProfileSchema } from '../profileSchema.js';
 import { createGen3Driver } from './gen3.js';
 import { createAm4Driver, type Am4Driver } from './am4.js';
 import { createGen2Driver } from './gen2.js';
 import { createGen1Driver } from './gen1.js';
 import { createVp4Driver } from './vp4.js';
 import type { DeviceDriver, DeviceEvent, DriverCtx, DriverCapabilities } from './types.js';
+import { assertRawProbeAllowed } from './sendPolicy.js';
 import { cadenceFor, isTelemetryMode, TELEMETRY_MODES, type TelemetryMode, type CadenceProfile } from './telemetryProfiles.js';
 
 /** Device-cache doc key for the deviceCaches store collection: `<model-hex>_<major>p<minor>`
@@ -59,6 +61,43 @@ import { cadenceFor, isTelemetryMode, TELEMETRY_MODES, type TelemetryMode, type 
  *  service (status / build / delete) so both address the exact same doc. */
 export function deviceCacheKey(modelId: number, major: number, minor: number): string {
   return `${modelId.toString(16).padStart(2, '0')}_${major}p${minor}`;
+}
+
+/** Per gen-3 model, the HIGHEST firmware (major.minor) on which the cache build's FULL mode — the live
+ *  self-describe walk that also taper-sweeps, i.e. WRITES to the device — is allowed. Each entry is a
+ *  version on which a full capture was actually carried out successfully; anything newer is refused
+ *  (fail closed) because a newer firmware may change the end-of-table behaviour the walk relies on —
+ *  FM3 firmware 13.0 did: a walk without the table-end bound does not stop at the end of a block (the
+ *  end-marker replies are counted as real records), so it runs for a very long time and would write sweep
+ *  values to parameters that do not exist. The bounded walk is verified on FM3 13.0. Fractal numbers firmware per model (the Axe-Fx III is on 32.x while the
+ *  FM3/FM9 are on 12.x/13.x), so the table is keyed by model byte. A model without an entry is never
+ *  allowed. Add or raise an entry only after a full capture has completed on that model and version.
+ *  The FM9 has NO entry: no full capture has completed on an FM9 yet (the attempts on firmware 12.0
+ *  stopped responding part-way through the walk), so full mode stays off there until one does.
+ *  Read-only mode is intentionally NOT governed by this table. */
+export const FULL_CAPTURE_MAX_VERIFIED_FW: Readonly<Record<number, { readonly major: number; readonly minor: number }>> = {
+  0x11: { major: 13, minor: 0 }, // FM3 (13.0 verified with the table-end-bounded walk)
+  0x10: { major: 32, minor: 6 }  // Axe-Fx III (a complete full capture exists on 32.6)
+};
+
+/** Whether FULL-mode capture is permitted for `modelId` on the given running firmware: only a KNOWN,
+ *  well-formed firmware (major >= 1) that is at or below the model's entry in
+ *  {@link FULL_CAPTURE_MAX_VERIFIED_FW} (major.minor comparison). Unknown firmware, an unknown model, or
+ *  a version above the verified one is refused — full mode writes to the device, so it never runs
+ *  against a version it has not been verified on. Shared by the cache-build service (the actual gate)
+ *  and the capabilities DTO (so the UI does not offer it). */
+export function fullCaptureAllowedOnFirmware(modelId: number, fw: { major: number; minor: number } | null | undefined): boolean {
+  if (fw == null || !Number.isInteger(fw.major) || !Number.isInteger(fw.minor) || fw.major < 1 || fw.minor < 0) return false;
+  const max = FULL_CAPTURE_MAX_VERIFIED_FW[modelId];
+  if (!max) return false;
+  return fw.major < max.major || (fw.major === max.major && fw.minor <= max.minor);
+}
+
+/** Whether the in-app diagnostic capture (POST /diagnostics/capture) may run on a device: gen-3 units whose
+ *  driver offers the self-describe walk (its read-only walk, label probe and dump probes are gen-3 wire
+ *  features). Shared by the capabilities DTO (`diagnosticCapture`) and the capture service (the 501 gate). */
+export function diagnosticCaptureSupported(modelId: number, caps: Pick<DriverCapabilities, 'selfDescribe'> | null | undefined): boolean {
+  return !!caps?.selfDescribe && DEVICE_MODELS[modelId]?.gen === 3;
 }
 
 /** The /telemetry/config DTO both surfaces serve: the current mode, its resolved cadence, and the
@@ -89,6 +128,18 @@ const GEN3_SHUNT_BASE = 1024;
 // Per-transport-instance idempotency flag for #instrumentTransport (double-wrapping would double-count
 // the fn-0x1F echo guard and silently break front-panel edit reflection).
 const INSTRUMENTED = Symbol('forgefx.transport.instrumented');
+
+/** TRANSITIONAL shim: the browser-direct transports (Axis webmidi / webserial / nativeMidi) still reject a
+ *  no-frame request timeout with a plain `Error('<MIDI|Serial> request timed out after Nms')` and no
+ *  `code`. Tag exactly those with the typed `code` the transport contract defines, HERE at the one choke
+ *  point every transport passes through, so no driver ever has to parse that text. Drop the shim once the
+ *  transports set `code` at source (Axis follow-up). Other errors pass through untouched. */
+function withTimeoutCode(e: unknown): unknown {
+  if (e instanceof Error && !isTransportTimeout(e) && /^(?:MIDI|Serial) request timed out after \d+ ?ms$/i.test(e.message)) {
+    (e as Error & { code?: string }).code = TRANSPORT_TIMEOUT_CODE;
+  }
+  return e;
+}
 
 /** One selectable connection as the deps' lister reports it (serial + MIDI, Fractal flagged) —
  *  structurally identical to transport/connection.ts's ConnInfo, re-declared here so the core stays
@@ -128,7 +179,9 @@ export interface RegistryDeps {
   midiAvailable(): boolean;
   /** Load a persisted device cache for the given key (deviceCacheKey), or null when none exists.
    *  Injected so the core stays store-agnostic: the Node server reads defaultStore; a browser runtime
-   *  its own. Absent → the registry never swaps in a runtime profile (static profile only). */
+   *  its own. Absent → the registry never swaps in a runtime profile (static profile only). A hook
+   *  should return only profiles this build may use (`loadUsableProfile`); applyRuntimeCache re-checks
+   *  the schema anyway, so a hook that forgets cannot make a stale profile live. */
   loadDeviceCache?(key: string): BuiltCache | null | Promise<BuiltCache | null>;
 }
 
@@ -182,7 +235,12 @@ export class DeviceRegistry {
   #active: DeviceDriver | null = null;
   // One driver instance per model byte (grid caches etc. survive re-detects of the same unit).
   #drivers = new Map<number, DeviceDriver>();
-  #ctx: DriverCtx = { transport: () => this.transport(), emit: (e) => this.#emit(e), getCadence: () => this.#cadence() };
+  #ctx: DriverCtx = {
+    transport: () => this.transport(),
+    emit: (e) => this.#emit(e),
+    getCadence: () => this.#cadence(),
+    getFirmware: () => this.#firmware // read at call time: drivers are built before detect() reads it
+  };
 
   get profile() { return this.#prof; }
 
@@ -194,6 +252,14 @@ export class DeviceRegistry {
   /** Running firmware (populated best-effort on gen-3 during detect), or null. Includes the numeric
    *  major/minor the deviceCache key needs alongside the display `version`. */
   firmwareInfo(): { major: number; minor: number; version: string; build: string } | null { return this.#firmware; }
+  /** Re-read the running firmware (fn 0x08, the same path detect() uses) for the CURRENT model and
+   *  return it — null when the device is silent / replies for another model / reports major 0. The
+   *  previous value is always cleared first, so a unit that changed firmware (or went quiet) since
+   *  detect() never leaves a stale version behind. Used by the full-capture gate right before it decides. */
+  async refreshFirmware(): Promise<{ major: number; minor: number; version: string; build: string } | null> {
+    await this.#populateFirmware(this.#modelId);
+    return this.#firmware;
+  }
   /** Public emit seam: services (device-cache build progress) publish on the same SSE bus the drivers
    *  reach through DriverCtx.emit. */
   emitEvent(e: DeviceEvent): void { this.#emit(e); }
@@ -313,6 +379,10 @@ export class DeviceRegistry {
     // too, so it re-primes silently instead of emitting a redundant `changed` (which would drive a
     // second, heavy grid reload on top of the scene handler's own lightweight refresh).
     if (e.type === 'scene') { this.#lastSceneIdx = e.index; this.#lastChannels = null; }
+    // A UI channel write (gen3 setChannel) emits `blockState` AFTER moving the device's active channel —
+    // keep the channel-watch baseline in sync so the next tick doesn't re-emit a redundant
+    // blockState against the stale baseline. (A scene event above also resets it.)
+    else if (e.type === 'blockState') this.#lastChannels = null;
     for (const fn of this.#subscribers) {
       try {
         fn(e);
@@ -338,6 +408,15 @@ export class DeviceRegistry {
         await t.open();
         this.#instrumentTransport(t); // echo-guard + traffic counters + interactive-request tracking
         this.#transport = t;
+        this.#linkSlow = t.slow;
+        // A NEW transport may reach another unit, or the same one after a reboot / re-plug, so a firmware
+        // read over the previous one can no longer be trusted. Clear it rather than re-read here: the read
+        // itself goes through transport() (it would recurse), and the next detect() redoes it. Null is the
+        // safe value — the FM3 store-ack scope reads it as "unknown" (lenient), deviceInfo() reports no
+        // firmware, and applyRuntimeCache() simply does nothing (no cache key is built from a stale value).
+        // (Today a dropped connection goes through selectConnection(), which clears it too; this keeps the
+        // invariant for any other path that ends up opening a new transport.)
+        this.#firmware = null;
         return t;
       })().catch((e) => {
         this.#connecting = null; // allow a retry on the next request
@@ -466,7 +545,13 @@ export class DeviceRegistry {
       // FULL-mode self-describe write-sweep (POST /device/cache/build with mode:'full'). True only for the
       // CaptureRig-proven gen-3 trio (III/FM3/FM9); false on VP4/AM4/gen-1/gen-2. Derived from the driver
       // cap so the DTO can't drift. Inserted after cacheImport (additive-only ordering — see #capabilitiesDto).
-      fullCapture: c.fullCapture,
+      // Also firmware-gated per model (FULL_CAPTURE_MAX_VERIFIED_FW; unknown firmware = false): detect()
+      // populates #firmware before any caps DTO is served, so the UI never offers a mode the build route
+      // would refuse. (The build route re-reads the firmware itself right before gating.)
+      fullCapture: c.fullCapture && fullCaptureAllowedOnFirmware(mid, this.#firmware),
+      // In-app diagnostic capture (POST /diagnostics/capture): gen-3 units with the self-describe walk.
+      // Inserted after fullCapture (additive-only ordering).
+      diagnosticCapture: diagnosticCaptureSupported(mid, c),
       editorLayouts: c.editorLayouts,
       firmwareValidate: !!d.validateFirmware,
       // Cross-device preset conversion (POST /preset/convert with no source): the current preset can be
@@ -565,6 +650,9 @@ export class DeviceRegistry {
     try {
       const dev = await this.transport();
       const port = this.#transport?.label ?? conn.id;
+      // Any Fractal-headed frame identifies the unit (its model byte is all detection needs), so the matcher is
+      // deliberately broad: this is the first exchange on a freshly opened link, and whichever Fractal frame
+      // arrives first names the same device.
       const frames = await dev.request(buildIdentifyBroadcast(), { timeoutMs: 1500, quietMs: 60, match: (fs) => fs.some((f) => isFractalHeaderFrame(f)) });
       const f = frames.find((x) => isFractalHeaderFrame(x));
       let modelId = f ? parseIdentifyResponse(f)!.modelId : -1;
@@ -615,6 +703,7 @@ export class DeviceRegistry {
    *  without gen-3 telemetry — the AM4 — must never receive gen-3 polls). */
   #activate(d: DeviceDriver | null) {
     this.#active = d;
+    d?.resetSession?.(); // a (re)detect starts a new session: forget what the driver learned about the last one
     if (d && !d.capabilities.telemetry.outputMeters) this.#stopMeters();
     if (d && !d.capabilities.telemetry.tuner && this.#tunerTimer) { clearTimeout(this.#tunerTimer); this.#tunerTimer = null; }
     // Device-edit watch is capability-gated (deviceEditWatch = AM4 + FM3, which don't push): stop it on a device that doesn't need it,
@@ -637,20 +726,27 @@ export class DeviceRegistry {
   }
 
   /** Best-effort firmware-version read (fn 0x08) over the shared transport — gen-3 only (the query is
-   *  HW-verified on the FM3, shared on FM9/III; AM4/gen1/gen2 are never queried). Silence/timeout or a
-   *  non-gen-3 model leaves `#firmware` null; never throws (detection must not depend on it). */
+   *  HW-verified on the FM3, shared on FM9/III; AM4/gen1/gen2 are never queried). Always clears the
+   *  previous value first, so silence/timeout, a non-gen-3 model, a reply whose model byte is not the
+   *  connected model, or a major of 0 all leave `#firmware` null (= unknown) instead of a stale version;
+   *  never throws (detection must not depend on it). The store-ack scope and the device-cache key
+   *  both read it; while the read is in flight the value is null, which consumers treat as "unknown". */
   async #populateFirmware(modelId: number): Promise<void> {
+    this.#firmware = null;
     if (modelId < 0 || DEVICE_MODELS[modelId]?.gen !== 3) return;
     try {
       const dev = await this.transport();
       const frames = await dev.request(buildFirmwareVersionQuery(modelId), {
         timeoutMs: 800,
         quietMs: 40,
-        match: (fs) => fs.some((f) => isFractalHeaderFrame(f) && f[5] === FN_FIRMWARE_VERSION)
+        // same predicate as the extraction below (connected model only), so a stray 0x08 from elsewhere neither
+        // completes the read nor gets parsed
+        match: (fs) => fs.some((f) => isFractalHeaderFrame(f) && f[5] === FN_FIRMWARE_VERSION && f[4] === modelId)
       });
-      const f = frames.find((x) => isFractalHeaderFrame(x) && x[5] === FN_FIRMWARE_VERSION);
+      // only a reply from the CONNECTED model counts (f[4] = model byte); a major of 0 is no real version
+      const f = frames.find((x) => isFractalHeaderFrame(x) && x[5] === FN_FIRMWARE_VERSION && x[4] === modelId);
       const v = f ? parseFirmwareVersionReply(f) : null;
-      if (v) this.#firmware = { major: v.major, minor: v.minor, version: formatFirmwareVersion(v.major, v.minor), build: v.build ?? '' };
+      if (v && v.major > 0) this.#firmware = { major: v.major, minor: v.minor, version: formatFirmwareVersion(v.major, v.minor), build: v.build ?? '' };
     } catch {
       /* silence / timeout / dead port → firmware stays null */
     }
@@ -659,7 +755,8 @@ export class DeviceRegistry {
   /** Swap the active driver's profile for a device-cache-derived RUNTIME profile when a cache doc
    *  exists for the attached model+firmware. Called on a fresh detect AND by the deviceCache service
    *  after a build completes. No-op without a loadDeviceCache hook, a selfDescribe driver, known
-   *  firmware, or a stored cache. Never throws. */
+   *  firmware, or a stored cache this build may use (a profile with a missing/outdated/newer schema
+   *  is never applied — the static profile stays). Never throws. */
   async applyRuntimeCache(): Promise<void> {
     if (!this.#deps.loadDeviceCache) return;
     const d = this.#active;
@@ -668,37 +765,63 @@ export class DeviceRegistry {
     const key = deviceCacheKey(mid, this.#firmware.major, this.#firmware.minor);
     let built: BuiltCache | null = null;
     try { built = (await this.#deps.loadDeviceCache(key)) ?? null; } catch { built = null; }
-    if (!built) return;
+    if (!built || !checkProfileSchema(built).usable) return; // absent, or stale (see profileSchema.ts): keep the static profile
     const runtime = runtimeProfileFrom(built, PROFILES[mid] ?? this.#prof);
     d.applyRuntimeProfile(runtime);
     if (PROFILES[mid]) this.#prof = runtime; // keep /diag + reporting profile in sync for gen-3
   }
 
   /** Pause the telemetry supervisor for the duration of an exclusive operation (the device-cache
-   *  self-describe walk saturates the port). Stops the tuner / meters / edit-watch / edit-push and
-   *  returns a resume fn that restarts exactly what was running (respecting the live subscriber count
-   *  + tuner-enabled state). Idempotent-safe: the resume closure captures the paused state. */
+   *  self-describe walk and the diagnostic capture saturate the port, and the capture records the wire).
+   *  Stops the tuner / meters / edit-watch / edit-push and HOLDS them off until the returned resume fn
+   *  runs: while held, nothing restarts them — not a new SSE subscriber, not a re-activated driver, not
+   *  the tuner switched on (its poll waits for the resume). The last resume restarts what was running
+   *  plus whatever the listeners present by then need. The resume fn is idempotent. */
   pauseTelemetry(): () => void {
-    const hadTuner = !!this.#tunerTimer;
-    const hadMeters = !!this.#metersTimer;
-    const hadEditWatch = !!this.#editWatchTimer;
-    const hadEditPush = !!this.#editPushUnsub;
-    if (this.#tunerTimer) { clearTimeout(this.#tunerTimer); this.#tunerTimer = null; }
+    this.#telemetryHolds++;
+    const held = this.#heldLoops;
+    if (this.#tunerTimer) { held.tuner = true; clearTimeout(this.#tunerTimer); this.#tunerTimer = null; }
+    if (this.#metersTimer) held.meters = true;
+    if (this.#editWatchTimer) held.editWatch = true;
+    if (this.#editPushUnsub) held.editPush = true;
     this.#stopMeters();
     this.#stopEditWatch();
     this.#stopEditPush();
+    let resumed = false;
     return () => {
-      if (hadMeters) this.#startMeters();
-      if (hadEditWatch) this.#startEditWatch();
-      if (hadEditPush) this.#startEditPush();
-      // the tuner page is still open (we only paused the poll) — just restart its poll timer.
-      if (hadTuner && this.#tunerDriver && !this.#tunerTimer) this.#tunerTimer = setTimeout(() => this.#pollTuner(), 30);
+      if (resumed) return;
+      resumed = true;
+      this.#telemetryHolds = Math.max(0, this.#telemetryHolds - 1);
+      if (this.#telemetryHolds > 0) return; // another exclusive operation still holds the supervisor
+      const h = this.#heldLoops;
+      this.#heldLoops = { tuner: false, meters: false, editWatch: false, editPush: false };
+      const listening = this.#subscribers.size > 0;
+      if (h.meters || listening) this.#startMeters();
+      if (h.editWatch || listening) this.#startEditWatch();
+      if (h.editPush || listening) this.#startEditPush();
+      // the tuner page is still open (only its poll was held) — just restart the poll timer.
+      if ((h.tuner || this.#tunerPending) && this.#tunerDriver && !this.#tunerTimer) this.#tunerTimer = setTimeout(() => this.#pollTuner(), 30);
+      this.#tunerPending = false;
     };
   }
+  /** Exclusive operations currently holding the supervisor (see pauseTelemetry). */
+  #telemetryHolds = 0;
+  /** The loops that were running when the first hold began (restarted by the last resume). */
+  #heldLoops = { tuner: false, meters: false, editWatch: false, editPush: false };
+  /** The tuner was switched on while held: its poll starts on the last resume. */
+  #tunerPending = false;
 
-  /** DEBUG probe: send a raw SysEx frame, return every response frame as hex (for FC read-decode). */
+  /** DEBUG probe: send ONE raw read-only SysEx frame, return every response frame as hex. The probe
+   *  policy (sendPolicy.ts) is enforced HERE, before the transport is opened or written: only a
+   *  read/query frame for a known model, or — on a connected gen-3 unit — a frame byte-identical to a
+   *  codec read/poll builder for that model (tuner/CPU/meter polls, tempo/scene GET, raw param-value
+   *  GET 0x1B as used by the FC read-back); anything else throws a 400/403 SendRejectedError. */
   async rawRequest(bytes: number[]): Promise<string[]> {
+    assertRawProbeAllowed(bytes, this.#modelId);
     const dev = await this.transport();
+    // Debug probe, deliberately accept-anything: the probe exists to show WHATEVER the device answers to an
+    // arbitrary read frame, so the first frame completes it (a late frame from an earlier request can too —
+    // it is shown as hex, never interpreted).
     const frames = await dev.request(bytes, { timeoutMs: 1200, quietMs: 120, match: (fs: number[][]) => fs.length > 0 });
     return frames.map((f) => f.map((b) => b.toString(16).padStart(2, '0')).join(''));
   }
@@ -752,6 +875,7 @@ export class DeviceRegistry {
           const frames = await dev.request(buildTunerPoll(d.modelId), {
             timeoutMs: 300,
             quietMs: 35,
+            routine: true,
             match: (fs) => fs.some((f) => isTunerResponse(f))
           });
           const f = frames.find((x) => isTunerResponse(x));
@@ -778,8 +902,10 @@ export class DeviceRegistry {
       // Gen-3 opens/closes a device tuner PAGE; AM4's tuner block (0x0023) is always live, so a
       // readTuner driver skips the page open/close and just runs the poll timer.
       if (!d.readTuner) await dev.sendQueued(buildTunerPageOpen(d.modelId)); // open the tuner page
-      if (!this.#tunerTimer) this.#tunerTimer = setTimeout(() => this.#pollTuner(), 30);
+      if (this.#telemetryHolds > 0) this.#tunerPending = true; // an exclusive operation runs: poll after it
+      else if (!this.#tunerTimer) this.#tunerTimer = setTimeout(() => this.#pollTuner(), 30);
     } else {
+      this.#tunerPending = false;
       if (this.#tunerTimer) {
         clearTimeout(this.#tunerTimer);
         this.#tunerTimer = null;
@@ -798,7 +924,7 @@ export class DeviceRegistry {
   //     590-byte frame, so we read it only once per round-robin cycle (meters are tiny 23-byte reads).
   // Runs while ≥1 SSE client is subscribed AND the active driver's telemetry capability allows it.
   #startMeters() {
-    if (this.#metersTimer) return;
+    if (this.#metersTimer || this.#telemetryHolds > 0) return; // held by an exclusive operation (pauseTelemetry)
     if (this.#active && !this.#active.capabilities.telemetry.outputMeters) return; // no gen-3 meter frames on this device
     this.#metersTimer = setTimeout(() => this.#pollMeters(), this.#cadence().meterTickMs); // primer at the mode's meter tick
   }
@@ -826,17 +952,18 @@ export class DeviceRegistry {
     // scene/channel watches never fully starve under sustained UI traffic.
     if (this.#interactiveInFlight() > 0 && this.#meterSkips < DeviceRegistry.MAX_SKIPS) {
       this.#meterSkips++;
-      if (this.#metersTimer) this.#metersTimer = setTimeout(() => this.#pollMeters(), cad.meterTickMs);
+      if (this.#metersTimer) this.#metersTimer = setTimeout(() => this.#pollMeters(), this.#linkSlow ? cad.meterSlowMs : cad.meterTickMs);
       return;
     }
     this.#meterSkips = 0;
     let slow = false;
+    const step = this.#meterStep++; // advance once per tick; the every-Nth gates + #pollReflection read this snapshot
     try {
       const dev = await this.transport();
       // A slow link — a generic MIDI interface into 5-pin DIN (≈31.25 kbaud) — can't carry meter polling
       // without inflating every other request to seconds, so SKIP it there (a cheap re-check resumes it
       // instantly on a fast link). Fast USB-MIDI (Axe-Fx III / FM9) and USB-CDC serial are NOT slow.
-      slow = dev.slow;
+      slow = this.#linkSlow = dev.slow;
       if (!slow) await this.#supervised(async () => {
         // Envelope-follower dt: keep the meter ballistics constant in wall-clock terms across the
         // per-mode tick cadences (60/100/400 ms) by scaling the 60 ms-calibrated fractions to elapsed dt.
@@ -850,7 +977,7 @@ export class DeviceRegistry {
         // refreshes every tick, not once per round-robin → smooth, not choppy.
         for (let i = 0; i < 4; i++) {
           const meter = GEN3_OUTPUT_METERS[i]!;
-          const frames = await dev.request(buildOutputMeterPoll(meter, d.modelId), { timeoutMs: 200, quietMs: 12, match: (fs) => fs.some((f) => isOutputMeterResponse(f, meter)) });
+          const frames = await dev.request(buildOutputMeterPoll(meter, d.modelId), { timeoutMs: 200, quietMs: 12, routine: true, match: (fs) => fs.some((f) => isOutputMeterResponse(f, meter)) });
           const f = frames.find((x) => isOutputMeterResponse(x, meter));
           if (f) {
             const raw = meterRmsToDb(parseOutputMeterRms(f), DeviceRegistry.METER_FLOOR, DeviceRegistry.METER_CEIL);
@@ -861,48 +988,61 @@ export class DeviceRegistry {
         }
         this.#emit({ type: 'meters', out1L: this.#mDb[0]!, out1R: this.#mDb[1]!, out2L: this.#mDb[2]!, out2R: this.#mDb[3]! });
         // CPU is a heavy 590-byte read → poll it only occasionally (every Nth tick), off the meter path.
-        if (this.#meterStep % cad.cpuEveryNTicks === 0) {
-          const frames = await dev.request(buildCpuPoll(d.modelId), { timeoutMs: 400, quietMs: 25, match: (fs) => fs.some((f) => isCpuResponse(f)) });
+        if (step % cad.cpuEveryNTicks === 0) {
+          const frames = await dev.request(buildCpuPoll(d.modelId), { timeoutMs: 400, quietMs: 25, routine: true, match: (fs) => fs.some((f) => isCpuResponse(f)) });
           const f = frames.find((x) => isCpuResponse(x));
           if (f) this.#emit({ type: 'cpu', percent: cpuPercentFromRaw(parseCpuRawLoad(f)) });
         }
-        // Front-panel CHANNEL-change watch: a device-side amp/block A–D switch emits no unsolicited
-        // frame and moves no param value (only the active-channel pointer), so the edit-burst diff
-        // can't see it — the amp TYPE NAME is per-channel, so Axis showed the old channel's model.
-        // Poll the tiny fn 0x13 status dump on the meter round-robin (offset 2) and emit `blockState`
-        // on any block's active-channel delta → Axis re-reads only live scene/block state. First read
-        // only primes the baseline (no event).
-        if (this.#meterStep % cad.channelEveryNTicks === 2 && d.getActiveChannels) {
-          const chans = await d.getActiveChannels();
-          if (chans.size > 0) {
-            let moved = false;
-            if (this.#lastChannels) {
-              for (const [eid, ch] of chans) {
-                if (this.#lastChannels.get(eid) !== ch) { moved = true; break; }
-              }
-            }
-            if (moved) this.#emit({ type: 'blockState' });
-            this.#lastChannels = chans;
-          }
-        }
-        // Front-panel SCENE-change watch: gen-3 devices emit NO unsolicited frame on a scene switch
-        // (FM3 field report 2026-07-06 — the panel changed, Axis didn't follow), so poll the tiny
-        // fn 0x0C scene GET on the CPU cadence, offset half a cycle so the two heavier reads never
-        // share a tick. Emits the SAME `scene` event the setScene write path emits, so clients need
-        // no new wiring. First read only primes the baseline (no event).
-        if (this.#meterStep++ % cad.sceneEveryNTicks === 4 && d.getScene) {
-          const { index } = await d.getScene();
-          if (Number.isInteger(index) && index >= 0) {
-            if (this.#lastSceneIdx !== null && index !== this.#lastSceneIdx) this.#emit({ type: 'scene', index });
-            this.#lastSceneIdx = index;
-          }
-        }
       });
+      // The cheap scene/channel reflection watches run on BOTH link speeds — on a slow link each
+      // tick is already the throttle (meterSlowMs), so wrapping them in the meter `if (!slow)` and
+      // disabling ALL device→UI reflection was wrong. The METERS above stay skipped on a slow link.
+      await this.#supervised(() => this.#pollReflection(step, cad, !slow));
     } catch {
       /* transient — keep polling */
     }
     // reschedule at the mode's meter tick (or the slow-link cadence)
     if (this.#metersTimer) this.#metersTimer = setTimeout(() => this.#pollMeters(), slow ? cad.meterSlowMs : cad.meterTickMs);
+  }
+
+  /** Front-panel SCENE + active-CHANNEL watches. Run on EVERY tick regardless of link speed —
+   *  gated by the every-Nth divider on a fast link, but on a slow link each (meterSlowMs) tick already
+   *  IS the throttle. First read only primes the baseline (no event). Kept out of the meter `if (!slow)`
+   *  so a 5-pin-DIN link still reflects scene/channel changes even though its meters are skipped. */
+  async #pollReflection(step: number, cad: CadenceProfile, gated: boolean): Promise<void> {
+    const d = this.#active;
+    if (!d) return;
+    // SCENE-change watch: gen-3 devices emit NO unsolicited frame on a scene switch (FM3 field report
+    // 2026-07-06 — the panel changed, Axis didn't follow), so poll the tiny fn 0x0C scene GET. Emits the
+    // SAME `scene` event the setScene write path emits, so clients need no new wiring.
+    // Runs BEFORE the channel watch: on a slow link both watches run every tick, and a front-panel scene
+    // change also moves the per-block active channels. The `scene` event re-primes the channel baseline
+    // (see #emit), so the channel watch below then adopts the new channels silently instead of emitting a
+    // `blockState` for them just ahead of the `scene`.
+    if ((!gated || step % cad.sceneEveryNTicks === 4) && d.getScene) {
+      const { index } = await d.getScene();
+      if (Number.isInteger(index) && index >= 0) {
+        if (this.#lastSceneIdx !== null && index !== this.#lastSceneIdx) this.#emit({ type: 'scene', index });
+        this.#lastSceneIdx = index;
+      }
+    }
+    // CHANNEL-change watch: a device-side amp/block A–D switch emits no unsolicited frame and moves no
+    // param value (only the active-channel pointer), so the edit-burst diff can't see it — the amp TYPE
+    // NAME is per-channel, so Axis showed the old channel's model. Poll the tiny fn 0x13 status dump and
+    // emit `blockState` on any block's active-channel delta → Axis re-reads only live scene/block state.
+    if ((!gated || step % cad.channelEveryNTicks === 2) && d.getActiveChannels) {
+      const chans = await d.getActiveChannels();
+      if (chans.size > 0) {
+        let moved = false;
+        if (this.#lastChannels) {
+          for (const [eid, ch] of chans) {
+            if (this.#lastChannels.get(eid) !== ch) { moved = true; break; }
+          }
+        }
+        if (moved) this.#emit({ type: 'blockState' });
+        this.#lastChannels = chans;
+      }
+    }
   }
 
   // ── device-edit watch (poll): catch front-panel edits on devices that DON'T push them (AM4 + FM3) ──
@@ -914,7 +1054,7 @@ export class DeviceRegistry {
   // (FM9 / Axe-Fx III DO push → they use the RX listener path instead; see #startEditPush.)
   #editWatchTimer: ReturnType<typeof setTimeout> | null = null;
   #startEditWatch() {
-    if (this.#editWatchTimer) return;
+    if (this.#editWatchTimer || this.#telemetryHolds > 0) return; // held by an exclusive operation (pauseTelemetry)
     if (this.#active && !this.#active.capabilities.deviceEditWatch) return; // active device doesn't need it
     this.#editWatchTimer = setTimeout(() => this.#pollEditWatch(), this.#cadence().editWatchMs);
   }
@@ -934,15 +1074,16 @@ export class DeviceRegistry {
     // flight, with the same MAX_SKIPS starvation guard as the meter loop.
     if (this.#interactiveInFlight() > 0 && this.#editWatchSkips < DeviceRegistry.MAX_SKIPS) {
       this.#editWatchSkips++;
-      if (this.#editWatchTimer) this.#editWatchTimer = setTimeout(() => this.#pollEditWatch(), cad.editWatchMs);
+      if (this.#editWatchTimer) this.#editWatchTimer = setTimeout(() => this.#pollEditWatch(), this.#linkSlow ? cad.editWatchSlowMs : cad.editWatchMs);
       return;
     }
     this.#editWatchSkips = 0;
     let slow = false;
     try {
       const dev = await this.transport();
-      slow = dev.slow; // a generic 5-pin DIN adapter can't carry the extra poll — back off (see #pollMeters)
-      if (!slow) await this.#supervised(async () => {
+      slow = this.#linkSlow = dev.slow; // a generic 5-pin DIN adapter throttles the poll (reschedule below) — but it
+      //                  STILL runs; skipping it entirely left a slow link with no FM3 edit reflection at all.
+      await this.#supervised(async () => {
         const r = await d.readDeviceEditState!();
         if (r.changed) this.#emit({ type: 'changed', scope: 'preset' });
       });
@@ -981,7 +1122,8 @@ export class DeviceRegistry {
 
   /** Wrap a freshly-opened transport with: (1) the edit-push ECHO GUARD — each in-flight fn-0x1F
    *  bulk-read (bytes[5]===0x1f) bumps #pendingBulkReads so the edit-push listener drops our own poll
-   *  replies; (2) TX traffic counting on every outgoing frame (send/sendQueued/sendPaced/request);
+   *  replies; (2) TX traffic counting (and frame observing) on every outgoing frame, exactly once each
+   *  (send/sendQueued/sendPaced/request — a request's own send() is not counted again);
    *  (3) ONE persistent onFrame handler for RX counting; (4) an all-requests in-flight counter for the
    *  interactive-yield logic. IDEMPOTENT per transport instance (a Symbol flag) so a re-wrap is a
    *  no-op — double-wrapping would double-count the echo guard and silently break edit reflection. */
@@ -990,30 +1132,95 @@ export class DeviceRegistry {
     if (inst[INSTRUMENTED]) return; // already wrapped — never double-wrap (breaks the echo guard)
     inst[INSTRUMENTED] = true;
 
-    const countTx = (bytes: readonly number[]) => { this.#traffic.txMsgs++; this.#traffic.txBytes += bytes.length; };
+    const countTx = (bytes: readonly number[]) => {
+      this.#traffic.txMsgs++;
+      this.#traffic.txBytes += bytes.length;
+      if (this.#frameObservers.size > 0) this.#observeFrame('TX', bytes);
+    };
+
+    // A frame handed to request()/sendQueued() is counted ONCE, when it is handed over. The serial and MIDI
+    // transports put it on the wire later through their own send() — the wrapped one below, since their
+    // queues call `this.send` — so the hand-over leaves a token per frame and the wrapped send consumes a
+    // matching token instead of counting the frame again. A token the transport never consumed (it wrote to
+    // its port another way, as the mocks do) is dropped when the call settles.
+    const handedOver = new Map<string, { consumed: boolean }[]>();
+    const keyOf = (bytes: readonly number[]) => bytes.join(',');
+    const handOver = (bytes: readonly number[]): (() => void) => {
+      countTx(bytes);
+      const key = keyOf(bytes);
+      const token = { consumed: false };
+      const list = handedOver.get(key);
+      if (list) list.push(token);
+      else handedOver.set(key, [token]);
+      return () => {
+        if (token.consumed) return;
+        const l = handedOver.get(key);
+        const i = l ? l.indexOf(token) : -1;
+        if (i >= 0) l!.splice(i, 1);
+        if (l && l.length === 0) handedOver.delete(key);
+      };
+    };
+    const consumeHandedOver = (bytes: readonly number[]): boolean => {
+      if (handedOver.size === 0) return false;
+      const key = keyOf(bytes);
+      const l = handedOver.get(key);
+      if (!l?.length) return false;
+      l.shift()!.consumed = true;
+      if (l.length === 0) handedOver.delete(key);
+      return true;
+    };
 
     const origRequest = t.request.bind(t);
     t.request = (bytes, opts) => {
-      countTx(bytes);
+      const settle = handOver(bytes);
       this.#inFlightRequests++;
       const bulk = bytes[5] === 0x1f; // only a bulk read can elicit a 0x74 burst → echo guard counts it
       if (bulk) this.#pendingBulkReads++;
-      return origRequest(bytes, opts).finally(() => {
+      return origRequest(bytes, opts).catch((e: unknown) => { throw withTimeoutCode(e); }).finally(() => {
+        settle();
         this.#inFlightRequests = Math.max(0, this.#inFlightRequests - 1);
         if (bulk) this.#pendingBulkReads = Math.max(0, this.#pendingBulkReads - 1);
       });
     };
     const origSend = t.send.bind(t);
-    t.send = (bytes) => { countTx(bytes); return origSend(bytes); };
+    t.send = (bytes) => {
+      if (!consumeHandedOver(bytes)) countTx(bytes); // a request's / queued send's own frame is counted already
+      return origSend(bytes);
+    };
     const origSendQueued = t.sendQueued.bind(t);
-    t.sendQueued = (bytes, settleMs) => { countTx(bytes); return origSendQueued(bytes, settleMs); };
+    t.sendQueued = (bytes, settleMs) => {
+      const settle = handOver(bytes);
+      return origSendQueued(bytes, settleMs).finally(settle);
+    };
     if (t.sendPaced) {
       const origSendPaced = t.sendPaced.bind(t);
       t.sendPaced = (bytes, chunk, delayMs) => { countTx(bytes); return origSendPaced(bytes, chunk, delayMs); };
     }
     // RX: one persistent handler for the transport's life (additive — coexists with request() waiters
     // and the edit-push listener, which register their own onFrame handlers).
-    t.onFrame((frame) => { this.#traffic.rxMsgs++; this.#traffic.rxBytes += frame.length; });
+    t.onFrame((frame) => {
+      this.#traffic.rxMsgs++;
+      this.#traffic.rxBytes += frame.length;
+      if (this.#frameObservers.size > 0) this.#observeFrame('RX', frame);
+    });
+  }
+
+  // ── frame observers (the diagnostic capture's wire log) ──
+  // Every frame the instrumented transport sends (request/send/sendQueued/sendPaced, at the moment the
+  // caller hands it over) or receives, while at least one observer is registered. Nothing is recorded
+  // or copied without an observer, so this costs one size check per frame otherwise.
+  #frameObservers = new Set<(dir: 'TX' | 'RX', bytes: readonly number[]) => void>();
+  #observeFrame(dir: 'TX' | 'RX', bytes: readonly number[]): void {
+    for (const fn of this.#frameObservers) {
+      try { fn(dir, bytes); } catch { /* an observer must never break the link */ }
+    }
+  }
+  /** Observe every frame on the device link (TX + RX) until the returned function is called. Used by the
+   *  diagnostic capture to record the wire log of its run only; observers must not keep a reference to
+   *  `bytes` (the transport may reuse it). */
+  addFrameObserver(fn: (dir: 'TX' | 'RX', bytes: readonly number[]) => void): () => void {
+    this.#frameObservers.add(fn);
+    return () => { this.#frameObservers.delete(fn); };
   }
 
   /** Run a supervisor-issued device call while marking it so it doesn't register as INTERACTIVE traffic
@@ -1032,6 +1239,11 @@ export class DeviceRegistry {
   static MAX_SKIPS = 3;
   #meterSkips = 0;
   #editWatchSkips = 0;
+  // Last-known link speed of the open transport (set when it opens, refreshed every poll). The yield
+  // back-off reschedules before a tick has read `dev.slow`, so it needs the speed remembered: on a slow
+  // link a back-off at the fast tick would force the status + scene reads through after ~MAX_SKIPS fast
+  // ticks of UI traffic instead of throttling at the slow cadence.
+  #linkSlow = false;
 
   // ── traffic emitter: ~1×/s while ≥1 SSE client is listening; only emits when a counter moved ──
   #trafficTimer: ReturnType<typeof setInterval> | null = null;
@@ -1062,7 +1274,7 @@ export class DeviceRegistry {
   }
 
   #startEditPush() {
-    if (this.#editPushUnsub) return;
+    if (this.#editPushUnsub || this.#telemetryHolds > 0) return; // held by an exclusive operation (pauseTelemetry)
     const t = this.#transport;
     if (!t?.isOpen) return; // not connected yet — #activate re-attaches once detection opens the transport
     if (this.#active && !this.#active.capabilities.deviceEditPush) return; // active device doesn't push

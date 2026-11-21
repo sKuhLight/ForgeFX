@@ -90,6 +90,13 @@ forgefx-midi.ref`. It **auto-merges once required checks pass** — which then a
 
 - **No `version-guard`** — feature PRs never bump `server/package.json`; the version is injected
   from the tag at build time in every job that builds or reports it.
+- **The pinned codec is stamped with its own tag version too** — the codec's committed
+  `package.json` version is frozen (`0.4.x`), but `gen-version.ts` bakes it into the `VERSION` the
+  server writes into diagnostics bundles. Where `release.yml` builds the codec from the
+  `stack.lock.json` pin (`gate` and, before staging it into the build context, `docker`),
+  `.github/scripts/stamp-sibling-version.mjs` first sets its `package.json` version to the pinned
+  tag (`v0.5.0` → `0.5.0`). Non-tag refs (empty / SHA) are left untouched; `ci.yml` runs the
+  script's `--self-test`.
 - **No `notify-axis` on main pushes** — axisapp.live now deploys from Axis releases, not ForgeFX
   main pushes (the `stack-updated` dispatch is retired).
 - **No manual tag / publish** — `release-on-main` tags; `validate-and-publish` publishes.

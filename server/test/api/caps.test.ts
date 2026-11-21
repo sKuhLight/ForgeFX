@@ -3,10 +3,11 @@
 // plus the v2 API handshake on /healthz and /device and the capabilities mirror on /device/detect.
 // Uses the REAL drivers (the caps DTO derives from DriverCapabilities + the optional-method surface;
 // nothing here touches the transport beyond the mocked handshake).
+import { fullCaptureAllowedOnFirmware } from '../../src/drivers/registryCore.js';
 import { buildTestApp } from '../helpers/api.js';
 import { assert, assertEqual } from '../helpers/mock.js';
 
-export const CAPS_CASE_COUNT = 5;
+export const CAPS_CASE_COUNT = 6;
 
 type Caps = {
   slotModel: string;
@@ -34,15 +35,19 @@ type Caps = {
   supportsSave: boolean;
 };
 
-async function fetchCaps(modelId: number): Promise<{ device: Record<string, unknown>; caps: Caps; app: Awaited<ReturnType<typeof buildTestApp>>['app'] }> {
-  const { app } = await buildTestApp(modelId);
+// fullCapture is firmware-gated per model (FULL_CAPTURE_MAX_VERIFIED_FW), so each gen-3 model's matrix is
+// served for a unit reporting a firmware its full capture is verified on (FM3 12.0, Axe-Fx III 32.6); the
+// FM9 has no verified firmware at all, so its matrix carries fullCapture false on every version. The gate
+// itself is covered by fullCaptureFirmwareGate().
+async function fetchCaps(modelId: number, firmware?: [number, number]): Promise<{ device: Record<string, unknown>; caps: Caps; app: Awaited<ReturnType<typeof buildTestApp>>['app'] }> {
+  const { app } = await buildTestApp(modelId, undefined, firmware ? { firmware } : undefined);
   const res = await app.inject({ method: 'GET', url: '/device' });
   assertEqual(res.statusCode, 200, `GET /device (0x${modelId.toString(16)})`);
   const device = res.json() as Record<string, unknown>;
   return { device, caps: device.capabilities as Caps, app };
 }
 
-function checkGen3Common(caps: Caps, label: string): void {
+function checkGen3Common(caps: Caps, label: string, fullCapture = true): void {
   assertEqual(caps.presets.count, 512, `${label} presets.count`);
   assertEqual(caps.presets.addressing, 'numeric', `${label} presets.addressing`);
   assertEqual(caps.presets.canRename, true, `${label} presets.canRename`);
@@ -64,7 +69,7 @@ function checkGen3Common(caps: Caps, label: string): void {
   assertEqual(caps.modifiers.model, true, `${label} modifiers.model`);
   assertEqual(caps.modifiers.bind, true, `${label} modifiers.bind`);
   assertEqual(caps.editorLayouts, true, `${label} editorLayouts (ships *_LAYOUTS)`);
-  assertEqual(caps.fullCapture, true, `${label} fullCapture (CaptureRig-proven gen-3 trio)`);
+  assertEqual(caps.fullCapture, fullCapture, `${label} fullCapture (only on a model + firmware a full capture completed on)`);
   assertEqual(caps.firmwareValidate, false, `${label} firmwareValidate`);
   // gen-3 dumps raw .syx by slot (library export-to-disk + audition); restore stays the
   // version-store flow (loadPresetBytes + store), so restoreDump remains false.
@@ -78,7 +83,7 @@ function checkGen3Common(caps: Caps, label: string): void {
 }
 
 async function fm3(): Promise<void> {
-  const { device, caps, app } = await fetchCaps(0x11);
+  const { device, caps, app } = await fetchCaps(0x11, [12, 0]);
   try {
     assertEqual(device.apiVersion, 2, 'FM3 /device apiVersion');
     checkGen3Common(caps, 'FM3');
@@ -103,10 +108,10 @@ async function fm3(): Promise<void> {
 }
 
 async function fm9(): Promise<void> {
-  const { device, caps, app } = await fetchCaps(0x12);
+  const { device, caps, app } = await fetchCaps(0x12, [12, 0]);
   try {
     assertEqual(device.apiVersion, 2, 'FM9 /device apiVersion');
-    checkGen3Common(caps, 'FM9');
+    checkGen3Common(caps, 'FM9', false); // no full capture has completed on an FM9: never offered
     assertEqual(caps.fc.liveState, false, 'FM9 fc.liveState false (address model only)');
     assertEqual(caps.cabIrs, true, 'FM9 cabIrs (factory banks bundled from the FM9-Edit cache, 2026-07-06)');
   } finally {
@@ -115,7 +120,7 @@ async function fm9(): Promise<void> {
 }
 
 async function axe3(): Promise<void> {
-  const { device, caps, app } = await fetchCaps(0x10);
+  const { device, caps, app } = await fetchCaps(0x10, [32, 6]);
   try {
     assertEqual(device.apiVersion, 2, 'III /device apiVersion');
     checkGen3Common(caps, 'III');
@@ -219,10 +224,71 @@ async function gen1(): Promise<void> {
   }
 }
 
+// fullCapture follows the firmware, per model: offered only on a known firmware at or below the model's
+// verified version (FM3 13.0, Axe-Fx III 32.6 — major.minor), withheld above it and when the firmware is
+// unknown / unusable. The FM9 has no verified version, so it is withheld on every firmware. The build route
+// refuses full mode in exactly those cases (see deviceCache.ts).
+async function fullCaptureFirmwareGate(): Promise<void> {
+  type FwCase = { fw?: [number, number]; expected: boolean; label: string };
+  const perModel: Array<{ modelId: number; name: string; cases: FwCase[] }> = [
+    { modelId: 0x11, name: 'FM3', cases: [
+      { fw: [13, 0], expected: true, label: 'fw 13.0 (verified)' },
+      { fw: [12, 99], expected: true, label: 'fw 12.99 (lower major, high minor)' },
+      { fw: [12, 0], expected: true, label: 'fw 12.0' },
+      { fw: [13, 1], expected: false, label: 'fw 13.1' },
+      { fw: [13, 99], expected: false, label: 'fw 13.99 (high minor boundary)' },
+      { fw: [14, 0], expected: false, label: 'fw 14.0' }
+    ] },
+    { modelId: 0x12, name: 'FM9', cases: [
+      { fw: [12, 0], expected: false, label: 'fw 12.0 (no full capture completed on it)' },
+      { fw: [11, 99], expected: false, label: 'fw 11.99 (lower major, high minor)' },
+      { fw: [12, 1], expected: false, label: 'fw 12.1' },
+      { fw: [12, 99], expected: false, label: 'fw 12.99 (high minor boundary)' },
+      { fw: [13, 0], expected: false, label: 'fw 13.0' }
+    ] },
+    { modelId: 0x10, name: 'Axe-Fx III', cases: [
+      { fw: [32, 6], expected: true, label: 'fw 32.6 (verified)' },
+      { fw: [31, 99], expected: true, label: 'fw 31.99 (lower major, high minor)' },
+      { fw: [32, 7], expected: false, label: 'fw 32.7' },
+      { fw: [32, 99], expected: false, label: 'fw 32.99 (high minor boundary)' },
+      { fw: [33, 0], expected: false, label: 'fw 33.0' }
+    ] }
+  ];
+  // unknown / unusable firmware is refused on every model: silent unit, major 0
+  const unusable: FwCase[] = [
+    { expected: false, label: 'unknown firmware (silent unit)' },
+    { fw: [0, 5], expected: false, label: 'fw major 0 (not a real version)' }
+  ];
+  for (const m of perModel) {
+    for (const c of [...m.cases, ...unusable]) {
+      const { caps, app } = await fetchCaps(m.modelId, c.fw);
+      try {
+        assertEqual(caps.fullCapture, c.expected, `${m.name} ${c.label}: GET /device fullCapture`);
+        const det = await app.inject({ method: 'GET', url: '/device/detect' });
+        const d = det.json() as { capabilities?: { fullCapture?: boolean } };
+        assertEqual(d.capabilities?.fullCapture, c.expected, `${m.name} ${c.label}: /device/detect mirrors fullCapture`);
+      } finally {
+        await app.close();
+      }
+    }
+  }
+  // the policy function itself: a model without an allowlist entry is never allowed, nor is a malformed version
+  assertEqual(fullCaptureAllowedOnFirmware(0x15, { major: 1, minor: 0 }), false, 'AM4 (no allowlist entry) never allowed');
+  assertEqual(fullCaptureAllowedOnFirmware(0x12, { major: 12, minor: 0 }), false, 'FM9 (no allowlist entry) never allowed, not even on 12.0');
+  assertEqual(fullCaptureAllowedOnFirmware(0x12, { major: 1, minor: 0 }), false, 'FM9 (no allowlist entry) never allowed on an old firmware either');
+  assertEqual(fullCaptureAllowedOnFirmware(0x10, { major: 32, minor: 6 }), true, 'policy: Axe-Fx III 32.6 allowed');
+  assertEqual(fullCaptureAllowedOnFirmware(0x11, { major: 12, minor: 0 }), true, 'policy: FM3 12.0 allowed');
+  assertEqual(fullCaptureAllowedOnFirmware(0x11, null), false, 'policy: null firmware refused');
+  assertEqual(fullCaptureAllowedOnFirmware(0x11, { major: NaN, minor: 0 }), false, 'policy: NaN major refused');
+  assertEqual(fullCaptureAllowedOnFirmware(0x11, { major: 12, minor: -1 }), false, 'policy: negative minor refused');
+  assertEqual(fullCaptureAllowedOnFirmware(0x11, { major: 0, minor: 0 }), false, 'policy: major 0 refused');
+}
+
 export async function runCapsTests(): Promise<void> {
   await fm3();
   await fm9();
   await axe3();
   await am4();
   await gen1();
+  await fullCaptureFirmwareGate();
 }

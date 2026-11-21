@@ -17,7 +17,7 @@ this file is the at-a-glance view. Each item links to its tracking issue.
 
 ## 🎚 Editing core
 
-- [ ] Save/store to flash + safe-edit gate — *(param/bypass/channel/grid/switch live-verified; store pending)* — [#4](https://github.com/sKuhLight/ForgeFX/issues/4)
+- [ ] Save/store to flash + safe-edit gate — *(param/bypass/channel/grid/switch live-verified; store ack verified on the FM3 (USB, firmware 12.0 and later; measured on 12.0 and 13.0), FM9/Axe-Fx III pending)* — [#4](https://github.com/sKuhLight/ForgeFX/issues/4)
 - [ ] Block channels A–D: full per-channel editing — *(channel switch live-verified)* — [#5](https://github.com/sKuhLight/ForgeFX/issues/5)
 - [ ] Scenes & scene leveling — [#6](https://github.com/sKuhLight/ForgeFX/issues/6)
 - [ ] Modifiers & controllers — [#7](https://github.com/sKuhLight/ForgeFX/issues/7)

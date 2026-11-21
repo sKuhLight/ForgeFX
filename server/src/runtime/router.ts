@@ -20,8 +20,10 @@ import * as backups from '../services/backups.js';
 import * as deviceCache from '../services/deviceCache.js';
 import * as editorCacheImport from '../services/editorCacheImport.js';
 import * as cloudProfiles from '../services/cloudProfiles.js';
+import * as diagnostics from '../services/diagnosticCapture.js';
 import { blockHelpBySlug, helpIndex } from '../help.js';
 import { createUnifiedHandlers } from './handlers.js';
+import { sendErrorStatus } from '../drivers/sendPolicy.js';
 import { putStoreDoc } from './services.js';
 import { createLocalService } from './localService.js';
 import type { FolderAdapter } from './folderAdapter.js';
@@ -58,6 +60,9 @@ export interface RuntimeDeps {
   local?: RouterLocalDeps;
   cloud?: CloudService;
   telemetry?: TelemetryService;
+  /** Version stamps for diagnostic-capture bundles (`app` in the bundle): the ForgeFX build this runtime
+   *  bundles, the codec and the hosting Axis, where the host knows them (each `[0-9A-Za-z.+-]{1,32}`). */
+  versions?: { forgefx?: string; codec?: string; axis?: string };
 }
 
 // ── request plumbing ──
@@ -168,6 +173,31 @@ export function createRouter(deps: RuntimeDeps): {
     c.reply.code(r.code);
     return r.body;
   });
+  // ── diagnostic capture (capability diagnosticCapture; shared service, see services/diagnosticCapture.ts).
+  //    No cloud dep → the upload answers the server's 503 cloud-disabled. ──
+  const captureOpts: diagnostics.CaptureOptions = deps.versions ? { versions: deps.versions } : {};
+  on('GET', '/diagnostics/capture', () => diagnostics.captureStatus(registry));
+  on('POST', '/diagnostics/capture', async (c) => {
+    const r = await diagnostics.startCapture(store, registry, c.body, captureOpts);
+    c.reply.code(r.code);
+    return r.body;
+  });
+  on('POST', '/diagnostics/capture/cancel', () => diagnostics.cancelCapture(registry));
+  on('GET', '/diagnostics/capture/preflight', async (c) => {
+    const r = await diagnostics.capturePreflight(registry);
+    c.reply.code(r.code);
+    return r.body;
+  });
+  on('GET', '/diagnostics/capture/result', (c) => {
+    const r = diagnostics.captureResult(registry);
+    c.reply.code(r.code);
+    return r.body;
+  });
+  on('POST', '/diagnostics/capture/upload', async (c) => {
+    const r = await diagnostics.uploadCapture(registry, deps.cloud ?? null, c.body);
+    c.reply.code(r.code);
+    return r.body;
+  });
   // cab IR names per bank (Factory 1/2, Legacy, Scratchpad) — refresh lets a driver merge live per-device banks.
   on('GET', '/cab/irs', async (c) => {
     if (c.query.get('refresh') === '1') {
@@ -194,22 +224,11 @@ export function createRouter(deps: RuntimeDeps): {
   // Stored preset name (driver-backed since Phase 6; gen-3 keeps the {number, name:''} stub).
   on('GET', '/presets/:n', (c) => h.presetNameH(Number(c.params.n)));
   // Decode any preset by number (non-disruptive) → library summary: name, scenes, unique blocks.
-  on('GET', '/presets/:n/summary', async (c) => {
-    try {
-      const d = await driver();
-      if (!d.presetSummary) return unsupported(c.reply, 'presetDump');
-      return await d.presetSummary(Number(c.params.n), c.query.get('full') === '1');
-    } catch (e) { c.reply.code(503); return { error: (e as Error).message }; }
-  });
+  on('GET', '/presets/:n/summary', (c) => h.presetSummaryH(c.reply, c.params.n ?? '', c.query.get('full') === '1'));
   // Full per-block decoded params for one preset (every family/param) — deep-search + browser detail.
-  on('GET', '/presets/:n/params', async (c) => {
-    try {
-      const d = await driver();
-      if (!d.presetParams) return unsupported(c.reply, 'presetDump');
-      return { blocks: await d.presetParams(Number(c.params.n)) };
-    } catch (e) { c.reply.code(503); return { error: (e as Error).message }; }
-  });
-  on('GET', '/presets/:n/grid', (c) => h.gridH(c.reply));
+  on('GET', '/presets/:n/params', (c) => h.presetParamsH(c.reply, c.params.n ?? ''));
+  // Grid of the STORED slot `:n` (never the edit buffer — that is /preset/grid); see presetGridH.
+  on('GET', '/presets/:n/grid', (c) => h.presetGridH(c.reply, c.params.n ?? ''));
   on('GET', '/preset/grid', (c) => h.gridH(c.reply));
   on('GET', '/preset/blocks', (c) => h.blocksH(c.reply));
   on('GET', '/preset/scene-state', (c) => h.sceneStateH(c.reply));
@@ -241,14 +260,15 @@ export function createRouter(deps: RuntimeDeps): {
     if (!bytes || !bytes.length) { c.reply.code(400); return { error: 'POST raw .syx bytes as application/octet-stream, or JSON {bytes:number[]}' }; }
     return h.decodeH(c.reply, Uint8Array.from(bytes));
   }, { octet: true });
-  // load arbitrary raw .syx bytes (e.g. a cloud/file preset) into the edit buffer
+  // load a .syx preset dump (e.g. a cloud/file preset) into the edit buffer — the driver validates it
+  // as ONE preset dump for the connected model (400 otherwise, see drivers/sendPolicy.ts)
   on('POST', '/preset/load', async (c) => {
     if (!c.raw || !c.raw.length) { c.reply.code(400); return { error: 'POST raw .syx bytes as application/octet-stream' }; }
     try {
       const d = await driver();
       if (!d.loadPresetBytes) return unsupported(c.reply, 'loadPresetBytes');
       return await d.loadPresetBytes(c.raw);
-    } catch (e) { c.reply.code(503); return { error: (e as Error).message }; }
+    } catch (e) { c.reply.code(sendErrorStatus(e, 503)); return { error: (e as Error).message }; }
   }, { octet: true });
 
   // ── catalog ──
@@ -493,7 +513,7 @@ export function createRouter(deps: RuntimeDeps): {
       const d = await driver();
       if (!d.loadPresetBytes) return unsupported(c.reply, 'loadPresetBytes');
       return await backups.loadVersion(store, d, c.params.id!);
-    } catch (e) { c.reply.code(503); return { error: (e as Error).message }; }
+    } catch (e) { c.reply.code(sendErrorStatus(e, 503)); return { error: (e as Error).message }; }
   });
   // restore a snapshot to its origin slot (load + commit to that slot — destructive for the slot)
   on('POST', '/version/:id/restore', async (c) => {
@@ -501,7 +521,7 @@ export function createRouter(deps: RuntimeDeps): {
       const d = await driver();
       if (!d.loadPresetBytes || !d.store) return unsupported(c.reply, 'loadPresetBytes');
       return await backups.restoreVersion(store, d, c.params.id!);
-    } catch (e) { c.reply.code(503); return { error: (e as Error).message }; }
+    } catch (e) { c.reply.code(sendErrorStatus(e, 503)); return { error: (e as Error).message }; }
   });
   // version history (all, or for one slot via ?location=)
   on('GET', '/versions', (c) => {

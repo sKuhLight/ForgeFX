@@ -15,12 +15,23 @@ export { createGen3Driver } from '../drivers/gen3.js';
 export { createAm4Driver, type Am4Driver } from '../drivers/am4.js';
 export type { DeviceDriver, DriverCapabilities, DriverCtx, DeviceEvent } from '../drivers/types.js';
 export type { Transport, RequestOpts, Conn, ConnKind } from '../transport/types.js';
+// the request/completion engine of the Node transports, for in-page transports to share (browser-safe)
+export {
+  RequestQueue, LATE_DRAIN_LIMITS, SAME_TICK_MS, isResultEcho, pacedWrite,
+  type ExchangeLink, type LateDrainLimits, type RequestQueueOpts, type QueueClock, type PacedPort
+} from '../transport/requestQueue.js';
 export { PROFILES, DEFAULT_PROFILE, profileForModel, profileForKey, SLUG_FAMILY, type DeviceProfile } from '../devices.js';
 
 // ── persistent store (backend-agnostic core + the browser-usable backend) ──
 export { createStore, type Store } from './store.js';
 export { createMemStoreBackend } from './memStoreBackend.js';
 export type { StoreBackend, StoreCodec, Doc, PresetVersion, Backup, JsonWriteOpts } from './storeBackend.js';
+
+// ── device-definition profile schema gate (usable vs stale; the lookup behind every apply hook) ──
+export {
+  CURRENT_CACHE_SCHEMA, checkProfileSchema, staleFields, loadStoredProfile, loadUsableProfile,
+  type StaleReason, type ProfileSchemaCheck, type StoredProfile
+} from '../profileSchema.js';
 
 // ── local storage folder (Presets/ library + Sync/ mirror) ──
 export type { FolderAdapter, FolderEntry } from './folderAdapter.js';

@@ -7,6 +7,8 @@
 // the router uses a tiny status recorder), so the exact same code produces the exact same
 // status+body on both surfaces. NO node:/fastify imports — this module must load in a browser.
 import type { DeviceRegistry } from '../drivers/registryCore.js';
+import { EmptyPresetError } from '../drivers/types.js';
+import { presetDumpFramesViolation } from '../drivers/sendPolicy.js';
 
 /** The one reply capability the shared handlers need: set the response status. FastifyReply's
  *  `code()` matches; the runtime router records the status into its RouterResponse. */
@@ -32,6 +34,57 @@ export function createUnifiedHandlers(registry: DeviceRegistry) {
 
   const gridH = async (reply: StatusSink) => {
     try { return await (await driver()).grid(); } catch (e) { return decodeFail(reply, 'grid decode', e); }
+  };
+  // ── slot-addressed routes (GET /presets/:n/{grid,summary,params}) ──
+  // The route's number arrives as a raw string so a malformed one (`abc`, `-1`, `1.5`, `1e2`, `0x10`) is a
+  // clean 400 BEFORE any device access; a well-formed one is then range-checked against the active
+  // driver's slot count (`presetCount`, when it knows it) — also 400.
+  const parseSlot = (raw: string): number | null => (/^\d{1,5}$/.test(raw) ? Number(raw) : null);
+  const slotOutOfRange = (d: { presetCount?: number }, n: number) =>
+    d.presetCount != null && n >= d.presetCount ? { error: 'preset number out of range', max: d.presetCount - 1 } : null;
+
+  // Routing grid of the STORED preset in slot `:n` (GET /presets/:n/grid) — never the edit buffer.
+  //  • a driver that can dump a stored slot (gen-3: `presetGrid`) answers from that dump, i.e. the SAVED
+  //    state of the slot (unsaved edits in the edit buffer are not in it);
+  //  • a driver that cannot but can name its loaded slot (`presetRef` — today only the AM4) answers the LIVE
+  //    grid when `:n` IS the loaded slot — that is the edit buffer, so it includes unsaved edits;
+  //  • everything else (any other slot; gen-1 / gen-2 / VP4, which have neither) answers 501: a named
+  //    refusal, never another preset's grid substituted for the one asked for.
+  const presetGridH = async (reply: StatusSink, raw: string) => {
+    const n = parseSlot(raw);
+    if (n == null) { reply.code(400); return { error: 'invalid preset number' }; }
+    try {
+      const d = await driver();
+      const oob = slotOutOfRange(d, n);
+      if (oob) { reply.code(400); return oob; }
+      if (d.presetGrid) return await d.presetGrid(n);
+      if (d.presetRef && (await d.presetRef()).number === n) return await d.grid();
+      return unsupported(reply, 'presetDump');
+    } catch (e) { return decodeFail(reply, 'preset grid decode', e); }
+  };
+  // Decode any stored preset by number (non-disruptive) → library summary (GET /presets/:n/summary).
+  const presetSummaryH = async (reply: StatusSink, raw: string, full: boolean) => {
+    const n = parseSlot(raw);
+    if (n == null) { reply.code(400); return { error: 'invalid preset number' }; }
+    try {
+      const d = await driver();
+      const oob = slotOutOfRange(d, n);
+      if (oob) { reply.code(400); return oob; }
+      if (!d.presetSummary) return unsupported(reply, 'presetDump');
+      return await d.presetSummary(n, full);
+    } catch (e) { reply.code(503); return { error: (e as Error).message }; }
+  };
+  // Full per-block decoded params of one stored preset (GET /presets/:n/params) — deep search + browser detail.
+  const presetParamsH = async (reply: StatusSink, raw: string) => {
+    const n = parseSlot(raw);
+    if (n == null) { reply.code(400); return { error: 'invalid preset number' }; }
+    try {
+      const d = await driver();
+      const oob = slotOutOfRange(d, n);
+      if (oob) { reply.code(400); return oob; }
+      if (!d.presetParams) return unsupported(reply, 'presetDump');
+      return { blocks: await d.presetParams(n) };
+    } catch (e) { reply.code(503); return { error: (e as Error).message }; }
   };
   const blocksH = async (reply: StatusSink) => {
     try {
@@ -86,7 +139,7 @@ export function createUnifiedHandlers(registry: DeviceRegistry) {
     // number omitted → store to the CURRENT slot (needs a live preset-number query).
     const n = number ?? (d.presetRef ? (await d.presetRef()).number : undefined);
     if (n == null || !Number.isFinite(n) || n < 0) { reply.code(400); return { error: 'number required' }; }
-    return d.store(n); // gen-3: {ok}; AM4 additionally carries {location, code}
+    return d.store(n); // gen-3: {ok, acked, location, error?|warning?} (see Gen3Driver.store); AM4: {ok, location, code}
   };
   // Stored preset name: driver-backed where supported (AM4 → {number, name, code}); the gen-3
   // drivers don't implement it, so they keep the pre-Phase-6 {number, name:''} stub byte-identically.
@@ -108,12 +161,20 @@ export function createUnifiedHandlers(registry: DeviceRegistry) {
   const backupH = async (reply: StatusSink, location?: number) => {
     const d = await driver();
     if (!d.backupPreset) return unsupported(reply, 'backupDump');
-    try { return await d.backupPreset(location); } catch (e) { reply.code(503); return { error: (e as Error).message }; }
+    try { return await d.backupPreset(location); } catch (e) {
+      // an unused slot has nothing to back up (its all-zero dump is not a restorable preset): 422, not 503
+      reply.code(e instanceof EmptyPresetError ? e.statusCode : 503);
+      return { error: (e as Error).message };
+    }
   };
   const restoreH = async (reply: StatusSink, bytes?: number[]) => {
     if (!Array.isArray(bytes) || !bytes.length) { reply.code(400); return { error: 'bytes[] of one preset dump required' }; }
     const d = await driver();
     if (!d.restorePreset) return unsupported(reply, 'restoreDump');
+    // Only preset-dump frames for the connected model, split exactly at their own boundaries, reach the
+    // driver — no frame hidden inside a chunk behind an inner F7/F0 (drivers/sendPolicy.ts).
+    const refused = presetDumpFramesViolation(bytes, d.modelId);
+    if (refused) { reply.code(refused.status); return { error: refused.message }; }
     try { return await d.restorePreset(bytes); } catch (e) { reply.code(400); return { error: (e as Error).message }; }
   };
   const fwValidateH = async (reply: StatusSink, bytes?: number[]) => {
@@ -170,7 +231,7 @@ export function createUnifiedHandlers(registry: DeviceRegistry) {
 
   return {
     driver, unsupported, decodeFail,
-    gridH, blocksH, sceneStateH, blockParamsH, setParamH, bypassH, sceneSetH,
+    gridH, presetGridH, presetSummaryH, presetParamsH, blocksH, sceneStateH, blockParamsH, setParamH, bypassH, sceneSetH,
     presetSelectH, presetStoreH, presetNameH, locationsH,
     backupH, restoreH, fwValidateH, deviceParamH, modModelH,
     telemetryConfigH, telemetrySetH,

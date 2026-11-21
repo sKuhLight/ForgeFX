@@ -14,6 +14,7 @@
 import { buildCache, type BuiltCache } from 'forgefx-midi/cache';
 import { deviceCacheKey, type DeviceRegistry } from '../drivers/registryCore.js';
 import { catalogForModel, resolveCacheKey } from './deviceCache.js';
+import { loadStoredProfile } from '../profileSchema.js';
 import type { Store } from '../runtime/store.js';
 
 /** Parsed identity of an `effectDefinitions_<modelHex>_<fwMajor>p<fwMinor>.cache` filename. */
@@ -35,14 +36,15 @@ export function parseEditorCacheFilename(name: string): EditorCacheFileInfo | nu
   return { model: parseInt(m[1]!, 16), fwMajor: Number(m[2]), fwMinor: Number(m[3]) };
 }
 
-/** Does a persisted cache already exist for the CURRENTLY attached model+firmware? Drives the
- *  `persisted` flag of GET /device/cache/sources (both twins call it; candidates are added per-twin). */
+/** Does a USABLE persisted cache already exist for the CURRENTLY attached model+firmware? Drives the
+ *  `persisted` flag of GET /device/cache/sources (both twins call it; candidates are added per-twin).
+ *  A stale profile (schema this build cannot use) is not "persisted": it is not applied, and the
+ *  definitions still have to be acquired (GET /device/cache reports it as `stale`). */
 export async function isPersisted(store: Store, registry: DeviceRegistry): Promise<boolean> {
   await registry.driver(); // ensure detection ran so model/firmware are populated
   const key = resolveCacheKey(store, registry);
   if (!key) return false;
-  const doc = store.getDoc('deviceCaches', key);
-  return !!(doc && !doc.deleted);
+  return loadStoredProfile(store, key).state === 'usable';
 }
 
 /**
@@ -103,6 +105,8 @@ export async function importEditorCache(
   const keyMajor = fw?.major ?? info.fwMajor;
   const keyMinor = fw?.minor ?? info.fwMinor;
   const key = deviceCacheKey(model, keyMajor, keyMinor);
+  // `built.meta.schema` is the codec's current stamp, so an import over a stale profile replaces it
+  // with a usable one (the import never consults the stored profile, stale or not).
   const doc = { ...built, meta: { ...built.meta, source: 'editor-cache' as const, importedAt: new Date().toISOString() } };
   store.putDoc('deviceCaches', key, doc);
   await registry.applyRuntimeCache(); // adopt the imported device-true profile immediately

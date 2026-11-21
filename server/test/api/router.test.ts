@@ -17,6 +17,7 @@ import { nodeCodec } from '../../src/runtime/fsStoreBackend.js';
 import type { ScanCache } from '../../src/runtime/localFolder.js';
 import type { DeviceEvent } from '../../src/drivers/types.js';
 import * as store from '../../src/store.js';
+import * as diagnostics from '../../src/services/diagnosticCapture.js';
 import { buildTestApp } from '../helpers/api.js';
 import { assert, assertEqual } from '../helpers/mock.js';
 
@@ -61,6 +62,12 @@ function makeFakeFm3(): DeviceDriver {
       { slug: 'amp', name: 'Amp 1', effectId: 58, row: 1, col: 1, fromRows: [], bypassed: false, channel: 'A' }
     ],
     presetRef: async () => ({ number: 3, name: 'Current' }),
+    presetCount: 512,
+    presetGrid: async (n: number) => ({
+      model: 'fm3', name: `SLOT-${n}`, crcValid: true, rows: 4, cols: 12, scenes: [],
+      cells: [{ row: 0, col: 0, effectId: 100 + n, name: `Block ${n}`, isShunt: false, routeFlag: 0, fromRows: [] }],
+      source: 'dump' as const
+    }),
     blocksCatalog: () => [{ slug: 'amp', family: 'AMP', instance: 1, name: 'Amp 1', page: 0, paramCount: 2, typeCount: 1 }],
     blockTypes: () => [{ value: 1, name: 'USA Lead', manufacturer: null, basedOn: null }],
     blockParams: async (eid: number) => ({
@@ -104,6 +111,9 @@ const ROWS: Row[] = [
   { name: 'preset ref', method: 'GET', url: '/preset' },
   { name: 'grid', method: 'GET', url: '/preset/grid' },
   { name: 'grid by number', method: 'GET', url: '/presets/7/grid' },
+  { name: 'grid by number (other slot)', method: 'GET', url: '/presets/8/grid' },
+  { name: 'grid by number (400 malformed)', method: 'GET', url: '/presets/abc/grid' },
+  { name: 'grid by number (400 out of range)', method: 'GET', url: '/presets/512/grid' },
   { name: 'blocks placed', method: 'GET', url: '/preset/blocks' },
   { name: 'blocks catalog', method: 'GET', url: '/blocks' },
   { name: 'block types', method: 'GET', url: '/blocks/amp/types' },
@@ -141,6 +151,19 @@ const ROWS: Row[] = [
   { name: 'device cache build (501)', method: 'POST', url: '/device/cache/build', body: {} },
   { name: 'device cache cancel', method: 'POST', url: '/device/cache/cancel' },
   { name: 'device cache delete', method: 'DELETE', url: '/device/cache' },
+  // diagnostic capture (five twins) — the fake FM3 has selfDescribe:false, so a start passes the 400 gates
+  // and then answers 501; nothing has run, so the result is 404 and the upload stops at its gates.
+  { name: 'diagnostics status (idle)', method: 'GET', url: '/diagnostics/capture' },
+  { name: 'diagnostics start without acknowledgement (400)', method: 'POST', url: '/diagnostics/capture', body: { steps: ['info'] } },
+  { name: 'diagnostics start with unknown steps (400)', method: 'POST', url: '/diagnostics/capture', body: { acknowledged: true, steps: ['nope'] } },
+  { name: 'diagnostics start (501 no diagnosticCapture)', method: 'POST', url: '/diagnostics/capture', body: { acknowledged: true } },
+  { name: 'diagnostics cancel (idle)', method: 'POST', url: '/diagnostics/capture/cancel' },
+  { name: 'diagnostics preflight (501 no diagnosticCapture)', method: 'GET', url: '/diagnostics/capture/preflight' },
+  { name: 'diagnostics start with an unknown unsavedEdits (400)', method: 'POST', url: '/diagnostics/capture', body: { acknowledged: true, unsavedEdits: 'keep' } },
+  { name: 'diagnostics start with a decision but no token (400)', method: 'POST', url: '/diagnostics/capture', body: { acknowledged: true, unsavedEdits: 'discard', preset: 3 } },
+  { name: 'diagnostics result (404)', method: 'GET', url: '/diagnostics/capture/result' },
+  { name: 'diagnostics upload without consent (400)', method: 'POST', url: '/diagnostics/capture/upload', body: {} },
+  { name: 'diagnostics upload without a result (404)', method: 'POST', url: '/diagnostics/capture/upload', body: { consent: true } },
   // version control (row order matters: backup first, listing after)
   { name: 'backup preset (dedup twin)', method: 'POST', url: '/backup/preset/5' },
   { name: 'versions', method: 'GET', url: '/versions' },
@@ -161,8 +184,11 @@ const ROWS: Row[] = [
   { name: 'unknown route 404', method: 'GET', url: '/definitely/not/a/route' }
 ];
 
-// dynamic follow-ups (need the version id from the backup row) + local rows + subscribe = extra cases
-export const ROUTER_PARITY_CASE_COUNT = ROWS.length + 8;
+// A capture on a self-describe unit through both surfaces (see diagnosticCaptureRunParity).
+const DIAGNOSTICS_RUN_CASES = 10;
+// dynamic follow-ups (need the version id from the backup row) + local rows + subscribe + the two
+// firmware-gate twins (full capture on fw 14.0 / unknown firmware) + the running-capture twins = extra cases
+export const ROUTER_PARITY_CASE_COUNT = ROWS.length + 10 + DIAGNOSTICS_RUN_CASES;
 
 function deepEq(a: unknown, b: unknown): boolean {
   if (Object.is(a, b)) return true;
@@ -171,6 +197,82 @@ function deepEq(a: unknown, b: unknown): boolean {
   const ka = Object.keys(a as object), kb = Object.keys(b as object);
   if (ka.length !== kb.length) return false;
   return ka.every((k) => deepEq((a as Record<string, unknown>)[k], (b as Record<string, unknown>)[k]));
+}
+
+// FULL-mode cache build is refused above the verified firmware (FM3: 13.0) and on unknown firmware: the Fastify route and its
+// Browser-Direct twin answer the SAME 501 (they share startCacheBuild). A self-describe + fullCapture
+// fake (the main matrix fake has both off) over a registry whose fn 0x08 reply is scripted — or silent.
+async function fullCaptureFirmwareGateParity(): Promise<void> {
+  const cases: Array<{ fw?: [number, number]; expectedFirmware: string | null; label: string }> = [
+    { fw: [14, 0], expectedFirmware: '14.0', label: 'fw 14.0' },
+    { expectedFirmware: null, label: 'unknown firmware' }
+  ];
+  for (const c of cases) {
+    const fake = { ...makeFakeFm3(), capabilities: { ...CAPS, selfDescribe: true, cacheImport: true, fullCapture: true } } as DeviceDriver;
+    const { app, registry } = await buildTestApp(0x11, fake, c.fw ? { firmware: c.fw } : undefined);
+    try {
+      const router = createRouter({ registry, store: store.defaultStore });
+      const res = await app.inject({ method: 'POST', url: '/device/cache/build', payload: { mode: 'full' } });
+      const routed = await router.handle('POST', '/device/cache/build', JSON.stringify({ mode: 'full' }));
+      assertEqual(res.statusCode, 501, `full capture on ${c.label}: app → 501`);
+      assertEqual(routed.status, 501, `full capture on ${c.label}: router twin → 501`);
+      const appJson = JSON.parse(res.payload) as Record<string, unknown>;
+      const routerJson = JSON.parse(routed.body as string) as Record<string, unknown>;
+      assert(deepEq(appJson, routerJson), `full capture on ${c.label}: body parity\napp:    ${JSON.stringify(appJson)}\nrouter: ${JSON.stringify(routerJson)}`);
+      assertEqual(appJson.capability, 'fullCapture', `${c.label}: 501 names fullCapture`);
+      assertEqual(appJson.reason, 'firmware', `${c.label}: 501 reason is firmware`);
+      assertEqual(appJson.firmware, c.expectedFirmware, `${c.label}: 501 reports the detected firmware`);
+    } finally {
+      await app.close();
+    }
+  }
+}
+
+// A capture on a self-describe unit through both surfaces (they share the job state of one registry):
+// 202 on either (ids differ), 409 busy on BOTH while one runs, the same running status, the same cancel,
+// the same finished status + result bundle, and the same 503 cloud-disabled upload.
+async function diagnosticCaptureRunParity(): Promise<void> {
+  const fake = { ...makeFakeFm3(), capabilities: { ...CAPS, selfDescribe: true } } as DeviceDriver;
+  const { app, registry } = await buildTestApp(0x11, fake);
+  // the walk parks until the run is cancelled, so the capture stays "running" while both surfaces are asked
+  const blocking = (_t: unknown, o: { signal?: AbortSignal }): Promise<never> =>
+    new Promise((_res, rej) => { o.signal?.addEventListener('abort', () => rej(new Error('live walk aborted'))); });
+  diagnostics.__setCaptureOptionsForTest(registry, { walkImpl: blocking as never, versions: { forgefx: 'parity' } });
+  const router = createRouter({ registry, store: store.defaultStore, versions: { forgefx: 'parity' } });
+  const both = async (method: string, url: string, body?: unknown) => {
+    const res = await app.inject({ method: method as 'GET', url, ...(body !== undefined ? { payload: body as Record<string, unknown> } : {}) });
+    const routed = await router.handle(method, url, body !== undefined ? JSON.stringify(body) : undefined);
+    return { app: { status: res.statusCode, json: res.payload ? JSON.parse(res.payload) as unknown : null }, router: { status: routed.status, json: JSON.parse(routed.body as string) as unknown } };
+  };
+  const same = (label: string, r: Awaited<ReturnType<typeof both>>, status: number) => {
+    assertEqual(r.app.status, status, `${label}: app status`);
+    assertEqual(r.router.status, status, `${label}: router status`);
+    assert(deepEq(r.app.json, r.router.json), `${label}: body parity\napp:    ${JSON.stringify(r.app.json)}\nrouter: ${JSON.stringify(r.router.json)}`);
+  };
+  const body = { acknowledged: true, steps: ['readonlyWalk'] };
+  try {
+    for (const starter of ['app', 'router'] as const) {
+      const started = starter === 'app'
+        ? await app.inject({ method: 'POST', url: '/diagnostics/capture', payload: body }).then((r) => ({ status: r.statusCode, json: r.json() as { started: boolean; id: string } }))
+        : await router.handle('POST', '/diagnostics/capture', JSON.stringify(body)).then((r) => ({ status: r.status, json: JSON.parse(r.body as string) as { started: boolean; id: string } }));
+      assertEqual(started.status, 202, `start via ${starter}: 202`);
+      assert(started.json.started === true && typeof started.json.id === 'string', `start via ${starter}: { started, id }`);
+      same(`busy while running (started via ${starter})`, await both('POST', '/diagnostics/capture', body), 409);
+      same(`status while running (started via ${starter})`, await both('GET', '/diagnostics/capture'), 200);
+      same(`preflight while running (started via ${starter})`, await both('GET', '/diagnostics/capture/preflight'), 409);
+      same(`cancel (started via ${starter})`, await both('POST', '/diagnostics/capture/cancel'), 200);
+      await diagnostics.capturePromise(registry);
+    }
+    same('status after the run', await both('GET', '/diagnostics/capture'), 200);
+    same('preflight when idle', await both('GET', '/diagnostics/capture/preflight'), 200);
+    const result = await both('GET', '/diagnostics/capture/result');
+    same('result bundle', result, 200);
+    assertEqual((result.app.json as { state: string }).state, 'cancelled', 'the result is the cancelled run');
+    same('upload without a cloud (503)', await both('POST', '/diagnostics/capture/upload', { consent: true }), 503);
+  } finally {
+    diagnostics.__setCaptureOptionsForTest(registry, null);
+    await app.close();
+  }
 }
 
 export async function runRouterParityTests(): Promise<void> {
@@ -262,6 +364,11 @@ export async function runRouterParityTests(): Promise<void> {
     unsub();
     const cfgEvents = events.filter((e) => e.type === 'config' && (e as { id?: string }).id === 'parity-ui');
     assert(cfgEvents.length >= 2, `config fan-out reaches router subscribers (got ${cfgEvents.length})`);
+
+    // 9..10 — firmware gate on full-mode cache builds (fw 14.0 + unknown firmware) holds on both twins
+    await fullCaptureFirmwareGateParity();
+    // + a running diagnostic capture on both twins
+    await diagnosticCaptureRunParity();
   } finally {
     await app.close();
     rmSync(localRoot, { recursive: true, force: true });

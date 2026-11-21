@@ -8,6 +8,9 @@ name: release
 #
 # The version is NOT committed in feature PRs — it is derived from the tag and injected into
 # server/package.json in every job that builds or reports it (--allow-same-version keeps it safe).
+# The pinned codec is a sibling with the same problem (its committed version is stale), so where
+# it is built (gate, docker) its own release-tag version is stamped first — see
+# .github/scripts/stamp-sibling-version.mjs.
 on:
   push:
     tags: ['v*']
@@ -61,6 +64,14 @@ jobs:
       - name: Inject release version into server/package.json
         working-directory: ForgeFX/server
         run: npm version "${GITHUB_REF_NAME#v}" --no-git-tag-version --allow-same-version
+      # The codec is built from source at the pinned ref, where its COMMITTED package.json version is
+      # stale. gen-version.ts bakes package.json into src/version.ts during `npm run build`, and the
+      # server stamps that VERSION into diagnostics bundles — so stamp the pinned tag's version
+      # BEFORE the codec build (no-op when the ref is empty / a SHA).
+      - name: Stamp pinned codec with its release tag version
+        env:
+          CODEC_REF: ${{ steps.resolve.outputs.ref }}
+        run: node ForgeFX/.github/scripts/stamp-sibling-version.mjs "$CODEC_REF" forgefx-midi forgefx-midi
       - name: Build codec (server exports resolve to dist/)
         working-directory: forgefx-midi
         run: |
@@ -102,6 +113,13 @@ jobs:
           repository: sKuhLight/forgefx-midi
           ref: ${{ steps.resolve.outputs.ref }}
           path: midi-checkout
+      # Stamp the pinned codec's package.json with its release tag version BEFORE it is staged: the
+      # Dockerfile builds it in-image (`npm run build` → gen-version.ts → src/version.ts), so the
+      # rsync'd copy must already carry the right version (no-op when the ref is empty / a SHA).
+      - name: Stamp pinned codec with its release tag version
+        env:
+          CODEC_REF: ${{ steps.resolve.outputs.ref }}
+        run: node .github/scripts/stamp-sibling-version.mjs "$CODEC_REF" midi-checkout forgefx-midi
       - name: Stage forgefx-midi into the build context
         run: rsync -a --exclude node_modules --exclude .git midi-checkout/ forgefx-midi/ && rm -rf midi-checkout
       - uses: docker/setup-qemu-action@v3

@@ -52,6 +52,26 @@ const checks: Array<{ name: string; ok: () => boolean }> = [
   { name: 'AM4 COMP with no matching type falls back to the first variant', ok: () => am4LayoutFor('compressor', 99999)?.variantName === 'Analog' },
   { name: 'unknown family → undefined', ok: () => fm3.layoutFor('NOT_A_FAMILY') === undefined && axe3.layoutFor('NOT_A_FAMILY', 3) === undefined },
 
+  // ── AM4 amp: DISTORT holds two value-less variants, the device-global setup pages ('Global', also the
+  //    layout's editorName) listed first and the real 'Amp' editor; the amp block must get the latter ──
+  { name: "AM4 amp serves the 'Amp' variant, not the device-global setup pages", ok: () => {
+    const l = am4LayoutFor('amp', 7);
+    return !!l && l.variantName === 'Amp' && l.variantValue === null
+      && !l.pages.some((p) => ['Audio', 'Footswitches', 'MIDI/Remote', 'Global'].includes(p.name))
+      && l.pages.some((p) => p.name === 'Amp'); } },
+  { name: 'AM4 amp: the variant is picked whatever the type value (unknown, or none at all)', ok: () =>
+    am4LayoutFor('amp', 99999)?.variantName === 'Amp' && am4LayoutFor('amp')?.variantName === 'Amp' },
+  { name: "AM4 amp: a model an explicit page names gets exactly that Amp page (7 → '7,8,93')", ok: () => {
+    const ampPages = (am4LayoutFor('amp', 7)?.pages ?? []).filter((p) => p.name === 'Amp');
+    return ampPages.length === 1 && ampPages[0]!.value === '7,8,93'; } },
+  { name: "AM4 amp: a model no explicit page names gets the group's catch-all Amp page (#86 reaches AM4)", ok: () => {
+    const byType = (am4LayoutFor('amp', 99999)?.pages ?? []).filter((p) => p.name === 'Amp');
+    const sel: SelectorValues = (n) => (n === 'DISTORT_TYPE' ? 99999 : undefined);
+    const bySelector = (resolveLayoutPages(am4LayoutFor('amp', 99999)?.pages ?? [], 99999, sel)).filter((p) => p.name === 'Amp');
+    return byType.length === 1 && byType[0]!.value === '' && bySelector.length === 1 && bySelector[0]!.value === ''; } },
+  { name: 'the per-family variant hint is AM4-only: gen-3 amp selection is unchanged', ok: () =>
+    fm3.layoutFor('DISTORT', 5)?.variantName === 'Amp GTE 8.00' && axe3.layoutFor('DISTORT', 0)?.variantName === 'Amp GTE 28.09' },
+
   // ── v2 passthrough shape ──
   { name: 'Axe-Fx III DISTORT layout is v2-shaped (pages→rows→controls)', ok: () => { const l = axe3.layoutFor('DISTORT', 0); return !!l && shapeOk(l); } },
   { name: 'AM4 COMP layout is v2-shaped', ok: () => { const l = am4LayoutFor('compressor', 6); return !!l && shapeOk(l); } },
@@ -106,11 +126,56 @@ const checks: Array<{ name: string; ok: () => boolean }> = [
     const l = fm3.layoutFor('DISTORT', 29, sel); if (!l) return false;
     const names = l.pages.map((p) => p.name);
     return new Set(names).size === names.length; } },
-  { name: 'FM3 amp: a non-matching selector group contributes no page (strict membership)', ok: () => {
-    // 29 lives in an 'Authentic' page but not in any 'Ideal' page → Ideal must be dropped entirely.
+  { name: "FM3 amp: a model with no explicit Ideal page still gets the group's catch-all Ideal page", ok: () => {
+    // 29 lives in an explicit 'Authentic' page but in no explicit 'Ideal' page. The Ideal group ends
+    // with the editor's catch-all (blank `value`), which is what the editor shows for every model its
+    // explicit siblings don't name — so exactly one Ideal page is served, not zero.
     const sel: SelectorValues = (n) => (n === 'DISTORT_TYPE' ? 29 : undefined);
     const l = fm3.layoutFor('DISTORT', 29, sel);
-    return !!l && l.pages.filter((p) => p.name === 'Ideal').length === 0; } },
+    const ideal = l?.pages.filter((p) => p.name === 'Ideal') ?? [];
+    return ideal.length === 1 && ideal[0]!.value === '' && ideal[0]!.rows.length > 0; } },
+  { name: 'FM3 amp: an explicit selector match wins over the catch-all (model 6)', ok: () => {
+    // 6 IS named by an explicit Ideal page → that page is served, never the blank-value default.
+    const sel: SelectorValues = (n) => (n === 'DISTORT_TYPE' ? 6 : undefined);
+    const l = fm3.layoutFor('DISTORT', 6, sel);
+    const ideal = l?.pages.filter((p) => p.name === 'Ideal') ?? [];
+    return ideal.length === 1 && (ideal[0]!.value ?? '').split(',').includes('6'); } },
+  { name: 'FM3 amp: model 0 does not duplicate a group (catch-all is not "value 0")', ok: () => {
+    // `Number('')` is 0, so a blank value list once read as "model 0" — serving BOTH the explicit
+    // model-0 page and the catch-all, which Axis rendered as duplicate 'Ideal'/'Ideal 2' tabs.
+    const sel: SelectorValues = (n) => (n === 'DISTORT_TYPE' ? 0 : undefined);
+    const l = fm3.layoutFor('DISTORT', 0, sel); if (!l) return false;
+    const names = l.pages.map((p) => p.name);
+    return new Set(names).size === names.length
+      && names.filter((n) => n === 'Ideal').length === 1
+      && names.filter((n) => n === 'Authentic').length === 1; } },
+  { name: 'every FM3 amp model is served both an Authentic and an Ideal page', ok: () => {
+    // The regression this guards: only the 124 models named by an explicit Ideal page got the tab.
+    for (let t = 0; t < 331; t++) {
+      const sel: SelectorValues = (n) => (n === 'DISTORT_TYPE' ? t : undefined);
+      const l = fm3.layoutFor('DISTORT', t, sel); if (!l) return false;
+      if (l.pages.filter((p) => p.name === 'Ideal').length !== 1) return false;
+      if (l.pages.filter((p) => p.name === 'Authentic').length !== 1) return false;
+    }
+    return true; } },
+  { name: 'catch-all page applies only when no explicit sibling matches (synthetic)', ok: () => {
+    const pages: EditorLayoutPage[] = [
+      { name: 'P', rows: [], selectorParamName: 'SEL', value: '1,2' },
+      { name: 'P', rows: [], selectorParamName: 'SEL', value: '' },
+    ];
+    const hit = resolveLayoutPages(pages, undefined, (n) => (n === 'SEL' ? 2 : undefined));
+    const miss = resolveLayoutPages(pages, undefined, (n) => (n === 'SEL' ? 9 : undefined));
+    return hit.length === 1 && hit[0]!.value === '1,2' && miss.length === 1 && miss[0]!.value === ''; } },
+  { name: 'a group with no catch-all still contributes no page when nothing matches (synthetic)', ok: () => {
+    const pages: EditorLayoutPage[] = [{ name: 'P', rows: [], selectorParamName: 'SEL', value: '1,2' }];
+    return resolveLayoutPages(pages, undefined, (n) => (n === 'SEL' ? 9 : undefined)).length === 0; } },
+  { name: 'unknown selector value prefers the catch-all over the first gated page (synthetic)', ok: () => {
+    const pages: EditorLayoutPage[] = [
+      { name: 'P', rows: [], selectorParamName: 'SEL', value: '1,2' },
+      { name: 'P', rows: [], selectorParamName: 'SEL', value: '' },
+    ];
+    const out = resolveLayoutPages(pages); // no typeValue, no selectors
+    return out.length === 1 && out[0]!.value === ''; } },
   { name: 'FM3 amp: unknown selector value never serves ALL — one page per same-named group', ok: () => {
     const l = fm3.layoutFor('DISTORT'); if (!l) return false; // no typeValue, no selectors
     const byName = new Map<string, number>();

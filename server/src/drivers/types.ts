@@ -7,6 +7,17 @@ import type { TypeModel, DeviceLayout, DeviceProfile } from '../devices.js';
 import type { Transport } from '../transport/types.js';
 import type { TelemetryMode, CadenceProfile } from './telemetryProfiles.js';
 
+/** Thrown by a driver's verbatim-dump export when the slot is an unused (empty) preset slot: its dump is
+ *  all zeros, not a restorable preset, so there is nothing to export or back up. Routes map it to 422
+ *  (`statusCode`), not the generic 503 "device unreachable". No imports — safe in the browser runtime. */
+export class EmptyPresetError extends Error {
+  readonly statusCode = 422;
+  constructor(message = 'empty preset slot') {
+    super(message);
+    this.name = 'EmptyPresetError';
+  }
+}
+
 /** Library-friendly decoded preset: name, scenes, and the unique effect blocks it contains. */
 export type PresetSummary = {
   number: number;
@@ -15,6 +26,9 @@ export type PresetSummary = {
   crcValid: boolean;
   /** Content fingerprint (stored CRC16) — changes when the preset changes; used to detect stale cache. */
   crc: number;
+  /** ADDITIVE: `true` only for an unused preset slot (blank name, no blocks/scenes, `crcValid: false`).
+   *  Omitted for every populated preset. Clients skip such slots instead of treating them as presets. */
+  empty?: boolean;
   scenes: string[];
   blocks: { effectId: number; slug: string | null; name: string; instance: number | null }[];
   /** Distinct model names in use per block family (amp/drive/cab/reverb/…) — for "presets using model X".
@@ -101,6 +115,32 @@ export interface Am4Slot {
   pidLow: number; // the block's pidLow (its type value)
 }
 
+/** Options of a preset switch. `silent`: a job-internal switch (the diagnostic capture's reload probe and
+ *  its full walk's reloads) — no `changed` event goes to the clients, which would otherwise reload their
+ *  views in the middle of the job. */
+export interface SelectPresetOpts { silent?: boolean }
+
+/** One diagnostic dump request (DeviceDriver.diagnosticDump). `header` is the preset number the first
+ *  whole dump's 0x77 header names (or the first header seen when no dump completed), null when no header
+ *  arrived. `patch` is the decoded raw patch of the whole dump — for an in-memory comparison only (the
+ *  edit buffer against its stored slot); callers must never persist or log it. */
+export interface DiagnosticDump {
+  /** The preset number the request asked for (0x3FFF = the edit buffer). */
+  requested: number;
+  header: number | null;
+  /** A whole dump (0x77 header through its 0x79 terminator, at least one 0x78 chunk) arrived. */
+  complete: boolean;
+  /** Dump frames received (0x77 / 0x78 / 0x79) and their total size in bytes. */
+  frames: number;
+  chunks: number;
+  bytes: number;
+  /** Request round trip in ms. */
+  ms: number;
+  /** The whole dump decodes to an unused (all-zero) slot; null when it could not be decoded. */
+  empty: boolean | null;
+  patch: { raw: Uint8Array; body: Uint8Array } | null;
+}
+
 /** What a device driver can actually do — the single truth the routes gate on (a missing optional
  *  DeviceDriver method always corresponds to a false/absent capability here). No cross-device
  *  `if (isAm4)`-style checks anywhere else. */
@@ -176,7 +216,23 @@ export interface DriverCtx {
    *  run their own edit-watch cadence (the AM4 redesign uses `editRehashMs`) read it here instead of
    *  hardcoding intervals, so a mode switch reaches them without a re-wire. */
   getCadence(): CadenceProfile;
+  /** The running firmware the registry read from the device at detect time (gen-3 `fn 0x08`), or null when
+   *  it was not read / is not known. Resolved AT CALL TIME (the driver is built before detection reads it).
+   *  Optional: a ctx without it simply reports no firmware. */
+  getFirmware?(): { major: number; minor: number } | null;
 }
+
+/** Why a store was not a plain acknowledged success (gen-3, additive on the store result): 'rejected' = a
+ *  fn-0x01 refusal (0x64) was seen in the store window and no ack followed (the 0x64 carries no sub-action, so
+ *  a late refusal of a preceding fn-0x01 write can be attributed to the store); 'no-ack' = nothing
+ *  acknowledged it in time (the slot may or may not have been written). Callers branch on this instead of
+ *  parsing `error` / `warning` text. */
+export type StoreReason = 'rejected' | 'no-ack';
+
+/** Result of a confirmed write (see the `── writes ──` note on DeviceDriver for what `ok` means per family).
+ *  `acked` is ADDITIVE: `true` when the device's own acknowledgement of THIS write was seen (AM4 command ack /
+ *  param-write echo) — acknowledged and not refused, which is still not proof the write took effect. */
+export interface WriteResult { ok: boolean; acked?: boolean }
 
 /**
  * Per-device driver surface. Method signatures are IDENTICAL to the pre-driver Device methods so the
@@ -198,6 +254,9 @@ export interface DeviceDriver {
    *  driver reads through the profile changes. Implemented by gen-3 (capability selfDescribe); absent
    *  on drivers whose profile is fixed. */
   applyRuntimeProfile?(profile: DeviceProfile): void;
+  /** A (re)detect activated this driver: forget what it learned about the previous connection (gen-3: the
+   *  dump-header strictness proven on it and the known current slot). Drivers keep no such state otherwise. */
+  resetSession?(): void;
 
   /** Routing grid (the AM4 serves its 4 slots as a 1×4 grid DTO). */
   grid(): Promise<PresetGridDTO>;
@@ -205,9 +264,22 @@ export interface DeviceDriver {
   // ── preset reads ──
   presetRef?(): Promise<{ number: number; name: string }>;
   presetSummary?(presetNumber: number, withParams?: boolean): Promise<PresetSummary>;
+  /** Routing grid of the STORED preset in slot `presetNumber` (GET /presets/:n/grid) — a non-disruptive
+   *  dump decode that never touches the edit buffer (and never the edit-buffer grid cache) — i.e. the SAVED
+   *  state of the slot. Absent on drivers that cannot read a stored slot (capability presetDump): the route
+   *  then answers the LIVE grid only when `presetRef()` (AM4 today) says the requested slot is the loaded
+   *  one, and 501 otherwise (gen-1 / gen-2 / VP4 have neither method → 501 for every slot). */
+  presetGrid?(presetNumber: number): Promise<PresetGridDTO>;
+  /** Number of stored preset slots (valid slot numbers are 0..presetCount-1) — the bound the
+   *  slot-addressed routes validate against. Absent = unknown (only the integer ≥ 0 check applies). */
+  readonly presetCount?: number;
   presetParams?(presetNumber: number): Promise<DecodedBlock[]>;
   /** Raw .syx bytes (the backup blob) + decoded summary for one slot — the backups service's source. */
   dumpRaw?(n: number): Promise<{ bytes: Uint8Array; summary: PresetSummary }>;
+  /** Diagnostic capture: ONE read-only dump request for a stored slot or the edit buffer that accepts
+   *  whatever whole dump the device answers with, so the caller learns which number the dump header
+   *  names. Never retried, never cached. gen-3 (capability presetDump). */
+  diagnosticDump?(target: number | 'edit-buffer'): Promise<DiagnosticDump>;
   decodePresetBytes?(bytes: Uint8Array): PresetSummary;
   presetBodyHex?(): Promise<{ len: number; hex: string }>;
   placedBlocks?(): Promise<PresetBlockDTO[]>;
@@ -244,25 +316,40 @@ export interface DeviceDriver {
   bindModifier?(slot: number, targetEffectId: number, targetParam: number, source: number): Promise<{ ok: boolean; error?: string; slotEid?: number; slot?: number; targetEffectId?: number; targetParam?: number; source?: number }>;
 
   // ── writes ──
-  setParam?(eid: number, paramId: number, value: number, continuous: boolean): Promise<{ ok: boolean }>;
-  setType?(eid: number, value: number): Promise<{ ok: boolean }>;
+  // What `ok` on a write result means differs by family — none of them means "applied":
+  //   gen-3 confirmed writes (discrete setParam, setType, placeCell, cable, names, preset select): `ok:true` =
+  //     no refusal for this write's function in its window (silence, or the device's value echo); `ok:false` =
+  //     a 0x64 refusal echoing that function. Fire-and-forget writes (continuous setParam, bypass, channel,
+  //     scene, tempo) report `ok:true` = sent.
+  //   AM4: `ok:true` = the device ACKNOWLEDGED the write (the 18-byte command ack or the 64-byte param-write
+  //     echo) and did not refuse it, with `acked:true` (WriteResult). The AM4 acks a write to an absent block
+  //     the same way while it silently does nothing, so this is "acknowledged, not refused", not "applied".
+  //     `ok:false` = no acknowledgement in time.
+  setParam?(eid: number, paramId: number, value: number, continuous: boolean): Promise<WriteResult>;
+  setType?(eid: number, value: number): Promise<WriteResult>;
   setBypass?(eid: number, bypassed: boolean): Promise<{ ok: boolean }>;
-  setChannel?(eid: number, channel: string): Promise<{ ok: boolean }>;
-  placeCell?(row: number, col: number, blockId: number): Promise<{ ok: boolean }>;
+  setChannel?(eid: number, channel: string): Promise<WriteResult>;
+  placeCell?(row: number, col: number, blockId: number): Promise<WriteResult>;
   selectCell?(row: number, col: number): Promise<{ ok: boolean }>;
   cable?(srcRow: number, srcCol: number, destRow: number, connect: boolean): Promise<{ ok: boolean }>;
   /** Switch the active preset. `code` is ADDITIVE (AM4 bank-letter location code, e.g. "C02"). */
-  selectPreset?(n: number): Promise<{ ok: boolean; code?: string }>;
+  selectPreset?(n: number, opts?: SelectPresetOpts): Promise<{ ok: boolean; code?: string }>;
   /** Re-select the CURRENT preset to reload it from flash — the non-destructive safety net the codec's
    *  FULL-mode self-describe walk runs after every block whose params it swept, discarding any lingering
    *  sweep write. Reuses the driver's current-preset ref + preset-select machinery; no new wire bytes.
    *  Implemented by gen-3 (capability fullCapture); absent elsewhere. */
-  reloadPreset?(): Promise<void>;
-  /** Store the edit buffer to slot n. `location`/`code` are ADDITIVE (AM4). */
-  store?(n: number): Promise<{ ok: boolean; location?: number; code?: string }>;
+  reloadPreset?(opts?: SelectPresetOpts): Promise<void>;
+  /** Store the edit buffer to slot n. `location`/`code` are ADDITIVE (AM4). `acked`/`reason`/`error`/`warning`
+   *  are ADDITIVE (gen-3): `acked` = the device's own acknowledgement was seen. `ok:false` + `error` = a real
+   *  refusal (`reason:'rejected'`), or (where the ack is verified for this model, link and firmware) no
+   *  acknowledgement in time (`reason:'no-ack'`, outcome unknown). `ok:true` + `warning` = sent but
+   *  unconfirmed (the ack is not verified here and none came; also `reason:'no-ack'`). `reason` is absent on
+   *  an acknowledged store. Drivers without a known ack (AM4 / VP4 fire-and-forget; gen-2 lenient) omit all
+   *  four. */
+  store?(n: number): Promise<{ ok: boolean; location?: number; code?: string; acked?: boolean; reason?: StoreReason; error?: string; warning?: string }>;
   loadPresetBytes?(syx: Uint8Array): Promise<{ ok: boolean }>;
-  setSceneName?(index: number, name: string): Promise<{ ok: boolean }>;
-  setPresetName?(name: string): Promise<{ ok: boolean }>;
+  setSceneName?(index: number, name: string): Promise<WriteResult>;
+  setPresetName?(name: string): Promise<WriteResult>;
 
   // ── tempo / scene ──
   getTempo?(): Promise<{ bpm: number }>;
@@ -293,7 +380,7 @@ export interface DeviceDriver {
   /** Offline firmware .syx integrity check (POST /firmware/validate) — capability firmwareValidate. */
   validateFirmware?(bytes: number[]): { valid: boolean; messages?: number; blocks?: number; headerTag?: number[]; finalizeTag?: number[]; error?: string };
   /** Device/global param write by catalog key (PUT /device/param) — capability deviceParams. */
-  setParamByKey?(key: string, value: number): Promise<{ ok: boolean }>;
+  setParamByKey?(key: string, value: number): Promise<WriteResult>;
   /** Modifier address model (GET /mod/model). Superset DTO: always carries `bindingSupported`. */
   modifierModel?(): Record<string, unknown> | null;
 

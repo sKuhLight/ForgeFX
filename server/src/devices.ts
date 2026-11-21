@@ -81,8 +81,14 @@ const VIRTUAL_EID_FAMILY: Record<number, string> = { 1: 'GLOBAL', 2: 'CONTROLLER
 const eidFamily = (map?: Record<number, string>) => (eid: number): string | undefined => map?.[eid] ?? VIRTUAL_EID_FAMILY[eid];
 
 // Parse a variant/page selector `value` ("10,11,12") into the numeric block-type values it activates.
+// Blank segments are dropped, so an EMPTY value ("") parses to NO values rather than to [0]: the editor
+// writes a blank value on a group's catch-all page (the default for every type its explicit siblings
+// don't name), and `Number('')` is 0 — without the blank filter that default reads as "type 0 only",
+// which both hides it from every other type and duplicates the type-0 page (see filterPagesBySelector).
 const parseSelectorValues = (value: string | null | undefined): number[] =>
-  value == null ? [] : value.split(',').map((s) => Number(s.trim())).filter((n) => Number.isFinite(n));
+  value == null
+    ? []
+    : value.split(',').map((s) => s.trim()).filter((s) => s !== '').map(Number).filter((n) => Number.isFinite(n));
 
 // Pick the block-type / firmware variant that matches the block's CURRENT type value:
 //   1. variants whose selector `value` list contains typeValue win (the normal per-type case);
@@ -90,14 +96,15 @@ const parseSelectorValues = (value: string | null | undefined): number[] =>
 //      variants all carry value:null but differ by `fw`;
 //   3. else every variant (degenerate: nothing declared).
 // Within the winning set, prefer the firmware-pinned variant (amp DISTORT ships every historical fw
-// layout with exactly one pinned:true), else the first in editor order.
-const selectVariant = (block: EditorBlockLayout, typeValue?: number): EditorLayoutVariant | undefined => {
+// layout with exactly one pinned:true), else the variant named `preferName` (a per-family hint, see
+// AM4_PREFERRED_VARIANT), else the first in editor order.
+const selectVariant = (block: EditorBlockLayout, typeValue?: number, preferName?: string): EditorLayoutVariant | undefined => {
   const variants = block.variants;
   if (!variants.length) return undefined;
   let cands = typeValue == null ? [] : variants.filter((v) => parseSelectorValues(v.value).includes(typeValue));
   if (!cands.length) cands = variants.filter((v) => v.value == null);
   if (!cands.length) cands = variants;
-  return cands.find((v) => v.pinned) ?? cands[0];
+  return cands.find((v) => v.pinned) ?? (preferName ? cands.find((v) => v.name === preferName) : undefined) ?? cands[0];
 };
 
 // Lookup from an editor selector parameter symbol (e.g. 'DISTORT_EQTYPE', 'DISTORT_TYPE') to the block's
@@ -130,24 +137,32 @@ const preferNewestFw = <T extends { fw?: EditorFwRange }>(items: T[]): T[] => {
 };
 
 // Selector filter for one group of same-named pages: a page with no selector value is always kept; a
-// selector-gated page is kept iff the block's CURRENT selector value is in its value list. When the
-// current value is unknown (selector not resolvable) we never include the whole set — prefer the page
-// whose list contains the block's type value, else the first gated page in editor order.
+// selector-gated page is kept iff the block's CURRENT selector value is in its value list. A gated page
+// with an EMPTY value list is the group's DEFAULT — the editor's catch-all, applying to every selector
+// value its explicit siblings don't name (the Amp block ends each of its Ideal/Authentic groups with
+// one; without it, the ~2/3 of amp models with no explicit Ideal page get no Ideal tab at all). It is
+// used only when nothing explicit matches. When the current value is unknown (selector not resolvable)
+// we never include the whole set — prefer the page whose list contains the block's type value, else the
+// group's default, else the first explicitly-gated page in editor order.
 const filterPagesBySelector = (
   group: EditorLayoutPage[],
   typeValue: number | undefined,
   selectors?: SelectorValues,
 ): EditorLayoutPage[] => {
-  const gated = group.filter((p) => p.selectorParamName != null && p.value != null);
-  if (!gated.length) return group; // nothing selector-gated → all pages always apply
-  const ungated = group.filter((p) => p.selectorParamName == null || p.value == null);
-  const cur = selectors?.(gated[0]!.selectorParamName!);
+  const isGated = (p: EditorLayoutPage) => p.selectorParamName != null && p.value != null;
+  const gated = group.filter((p) => isGated(p) && parseSelectorValues(p.value).length > 0);
+  const dflt = group.filter((p) => isGated(p) && parseSelectorValues(p.value).length === 0);
+  if (!gated.length && !dflt.length) return group; // nothing selector-gated → all pages always apply
+  const ungated = group.filter((p) => !isGated(p));
+  const cur = selectors?.((gated[0] ?? dflt[0])!.selectorParamName!);
   if (cur != null) {
-    // known current value → strict membership; a group that matches nothing contributes no page
-    return [...ungated, ...gated.filter((p) => parseSelectorValues(p.value).includes(cur))];
+    // known current value → strict membership, falling back to the group's default page
+    const hit = gated.filter((p) => parseSelectorValues(p.value).includes(cur));
+    return [...ungated, ...(hit.length ? hit : dflt)];
   }
   const byType = typeValue != null ? gated.filter((p) => parseSelectorValues(p.value).includes(typeValue)) : [];
-  return [...ungated, ...(byType.length ? byType : [gated[0]!])];
+  const fallback = dflt.length ? dflt : gated.length ? [gated[0]!] : [];
+  return [...ungated, ...(byType.length ? byType : fallback)];
 };
 
 // Drop controls that the newest firmware would hide: a control gated with an `lt` (only firmware < X)
@@ -191,11 +206,11 @@ export const resolveLayoutPages = (
 
 // Resolve a family's editor layout to the wire DeviceLayout for the block's CURRENT type value, with the
 // selected variant's pages filtered to the current selector/firmware state (see resolveLayoutPages).
-const layoutFrom = (layouts: DeviceEditorLayouts) =>
+const layoutFrom = (layouts: DeviceEditorLayouts, preferredVariant: Record<string, string> = {}) =>
   (family: string, typeValue?: number, selectors?: SelectorValues): DeviceLayout | undefined => {
     const block = layouts[family];
     if (!block) return undefined;
-    const variant = selectVariant(block, typeValue);
+    const variant = selectVariant(block, typeValue, preferredVariant[family]);
     if (!variant) return undefined;
     return {
       editorName: block.editorName,
@@ -216,7 +231,12 @@ const AM4_FAMILY_BY_BLOCK: Record<string, string> = {
   chorus: 'CHORUS', flanger: 'FLANGER', rotary: 'ROTARY', phaser: 'PHASER', wah: 'WAH', volpan: 'VOLUME',
   tremolo: 'TREMOLO', filter: 'FILTER', drive: 'FUZZ', enhancer: 'ENHANCER', gate: 'GATE',
 };
-const am4LayoutOf = layoutFrom(AM4_LAYOUTS);
+// The AM4 DISTORT layout holds two unconditional (value-less) variants: the device-global setup pages
+// ('Global': Audio / Footswitches / MIDI / Remote / Global — also the block's editorName) listed first, and
+// the actual 'Amp' editor. Plain first-wins selection served the global pages on the AM4 amp block, so name
+// the block editor. (The layout data itself should tag the global variant; that is a forgefx-midi matter.)
+const AM4_PREFERRED_VARIANT: Record<string, string> = { DISTORT: 'Amp' };
+const am4LayoutOf = layoutFrom(AM4_LAYOUTS, AM4_PREFERRED_VARIANT);
 /** Editor-authentic layout for an AM4 block (by its lowercase block name, e.g. 'amp'/'drive'), for the
  *  block's current type value. Controls join to the AM4 catalog by cacheId in the codec; unresolved
  *  paramIds ride through as null (display-only). Undefined for a block with no AM4 layout. */
@@ -577,13 +597,37 @@ export const profileForModel = (model: number): DeviceProfile => PROFILES[model]
 export const profileForKey = (key: string): DeviceProfile | undefined => Object.values(PROFILES).find((p) => p.key === key);
 
 /**
+ * Is a persisted device-cache profile byte-exact device data (decoded from an editor `.cache`), as
+ * opposed to a live-walk reconstruction? The vocabulary of `meta.source` as it is actually persisted
+ * in `deviceCaches`:
+ *   • 'editor-cache' — an editor-cache import (services/editorCacheImport.ts), byte-exact;
+ *   • 'live'         — an on-device walk (services/deviceCache.ts, the codec's own value), heuristic;
+ *   • 'cloud'        — a pulled profile (services/cloudProfiles.ts); the build kind it was published
+ *                      from rides in `meta.origin` ('bytes' | 'live', normalised on publish), so it is
+ *                      byte-exact only when that origin is a byte source;
+ *   • 'bytes'        — the codec's raw byte-source value (never persisted as-is by ForgeFX, but it is
+ *                      what a cloud profile's `origin` carries).
+ * Anything else, including a missing source (GET /device/cache reports that as 'live' too), counts as
+ * NOT byte-exact: unknown provenance gets the cautious live-walk treatment in runtimeProfileFrom.
+ */
+export function isByteExactProfile(meta: { source?: unknown; origin?: unknown } | undefined): boolean {
+  const isByteKind = (v: unknown) => v === 'editor-cache' || v === 'bytes';
+  if (!meta) return false;
+  return meta.source === 'cloud' ? isByteKind(meta.origin) : isByteKind(meta.source);
+}
+
+/**
  * Overlay a device-cache-derived `BuiltCache` (from the on-connect self-describe walk) onto a static
  * gen-3 profile: DEVICE data wins where the cache has it, the static profile supplies everything else.
  *   • rosterFor — the family's device-true model list from `built.rosters` (keyed by catalog family,
  *     mapped from slug via SLUG_FAMILY), with the STATIC roster's manufacturer/basedOn LINEAGE
  *     overlaid by value (the cache carries names only); families the walk didn't map fall back to static.
  *   • enumLabelsFor — `built.enumOverrides` first, else static.
- *   • ranges / rangeSections — the cache's per-family entries merged OVER the static ones.
+ *   • ranges / rangeSections — the cache's per-family entries merged OVER the static ones. A profile
+ *     that is not byte-exact (`isByteExactProfile`: a live walk, a cloud profile that came from one,
+ *     unknown provenance) is the exception: it never re-classifies the kind of a catalog-known param,
+ *     never overwrites a catalog range with a placeholder row (min === max), and never shrinks a
+ *     catalog stride (see the comments in the body).
  *   • cabIrs — the cache's banks when non-empty, else static.
  * The model byte, grid dims, instanceLimits, params, layouts, FC/Mod/monitor models, and write mode
  * all stay from the static profile (the walk doesn't recover them). Pure — returns a fresh profile.
@@ -593,14 +637,54 @@ export function runtimeProfileFrom(built: BuiltCache, staticProfile: DeviceProfi
   const builtEnums = (built.enumOverrides ?? {}) as Record<string, Record<string, string[]>>;
   const builtCabIrs = built.cabIrs ?? {};
 
+  // Provenance decides how far the cache may override the static tables. A byte-exact profile (an
+  // editor cache import, or a cloud profile that was published from one) is exact device data for its
+  // firmware, possibly newer than the static catalog, so it always wins. Everything else is treated
+  // as a live-walk reconstruction (a heuristic), including a cloud profile that came from a walk and
+  // a profile of unknown provenance.
+  const live = !isByteExactProfile(built.meta);
+
   // ranges: static per-family maps, then the cache's rows merged over them (device-true wins).
+  // One exception, for a live-walk profile only: its enum/float split is a numeric heuristic (integral
+  // bounds, step/scale shape, gated on a label probe) and is not reliable in either direction, so a
+  // live row must not re-classify a pid the static catalog already classifies. The static row is
+  // kept and only gains the walk's device-true unit. A live row still wins for a pid the catalog
+  // lacks, and when it agrees on the kind (it then refines the display range).
+  // The other live-walk exception: a PLACEHOLDER row (displayMin === displayMax, typically 0..0: an
+  // unused slot, or a gap id no source knows) carries no range, so it never replaces a catalog row and
+  // is not added for a pid the catalog lacks. A byte-exact profile keeps its placeholders as they are:
+  // for its firmware an all-zero row says the slot is unused, which is device-true (and it is excluded
+  // from the knob/enum lists by its empty range).
   const mergedRanges: Ranges = {};
   for (const [fam, rows] of Object.entries(staticProfile.ranges)) mergedRanges[fam] = { ...rows };
-  for (const [fam, rows] of Object.entries(built.ranges ?? {})) mergedRanges[fam] = { ...(mergedRanges[fam] ?? {}), ...(rows as Record<number, RangeDef>) };
+  for (const [fam, rows] of Object.entries(built.ranges ?? {})) {
+    const dst = (mergedRanges[fam] ??= {});
+    for (const [pidStr, row] of Object.entries(rows as Record<number, RangeDef>)) {
+      const pid = Number(pidStr);
+      const stat = dst[pid];
+      if (live) {
+        if (row.displayMin === row.displayMax) continue; // placeholder: no information, keep what we have
+        if (stat && stat.kind !== row.kind) {
+          if (row.unit) dst[pid] = { ...stat, unit: row.unit };
+          continue;
+        }
+      }
+      dst[pid] = row;
+    }
+  }
 
-  // rangeSections: same static-then-cache merge (per family).
+  // rangeSections: same static-then-cache merge (per family). The stride is the other live-walk
+  // exception: it is the number of records the walk managed to collect (placeholder slots and filler
+  // rows are dropped), so it is a lower bound on the section's width and must not shrink a catalog
+  // stride. A byte-exact profile carries every slot and wins outright, which is also what corrects a
+  // catalog stride that does not match the connected firmware. Either way the stride is only a
+  // hint: #channelSlice validates it against the reply's itemCount before slicing a channel.
   const mergedSections: RangeSections = { ...staticProfile.rangeSections };
-  for (const [fam, meta] of Object.entries(built.rangeSections ?? {})) mergedSections[fam] = meta as unknown as RangeSections[string];
+  for (const [fam, meta] of Object.entries(built.rangeSections ?? {})) {
+    const cached = meta as unknown as RangeSections[string];
+    const stat = mergedSections[fam];
+    mergedSections[fam] = live && stat ? { ...cached, stride: Math.max(stat.stride, cached.stride) } : cached;
+  }
 
   return {
     ...staticProfile,

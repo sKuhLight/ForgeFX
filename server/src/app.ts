@@ -20,9 +20,10 @@
 // shims, SSE, static UI and the Node-gated cloud/remote/telemetry surface.
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
 import cors from '@fastify/cors';
-import { existsSync, statSync, createReadStream } from 'node:fs';
+import { existsSync, statSync, createReadStream, readFileSync } from 'node:fs';
 import { join, resolve, extname } from 'node:path';
 import type { DeviceRegistry } from './drivers/registry.js';
+import { parseHexBytes, sendErrorStatus } from './drivers/sendPolicy.js';
 import * as backups from './services/backups.js';
 import * as convert from './services/convert.js';
 import type { ConverterPreset } from 'forgefx-midi/convert';
@@ -30,12 +31,23 @@ import * as deviceCache from './services/deviceCache.js';
 import * as editorCacheImport from './services/editorCacheImport.js';
 import * as editorCacheDiscovery from './services/editorCacheDiscovery.js';
 import * as cloudProfiles from './services/cloudProfiles.js';
+import * as diagnostics from './services/diagnosticCapture.js';
 import * as store from './store.js';
 import { createUnifiedHandlers } from './runtime/handlers.js';
 import { putStoreDoc } from './runtime/services.js';
 import { registerLocalRoutes } from './localStore.js';
 import { registerHelpRoutes } from './help.js';
 import { telemetryStatus, uploadDebugReport, type DebugReport } from './telemetry.js';
+
+/** This server's package version (server/package.json — one level above both src/ and dist/), stamped
+ *  into diagnostic-capture bundles. 'unknown' where the file is not shipped next to the build. */
+const FORGEFX_VERSION: string = (() => {
+  try {
+    return (JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as { version?: string }).version ?? 'unknown';
+  } catch {
+    return 'unknown';
+  }
+})();
 
 export async function buildApp(registry: DeviceRegistry): Promise<FastifyInstance> {
   const app = Fastify({ logger: { level: process.env.LOG_LEVEL ?? 'info' } });
@@ -53,7 +65,7 @@ export async function buildApp(registry: DeviceRegistry): Promise<FastifyInstanc
   // The unified handler bodies + capability gate — shared with the runtime router (see handlers.ts).
   const {
     driver, unsupported,
-    gridH, blocksH, sceneStateH, blockParamsH, setParamH, bypassH, sceneSetH,
+    gridH, presetGridH, presetSummaryH, presetParamsH, blocksH, sceneStateH, blockParamsH, setParamH, bypassH, sceneSetH,
     presetSelectH, presetStoreH, presetNameH, locationsH,
     backupH, restoreH, fwValidateH, deviceParamH, modModelH,
     telemetryConfigH, telemetrySetH,
@@ -81,10 +93,16 @@ export async function buildApp(registry: DeviceRegistry): Promise<FastifyInstanc
   // ── block & parameter help (curated tooltips; see help.ts) ──
   registerHelpRoutes(app, registry);
 
-  // ── debug probe (raw SysEx round-trip; for FC read-decode RE) ──
-  app.post<{ Body: { hex: string } }>('/debug/raw', async (req, reply) => {
-    try { const bytes = (req.body.hex.match(/../g) ?? []).map((x) => parseInt(x, 16)); return { frames: await registry.rawRequest(bytes) }; }
-    catch (e) { reply.code(503); return { error: (e as Error).message }; }
+  // ── debug probe (raw read-only SysEx round-trip) ──
+  // Malformed hex → 400 here. registry.rawRequest() then applies the probe policy (drivers/sendPolicy.ts)
+  // before the transport is touched: not ONE SysEx frame ≤512 B → 400; anything but a read/query frame for
+  // a known model, or (connected gen-3 unit) a frame byte-identical to a codec read/poll builder — tuner/
+  // CPU/meter polls, tempo/scene GET, raw param-value GET 0x1B used by the FC read-back — → 403.
+  app.post<{ Body: { hex?: unknown } | undefined }>('/debug/raw', async (req, reply) => {
+    const bytes = parseHexBytes(req.body?.hex);
+    if (!bytes) { reply.code(400); return { error: 'hex must be a non-empty, even-length string of hex digits' }; }
+    try { return { frames: await registry.rawRequest(bytes) }; }
+    catch (e) { reply.code(sendErrorStatus(e, 503)); return { error: (e as Error).message }; }
   });
 
   // ── system ──
@@ -109,7 +127,9 @@ export async function buildApp(registry: DeviceRegistry): Promise<FastifyInstanc
   // ── device cache (on-connect self-describe build; capability selfDescribe) ──
   // Status: current key + existence + live build progress + stored-doc meta.
   app.get('/device/cache', () => deviceCache.cacheStatus(store.defaultStore, registry));
-  // Start a background build (501 no selfDescribe, 503 no device/firmware, 409 already building).
+  // Start a background build (501 no selfDescribe / no fullCapture; 501 reason:'firmware' for mode 'full' on a firmware
+  // it has not been verified on — FAIL CLOSED: full mode on unknown/unreadable firmware is 501 too, no longer 503;
+  // 503 no device/firmware for read-only; 409 already building). Read-only is never firmware-gated.
   app.post<{ Body: { force?: boolean; mode?: 'read-only' | 'full' } }>('/device/cache/build', async (req, reply) => {
     const r = await deviceCache.startCacheBuild(store.defaultStore, registry, { force: req.body?.force, mode: req.body?.mode });
     reply.code(r.code);
@@ -163,21 +183,10 @@ export async function buildApp(registry: DeviceRegistry): Promise<FastifyInstanc
   // Stored preset name (driver-backed since Phase 6; gen-3 keeps the {number, name:''} stub).
   app.get<{ Params: { n: string } }>('/presets/:n', (req) => presetNameH(Number(req.params.n)));
   // Decode any preset by number (non-disruptive) → library summary: name, scenes, unique blocks.
-  app.get<{ Params: { n: string }; Querystring: { full?: string } }>('/presets/:n/summary', async (req, reply) => {
-    try {
-      const d = await driver();
-      if (!d.presetSummary) return unsupported(reply, 'presetDump');
-      return await d.presetSummary(Number(req.params.n), req.query.full === '1');
-    } catch (e) { reply.code(503); return { error: (e as Error).message }; }
-  });
+  app.get<{ Params: { n: string }; Querystring: { full?: string } }>('/presets/:n/summary', async (req, reply) =>
+    presetSummaryH(reply, req.params.n, req.query.full === '1'));
   // Full per-block decoded params for one preset (every family/param) — deep-search + browser detail.
-  app.get<{ Params: { n: string } }>('/presets/:n/params', async (req, reply) => {
-    try {
-      const d = await driver();
-      if (!d.presetParams) return unsupported(reply, 'presetDump');
-      return { blocks: await d.presetParams(Number(req.params.n)) };
-    } catch (e) { reply.code(503); return { error: (e as Error).message }; }
-  });
+  app.get<{ Params: { n: string } }>('/presets/:n/params', async (req, reply) => presetParamsH(reply, req.params.n));
   // ── persistent store: documents (Axis config · library metadata · layouts) ──
   app.get<{ Params: { c: string } }>('/store/:c', (req) => ({ docs: store.listDocs(req.params.c) }));
   app.get<{ Params: { c: string; id: string } }>('/store/:c/:id', (req, reply) => {
@@ -218,7 +227,7 @@ export async function buildApp(registry: DeviceRegistry): Promise<FastifyInstanc
       const d = await driver();
       if (!d.loadPresetBytes) return unsupported(reply, 'loadPresetBytes');
       return await backups.loadVersion(store.defaultStore, d, req.params.id);
-    } catch (e) { reply.code(503); return { error: (e as Error).message }; }
+    } catch (e) { reply.code(sendErrorStatus(e, 503)); return { error: (e as Error).message }; }
   });
   // restore a snapshot to its origin slot (load + commit to that slot — destructive for the slot)
   app.post<{ Params: { id: string } }>('/version/:id/restore', async (req, reply) => {
@@ -226,9 +235,10 @@ export async function buildApp(registry: DeviceRegistry): Promise<FastifyInstanc
       const d = await driver();
       if (!d.loadPresetBytes || !d.store) return unsupported(reply, 'loadPresetBytes');
       return await backups.restoreVersion(store.defaultStore, d, req.params.id);
-    } catch (e) { reply.code(503); return { error: (e as Error).message }; }
+    } catch (e) { reply.code(sendErrorStatus(e, 503)); return { error: (e as Error).message }; }
   });
-  // load arbitrary raw .syx bytes (e.g. a cloud/file preset) into the edit buffer
+  // load a .syx preset dump (e.g. a cloud/file preset) into the edit buffer — the driver validates it
+  // as ONE preset dump for the connected model (400 otherwise, see drivers/sendPolicy.ts)
   app.post('/preset/load', async (req, reply) => {
     const buf = req.body as Buffer | undefined;
     if (!buf || !buf.length) { reply.code(400); return { error: 'POST raw .syx bytes as application/octet-stream' }; }
@@ -236,7 +246,7 @@ export async function buildApp(registry: DeviceRegistry): Promise<FastifyInstanc
       const d = await driver();
       if (!d.loadPresetBytes) return unsupported(reply, 'loadPresetBytes');
       return await d.loadPresetBytes(new Uint8Array(buf));
-    } catch (e) { reply.code(503); return { error: (e as Error).message }; }
+    } catch (e) { reply.code(sendErrorStatus(e, 503)); return { error: (e as Error).message }; }
   });
   // version history (all, or for one slot via ?location=)
   app.get<{ Querystring: { location?: string } }>('/versions', (req) => ({ versions: store.listPresetVersions(req.query.location != null ? Number(req.query.location) : undefined) }));
@@ -343,7 +353,8 @@ export async function buildApp(registry: DeviceRegistry): Promise<FastifyInstanc
   );
 
   app.get('/preset/grid', async (_req, reply) => gridH(reply));
-  app.get<{ Params: { n: string } }>('/presets/:n/grid', async (_req, reply) => gridH(reply));
+  // Grid of the STORED slot `:n` (never the edit buffer — that is /preset/grid); see presetGridH.
+  app.get<{ Params: { n: string } }>('/presets/:n/grid', async (req, reply) => presetGridH(reply, req.params.n));
   app.get('/preset/blocks', async (_req, reply) => blocksH(reply));
   // Lightweight per-block bypass+channel (no preset dump) — Axis applies it to its cached grid on a scene change.
   app.get('/preset/scene-state', async (_req, reply) => sceneStateH(reply));
@@ -657,9 +668,39 @@ export async function buildApp(registry: DeviceRegistry): Promise<FastifyInstanc
     });
   }
 
+  // ── diagnostic capture (Settings → Debugging → Device diagnostics; capability diagnosticCapture) ──
+  // Shared service (services/diagnosticCapture.ts) — the router twin calls the same functions. The upload
+  // needs the cloud client, which only exists when AXIS_CLOUD=1 (set below); without it → 503 cloud-disabled.
+  const captureOpts: diagnostics.CaptureOptions = { versions: { forgefx: FORGEFX_VERSION } };
+  let diagCloud: diagnostics.DiagnosticCaptureCloud | null = null;
+  app.get('/diagnostics/capture', () => diagnostics.captureStatus(registry));
+  app.post<{ Body: unknown }>('/diagnostics/capture', async (req, reply) => {
+    const r = await diagnostics.startCapture(store.defaultStore, registry, req.body, captureOpts);
+    reply.code(r.code);
+    return r.body;
+  });
+  app.post('/diagnostics/capture/cancel', () => diagnostics.cancelCapture(registry));
+  // the edit-buffer state a run would meet, so the client can ask about unsaved edits before starting
+  app.get('/diagnostics/capture/preflight', async (_req, reply) => {
+    const r = await diagnostics.capturePreflight(registry);
+    reply.code(r.code);
+    return r.body;
+  });
+  app.get('/diagnostics/capture/result', (_req, reply) => {
+    const r = diagnostics.captureResult(registry);
+    reply.code(r.code);
+    return r.body;
+  });
+  app.post<{ Body: unknown }>('/diagnostics/capture/upload', async (req, reply) => {
+    const r = await diagnostics.uploadCapture(registry, diagCloud, req.body);
+    reply.code(r.code);
+    return r.body;
+  });
+
   // ── cloud sync (GATED: only when AXIS_CLOUD=1; release builds never load supabase-js) ──
   if (process.env.AXIS_CLOUD === '1') {
     const { cloud } = await import('./cloud.js');
+    diagCloud = cloud;
     type Creds = { email: string; password: string };
     app.get('/cloud/status', async () => cloud.status());
     app.post<{ Body: Creds }>('/cloud/register', async (req, reply) => { try { return await cloud.register(req.body.email, req.body.password); } catch (e) { reply.code(400); return { error: (e as Error).message }; } });

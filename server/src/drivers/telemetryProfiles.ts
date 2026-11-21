@@ -72,7 +72,10 @@ export function cadenceFor(modelId: number | null, mode: TelemetryMode): Cadence
     channelEveryNTicks: 8,
     sceneEveryNTicks: 8,
     editWatchMs: [1500, 2000, 4000][i]!,
-    editWatchSlowMs: [4000, 4000, 8000][i]!,
+    // Slow-link edit-watch: the FM3 read behind it is a multi-KB block bulk read (~1 s at 31.25 kbaud), so it
+    // runs far less often there — UI writes queue behind it, and the 4-8 s cadence it used to have left the
+    // link mostly busy.
+    editWatchSlowMs: [10000, 15000, 30000][i]!,
     tunerMs: fam === 'am4' ? 100 : 55,
     // Latched-rehash DISABLED in every mode (FORGEFX-25 follow-up): while the AM4 active-buffer edited
     // bit stays latched (e.g. after a channel swap), periodically re-dumping all placed blocks via fn-0x1F

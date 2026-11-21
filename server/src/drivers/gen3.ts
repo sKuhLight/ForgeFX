@@ -17,6 +17,10 @@ import {
   isLooperWaveformResponse,
   parseLooperWaveform,
   buildLooperControl,
+  isMultipurposeResponse,
+  parseMultipurposeResponse,
+  describeMultipurposeResultCode,
+  buildGetRawParamValue,
   type ModernFractalCodec
 } from 'forgefx-midi/gen3/axe-fx-iii';
 import { wireToDisplay } from 'forgefx-midi/shared';
@@ -27,12 +31,15 @@ import {
   retargetPresetDumpToEditBuffer,
   type DecodedBlock
 } from 'forgefx-midi/devices/gen3';
-import { SLUG_FAMILY, type DeviceProfile, type TypeModel, type DeviceLayout, type SelectorValues } from '../devices.js';
+import { isTransportTimeout, type Transport } from '../transport/types.js';
+import { SLUG_FAMILY, PROFILES, type DeviceProfile, type TypeModel, type DeviceLayout, type SelectorValues } from '../devices.js';
+import { EmptyPresetError } from './types.js';
 import type {
-  DeviceDriver, DriverCapabilities, DriverCtx,
+  DeviceDriver, DriverCapabilities, DriverCtx, DiagnosticDump, SelectPresetOpts,
   PresetGridDTO, PresetBlockDTO, PresetSummary, NamedParam, EnumParam, MeterVal,
-  FcSwitchState, FcReadState
+  FcSwitchState, FcReadState, StoreReason
 } from './types.js';
+import { validatedPresetDump } from './sendPolicy.js';
 
 // slug → { name, page=base effect id } from the authoritative codec base table (replaces the old
 // defs.js pack lookup; block names + base ids are codec facts, not editor-cache definitions).
@@ -43,6 +50,180 @@ const BLOCK_META: Record<string, { name: string; page: number }> = (() => {
 })();
 
 const EDIT_BUFFER = 0x3fff; // preset number sentinel = current edit buffer
+
+// ── reply shapes of the two multi-frame reads, so a late reply to an EARLIER read can never pass for this
+// one (the transport only holds the link for a short drain after a lost reply; anything later reaches the
+// next request, and only these matchers keep it out) ──
+const isFrameOf = (f: readonly number[], model: number, fn: number): boolean =>
+  f.length > 6 && f[0] === 0xf0 && f[1] === 0x00 && f[2] === 0x01 && f[3] === 0x74 && f[4] === model && f[5] === fn;
+
+/** Preset dump: a 0x77 header, 0x78 chunks, a 0x79 terminator. The header names the dump's preset number in
+ *  bytes 6-7 (MSB-first 7-bit pair — the field retargetPresetDumpToEditBuffer rewrites; 0x3FFF = the edit
+ *  buffer). How strictly a read holds the device to that number is per model (DUMP_HEADER_POLICY). */
+type DumpHeaderCheck =
+  /** Only a header naming the requested preset number counts. */
+  | 'strict'
+  /** Complete at once on a header naming the requested number; if only whole dumps naming another number
+   *  arrive, use the LAST of them after the quiet gap (a device answers in order, so a late reply to an
+   *  earlier read comes first) and log it once. Owned frames and the terminator logic still keep a stale
+   *  tail out. */
+  | 'prefer'
+  /** Any header (the device does not name the request in it). */
+  | 'any';
+/** Per model: [stored-slot reads, edit-buffer reads] — the STARTING policy of a connection; tighten as tester
+ *  evidence comes in. Within a connection a 'prefer' kind turns 'strict' as soon as the device has sent one
+ *  header naming the requested number (the driver's per-connection session, see #dumpHeaderPlan).
+ *   FM3 stored slots: strict — the header names exactly the requested slot (hardware, fw 13.0: populated and
+ *   empty slots, slots >= 128).
+ *   Edit buffer, every model: prefer. A read counts EDIT_BUFFER_HEADERS (the FM3 answers a 0x3FFF request
+ *   with 7F 00 on fw 13.0) and the known CURRENT slot as named, so only a header naming another stored slot (a
+ *   late scan reply, or a convention not seen yet — 7F 00 is proven on one firmware only) falls back: one quiet
+ *   gap and a log line, never failed reads. The connection turns strict once a named header has been seen.
+ *   FM9 / Axe-Fx III stored slots: prefer — not verified on these yet. */
+const DUMP_HEADER_POLICY: Readonly<Record<number, readonly [stored: DumpHeaderCheck, editBuffer: DumpHeaderCheck]>> = {
+  0x11: ['strict', 'prefer'], // FM3
+  0x12: ['prefer', 'prefer'], // FM9
+  0x10: ['prefer', 'prefer'] // Axe-Fx III
+};
+/** Header numbers that name the EDIT BUFFER in a dump answering an edit-buffer (0x3FFF) request: the 0x3FFF
+ *  sentinel itself, and 0x3F80 (`7F 00`) — what the FM3 sends on fw 13.0 and what the Axe-Fx III fixture
+ *  carries. A stored-slot read never uses a dump with one of these headers, not even as a 'prefer' fallback
+ *  (a late grid() dump must not be backed up as slot n).
+ *  Limit: two edit-buffer dumps are indistinguishable (same header, no request id). An edit-buffer read whose
+ *  dump arrives only after its request gave up and the drain released the link (> ~5 s late, rare) can
+ *  therefore answer the NEXT edit-buffer read — with the older contents of the edit buffer. */
+const EDIT_BUFFER_HEADERS: readonly number[] = [EDIT_BUFFER, 0x3f80];
+const dumpHeaderCheck = (model: number, target: number): DumpHeaderCheck =>
+  (DUMP_HEADER_POLICY[model] ?? ['prefer', 'prefer'])[target === EDIT_BUFFER ? 1 : 0];
+const dumpHeaderNumber = (f: readonly number[]) => ((f[6]! & 0x7f) << 7) | (f[7]! & 0x7f);
+/** Does header number `n` name the request for `target` itself (proof of the device's convention)? */
+const headerNamesRequest = (n: number, target: number): boolean =>
+  n === target || (target === EDIT_BUFFER && EDIT_BUFFER_HEADERS.includes(n));
+const dumpFramesOnly = (fs: number[][], model: number) => fs.filter((f) => isFrameOf(f, model, 0x77) || isFrameOf(f, model, 0x78) || isFrameOf(f, model, 0x79));
+/** Every WHOLE dump in `frames` whose header passes `want` — each its header through the 0x79 after it, that
+ *  dump's frames only. A terminator without a wanted header before it (the tail of an earlier dump) is never
+ *  part of one. */
+function wholeDumps(frames: number[][], model: number, want: (header: number[]) => boolean): number[][][] {
+  const out: number[][][] = [];
+  let start = -1;
+  for (let i = 0; i < frames.length; i++) {
+    const f = frames[i]!;
+    if (isFrameOf(f, model, 0x77)) start = want(f) ? i : -1;
+    else if (start >= 0 && isFrameOf(f, model, 0x79)) {
+      out.push(dumpFramesOnly(frames.slice(start, i + 1), model));
+      start = -1;
+    }
+  }
+  return out;
+}
+/** How one dump read judges headers: the effective check, which headers NAME the request, and which ones the
+ *  read may use at all (named ones, plus — under 'prefer' — fallback candidates). */
+interface DumpHeaderPlan { check: DumpHeaderCheck; named: (header: number[]) => boolean; usable: (header: number[]) => boolean }
+/** Request options for one dump: complete at once on a whole dump whose header the plan calls named; own the
+ *  headers the plan may use and the chunks after them, so a dump that stops short ends one quiet gap after
+ *  its last chunk (the transport drains the rest), and a whole dump under 'prefer' ends one quiet gap after its
+ *  terminator without a drain (`settles`). */
+function presetDumpOpts(model: number, plan: DumpHeaderPlan, timeoutMs: number, quietMs: number) {
+  const { named, usable } = plan;
+  let inOurs = false;
+  return {
+    timeoutMs,
+    quietMs,
+    match: (fs: number[][]) => wholeDumps(fs, model, named).length > 0,
+    owns: (f: number[]) => {
+      if (isFrameOf(f, model, 0x77)) return (inOurs = usable(f));
+      return inOurs && (isFrameOf(f, model, 0x78) || isFrameOf(f, model, 0x79));
+    },
+    settles: (f: number[]) => isFrameOf(f, model, 0x79)
+  };
+}
+
+/** Block bulk read (fn 0x1F poll): a 0x74 head naming the block (bytes 6-7, LSB-first 7-bit pair), 0x75
+ *  bodies, a 0x76 end. Only a burst whose head names THIS block answers the poll — a spontaneous broadcast or
+ *  another block's late burst does not. */
+const isBulkHeadFor = (f: readonly number[], model: number, eid: number): boolean =>
+  isFrameOf(f, model, 0x74) && f.length >= 11 && ((f[6]! & 0x7f) | ((f[7]! & 0x7f) << 7)) === eid;
+const bulkFramesOnly = (fs: number[][], model: number) => fs.filter((f) => isFrameOf(f, model, 0x74) || isFrameOf(f, model, 0x75) || isFrameOf(f, model, 0x76));
+/** The first whole burst for `eid` (its head through the next 0x76), or null. */
+function bulkReadSpan(frames: number[][], model: number, eid: number): number[][] | null {
+  let start = -1;
+  for (let i = 0; i < frames.length; i++) {
+    const f = frames[i]!;
+    if (isFrameOf(f, model, 0x74)) start = isBulkHeadFor(f, model, eid) ? i : -1;
+    else if (start >= 0 && isFrameOf(f, model, 0x76)) return bulkFramesOnly(frames.slice(start, i + 1), model);
+  }
+  return null;
+}
+/** What a bulk read hands its caller: the whole burst for `eid`, else the last one that started for it (a lost
+ *  0x76 — assembleGen3BlockBulkRead decodes what arrived), else nothing (→ "no 0x74 head", as for silence). */
+function bulkReadFrames(frames: number[][], model: number, eid: number): number[][] {
+  const whole = bulkReadSpan(frames, model, eid);
+  if (whole) return whole;
+  let last = -1;
+  frames.forEach((f, i) => { if (isBulkHeadFor(f, model, eid)) last = i; });
+  if (last < 0) return [];
+  const tail: number[][] = [frames[last]!];
+  for (const f of frames.slice(last + 1)) {
+    if (isFrameOf(f, model, 0x74)) break; // another block's burst
+    if (isFrameOf(f, model, 0x75)) tail.push(f);
+  }
+  return tail;
+}
+
+/** Is the device's own acknowledgement of a preset store EVIDENCED on this model? ForgeFX-side table (the
+ *  codec does not carry this fact; FOLLOW-UP: move it into the codec's per-device config).
+ *   'verified' — an ack was seen on our OWN hardware: a missing ack is a failure (`ok:false`).
+ *   'unknown'  — not seen on our own hardware: a missing ack is only a warning (`ok:true, acked:false,
+ *                warning`); a real 0x64 refusal is `ok:false` either way.
+ *  The ack repeats the request's fn/sub envelope (it is not byte-identical to the request). It is VERIFIED
+ *  on our own FM3 (model byte 0x11): it arrives ~0.8–0.9 s after the request on fw 12.0 and ~1.25–1.35 s on
+ *  fw 13.0, over USB. FM9 (0x12) and Axe-Fx III (0x10) are still 'unknown' — flip one only with our own
+ *  hardware evidence for that model, never on a report.
+ *
+ *  A level is only as wide as what was measured, so the table entry carries its scope as data
+ *  (`StoreAckScope`) and `resolveStoreAck` narrows it to 'unknown' outside it: the FM3's 'verified' holds on
+ *  a fast (USB) link and firmware >= 12.0 only; a slow (5-pin DIN) link, older firmware, or firmware that
+ *  could not be read all fall back to the lenient 'unknown'. */
+export type StoreAckEvidence = 'verified' | 'unknown';
+export interface StoreAckScope {
+  readonly level: StoreAckEvidence;
+  /** The level holds on firmware >= [major, minor] only; older or unknown firmware → 'unknown'. */
+  readonly minFirmware?: readonly [number, number];
+  /** The level holds on a fast (USB) link only; a slow (5-pin DIN) link → 'unknown'. */
+  readonly fastLinkOnly?: boolean;
+}
+const STORE_ACK_EVIDENCE: Readonly<Record<number, StoreAckScope>> = {
+  0x10: { level: 'unknown' },
+  0x11: { level: 'verified', minFirmware: [12, 0], fastLinkOnly: true },
+  0x12: { level: 'unknown' }
+};
+
+/** The effective store-ack evidence for one model entry on THIS link and firmware (pure). `firmware` is the
+ *  running firmware the registry read at detect time (null = not read / not known). */
+export function resolveStoreAck(
+  scope: StoreAckScope | undefined,
+  link: { slow: boolean; firmware: { major: number; minor: number } | null }
+): StoreAckEvidence {
+  if (!scope || scope.level !== 'verified') return 'unknown';
+  if (scope.fastLinkOnly && link.slow) return 'unknown';
+  if (scope.minFirmware) {
+    const fw = link.firmware;
+    if (!fw) return 'unknown';
+    const [major, minor] = scope.minFirmware;
+    if (fw.major < major || (fw.major === major && fw.minor < minor)) return 'unknown';
+  }
+  return 'verified';
+}
+
+/** How long `store()` waits for the ack, per evidence level and link. The wait ends the instant the ack
+ *  arrives, so the cap only costs time when none comes. 'verified': the fast 6 s is ~4.4x the slowest FM3 ack
+ *  measured (~1.35 s, fw 13.0); the slow 8 s was not measured and stays under the client's 12 s request
+ *  ceiling, which includes queue time. 'unknown': shorter, because on a model that never acks EVERY
+ *  successful save would otherwise pay the full cap. A slow (5-pin DIN) link gets more. */
+const STORE_ACK_TIMEOUT_MS: Readonly<Record<StoreAckEvidence, { fast: number; slow: number }>> = {
+  verified: { fast: 6000, slow: 8000 },
+  unknown: { fast: 2500, slow: 6000 }
+};
 
 // ── preset-dump decode (forgefx-midi devices/gen3 pipeline) ──
 // Adapter producing the exact DTO the pre-Phase-4 server-local codec (fm3PresetGrid.ts
@@ -62,6 +243,9 @@ interface DecodedDumpDTO {
   cols: number;
   grid: { effectId: number; row: number; col: number; routeFlag: number; name: string; isShunt: boolean; fromRows: number[] }[];
   sceneNames: string[];
+  /** ADDITIVE: present (true) only for an unused preset slot — an all-zero patch with no name, grid,
+   *  scenes or valid CRC. Omitted for every populated preset so existing payloads are unchanged. */
+  empty?: boolean;
 }
 /** Decoded dump: the DTO plus the decompressed body (per-block param decode source). */
 interface DecodedDump {
@@ -91,6 +275,27 @@ function dumpBytesFromFrames(frames: readonly (readonly number[])[]): Uint8Array
 function decodeDump(frames: readonly (readonly number[])[], prof: DeviceProfile): DecodedDump {
   const parsed = parsePresetDump(dumpBytesFromFrames(frames), 0, prof.model);
   const raw = decodeRawPatch(parsed.chunkPayloads);
+  if (raw.empty) {
+    // An unused slot reads back as a normal full-length dump with an all-zero patch: nothing to
+    // decompress or decode. Answer it as an empty preset (blank name, no grid/scenes, CRC not valid)
+    // so every dump-backed route answers normally instead of failing the whole request.
+    return {
+      dump: {
+        modelId: prof.model,
+        modelName: prof.name,
+        name: '',
+        crcValid: false,
+        crc: raw.storedCrc,
+        rows: prof.rows,
+        cols: prof.cols,
+        grid: [],
+        sceneNames: [],
+        empty: true
+      },
+      body: raw.body,
+      decompSize: 0
+    };
+  }
   const body3 = decodeGen3Body(raw.body, prof.model);
   let name = '';
   for (let i = 0x08; i < 0x28; i++) {
@@ -131,11 +336,130 @@ const UNIT_LABEL: Record<string, string> = {
   db: 'dB', hz: 'Hz', ms: 'ms', seconds: 's', percent: '%', bipolar_percent: '%',
   degrees: '°', semitones: 'st', pf: 'pF', ratio: ':1'
 };
-// units that mark a musician-facing knob. 'numeric' = a plain unitless knob (Drive, Tone, Level,
-// cut freqs…) — primary controls in many families; only 'unverified'/'count'/'enum' are non-knobs.
-const KNOB_UNITS = new Set([
-  'numeric', 'knob_0_10', 'knob_0_20', 'db', 'hz', 'ms', 'seconds', 'percent', 'bipolar_percent', 'ratio', 'semitones', 'degrees'
+// Catalog unit codes that mark a CONTINUOUS control (a dial), i.e. everything except 'enum'.
+// A float-kind range alone is not enough to call a param a knob: some selectors ship a float-typed
+// range record under unit 'enum' (CABINET_ZOOM, the CONTROLLERS_*_MODE rows, GLOBAL_SEND_MIDI_CLOCK
+// …), and rendering those as dials would write fractional values into a selector.
+// This allowlist is an interim guard; the lasting source for widget choice is the device-true
+// kind/labels of the profile.
+//   'numeric' = a plain unitless knob (Drive, Tone, Level, cut freqs…) and the other unit codes below
+//   are established continuous controls.
+const ESTABLISHED_KNOB_UNITS = ['numeric', 'knob_0_10', 'knob_0_20', 'db', 'hz', 'ms', 'seconds', 'percent', 'bipolar_percent', 'ratio', 'semitones', 'degrees'];
+//   'unverified' = the catalog could not confirm a unit, 'count' = a catch-all that holds both real
+//   continuous values (a filter Q) and plain stepper counts, 'pf' = capacitance. The catalog's unit
+//   is NOT evidence of continuity for these, so they are admitted conservatively (see isKnobParam).
+const PROVISIONAL_KNOB_UNITS = new Set(['unverified', 'count', 'pf']);
+const KNOB_UNITS = new Set([...ESTABLISHED_KNOB_UNITS, ...PROVISIONAL_KNOB_UNITS]);
+
+// Params that look like a dial but are not one, which no range heuristic can tell apart. Keyed by the
+// catalog param name; extend only with a reason.
+const NOT_A_KNOB = new Set([
+  'MOD_EFFECTID', // the modifier's target block id: a knob would silently retarget the modifier
+  'GLOBAL_CS_CHAN_BEGIN', // its paramId lies outside the fn-0x1F body, so the read-back is always the minimum
 ]);
+
+/** `FAMILY.NAME` of every param that is a selector ('enum' unit) on ANY gen-3 device's static catalog.
+ *  The same param can carry a confirmed unit on one device and 'unverified' on another (TENTAP_DECAYSTYLE
+ *  is a 2-way selector on the Axe-Fx III). Consulted only for the provisional units, whose catalog unit
+ *  proves nothing on this device. */
+let enumElsewhere: Set<string> | undefined;
+function isEnumOnAnyDevice(family: string, name: string): boolean {
+  if (!enumElsewhere) {
+    enumElsewhere = new Set();
+    for (const prof of Object.values(PROFILES)) {
+      for (const [fam, list] of Object.entries(prof.params)) for (const q of list) if (q.unit === 'enum') enumElsewhere.add(`${fam}.${q.name}`);
+    }
+  }
+  return enumElsewhere.has(`${family}.${name}`);
+}
+
+/** A range that reads like a stepper or selector rather than a dial: integral bounds with either an
+ *  integer step, or no step and a small span (<= 64 values). Deliberately conservative (it also hides
+ *  a plain 0..1 range): used only to vet the provisional units, whose catalog unit proves nothing. */
+function looksDiscrete(range: { displayMin: number; displayMax: number; step?: number }): boolean {
+  if (!Number.isInteger(range.displayMin) || !Number.isInteger(range.displayMax)) return false;
+  const step = range.step ?? 0;
+  if (step >= 1 && Number.isInteger(step)) return true;
+  return step === 0 && range.displayMax - range.displayMin <= 64;
+}
+
+type FamilyParam = DeviceProfile['params'][string][number];
+
+/** Is this catalog param a knob: a float-kind range with a usable span (min !== max), a continuous
+ *  catalog unit (KNOB_UNITS), not the bypass flag and not a known non-dial (NOT_A_KNOB). A param on one
+ *  of the provisional units ('unverified' / 'count' / 'pf') must also not be a selector on another
+ *  gen-3 device, be label-less, and not look like a stepper (integer step, or integral bounds over a
+ *  small span). Shared by blockParams() and meters(), so the grid's meter param is always one of the
+ *  block's knobs. */
+function isKnobParam(profile: DeviceProfile, family: string, p: FamilyParam): boolean {
+  const range = profile.ranges[family]?.[p.paramId];
+  if (range?.kind !== 'float') return false;
+  if (!KNOB_UNITS.has(p.unit ?? '')) return false;
+  if (/bypass/i.test(p.displayLabel ?? p.name)) return false;
+  if (range.displayMin === range.displayMax) return false; // 0..0 is an unusable knob
+  if (NOT_A_KNOB.has(p.name)) return false;
+  if (PROVISIONAL_KNOB_UNITS.has(p.unit ?? '')) {
+    // Only where this device's catalog unit proves nothing: an established unit is trusted as-is, so a
+    // later catalog change on one device can never silently hide a dial on the others.
+    if (isEnumOnAnyDevice(family, p.name)) return false;
+    if ((profile.enumLabelsFor(family, p.paramId)?.length ?? 0) > 0) return false; // labels = a selector
+    if (looksDiscrete(range)) return false;
+  }
+  return true;
+}
+
+/** The family's knob params, one per wire paramId (first wins). Exported for the per-device
+ *  knob-count test. */
+export function knobParams(profile: DeviceProfile, family: string): FamilyParam[] {
+  const seenIds = new Set<number>();
+  return (profile.params[family] ?? []).filter((p) => {
+    if (!isKnobParam(profile, family, p) || seenIds.has(p.paramId)) return false;
+    seenIds.add(p.paramId);
+    return true;
+  });
+}
+
+/** Selectors whose range row is a FLOAT row although the device ships a label list for them. The codec
+ *  reports these under unit 'enum' (a device label list makes a param a selector), which keeps them out of
+ *  the knobs (isKnobParam) while the enum list only looked at enum-kind rows: they listed nowhere and the
+ *  block editor lost the control. Today that is the Axe-Fx III's 13 `*_GLOBALMIX` toggles (OFF / ON over a
+ *  0..1 float row; they were dials while the catalog still read them as 'percent').
+ *
+ *  Deliberately a narrow, named class and not "every float row with labels": that wider set also holds
+ *  selectors that were never shown (KILLDRY, GLOBAL_IRCAPTURE_PROCESS, the bypass flags) and admitting them
+ *  is a separate decision. The structural guards below make sure a later catalog change cannot turn a
+ *  non-selector into an enum through this name alone. */
+const FLOAT_ROW_SELECTOR_NAME = /_GLOBALMIX$/;
+
+/** Is this catalog param a float-row selector (see FLOAT_ROW_SELECTOR_NAME): the 'enum' unit, a named
+ *  class member, a float row spanning exactly 0..1 and a device label list of exactly 2 entries (OFF / ON).
+ *  The writes are the existing discrete path: float32(ordinal), which is also how the codec routes a
+ *  param that carries a label list; that path is only proven for a 0..1 toggle, so a wider row (0..2 with
+ *  3 labels, ...) is deliberately not admitted. */
+function isFloatRowSelector(profile: DeviceProfile, family: string, p: FamilyParam): boolean {
+  if (p.unit !== 'enum' || !FLOAT_ROW_SELECTOR_NAME.test(p.name)) return false;
+  const range = profile.ranges[family]?.[p.paramId];
+  if (range?.kind !== 'float') return false;
+  if (range.displayMin !== 0 || range.displayMax !== 1) return false;
+  return profile.enumLabelsFor(family, p.paramId)?.length === 2;
+}
+
+/** The family's enum (selector) params for the block editor: every param whose device range row is an
+ *  enum with a usable span, plus the float-row selectors (isFloatRowSelector, one per wire paramId, first
+ *  wins like knobParams). The family TYPE selector (`typeId`, shown by the header retype palette) and the
+ *  raw bypass flag are left out. Exported for the per-device classification test. */
+export function enumParams(profile: DeviceProfile, family: string, typeId?: number): FamilyParam[] {
+  const floatSelectorIds = new Set<number>();
+  return (profile.params[family] ?? []).filter((p) => {
+    const range = profile.ranges[family]?.[p.paramId];
+    if (p.paramId === typeId) return false;
+    if (/^bypass$/i.test(p.displayLabel ?? p.name)) return false;
+    if (range?.kind === 'enum') return range.displayMax > range.displayMin;
+    if (!isFloatRowSelector(profile, family, p) || floatSelectorIds.has(p.paramId)) return false;
+    floatSelectorIds.add(p.paramId);
+    return true;
+  });
+}
 
 /** Append 1/2/3… to labels that repeat within a list (e.g. the cab's four "Low Cut" mic params),
  * so the UI can tell otherwise-identical controls apart. Mutates the items' `name`. */
@@ -162,7 +486,14 @@ class Gen3Driver implements DeviceDriver {
   #ctx: DriverCtx;
   readonly capabilities: DriverCapabilities;
 
-  constructor(profile: DeviceProfile, ctx: DriverCtx) {
+  /** Store-ack evidence scope for THIS model (see STORE_ACK_EVIDENCE). */
+  readonly storeAckScope: StoreAckScope | undefined;
+  /** An INJECTED evidence level (tests / a hardware run): overrides the table, scope included. */
+  readonly storeAckOverride: StoreAckEvidence | undefined;
+
+  constructor(profile: DeviceProfile, ctx: DriverCtx, opts: { storeAck?: StoreAckEvidence } = {}) {
+    this.storeAckScope = STORE_ACK_EVIDENCE[profile.model];
+    this.storeAckOverride = opts.storeAck;
     this.#prof = profile;
     this.#codec = createModernFractalCodec(profile.model); // every frame carries THIS device's model byte
     this.#ctx = ctx;
@@ -204,6 +535,11 @@ class Gen3Driver implements DeviceDriver {
   get key() { return this.#prof.key; }
   get name() { return this.#prof.name; }
   get profile() { return this.#prof; }
+  /** Stored preset slots: 1024 on the Axe-Fx III, 512 on the FM3 / FM9. Slot-addressed routes validate
+   *  against this. These numbers MIRROR the codec's per-model `preset_count` (forgefx-midi
+   *  devices/gen3/configs/*), but that field is not exported — so they are hard-coded here. FOLLOW-UP:
+   *  export `preset_count` from the codec and read it from the profile instead of this model-byte switch. */
+  get presetCount(): number { return this.#prof.model === 0x10 ? 1024 : 512; }
 
   /** Adopt a device-cache-derived runtime profile (device-true rosters / enum labels / ranges). The
    *  model byte is unchanged so the codec bound at construction stays valid; only the data the reads
@@ -217,15 +553,44 @@ class Gen3Driver implements DeviceDriver {
   #conn() { return this.#ctx.transport(); }
   #emit: DriverCtx['emit'] = (e) => this.#ctx.emit(e);
 
+  /** fn-0x1F channel-block geometry for a family: one channel's slice width, how many channels the
+   *  body carries, and where the active channel's slice starts.
+   *
+   *  The profile's table stride is only a hint. A static catalog stride was measured on one firmware
+   *  (and some were never confirmed on the device they ship for), and a walk-built stride is the
+   *  number of records the walk managed to collect, not the section's true width. A wrong stride is
+   *  silent and destructive: base = channel x stride lands mid-way through an EARLIER channel's slice,
+   *  so every param read for channels B-D, the amp model included, is a real, valid-looking value
+   *  from the wrong param.
+   *
+   *  The reply is the tiebreaker. The body is whole channel slices back to back (at most A-D), so
+   *  itemCount = channels x stride, and a stride only counts when it divides itemCount into 1-4
+   *  slices. That also rejects a short stride that merely happens to divide the body, because it
+   *  would imply more than four channels. Order of preference:
+   *    1. the table stride, when the reply agrees with it (or advertised no count at all);
+   *    2. itemCount / 4, the four-channel layout of a channel-bearing block;
+   *    3. one slice spanning the whole body (a block that is not channel-blocked; only channel A is
+   *       real there, so base stays 0).
+   *  `channelBlocked: false` (the virtual effects GLOBAL / CONTROLLERS / MODIFIER / FC, which have no
+   *  channels A-D) skips all of that: the whole body is the one slice. Dividing it by four, or trusting
+   *  a drifted table stride, would shrink the slice and make decodeEditBurst drop every device edit
+   *  from that paramId on. */
   #channelSlice(
     family: string | undefined,
     bulk: { itemCount: number; values: readonly number[] },
     activeChannel: number,
+    channelBlocked = true,
   ): { stride: number; channelCount: number; base: number } {
+    if (!channelBlocked) return { stride: Math.max(1, bulk.values.length), channelCount: 1, base: 0 };
+    const MAX_CHANNELS = 4;
     const tableStride = family ? this.#prof.rangeSections[family]?.stride : undefined;
-    const stride = tableStride && tableStride > 0
-      ? tableStride
-      : (bulk.itemCount > 0 && bulk.itemCount % 4 === 0 ? bulk.itemCount / 4 : Math.max(1, bulk.values.length));
+    const tableFits = !!tableStride && tableStride > 0
+      && (bulk.itemCount <= 0 || (bulk.itemCount % tableStride === 0 && bulk.itemCount / tableStride <= MAX_CHANNELS));
+    const stride = tableFits
+      ? tableStride!
+      : bulk.itemCount > 0 && bulk.itemCount % MAX_CHANNELS === 0
+        ? bulk.itemCount / MAX_CHANNELS
+        : Math.max(1, bulk.values.length);
     const basis = bulk.itemCount > 0 ? bulk.itemCount : bulk.values.length;
     const channelCount = Math.max(1, Math.floor(basis / stride));
     return { stride, channelCount, base: Math.min(activeChannel, channelCount - 1) * stride };
@@ -237,11 +602,64 @@ class Gen3Driver implements DeviceDriver {
     return { ok: true };
   }
 
-  /** Write + watch a short window for a 0x64 rejection. For structural ops where a reject matters. */
+  /** Write + watch a short window for a 0x64 rejection. For structural ops where a reject matters.
+   *  The device answers an accepted write with silence and a refused one with a 0x64 MULTIPURPOSE_RESPONSE
+   *  `[echoedFn, resultCode]`, so only a 0x64 from this model echoing THIS write's function is its refusal (one
+   *  too short to carry a function counts, conservatively). A foreign 0x64 — a late refusal of another
+   *  operation — neither ends the window nor fails the write.
+   *  `rejectOnly`: silence until the window closes is the success outcome, so the transport neither warns nor
+   *  holds the link for a late reply after it; a browser-direct transport that still reports the silence as
+   *  a typed timeout gets the same answer. */
   async #write(bytes: number[]): Promise<{ ok: boolean }> {
     const dev = await this.#conn();
-    const frames = await dev.request(bytes, { timeoutMs: 120, quietMs: 60, match: (fs) => fs.some((f) => f[5] === 0x64) });
-    return { ok: !frames.some((f) => f[5] === 0x64) };
+    const model = bytes[4]!;
+    const fn = bytes[5];
+    const isOwnRejection = (f: number[]) => isMultipurposeResponse(f, model) && (f.length < 9 || f[6] === fn);
+    // The device's synchronous echo of THIS write — a SET's value echo carries the same function, sub-action,
+    // effect id and param id (bytes 6-11). A frame byte-identical to the request is our own write coming back
+    // (loopback), not an echo. The echo is OWNED, not a match: whether a device ever echoes a write it then
+    // refuses is not known, so after an echo the write stays open for its quiet gap (half the window) and a
+    // refusal of its function arriving in that time is still this write's; then it ends as accepted, earlier
+    // than the full window.
+    const sameAsRequest = (f: number[]) => f.length === bytes.length && f.every((b, i) => b === bytes[i]);
+    const isOwnEcho = (f: number[]) =>
+      bytes.length >= 14 && f.length >= 14 && f[0] === 0xf0 && f[1] === 0x00 && f[2] === 0x01 && f[3] === 0x74
+      && f[4] === model && f[5] === fn && [6, 7, 8, 9, 10, 11].every((i) => f[i] === bytes[i]) && !sameAsRequest(f);
+    // A slow link (5-pin DIN) needs a longer refusal window: the request itself takes ~10-20 ms on the wire.
+    const timeoutMs = dev.slow ? 250 : 120;
+    let frames: number[][];
+    try {
+      frames = await dev.request(bytes, {
+        timeoutMs,
+        quietMs: timeoutMs / 2,
+        rejectOnly: true,
+        match: (fs) => fs.some(isOwnRejection),
+        owns: isOwnEcho
+      });
+    } catch (e) {
+      if (isTransportTimeout(e)) return { ok: true }; // silence: accepted
+      throw e;
+    }
+    return { ok: !frames.some(isOwnRejection) };
+  }
+
+  /** One fn-0x1F bulk read of block `eid`: the burst whose 0x74 head names `eid` (bulkReadFrames), never another
+   *  block's late burst. Its head and bodies are owned, so a burst whose 0x76 is lost still ends one quiet gap
+   *  after its last body (and the transport drains the rest) instead of waiting the full timeout. */
+  async #bulkRead(dev: Transport, eid: number, timeoutMs: number, quietMs: number, routine = false): Promise<number[][]> {
+    const model = this.#prof.model;
+    let inOurs = false;
+    const frames = await dev.request(this.#codec.buildBlockBulkReadPoll(eid), {
+      timeoutMs,
+      quietMs,
+      routine,
+      match: (fs) => bulkReadSpan(fs, model, eid) !== null,
+      owns: (f) => {
+        if (isFrameOf(f, model, 0x74)) return (inOurs = isBulkHeadFor(f, model, eid));
+        return inOurs && isFrameOf(f, model, 0x75);
+      }
+    });
+    return bulkReadFrames(frames, model, eid);
   }
 
   /** Current preset number + name (one query). */
@@ -254,6 +672,7 @@ class Gen3Driver implements DeviceDriver {
     const f = frames.find((x) => this.#codec.isQueryPatchNameResponse(x));
     if (!f) return { number: -1, name: '' };
     const r = this.#codec.parseQueryPatchNameResponse(f);
+    if (r.presetNumber >= 0) this.#session(dev).currentSlot = r.presetNumber;
     return { number: r.presetNumber, name: r.name };
   }
 
@@ -280,23 +699,100 @@ class Gen3Driver implements DeviceDriver {
     // several seconds with ~1s gaps between chunks. The USB-tuned windows (5s / 180ms quiet) give up mid
     // dump. Widen them so the transfer completes; the 0x79-terminator `match` still returns the instant the
     // dump is whole, so a fast link isn't slowed.
+    // Only a whole dump counts (a 0x77 header through the 0x79 after it — a tail never does), and which header
+    // is acceptable is per model (DUMP_HEADER_POLICY): a late whole dump of another slot decoded as this one
+    // shifted every later slot by one in a library scan.
     const slow = dev.slow;
-    let frames: number[][] = [];
+    const model = this.#prof.model;
+    const what = target === EDIT_BUFFER ? 'edit buffer' : `slot ${target}`;
+    let partial: number[][] = [];
     for (let attempt = 1; attempt <= 3; attempt++) {
-      frames = await dev.request(this.#codec.buildRequestPresetDump(target), {
-        timeoutMs: slow ? 25000 : 5000,
-        quietMs: slow ? 1500 : 180,
-        match: (fs) => fs.some((f) => f[5] === 0x79) // 0x79 = dump terminator
-      });
-      const ok = frames.some((f) => f[5] === 0x78) && frames.some((f) => f[5] === 0x79);
-      if (ok) return frames;
-      console.log(`[forgefx] presetDump: incomplete attempt ${attempt}/3 (frames=${frames.length}, 0x78=${frames.some((f) => f[5] === 0x78)}, 0x79=${frames.some((f) => f[5] === 0x79)}) — retrying`);
+      const plan = this.#dumpHeaderPlan(dev, target);
+      const frames = await dev.request(this.#codec.buildRequestPresetDump(target), presetDumpOpts(model, plan, slow ? 25000 : 5000, slow ? 1500 : 180));
+      let whole = wholeDumps(frames, model, plan.named)[0];
+      if (whole && headerNamesRequest(dumpHeaderNumber(whole[0]!), target)) this.#session(dev).learned.add(target === EDIT_BUFFER ? 'edit' : 'stored');
+      if (!whole && plan.check === 'prefer') {
+        whole = wholeDumps(frames, model, plan.usable).at(-1);
+        if (whole) this.#noteDumpHeader(what, dumpHeaderNumber(whole[0]!));
+      }
+      if (whole && whole.some((f) => f[5] === 0x78)) return whole;
+      // keep what started (from the last usable header) for the decoder's error message
+      let last = -1;
+      frames.forEach((f, i) => { if (isFrameOf(f, model, 0x77) && plan.usable(f)) last = i; });
+      partial = last < 0 ? [] : dumpFramesOnly(frames.slice(last), model);
+      console.log(`[forgefx] presetDump: incomplete ${what} attempt ${attempt}/3 (frames=${frames.length}, header=${last >= 0}, 0x78=${partial.some((f) => f[5] === 0x78)}, 0x79=${partial.some((f) => f[5] === 0x79)}) — retrying`);
     }
-    return frames; // still incomplete → let decodePresetDump throw its clear error
+    return partial; // still incomplete → let decodePresetDump throw its clear error
+  }
+  /** Log ONCE per driver and kind of read that a 'prefer' dump read fell back to a dump whose header names
+   *  another preset number — the evidence needed to tighten DUMP_HEADER_POLICY for this model. */
+  #noteDumpHeader(what: string, named: number): void {
+    const kind = what === 'edit buffer' ? what : 'stored slot';
+    if (this.#dumpHeaderNoted.has(kind)) return;
+    this.#dumpHeaderNoted.add(kind);
+    const n = EDIT_BUFFER_HEADERS.includes(named) ? `the edit buffer (0x${named.toString(16)})` : `slot ${named}`;
+    console.warn(`[forgefx] presetDump: ${what} read answered by a dump whose header names ${n} — used it (no dump naming the request arrived; header check is lenient for model 0x${this.#prof.model.toString(16)}). Logged once.`);
+  }
+  #dumpHeaderNoted = new Set<string>();
+
+  /** What the driver learned about THIS connection (reset on reconnect — a new transport — and on re-detect,
+   *  see resetSession): which dump-read kinds the device has proven to name the requested number in their
+   *  header, and the current slot when the driver knows it (set by presetRef / selectPreset). */
+  #sessionState: { transport: Transport; learned: Set<'stored' | 'edit'>; currentSlot: number | null } | null = null;
+  #session(dev: Transport) {
+    if (this.#sessionState?.transport !== dev) this.#sessionState = { transport: dev, learned: new Set(), currentSlot: null };
+    return this.#sessionState;
+  }
+  /** A fresh detect: forget what was learned about the connection. */
+  resetSession(): void {
+    this.#sessionState = null;
+  }
+  /** How a dump read of `target` judges headers on this connection. Starts from DUMP_HEADER_POLICY; a
+   *  'prefer' kind becomes 'strict' once the device has named the requested number in a header (so a late dump
+   *  of another slot can never be used as a fallback again). An edit-buffer read is named by any of
+   *  EDIT_BUFFER_HEADERS (0x3FFF, 0x3F80) — proof of the convention — and also by a header naming the CURRENT
+   *  slot when the driver knows it, which does not count as proof (a front-panel preset change can make the
+   *  known slot stale). */
+  #dumpHeaderPlan(dev: Transport, target: number): DumpHeaderPlan {
+    const s = this.#session(dev);
+    const base = dumpHeaderCheck(this.#prof.model, target);
+    const kind = target === EDIT_BUFFER ? 'edit' : 'stored';
+    const check: DumpHeaderCheck = base === 'prefer' && s.learned.has(kind) ? 'strict' : base;
+    const current = target === EDIT_BUFFER ? s.currentSlot : null;
+    const named = (h: number[]) => {
+      if (check === 'any') return true;
+      const n = dumpHeaderNumber(h);
+      return headerNamesRequest(n, target) || (current !== null && n === current);
+    };
+    // Fallback candidates under 'prefer': any other header — except that a stored-slot read never takes a dump
+    // whose header is an edit-buffer value (a late grid() dump is not slot n).
+    const usable = (h: number[]) =>
+      named(h) || (check === 'prefer' && (target === EDIT_BUFFER || !EDIT_BUFFER_HEADERS.includes(dumpHeaderNumber(h))));
+    return { check, named, usable };
   }
 
+  /** Routing grid of ONE STORED SLOT (GET /presets/:n/grid): the dump the device returns for slot `n`,
+   *  decoded exactly like the edit-buffer grid. Deliberately bypasses `#gridCache`/`#gridInflight` —
+   *  those are keyed on the edit buffer, so routing a slot through them would serve one preset's grid
+   *  for another (the very confusion this method exists to end). */
+  async presetGrid(n: number): Promise<PresetGridDTO> {
+    // Concurrent requests for the SAME slot share one dump (a browser can fire several for one slot);
+    // nothing is kept once the dump settles, so the next call always reads the device again.
+    const inflight = this.#slotGridInflight.get(n);
+    if (inflight) return inflight;
+    const p = this.#gridFromDump(n).finally(() => { this.#slotGridInflight.delete(n); });
+    this.#slotGridInflight.set(n, p);
+    return p;
+  }
+  #slotGridInflight = new Map<number, Promise<PresetGridDTO>>();
+
   async #dumpGrid(): Promise<PresetGridDTO> {
-    const frames = await this.#dumpFrames(EDIT_BUFFER);
+    return this.#gridFromDump(EDIT_BUFFER);
+  }
+
+  /** Decode a preset dump (the edit buffer or a stored slot) into the routing-grid DTO. */
+  async #gridFromDump(target: number): Promise<PresetGridDTO> {
+    const frames = await this.#dumpFrames(target);
     // diagnostic: did the dump arrive? (Windows MIDI large-SysEx debugging) — frame count, the function
     // bytes seen, total bytes, and whether the 0x79 terminator came through.
     const fns = [...new Set(frames.map((f) => f[5]))].map((x) => '0x' + (x ?? 0).toString(16));
@@ -304,7 +800,7 @@ class Gen3Driver implements DeviceDriver {
     console.log(`[forgefx] presetDump: frames=${frames.length} bytes=${bytes} fns=[${fns.join(',')}] terminator=${frames.some((f) => f[5] === 0x79)}`);
     const d = decodeDump(frames, this.#prof).dump;
     return {
-      model: 'fm3',
+      model: this.#prof.key, // 'fm3' | 'fm9' | 'axe3' (was a hard-coded 'fm3' for every gen-3 unit)
       name: d.name,
       crcValid: d.crcValid,
       rows: d.rows,
@@ -342,12 +838,54 @@ class Gen3Driver implements DeviceDriver {
     return { bytes: Uint8Array.from(frames.flat()), summary };
   }
 
+  /** Diagnostic capture: ONE read-only dump request for `target` that accepts ANY whole dump the device
+   *  answers with (header check 'any'), so the caller learns which preset number the 0x77 header names —
+   *  the evidence DUMP_HEADER_POLICY is tightened on. Unlike #dumpFrames it never retries, never falls back
+   *  and does not teach the connection's header strictness. The raw patch is decoded only far enough to
+   *  tell an unused slot and to let the caller compare two dumps in memory. */
+  async diagnosticDump(target: number | 'edit-buffer'): Promise<DiagnosticDump> {
+    const dev = await this.#conn();
+    const model = this.#prof.model;
+    const requested = target === 'edit-buffer' ? EDIT_BUFFER : target;
+    const named = (h: number[]) => headerNamesRequest(dumpHeaderNumber(h), requested);
+    const plan: DumpHeaderPlan = { check: 'any', named, usable: () => true };
+    const t0 = Date.now();
+    const frames = await dev.request(this.#codec.buildRequestPresetDump(requested), presetDumpOpts(model, plan, dev.slow ? 25000 : 5000, dev.slow ? 1500 : 180));
+    const ms = Date.now() - t0;
+    const whole = wholeDumps(frames, model, named)[0] ?? wholeDumps(frames, model, () => true)[0] ?? null;
+    const dumpFrames = whole ?? dumpFramesOnly(frames, model);
+    const headerFrame = dumpFrames.find((f) => isFrameOf(f, model, 0x77));
+    const chunks = dumpFrames.filter((f) => isFrameOf(f, model, 0x78)).length;
+    let patch: DiagnosticDump['patch'] = null;
+    let empty: boolean | null = null;
+    if (whole && chunks > 0) {
+      try {
+        const raw = decodeRawPatch(parsePresetDump(dumpBytesFromFrames(whole), 0, model).chunkPayloads);
+        empty = raw.empty;
+        patch = { raw: raw.rawPatch, body: raw.body };
+      } catch { /* undecodable: header facts only */ }
+    }
+    return {
+      requested,
+      header: headerFrame ? dumpHeaderNumber(headerFrame) : null,
+      complete: !!whole && chunks > 0,
+      frames: dumpFrames.length,
+      chunks,
+      bytes: dumpFrames.reduce((n, f) => n + f.length, 0),
+      ms,
+      empty,
+      patch
+    };
+  }
+
   /** Verbatim .syx dump for POST /preset/backup (capability `backupDump`) — the library's
    *  export-to-disk + audition source. Location omitted → the currently selected preset's slot
-   *  (gen-3 dumps by slot; the raw edit-buffer stream is a different frame format, not a .syx). */
+   *  (gen-3 dumps by slot; the raw edit-buffer stream is a different frame format, not a .syx).
+   *  An unused slot is refused (`EmptyPresetError` → 422): its all-zero dump is not a restorable preset. */
   async backupPreset(location?: number): Promise<{ location: number | null; code: string | null; name: string; bytes: number[] }> {
     const n = location ?? (await this.presetRef()).number;
     const { bytes, summary } = await this.dumpRaw(n);
+    if (summary.empty) throw new EmptyPresetError();
     return { location: n, code: null, name: summary.name, bytes: Array.from(bytes) };
   }
 
@@ -395,18 +933,17 @@ class Gen3Driver implements DeviceDriver {
       const ref = blockRefForEid(c.effectId);
       seen.set(c.effectId, { effectId: c.effectId, slug: ref?.slug ?? null, name: c.name, instance: ref?.instance ?? null });
     }
-    return { number: presetNumber, name: d.name, model: d.modelName, crcValid: d.crcValid, crc: d.crc, scenes: d.sceneNames, blocks: [...seen.values()], models, amps: models.amp ?? [] };
+    return {
+      number: presetNumber, name: d.name, model: d.modelName, crcValid: d.crcValid, crc: d.crc, scenes: d.sceneNames,
+      blocks: [...seen.values()], models, amps: models.amp ?? [],
+      ...(d.empty ? { empty: true } : {})
+    };
   }
 
   /** Decompressed preset body as hex — for per-block param-decode RE (diff bodies across known param
    *  changes to locate offsets). Dumps the active edit buffer. */
   async presetBodyHex(): Promise<{ len: number; hex: string }> {
-    const dev = await this.#conn();
-    const frames = await dev.request(this.#codec.buildRequestPresetDump(EDIT_BUFFER), {
-      timeoutMs: 5000,
-      quietMs: 180,
-      match: (fs) => fs.some((f) => f[5] === 0x79)
-    });
+    const frames = await this.#dumpFrames(EDIT_BUFFER); // the same whole-dump matching (and retry) as every dump read
     const parsed = parsePresetDump(dumpBytesFromFrames(frames), 0, this.#prof.model);
     const { body } = decodeRawPatch(parsed.chunkPayloads);
     return { len: body.length, hex: Buffer.from(body).toString('hex') };
@@ -418,7 +955,8 @@ class Gen3Driver implements DeviceDriver {
     try {
       // fractal-midi's isStatusDumpResponse is locked to model 0x10 (III), so match the
       // 0x13 frame ourselves (any model) and parse the id-id-dd triples inline.
-      const frames = await dev.request(this.#codec.buildStatusDump(), { timeoutMs: 1500, match: (fs) => fs.some((f) => f[5] === 0x13) });
+      // fn-only matcher: the status dump carries no request id (polled by the channel watch)
+      const frames = await dev.request(this.#codec.buildStatusDump(), { timeoutMs: 1500, routine: true, match: (fs) => fs.some((f) => f[5] === 0x13) });
       const f = frames.find((x) => x[5] === 0x13);
       if (f) {
         const payload = f.slice(6, f.length - 2);
@@ -472,7 +1010,19 @@ class Gen3Driver implements DeviceDriver {
    *  and re-apply just this. One small round-trip; keeps scene changes snappy and OFF the heavy,
    *  crash-prone dump path (a full dump right after a scene switch hits the device mid-rebuild). */
   async sceneState(): Promise<{ effectId: number; bypassed: boolean; channel: string | null }[]> {
-    const status = await this.#statusByEffectId();
+    let status = await this.#statusByEffectId();
+    // A scene switch leaves the unit busy rebuilding for a moment, so the first status read can come back
+    // empty even though the device is fine. Retry once shortly after before treating it as a failure — the
+    // alternative (503 → the client's full preset dump) lands on the device exactly while it is rebuilding.
+    if (status.size === 0) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 200));
+      status = await this.#statusByEffectId();
+    }
+    // An EMPTY status map means the fn-0x13 read failed/timed out (#statusByEffectId swallows the
+    // error). A real preset always has ≥ Output blocks, so `[]` can never be a legitimate scene state —
+    // returning it made the route answer 200 `[]` and Axis kept the previous scene's bypass/channel
+    // forever. Throw so the route maps it to 503 and Axis's `.catch(() => null) → load()` fallback fires.
+    if (status.size === 0) throw new Error('scene-state read failed (no status dump from the device)');
     return [...status].map(([effectId, s]) => ({ effectId, bypassed: s.bypassed, channel: CH_LETTERS[s.channel] ?? null }));
   }
 
@@ -512,6 +1062,7 @@ class Gen3Driver implements DeviceDriver {
     const codecSlug = slugForEffectId(eid) ?? ''; // audio blocks resolve via the codec
     // virtual effects (GLOBAL=1, Controllers=2, Modifier=3, FC=199) resolve via the profile's effectId map
     const family = SLUG_FAMILY[codecSlug.toLowerCase()] ?? this.#prof.familyForEffectId(eid);
+    const hasChannels = !!SLUG_FAMILY[codecSlug.toLowerCase()]; // an audio block; the virtual effects have no channels A-D
     const slug = codecSlug || (family ? family.toLowerCase() : ''); // virtual effects key on the family name
     const meta = BLOCK_META[codecSlug];
     const blockName = meta?.name ?? family ?? slug;
@@ -523,31 +1074,16 @@ class Gen3Driver implements DeviceDriver {
       return { block: blockName, slug, page, named: [], enums: [], type: null, layout }; // no device-true param family mapped
     }
     const defs = this.#prof.params[family] ?? [];
-    // knob params = continuous, musician-facing: a float range + a real display unit
-    // (drops enum selectors, internal 'numeric'/'unverified' params, and bypass flags).
-    // knobs = every continuous param with a usable range. We expose ALL real controls (the UI
-    // organizes them); only genuinely-dead params are dropped: no range (min===max) or the bypass flag.
-    const seenIds = new Set<number>();
-    const knobs = defs.filter((p) => {
-      const range = this.#prof.ranges[family]?.[p.paramId];
-      if (range?.kind !== 'float') return false;
-      if (!KNOB_UNITS.has(p.unit ?? '')) return false;
-      if (/bypass/i.test(p.displayLabel ?? p.name)) return false;
-      if (range.displayMin === range.displayMax) return false; // unusable (0..0) knob
-      if (seenIds.has(p.paramId)) return false; // dedupe same wire paramId (first wins)
-      seenIds.add(p.paramId);
-      return true;
-    });
+    // knobs = every continuous param with a usable range: a float-kind range AND a continuous catalog
+    // unit (KNOB_UNITS; this keeps selectors that carry a float-typed range record out of the dial
+    // list). We expose ALL real controls (the UI organizes them); besides that only genuinely-dead
+    // params are dropped: no range (min===max) or the bypass flag.
+    const knobs = knobParams(this.#prof, family);
     // enums = every discrete selector. The family TYPE selector is excluded (header retype palette),
-    // plus the raw bypass flag; everything else (modes, slopes, mics, mic/cab pickers…) is shown.
+    // plus the raw bypass flag; everything else (modes, slopes, mics, mic/cab pickers…) is shown, and so
+    // are the float-row selectors (enumParams: the III's GLOBALMIX toggles).
     const typeId = this.#paramId(family, 'type');
-    const enumDefs = defs.filter((p) => {
-      const range = this.#prof.ranges[family]?.[p.paramId];
-      if (range?.kind !== 'enum' || p.paramId === typeId) return false;
-      if (range.displayMax <= range.displayMin) return false;
-      if (/^bypass$/i.test(p.displayLabel ?? p.name)) return false;
-      return true;
-    });
+    const enumDefs = enumParams(this.#prof, family, typeId);
     const named: NamedParam[] = [];
     const enums: EnumParam[] = [];
     let type: { value: number; name: string } | null = null;
@@ -559,9 +1095,9 @@ class Gen3Driver implements DeviceDriver {
         // active one, not always channel A. Costs one status round-trip per open — worth it for correctness.
         const activeCh = (await this.#statusByEffectId()).get(eid)?.channel ?? 0;
         this.#watchedChannel = activeCh; // keep the device-edit-burst diff on the same channel (see decodeEditBurst)
-        const frames = await dev.request(this.#codec.buildBlockBulkReadPoll(eid), { timeoutMs: dev.slow ? 8000 : 2500, quietMs: dev.slow ? 600 : 120, match: (fs) => fs.some((f) => f[5] === 0x76) });
+        const frames = await this.#bulkRead(dev, eid, dev.slow ? 8000 : 2500, dev.slow ? 600 : 120);
         const bulk = this.#codec.assembleGen3BlockBulkRead(frames);
-        const { stride, base } = this.#channelSlice(family, bulk, activeCh);
+        const { stride, base } = this.#channelSlice(family, bulk, activeCh, hasChannels);
         // Prime the device-edit-push baseline with the OPEN channel's values so a later front-panel
         // edit's burst diffs cleanly to the moved param (no first-sight reload — see decodeEditBurst).
         this.#editSnapshot.set(eid, bulk.values.slice(base, base + stride));
@@ -574,8 +1110,15 @@ class Gen3Driver implements DeviceDriver {
           const max = Math.round(range.displayMax);
           const min = Math.round(range.displayMin);
           const raw = bulk.values[base + p.paramId] ?? 0;
-          // discrete params store the ordinal; if the wire value looks 16-bit-scaled, unscale it
-          const value = raw > max ? Math.round((raw / 65534) * (max - min)) + min : raw;
+          // An enum-KIND row stores the ordinal; if the wire value looks 16-bit-scaled, unscale it. A FLOAT
+          // row (the float-row selectors admitted by enumParams) always carries the normalized raw/65534
+          // value, so it is always scaled onto the label range: guessing "ordinal or scaled" there would
+          // read raw 1 (~0.0) as ON. Midpoint: raw 32767 (exactly 0.5) rounds up, like Math.round does
+          // for the rest of the decode.
+          const value =
+            range.kind === 'float'
+              ? Math.min(max, Math.max(min, Math.round((raw / 65534) * (max - min)) + min))
+              : raw > max ? Math.round((raw / 65534) * (max - min)) + min : raw;
           enums.push({ id: p.paramId, name: paramLabel(p), value, options: this.#enumOptions(family, p.paramId, p.name, min, max) });
         }
         // current model/type (for EQ band layout etc.)
@@ -789,14 +1332,7 @@ class Gen3Driver implements DeviceDriver {
     if (!model.liveState) throw new Error('live FC state read is not supported for this device model (FM3 only); the address model is available via GET /fc/model');
     const eid = model.effectId;
     const config = layout * model.configsPerLayout! + view * model.switches! + sw;
-    const enc14 = (n: number) => [n & 0x7f, (n >> 7) & 0x7f];
-    const build = (pid: number): number[] => {
-      const f = [0xf0, 0x00, 0x01, 0x74, this.#prof.model, 0x01, 0x1b, 0x00, ...enc14(eid), ...enc14(pid), 0, 0, 0, 0, 0, 0, 0, 0, 0];
-      let cs = 0;
-      for (const b of f) cs ^= b;
-      f.push(cs & 0x7f, 0xf7);
-      return f;
-    };
+    const build = (pid: number): number[] => buildGetRawParamValue(eid, pid, this.#prof.model); // codec raw-value GET (sub 0x1B)
     const read = async (pid: number): Promise<number | null> => {
       const match = (f: number[]) =>
         f[5] === 0x01 && f[6] === 0x1b && f[7] === 0x00 && (f[8]! | (f[9]! << 7)) === eid && (f[10]! | (f[11]! << 7)) === pid;
@@ -833,11 +1369,7 @@ class Gen3Driver implements DeviceDriver {
    *  (only non-zero pids), first channel. The client computes pids from the FC/Modifier model. */
   async rawBlock(eid: number): Promise<{ eid: number; values: Record<number, number> }> {
     const dev = await this.#conn();
-    const frames = await dev.request(this.#codec.buildBlockBulkReadPoll(eid), {
-      timeoutMs: 2500,
-      quietMs: 120,
-      match: (fs) => fs.some((f) => f[5] === 0x76)
-    });
+    const frames = await this.#bulkRead(dev, eid, 2500, 120);
     const bulk = this.#codec.assembleGen3BlockBulkRead(frames);
     const values: Record<number, number> = {};
     bulk.values.forEach((v, i) => {
@@ -875,7 +1407,7 @@ class Gen3Driver implements DeviceDriver {
     let base = 0;
     try {
       const dev = await this.#conn();
-      const frames = await dev.request(this.#codec.buildBlockBulkReadPoll(eid), { timeoutMs: 2500, quietMs: 120, match: (fs) => fs.some((f) => f[5] === 0x76) });
+      const frames = await this.#bulkRead(dev, eid, 2500, 120);
       const bulk = this.#codec.assembleGen3BlockBulkRead(frames);
       values = bulk.values;
       const activeCh = (await this.#statusByEffectId()).get(eid)?.channel ?? 0;
@@ -928,11 +1460,13 @@ class Gen3Driver implements DeviceDriver {
       const family = slug ? SLUG_FAMILY[slug] : undefined;
       if (!slug || !family) continue;
       const defs = this.#prof.params[family] ?? [];
+      // A knob in blockParams()'s sense (isKnobParam), narrowed to the meter-worthy ones: not a 0..1
+      // flag-like range and a human label rather than a raw symbol.
       const knobs = defs.filter((p) => {
         const r = this.#prof.ranges[family]?.[p.paramId];
-        if (r?.kind !== 'float' || r.displayMin === r.displayMax || (r.displayMin === 0 && r.displayMax === 1)) return false;
+        if (!isKnobParam(this.#prof, family, p) || (r?.displayMin === 0 && r.displayMax === 1)) return false;
         const label = p.displayLabel ?? p.name;
-        return KNOB_UNITS.has(p.unit ?? '') && !/bypass/i.test(label) && !/_/.test(label) && !/^[A-Z][A-Z0-9+]*$/.test(label);
+        return !/_/.test(label) && !/^[A-Z][A-Z0-9+]*$/.test(label);
       });
       const primary = knobs.find((p) => /level|mix|master|volume|gain|drive/i.test(p.displayLabel ?? p.name)) ?? knobs[0];
       if (!primary) continue;
@@ -940,7 +1474,7 @@ class Gen3Driver implements DeviceDriver {
       const vals: Record<number, MeterVal> = {};
       let typeName = '';
       try {
-        const frames = await dev.request(this.#codec.buildBlockBulkReadPoll(c.effectId), { timeoutMs: 2000, quietMs: 100, match: (fs) => fs.some((f) => f[5] === 0x76) });
+        const frames = await this.#bulkRead(dev, c.effectId, 2000, 100);
         const bulk = this.#codec.assembleGen3BlockBulkRead(frames);
         const activeCh = status.get(c.effectId)?.channel ?? 0;
         const { base } = this.#channelSlice(family, bulk, activeCh);
@@ -997,7 +1531,7 @@ class Gen3Driver implements DeviceDriver {
       for (const def of defs) {
         try {
           const frames = await dev.request(buildBlockMonitorPoll(eid, def.pid, model), {
-            timeoutMs: 800, quietMs: 40,
+            timeoutMs: 800, quietMs: 40, routine: true,
             match: (fs) => fs.some((f) => isBlockMonitorResponse(f, eid, def.pid))
           });
           const r = frames.find((f) => isBlockMonitorResponse(f, eid, def.pid));
@@ -1036,13 +1570,13 @@ class Gen3Driver implements DeviceDriver {
     let position: number | null = null;
     let level: number | null = null;
     try {
-      const wf = await dev.request(buildLooperWaveformPoll(eid, model), { timeoutMs: 900, quietMs: 60, match: (fs) => fs.some((f) => isLooperWaveformResponse(f, eid)) });
+      const wf = await dev.request(buildLooperWaveformPoll(eid, model), { timeoutMs: 900, quietMs: 60, routine: true, match: (fs) => fs.some((f) => isLooperWaveformResponse(f, eid)) });
       const r = wf.find((f) => isLooperWaveformResponse(f, eid));
       if (r) wave = parseLooperWaveform(r);
     } catch { /* no waveform this tick */ }
     for (const [pid, isPos] of [[14, true], [22, false]] as const) {
       try {
-        const fr = await dev.request(buildBlockMonitorPoll(eid, pid, model), { timeoutMs: 500, quietMs: 40, match: (fs) => fs.some((f) => isBlockMonitorResponse(f, eid, pid)) });
+        const fr = await dev.request(buildBlockMonitorPoll(eid, pid, model), { timeoutMs: 500, quietMs: 40, routine: true, match: (fs) => fs.some((f) => isBlockMonitorResponse(f, eid, pid)) });
         const rr = fr.find((f) => isBlockMonitorResponse(f, eid, pid));
         if (rr) { const v = parseBlockMonitorNorm(rr); if (isPos) position = v; else level = v; }
       } catch { /* skip */ }
@@ -1082,7 +1616,7 @@ class Gen3Driver implements DeviceDriver {
 
   /** Map a raw 0..65534 wire value to {value, norm, unit, min, max, log} via the device-true FM3 range.
    * Taper: a device-true explicit `range.taper` ('log'→log10; 'linear'|'flat'|'custom'→linear) wins;
-   * absent it falls back to the typecode heuristic (middle nibble 4/5 = log10, e.g. freq cuts, else linear). */
+   * absent it falls back to the typecode heuristic (middle nibble 4 = log10, e.g. freq cuts; every other nibble linear). */
   #display(family: string | undefined, paramId: number, raw: number): { value: number; norm: number; unit?: string; min?: number; max?: number; log?: boolean } {
     const norm = clamp01(raw / 65534);
     const range = family ? this.#prof.ranges[family]?.[paramId] : undefined;
@@ -1093,7 +1627,11 @@ class Gen3Driver implements DeviceDriver {
         // 'custom' taper's `taperPoints` are NOT applied on the wire yet, so custom is served linear
         // for now (the Axis side documents the same). A log sweep still requires a positive range —
         // wireToDisplay throws on log10 with displayMin<=0 — the same guard the nibble heuristic uses.
-        // When NO explicit taper is present, fall back to the unchanged typecode-nibble heuristic.
+        // When NO explicit taper is present, fall back to the typecode-nibble heuristic: only nibble 4
+        // marks a log taper, every other nibble is linear. Nibble 5 used to count as log too, but the
+        // explicit tapers in the FM9 and Axe-Fx III catalogs have it linear every time (7 and 17 params,
+        // none log), while nibble 4 is log for all but a few. The FM3 catalog carries no explicit tapers,
+        // so for the FM3 the rule is carried over from those two devices, not measured on it.
         // `range.taper` reads device-true from a static-catalog row today, and reads the same field once
         // walk-built RangeDefs carry it (parallel WP) — no rework needed here either way.
         let log: boolean;
@@ -1101,7 +1639,7 @@ class Gen3Driver implements DeviceDriver {
           log = range.taper === 'log' && range.displayMin > 0;
         } else {
           const taperNib = (range.typecode >> 4) & 0xf;
-          log = (taperNib === 4 || taperNib === 5) && range.displayMin > 0;
+          log = taperNib === 4 && range.displayMin > 0;
         }
         const v = wireToDisplay(raw, { displayMin: range.displayMin, displayMax: range.displayMax, displayScale: log ? 'log10' : 'linear' });
         // Prefer the DEVICE-TRUE unit captured by the live-walk (RangeDef.unit, view 0x00)
@@ -1157,7 +1695,7 @@ class Gen3Driver implements DeviceDriver {
     const dev = await this.#conn();
     let frames: number[][];
     try {
-      frames = await dev.request(this.#codec.buildBlockBulkReadPoll(eid), { timeoutMs: dev.slow ? 4000 : 1500, quietMs: dev.slow ? 300 : 100, match: (fs) => fs.some((f) => f[5] === 0x76) });
+      frames = await this.#bulkRead(dev, eid, dev.slow ? 4000 : 1500, dev.slow ? 300 : 100, true); // edit-watch tick: routine poll
     } catch { return { changed: false }; } // no reply / timeout — keep last baseline
     const res = this.decodeEditBurst(frames);
     if (res.reload) return { changed: true }; // first sight of this block → let the registry emit a reload
@@ -1170,12 +1708,13 @@ class Gen3Driver implements DeviceDriver {
     try { bulk = this.#codec.assembleGen3BlockBulkRead(frames); } catch { return { events: [], reload: false }; }
     const eid = bulk.blockId;
     if (bulk.values.length === 0) return { events: [], reload: false }; // head-only / empty — nothing to read
-    const family = SLUG_FAMILY[(slugForEffectId(eid) ?? '').toLowerCase()] ?? this.#prof.familyForEffectId(eid);
+    const audioFamily = SLUG_FAMILY[(slugForEffectId(eid) ?? '').toLowerCase()];
+    const family = audioFamily ?? this.#prof.familyForEffectId(eid);
     const defs = family ? (this.#prof.params[family] ?? []) : [];
     if (!family || defs.length === 0) return { events: [], reload: false }; // no param family mapped
     // Slice the block's ACTIVE channel (the one blockParams surfaced) — the body is channel-blocked, so
     // diffing against channel A while the user has B-D open would flag every A/B-different param as "moved".
-    const { stride, base } = this.#channelSlice(family, bulk, eid === this.#watchedEid ? this.#watchedChannel : 0);
+    const { stride, base } = this.#channelSlice(family, bulk, eid === this.#watchedEid ? this.#watchedChannel : 0, !!audioFamily);
     const cur = bulk.values.slice(base, base + stride);
     const prev = this.#editSnapshot.get(eid);
     this.#editSnapshot.set(eid, cur);
@@ -1277,7 +1816,8 @@ class Gen3Driver implements DeviceDriver {
   /** Current scene index (0-based). Parsed via the bound codec's 0x0C payload parser. */
   async getScene(): Promise<{ index: number }> {
     const dev = await this.#conn();
-    const frames = await dev.request(this.#codec.buildGetScene(), { timeoutMs: 1200, match: (fs) => fs.some((f) => f[5] === 0x0c) });
+    // fn-only matcher: the scene reply carries nothing that ties it to one request (polled by the scene watch)
+    const frames = await dev.request(this.#codec.buildGetScene(), { timeoutMs: 1200, routine: true, match: (fs) => fs.some((f) => f[5] === 0x0c) });
     const f = frames.find((x) => x[5] === 0x0c);
     if (!f) return { index: -1 }; // FAILED read (racy/late on a busy link) — sentinel so the scene watch
     //                               and UI skip it, instead of fabricating scene 1 (caused a 2↔1 badge flicker)
@@ -1341,21 +1881,112 @@ class Gen3Driver implements DeviceDriver {
     this.#emit({ type: 'changed', scope: 'grid' });
     return r;
   }
-  async selectPreset(n: number) {
+  async selectPreset(n: number, opts?: SelectPresetOpts) {
     this.#gridCache = null;
     const r = await this.#write(this.#codec.buildSwitchPresetSysEx(n));
-    this.#emit({ type: 'changed', scope: 'preset' });
+    if (r.ok) this.#session(await this.#conn()).currentSlot = n; // the edit buffer now holds slot n
+    else if (this.#sessionState) this.#sessionState.currentSlot = null; // refused: no longer sure
+    if (!opts?.silent) this.#emit({ type: 'changed', scope: 'preset' });
     return r;
   }
   /** Reload the CURRENT preset from flash by re-selecting it — the FULL-mode self-describe walk's
    *  non-destructive per-block safety net. Reuses presetRef() (current number) + selectPreset() (the
    *  wire builder), so no new preset-switch bytes are minted here. No-op when no preset is resolvable. */
-  async reloadPreset(): Promise<void> {
+  async reloadPreset(opts?: SelectPresetOpts): Promise<void> {
     const { number } = await this.presetRef();
-    if (number >= 0) await this.selectPreset(number);
+    if (number >= 0) await this.selectPreset(number, opts);
   }
-  async store(n: number) {
-    return this.#write(this.#codec.buildStorePreset(n));
+  /** The store-ack evidence in force right now: an injected level wins, else the model's table entry narrowed
+   *  to this link (`slow`) and the firmware the registry read at detect time (see `resolveStoreAck`). */
+  storeAckFor(slow: boolean): StoreAckEvidence {
+    return this.storeAckOverride ?? resolveStoreAck(this.storeAckScope, { slow, firmware: this.#ctx.getFirmware?.() ?? null });
+  }
+  /**
+   * Persist the working buffer to preset slot `n`.
+   *
+   * The device acknowledges a store by repeating the request's envelope (fn 0x01, sub 0x26) — on our own
+   * FM3 about 0.8–0.9 s after the request on fw 12.0 and about 1.25–1.35 s on fw 13.0, while the generic
+   * `#write` window is only 120 ms. So the old call could never see its own ack: it returned
+   * `{ok:true}` by ABSENCE of a refusal, and any foreign `0x64` that happened to land in that window (a
+   * refused read while the meter poll was running, say) was misread as the device rejecting the save.
+   * Wait for the acknowledgement instead.
+   *
+   * Result contract (HTTP 200 on every outcome; the body says which). The evidence level in force on this
+   * link and firmware (`storeAckFor`, see STORE_ACK_EVIDENCE) decides what a MISSING ack means. `reason`
+   * (additive) tells a refusal from an unknown outcome without parsing text: 'rejected' = a fn-0x01 refusal
+   * (0x64) was seen in the store window and no ack followed; 'no-ack' = nothing acknowledged the store in
+   * time. It is set on every `ok:false` and on the lenient no-ack warning, and absent on an acknowledged
+   * store.
+   *  • ack seen          → `{ok:true, acked:true, location}` — the device's own reply, even if a stray
+   *                         0x64 from another exchange landed in the same window;
+   *  • 0x64, no ack      → `{ok:false, acked:false, reason:'rejected', location, error}` — a real refusal
+   *                         (the error carries the device's result code), whatever the evidence level;
+   *  • neither in time   → 'verified': `{ok:false, acked:false, reason:'no-ack', location, error}` (the
+   *                         outcome is unknown — the slot may or may not have been written); 'unknown':
+   *                         `{ok:true, acked:false, reason:'no-ack', location, warning}` — the store was
+   *                         SENT but could not be confirmed, which is all a model without a proven ack (or
+   *                         a link / firmware outside what was measured) can honestly say.
+   *
+   * The wait ends only on the ack or the hard cap: `quietMs` is set to the cap so a gap of silence after
+   * some unrelated early frame can't end it before the (late) ack, and a 0x64 does not end it early either
+   * (a refusal costs the full cap, which is rare and keeps a foreign 0x64 from faking one).
+   */
+  async store(n: number): Promise<{ ok: boolean; acked: boolean; reason?: StoreReason; location: number; error?: string; warning?: string }> {
+    const dev = await this.#conn();
+    const bytes = this.#codec.buildStorePreset(n);
+    const model = bytes[4]!;
+    const fn = bytes[5];
+    // The ack repeats the request's envelope up to and including the sub-action: Fractal header, model
+    // byte, fn 0x01, sub 0x26. A frame BYTE-IDENTICAL to the request is our own request coming back (MIDI
+    // thru / loopback), not the device's answer — it is not an ack. (On our own FM3 the real ack differs
+    // from the request on fw 12.0 and 13.0; for the other models that is still an assumption — if a unit's
+    // ack ever turns out byte-identical, revisit this.)
+    const sameAsRequest = (f: number[]) => f.length === bytes.length && f.every((b, i) => b === bytes[i]);
+    // The ack carries no slot (nothing after the sub-action identifies which preset it answers), so a late
+    // ack from an EARLIER store cannot be told apart from this one's.
+    const isAck = (f: number[]) => f.length > 7 && f[0] === 0xf0 && [1, 2, 3, 4, 5, 6].every((i) => f[i] === bytes[i]) && !sameAsRequest(f);
+    // A refusal is a 0x64 MULTIPURPOSE_RESPONSE echoing fn 0x01. Its body carries no sub-action, so ANY fn-0x01
+    // refusal seen in the store window counts: a late refusal of a preceding fn-0x01 write can be attributed
+    // to this store. That is what `reason:'rejected'` means — a fn-0x01 refusal was seen and no ack followed.
+    const isReject = (f: number[]) => isMultipurposeResponse(f, model) && f[6] === fn;
+    const evidence = this.storeAckFor(dev.slow);
+    const caps = STORE_ACK_TIMEOUT_MS[evidence];
+    const timeoutMs = dev.slow ? caps.slow : caps.fast;
+    const unconfirmed = (why: string) => evidence === 'verified'
+      ? {
+          ok: false,
+          acked: false,
+          reason: 'no-ack' as const,
+          location: n,
+          error: `${why} — the device did not acknowledge the store within ${timeoutMs} ms, so the preset may or may not have been written to slot ${n}`
+        }
+      : {
+          ok: true,
+          acked: false,
+          reason: 'no-ack' as const,
+          location: n,
+          warning: `${why} — no store acknowledgement from the device within ${timeoutMs} ms; the store to slot ${n} was sent but is unconfirmed (acknowledgement not verified for this model, link and firmware)`
+        };
+    let frames: number[][];
+    try {
+      frames = await dev.request(bytes, { timeoutMs, quietMs: timeoutMs, match: (fs) => fs.some(isAck) });
+    } catch (e) {
+      // The browser-direct transports REJECT a no-frame request timeout (the Node transports resolve []):
+      // same outcome as silence. Typed (`code`), never matched on message text — see transport/types.ts.
+      if (isTransportTimeout(e)) return unconfirmed('no reply');
+      throw e;
+    }
+    if (frames.some(isAck)) return { ok: true, acked: true, location: n };
+    const reject = frames.find(isReject);
+    if (reject) {
+      let detail = '';
+      try {
+        const code = parseMultipurposeResponse(reject, model).resultCode;
+        detail = ` (result 0x${code.toString(16).padStart(2, '0')}${describeMultipurposeResultCode(code) ? `: ${describeMultipurposeResultCode(code)}` : ''})`;
+      } catch { /* malformed 0x64 — keep the bare message */ }
+      return { ok: false, acked: false, reason: 'rejected', location: n, error: `store to slot ${n} rejected by the device${detail}` };
+    }
+    return unconfirmed('no acknowledgement');
   }
 
   /** Load a raw preset dump (.syx bytes) straight into the device's EDIT BUFFER — no slot is touched
@@ -1366,10 +1997,14 @@ class Gen3Driver implements DeviceDriver {
    *  7-bit pair. A dump captured from slot N still names N — re-sending it verbatim makes the unit
    *  treat it as a store-to-N, NOT a load. Retargeting the header to 0x3FFF (`7F 7F`, the
    *  edit-buffer sentinel) is exactly what FM3-Edit's "Audition" does: the preset goes live in the
-   *  edit buffer, no slot is written. We patch that field and fix the frame checksum in place. */
+   *  edit buffer, no slot is written. We patch that field and fix the frame checksum in place.
+   *
+   *  Only ONE well-formed preset dump for THIS model goes out: anything else (other frames around it,
+   *  a bank, another model's dump, 8-bit bytes) throws a 400 SendRejectedError before the transport
+   *  is touched (sendPolicy.ts). */
   async loadPresetBytes(syx: Uint8Array): Promise<{ ok: boolean }> {
+    const bytes = validatedPresetDump(syx, this.#prof.model);
     const dev = await this.#conn();
-    const bytes = Array.from(syx);
     retargetPresetDumpToEditBuffer(bytes);
     if (dev.sendPaced) await dev.sendPaced(bytes);
     else await dev.sendQueued(bytes);
@@ -1382,7 +2017,7 @@ function clamp01(v: number) { return Math.max(0, Math.min(1, v)); }
 function round3(v: number) { return Math.round(v * 1000) / 1000; }
 
 /** Create a gen-3 driver bound to one device profile (Axe-Fx III / FM3 / FM9). */
-export function createGen3Driver(profile: DeviceProfile, ctx: DriverCtx): Gen3Driver {
-  return new Gen3Driver(profile, ctx);
+export function createGen3Driver(profile: DeviceProfile, ctx: DriverCtx, opts?: { storeAck?: StoreAckEvidence }): Gen3Driver {
+  return new Gen3Driver(profile, ctx, opts);
 }
 export type { Gen3Driver };
