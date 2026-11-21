@@ -7,15 +7,18 @@
 // FLOAT_ROW_SELECTOR_NAME in gen3.ts) so that no other param changes category.
 //
 // The suite pins:
-//   • the admission rule on a synthetic family (unit, class name, float row, integral span == label count,
-//     one entry per wire paramId, type and bypass exclusions, enum-kind rows untouched);
+//   • the admission rule on a synthetic family (unit, class name, float row spanning exactly 0..1 with exactly
+//     2 labels - the discrete write is only proven for a 0..1 toggle, so a 0..2 row with 3 labels is NOT
+//     admitted - one entry per wire paramId, type and bypass exclusions, enum-kind rows untouched);
 //   • per device (FM3 / FM9 / Axe-Fx III), against the pre-change enum rule restated independently here:
 //     the enum list differs from it by exactly the III's 13 global-mix toggles (none on FM3 / FM9), no
 //     enum is a knob, the numeric global-mix rows (no label list) are still knobs, and the labelled
 //     float rows that were never shown (KILLDRY, IR processing, CABINET_ZOOM ...) are still hidden;
 //   • end to end through blockParams() on the shipped III profile: the toggle is served as an enum with the
-//     device's OFF / ON labels (not as a knob), reads 0 / 1 and a 16-bit-scaled 65534 as ON, and its write
-//     is the discrete SET (sub 09 00, float32(ordinal)) the codec builds for a labelled param.
+//     device's OFF / ON labels (not as a knob), reads raw 0 / 1 / 32766 as OFF and 32768 / 65534 as ON, and its write
+//     is the discrete SET (sub 09 00, float32(ordinal)) the codec builds for a labelled param. The read
+//     always scales the normalized float-row value (raw/65534) onto the label range, so raw 1 (~0.0) is OFF;
+//     an enum-kind row keeps its ordinal-or-scaled read.
 // Mocked transport, no hardware.
 import { createGen3Driver, enumParams, knobParams } from '../../src/drivers/gen3.js';
 import { cadenceFor } from '../../src/drivers/telemetryProfiles.js';
@@ -86,7 +89,8 @@ function driverWith(profile: DeviceProfile, slug: string, raw: Record<number, nu
 type Rng = { kind: 'float' | 'enum'; displayMin: number; displayMax: number; typecode: number; step?: number };
 const rng = (kind: 'float' | 'enum', lo = 0, hi = 1): Rng => ({ kind, displayMin: lo, displayMax: hi, typecode: 0 });
 
-/** One family 'TEST' of single-rule params. Labels: pid 0..3, 9 and 10 carry a 2-entry OFF/ON list. */
+/** One family 'TEST' of single-rule params. Labels: pid 0..3, 5, 6, 9..12 and 14 carry a 2-entry OFF/ON
+ *  list, pid 13 a 3-entry one. */
 function synth(): DeviceProfile {
   return {
     model: AXE3, key: 'axe3', name: 'Axe3-float-row-test', rows: 6, cols: 14,
@@ -107,19 +111,24 @@ function synth(): DeviceProfile {
         { paramId: 10, name: 'TEST_TYPE_GLOBALMIX', unit: 'enum' }, // the family type selector id: excluded
         { paramId: 11, name: 'TEST_BYPASS_GLOBALMIX', unit: 'enum', displayLabel: 'Bypass' }, // the bypass flag: excluded
         { paramId: 12, name: 'TEST_NOROW_GLOBALMIX', unit: 'enum' }, // no range row at all
+        { paramId: 13, name: 'TEST_WIDE_GLOBALMIX', unit: 'enum' }, // 0..2 with 3 labels: an exact cover, but not 0..1
+        { paramId: 14, name: 'TEST_OFFSET_GLOBALMIX', unit: 'enum' }, // 1..2 with 2 labels: not a 0..1 row
       ],
     },
     ranges: {
       TEST: {
         0: rng('float', 0, 1), 1: rng('float', 0, 1), 2: rng('float', 0, 1), 3: rng('float', 0, 2), 4: rng('float', 0, 1),
         5: rng('float', 0, 1.5), 6: rng('float', 0, 0), 7: rng('enum', 0, 3), 8: rng('enum', 0, 0), 9: rng('float', 0, 1),
-        10: rng('float', 0, 1), 11: rng('float', 0, 1),
+        10: rng('float', 0, 1), 11: rng('float', 0, 1), 13: rng('float', 0, 2), 14: rng('float', 1, 2),
       },
     },
     rangeSections: {},
     rosterFor: () => [],
-    enumLabelsFor: (family: string, paramId: number) =>
-      family === 'TEST' && [0, 1, 2, 3, 5, 6, 9, 10, 11, 12].includes(paramId) ? ['OFF', 'ON'] : undefined,
+    enumLabelsFor: (family: string, paramId: number) => {
+      if (family !== 'TEST') return undefined;
+      if (paramId === 13) return ['OFF', 'MID', 'ON'];
+      return [0, 1, 2, 3, 5, 6, 9, 10, 11, 12, 14].includes(paramId) ? ['OFF', 'ON'] : undefined;
+    },
     cabIrs: () => ({}),
     familyForEffectId: () => undefined,
     layoutFor: () => undefined,
@@ -158,7 +167,17 @@ export async function runFloatRowSelectorsTests(): Promise<void> {
     'TEST_PERCENT_GLOBALMIX',
     'the class name on a continuous unit stays a knob, not an enum',
   );
-  console.log('  drivers/float-row-selectors: admission rule (enum unit, class name, float row, label list == integral span, one per wire id, type/bypass out, enum rows as before)');
+  // The write path (continuous:false -> float32(ordinal), sub 09 00) is only proven for 0..1: a wider or
+  // shifted row is not admitted even when its label list covers the span exactly.
+  for (const name of ['TEST_WIDE_GLOBALMIX', 'TEST_OFFSET_GLOBALMIX', 'TEST_BADCOUNT_GLOBALMIX']) {
+    assert(!enumParams(prof, 'TEST').some((p) => p.name === name), `${name} (not exactly 0..1 with 2 labels) is not admitted`);
+  }
+  assertEqual(
+    prof.enumLabelsFor('TEST', 13)!.length,
+    prof.ranges['TEST']![13]!.displayMax - prof.ranges['TEST']![13]!.displayMin + 1,
+    'the 0..2 row carries a label list that exactly covers its span (the guard, not the cover check, rejects it)',
+  );
+  console.log('  drivers/float-row-selectors: admission rule (enum unit, class name, float row exactly 0..1 with exactly 2 labels, one per wire id, type/bypass out, enum rows as before)');
 
   // ---- Cases 2-5: per device, against the shipped catalogs -------------------------------------
   const iii = profileForModel(AXE3);
@@ -224,7 +243,10 @@ export async function runFloatRowSelectorsTests(): Promise<void> {
   // ---- Case 5: end to end on the III, REVERB_GLOBALMIX: enum with OFF / ON, not a knob ----------
   const reverbToggle = iii.params['REVERB']!.find((p) => p.name === 'REVERB_GLOBALMIX')!;
   const pid = reverbToggle.paramId;
-  for (const [raw, want] of [[0, 0], [1, 1], [65534, 1], [20000, 0], [40000, 1]] as const) {
+  // The row is a FLOAT row: the bulk value is always the normalized raw/65534, never an ordinal. So raw 1
+  // (~0.0) is OFF, and the midpoint raw 32767 (exactly 0.5) rounds half-up to ON (Math.round); either side
+  // of it (32766 / 32768) falls to OFF / ON.
+  for (const [raw, want] of [[0, 0], [1, 0], [20000, 0], [32766, 0], [32767, 1], [32768, 1], [40000, 1], [65534, 1]] as const) {
     const { driver } = driverWith(iii, 'reverb', { [pid]: raw });
     const served = await driver.blockParams(eidOf('reverb'));
     const e = served.enums.find((x) => x.id === pid);
@@ -233,12 +255,20 @@ export async function runFloatRowSelectorsTests(): Promise<void> {
     assertEqual(JSON.stringify(e!.options), JSON.stringify([{ value: 0, label: 'OFF' }, { value: 1, label: 'ON' }]), 'options carry the device OFF / ON labels');
     assert(!served.named.some((n) => n.id === pid), 'REVERB_GLOBALMIX is not served as a knob');
   }
+  // An enum-KIND row (REVERB_LOWSLOPE, 0..1) keeps its ordinal-or-scaled read: raw 1 is the ordinal 1.
+  const lowSlope = iii.params['REVERB']!.find((p) => p.name === 'REVERB_LOWSLOPE')!;
+  assertEqual(iii.ranges['REVERB']![lowSlope.paramId]!.kind, 'enum', 'REVERB_LOWSLOPE is an enum-kind row (the check is not vacuous)');
+  for (const [raw, want] of [[0, 0], [1, 1], [65534, 1]] as const) {
+    const { driver } = driverWith(iii, 'reverb', { [lowSlope.paramId]: raw });
+    const served = await driver.blockParams(eidOf('reverb'));
+    assertEqual(served.enums.find((x) => x.id === lowSlope.paramId)!.value, want, `enum-kind REVERB_LOWSLOPE raw ${raw} reads as ordinal ${want} (unchanged)`);
+  }
   {
     const { driver } = driverWith(iii, 'flanger', {});
     const served = await driver.blockParams(eidOf('flanger'));
     assertEqual(served.enums.filter((x) => x.id === 15 && /GLOBALMIX/i.test(x.name)).length, 1, 'the FLANGER toggle is served once');
   }
-  console.log('  drivers/float-row-selectors: blockParams() serves REVERB_GLOBALMIX as an OFF/ON enum (0 / 1 / 16-bit-scaled values), not a knob');
+  console.log('  drivers/float-row-selectors: blockParams() serves REVERB_GLOBALMIX as an OFF/ON enum (float-row read: always raw/65534-scaled; enum-kind rows unchanged), not a knob');
 
   // ---- Case 6: the write is the discrete SET the codec builds for a labelled param ---------------
   {

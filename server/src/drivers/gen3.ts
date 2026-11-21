@@ -432,16 +432,16 @@ export function knobParams(profile: DeviceProfile, family: string): FamilyParam[
 const FLOAT_ROW_SELECTOR_NAME = /_GLOBALMIX$/;
 
 /** Is this catalog param a float-row selector (see FLOAT_ROW_SELECTOR_NAME): the 'enum' unit, a named
- *  class member, and a device label list that covers the row's integral span exactly (0..1 -> 2 labels).
+ *  class member, a float row spanning exactly 0..1 and a device label list of exactly 2 entries (OFF / ON).
  *  The writes are the existing discrete path: float32(ordinal), which is also how the codec routes a
- *  param that carries a label list. */
+ *  param that carries a label list; that path is only proven for a 0..1 toggle, so a wider row (0..2 with
+ *  3 labels, ...) is deliberately not admitted. */
 function isFloatRowSelector(profile: DeviceProfile, family: string, p: FamilyParam): boolean {
   if (p.unit !== 'enum' || !FLOAT_ROW_SELECTOR_NAME.test(p.name)) return false;
   const range = profile.ranges[family]?.[p.paramId];
   if (range?.kind !== 'float') return false;
-  if (!Number.isInteger(range.displayMin) || !Number.isInteger(range.displayMax) || range.displayMax <= range.displayMin) return false;
-  const labels = profile.enumLabelsFor(family, p.paramId);
-  return !!labels?.length && labels.length === range.displayMax - range.displayMin + 1;
+  if (range.displayMin !== 0 || range.displayMax !== 1) return false;
+  return profile.enumLabelsFor(family, p.paramId)?.length === 2;
 }
 
 /** The family's enum (selector) params for the block editor: every param whose device range row is an
@@ -1110,8 +1110,15 @@ class Gen3Driver implements DeviceDriver {
           const max = Math.round(range.displayMax);
           const min = Math.round(range.displayMin);
           const raw = bulk.values[base + p.paramId] ?? 0;
-          // discrete params store the ordinal; if the wire value looks 16-bit-scaled, unscale it
-          const value = raw > max ? Math.round((raw / 65534) * (max - min)) + min : raw;
+          // An enum-KIND row stores the ordinal; if the wire value looks 16-bit-scaled, unscale it. A FLOAT
+          // row (the float-row selectors admitted by enumParams) always carries the normalized raw/65534
+          // value, so it is always scaled onto the label range: guessing "ordinal or scaled" there would
+          // read raw 1 (~0.0) as ON. Midpoint: raw 32767 (exactly 0.5) rounds up, like Math.round does
+          // for the rest of the decode.
+          const value =
+            range.kind === 'float'
+              ? Math.min(max, Math.max(min, Math.round((raw / 65534) * (max - min)) + min))
+              : raw > max ? Math.round((raw / 65534) * (max - min)) + min : raw;
           enums.push({ id: p.paramId, name: paramLabel(p), value, options: this.#enumOptions(family, p.paramId, p.name, min, max) });
         }
         // current model/type (for EQ band layout etc.)
