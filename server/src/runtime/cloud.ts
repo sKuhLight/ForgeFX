@@ -165,46 +165,33 @@ export class Cloud {
   }
 
   // ── diagnostic capture upload (axis-cloud `diagnostic-captures`; private bucket, maintainer-read only) ──
-  /** Upload a gzip'd diagnostic-capture bundle under the signed-in user — the ONE place that knows the
-   *  cloud's upload transport:
-   *    1. POST `diagnostic-captures` with the small metadata JSON → a signed upload slot
-   *       (`{ captureId, uploadUrl, token, path, expiresIn }`), or `{ captureId, deduped: true }` when this
-   *       bundle id is already stored (done — nothing is uploaded again);
-   *    2. upload the gzip bytes straight to storage through that signed slot (`application/gzip`);
-   *    3. POST `diagnostic-captures/finalize` `{ captureId }` → `{ captureId, status: 'complete' }`.
-   *  Returns the HTTP outcome of the step that ended the flow (`code` 0 = network failure, `retryAfter` = a
-   *  Retry-After header), with `body.captureId` on success; `disabled` when cloud is off, 401 when nobody is
-   *  signed in. */
-  async diagnosticCaptureUpload(gz: Uint8Array, meta: { captureId: string; model: number; firmware: string | null; app: Record<string, string>; bytes: number }): Promise<{ code: number; body: unknown; retryAfter?: string | null; disabled?: boolean }> {
+  /** Upload a gzip'd diagnostic-capture bundle under the signed-in user: `runDiagnosticUpload` over this
+   *  client's session (edge-function calls with the user's token + the anon key, the storage upload through
+   *  supabase-js). `disabled` when cloud is off, 401 when nobody is signed in. */
+  async diagnosticCaptureUpload(gz: Uint8Array, meta: DiagnosticUploadMeta): Promise<DiagnosticUploadOutcome & { disabled?: boolean }> {
     if (!this.#enabled()) return { code: 503, body: { error: 'cloud-disabled' }, disabled: true };
     const c = this.#c();
     const { data: s } = await c.auth.getSession();
     const token = s.session?.access_token;
     if (!token) return { code: 401, body: { error: 'not signed in' } };
-    const fn = `${this.#cfg.url}/functions/v1/diagnostic-captures`;
-    const post = async (url: string, body: unknown) => {
-      const res = await fetch(url, {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${token}`, apikey: this.#cfg.anonKey, 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-        signal: AbortSignal.timeout(30000)
-      });
-      return { code: res.status, body: (await res.json().catch(() => ({}))) as Record<string, unknown>, retryAfter: res.headers.get('retry-after') };
-    };
-    try {
-      const slot = await post(fn, meta);
-      if (slot.code < 200 || slot.code >= 300) return slot;
-      if (slot.body.deduped === true) return { code: 200, body: { captureId: slot.body.captureId, deduped: true } };
-      const path = slot.body.path;
-      const uploadToken = slot.body.token;
-      if (typeof path !== 'string' || typeof uploadToken !== 'string') return { code: 502, body: { error: 'cloud', message: 'no upload slot in the answer' } };
-      const up = await withTimeout(c.storage.from('diagnostic-captures').uploadToSignedUrl(path, uploadToken, gz, { contentType: 'application/gzip' }), 120000, 'capture upload');
-      if (up.error) {
-        const status = Number((up.error as { statusCode?: unknown; status?: unknown }).statusCode ?? (up.error as { status?: unknown }).status);
-        return { code: Number.isFinite(status) && status > 0 ? status : 0, body: { error: 'storage', message: up.error.message } };
+    return runDiagnosticUpload({
+      post: async (fnPath, body) => {
+        const res = await fetch(`${this.#cfg.url}/functions/v1/${fnPath}`, {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${token}`, apikey: this.#cfg.anonKey, 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+          signal: AbortSignal.timeout(30000)
+        });
+        return { code: res.status, body: (await res.json().catch(() => ({}))) as Record<string, unknown>, retryAfter: res.headers.get('retry-after') };
+      },
+      upload: async (bucket, path, uploadToken, body) => {
+        const up = await withTimeout(c.storage.from(bucket).uploadToSignedUrl(path, uploadToken, body, { contentType: 'application/gzip' }), 120000, 'capture upload');
+        if (!up.error) return null;
+        const e = up.error as { message: string; statusCode?: unknown; status?: unknown };
+        const status = Number(e.statusCode ?? e.status);
+        return { status: Number.isFinite(status) && status > 0 ? status : 0, message: e.message };
       }
-      return await post(`${fn}/finalize`, { captureId: slot.body.captureId ?? meta.captureId });
-    } catch (e) { return { code: 0, body: { error: (e as Error).message } }; }
+    }, gz, meta);
   }
 
   /** For Axis Cloud Remote: the authed Supabase client + current user id (for the Realtime host channel),
@@ -389,6 +376,90 @@ export class Cloud {
     const versions = doPresets ? await this.syncVersions(sub.active) : { pushed: 0, pulled: 0, pruned: 0 };
     console.log('[cloud] sync: done');
     return { config, versions };
+  }
+}
+
+// ── diagnostic capture upload flow (axis-cloud `diagnostic-captures`) ──
+
+/** What the cloud stores next to an uploaded bundle (all derived from the bundle itself). */
+export interface DiagnosticUploadMeta {
+  /** The bundle id (path-safe). */
+  captureId: string;
+  model: number;
+  firmware: string | null;
+  app: { forgefx: string; codec: string; axis?: string };
+  state: string;
+  /** Exact size of the gzip body in bytes. */
+  bytes: number;
+}
+
+/** The HTTP outcome of the step that ended the flow: `code` 0 = network failure, `retryAfter` = a
+ *  Retry-After header; on success (`code` 200) `body` is `{ captureId: <cloud row id>, status, deduped? }`. */
+export interface DiagnosticUploadOutcome { code: number; body: unknown; retryAfter?: string | null }
+
+/** The wire the upload flow runs over (Cloud wires its session; tests fake it). */
+export interface DiagnosticUploadTransport {
+  /** POST a JSON body to an edge function (`diagnostic-captures`, `diagnostic-captures/finalize`). */
+  post(fnPath: string, body: unknown): Promise<{ code: number; body: Record<string, unknown>; retryAfter: string | null }>;
+  /** Put the gzip bytes into storage through a signed upload slot (create-only). Null = stored; otherwise
+   *  the storage error (`status` 0 = no HTTP answer). Throws on a network failure. */
+  upload(bucket: string, path: string, token: string, gz: Uint8Array): Promise<{ status: number; message: string } | null>;
+}
+
+const DIAGNOSTIC_BUCKET = 'diagnostic-captures';
+
+/**
+ * The three-step diagnostic upload:
+ *   1. reserve — POST `diagnostic-captures` with the metadata → the cloud row id (`captureId`, a UUID used
+ *      from here on) and a signed upload slot (`bucket`, `path`, `token`). A bundle id the cloud already knows
+ *      answers `deduped: true` with status 'complete' (done), 'pending' with a slot (upload again) or 'pending'
+ *      without one (the object is there: finalize only);
+ *   2. upload — the gzip bytes go straight to storage through the slot (`application/gzip`, create-only: an
+ *      object that already exists counts as stored); retried once after a network failure;
+ *   3. finalize — POST `diagnostic-captures/finalize` `{ captureId }`; a 409 `not-uploaded` re-runs upload +
+ *      finalize once.
+ */
+export async function runDiagnosticUpload(t: DiagnosticUploadTransport, gz: Uint8Array, meta: DiagnosticUploadMeta): Promise<DiagnosticUploadOutcome> {
+  const fail = (code: number, message: string): DiagnosticUploadOutcome => ({ code, body: { error: 'storage', message } });
+  /** Upload once, again after a network failure. Null = stored. */
+  const upload = async (bucket: string, path: string, token: string): Promise<DiagnosticUploadOutcome | null> => {
+    for (let attempt = 1; ; attempt++) {
+      try {
+        const err = await t.upload(bucket, path, token, gz);
+        if (!err) return null;
+        if (err.status === 409 || /already exists|duplicate/i.test(err.message)) return null; // create-only: already stored
+        if (err.status > 0 || attempt >= 2) return fail(err.status, err.message);
+      } catch (e) {
+        if (attempt >= 2) return fail(0, (e as Error).message);
+      }
+    }
+  };
+  try {
+    const reserve = await t.post('diagnostic-captures', {
+      captureId: meta.captureId, model: meta.model, firmware: meta.firmware, app: meta.app, state: meta.state, bytes: meta.bytes
+    });
+    if (reserve.code < 200 || reserve.code >= 300) return reserve;
+    const r = reserve.body;
+    const rowId = typeof r.captureId === 'string' ? r.captureId : null;
+    if (!rowId) return { code: 502, body: { error: 'cloud', message: 'the reservation carries no capture id' } };
+    const deduped = r.deduped === true ? { deduped: true } : {};
+    if (r.status === 'complete') return { code: 200, body: { captureId: rowId, status: 'complete', ...deduped } };
+    const bucket = typeof r.bucket === 'string' && r.bucket ? r.bucket : DIAGNOSTIC_BUCKET;
+    const slot = typeof r.path === 'string' && typeof r.token === 'string' ? { path: r.path, token: r.token } : null;
+    if (slot) {
+      const err = await upload(bucket, slot.path, slot.token);
+      if (err) return err;
+    }
+    let fin = await t.post('diagnostic-captures/finalize', { captureId: rowId });
+    if (fin.code === 409 && fin.body.error === 'not-uploaded' && slot) {
+      const err = await upload(bucket, slot.path, slot.token);
+      if (err) return err;
+      fin = await t.post('diagnostic-captures/finalize', { captureId: rowId });
+    }
+    if (fin.code < 200 || fin.code >= 300) return fin;
+    return { code: 200, body: { captureId: rowId, status: typeof fin.body.status === 'string' ? fin.body.status : 'complete', ...deduped } };
+  } catch (e) {
+    return { code: 0, body: { error: (e as Error).message } };
   }
 }
 

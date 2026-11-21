@@ -32,6 +32,7 @@ import { deviceCacheKey, diagnosticCaptureSupported, fullCaptureAllowedOnFirmwar
 import type { DeviceDriver, DiagnosticDump } from '../drivers/types.js';
 import { PROFILES } from '../devices.js';
 import { loadStoredProfile } from '../profileSchema.js';
+import type { DiagnosticUploadMeta } from '../runtime/cloud.js';
 import type { Store } from '../runtime/store.js';
 import { isTransportTimeout, type Transport } from '../transport/types.js';
 import {
@@ -263,26 +264,21 @@ export function captureResult(registry: DeviceRegistry): CaptureResult {
   return last ? { code: 200, body: last.bundle } : { code: 404, body: { error: 'no-result' } };
 }
 
-/** What the cloud stores next to an uploaded bundle (all derived from the bundle itself). */
-export interface DiagnosticUploadMeta {
-  captureId: string;
-  model: number;
-  firmware: string | null;
-  app: Record<string, string>;
-  /** Size of the gzip body in bytes. */
-  bytes: number;
-}
+export type { DiagnosticUploadMeta } from '../runtime/cloud.js';
 
 /** The slice of the cloud client the upload needs (structural, so tests fake it): ONE call that moves the
- *  gzip body to the cloud however the cloud wants it (runtime/cloud.ts). `code` is the final HTTP status,
- *  0 for a network failure, `body.captureId` on success; `disabled` = no cloud configured in this runtime. */
+ *  gzip body to the cloud however the cloud wants it (runtime/cloud.ts `runDiagnosticUpload`). `code` is the
+ *  final HTTP status, 0 for a network failure, `body.captureId` (the cloud's row id) on success;
+ *  `disabled` = no cloud configured in this runtime. */
 export interface DiagnosticCaptureCloud {
   diagnosticCaptureUpload(gz: Uint8Array, meta: DiagnosticUploadMeta): Promise<{ code: number; body: unknown; retryAfter?: string | null; disabled?: boolean }>;
 }
 
 /** POST /diagnostics/capture/upload — body `{ consent: true, axisVersion? }`: gzip the last bundle and hand it to
- *  the cloud client (axis-cloud `diagnostic-captures`) under the signed-in user. 200 `{ ok, captureId, bytes }`; 400 no
- *  consent; 404 no result; 413 too large; 401 not signed in; 429 rate limited; 503 no cloud; 502 cloud error. */
+ *  the cloud client (axis-cloud `diagnostic-captures`) under the signed-in user. 200 `{ ok, captureId (the cloud's
+ *  row id), bytes, deduped? }`; 400 no consent; 404 no result; 413 too large (here or in the cloud); 401
+ *  not signed in (`reason: 'account-required'` for an anonymous session); 429 rate limited / quota exceeded
+ *  (`retryAfterSeconds`); 503 no cloud; 502 any other cloud error. */
 export async function uploadCapture(
   registry: DeviceRegistry,
   cloud: DiagnosticCaptureCloud | null,
@@ -300,17 +296,19 @@ export async function uploadCapture(
   const gz = await (opts.gzip ?? gzipBytes)(new TextEncoder().encode(JSON.stringify(bundle)));
   const limit = opts.limitBytes ?? UPLOAD_LIMIT_BYTES;
   if (gz.length > limit) return { code: 413, body: { error: 'too-large', bytes: gz.length, limit } };
-  const app: Record<string, string> = { forgefx: bundle.app.forgefx, codec: bundle.app.codec, ...(bundle.app.axis ? { axis: bundle.app.axis } : {}) };
-  const r = await cloud.diagnosticCaptureUpload(gz, { captureId: bundle.id, model: bundle.device.model, firmware: bundle.device.firmware, app, bytes: gz.length });
+  const app = { forgefx: bundle.app.forgefx, codec: bundle.app.codec, ...(bundle.app.axis ? { axis: bundle.app.axis } : {}) };
+  const r = await cloud.diagnosticCaptureUpload(gz, { captureId: bundle.id, model: bundle.device.model, firmware: bundle.device.firmware, app, state: bundle.state, bytes: gz.length });
   const rb = (r.body && typeof r.body === 'object' ? r.body : {}) as Record<string, unknown>;
   if (r.disabled) return { code: 503, body: { error: 'cloud-disabled' } };
   if (r.code === 401) return { code: 401, body: { error: 'not-signed-in' } };
+  if (r.code === 403 && rb.error === 'account-required') return { code: 401, body: { error: 'not-signed-in', reason: 'account-required' } };
   if (r.code === 429) {
     const fromBody = typeof rb.retryAfterSeconds === 'number' ? rb.retryAfterSeconds : NaN;
-    const fromHeader = Number(r.retryAfter);
+    const fromHeader = Number(r.retryAfter ?? NaN);
     const retryAfterSeconds = Number.isFinite(fromBody) ? fromBody : Number.isFinite(fromHeader) ? fromHeader : null;
-    return { code: 429, body: { error: 'rate-limited', retryAfterSeconds } };
+    return { code: 429, body: { error: rb.error === 'quota-exceeded' ? 'quota-exceeded' : 'rate-limited', retryAfterSeconds } };
   }
+  if (r.code === 413) return { code: 413, body: { error: 'too-large', bytes: gz.length, limit: typeof rb.limit === 'number' ? rb.limit : limit, ...(typeof rb.stage === 'string' ? { stage: rb.stage } : {}) } };
   if (r.code >= 200 && r.code < 300 && typeof rb.captureId === 'string') {
     return { code: 200, body: { ok: true, captureId: rb.captureId, bytes: gz.length, ...(rb.deduped === true ? { deduped: true } : {}) } };
   }

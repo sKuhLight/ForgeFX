@@ -17,8 +17,9 @@ import { buildDefQuery, CACHE_SCHEMA, VIEW_DEFINITION, VIEW_ENUM_LABEL, VIEW_VAL
 import type { RequestOpts } from '../../src/transport/types.js';
 import { MockTransport, handshakeReply, isIdentifyBroadcast, assert, assertEqual, sleep } from '../helpers/mock.js';
 import { fakeCacheDoc, seedRecords } from './device-cache.test.js';
+import { runDiagnosticUpload, type DiagnosticUploadTransport } from '../../src/runtime/cloud.js';
 
-export const DIAGNOSTIC_CAPTURE_CASE_COUNT = 18;
+export const DIAGNOSTIC_CAPTURE_CASE_COUNT = 19;
 
 const FM3 = 0x11;
 const NAME = 'Secret Name';
@@ -591,6 +592,7 @@ async function upload(): Promise<void> {
   assertEqual(meta.firmware, '13.0', 'meta: firmware');
   assertEqual(meta.bytes, gz.length, 'meta: compressed size');
   assertEqual(meta.app.axis, '0.9.1-beta', 'meta: app versions incl. axis');
+  assertEqual(meta.state, 'done', 'meta: run state');
   assertEqual((diag.captureResult(registry).body as diag.CaptureBundle).app.axis, undefined, 'stored result not mutated');
   await diag.uploadCapture(registry, cloud, { consent: true, axisVersion: 'x'.repeat(40) });
   assertEqual((JSON.parse(gunzipSync(calls[1]!).toString('utf8')) as diag.CaptureBundle).app.axis, undefined, 'an invalid axisVersion is ignored');
@@ -612,6 +614,98 @@ async function upload(): Promise<void> {
   assertEqual((await diag.uploadCapture(registry, cloud, { consent: true })).code, 502, 'network failure → 502');
   answer = { code: 503, body: { error: 'cloud-disabled' }, disabled: true };
   assertEqual((await diag.uploadCapture(registry, cloud, { consent: true })).code, 503, 'disabled cloud client → 503');
+  answer = { code: 403, body: { error: 'account-required' } };
+  assertEqual(JSON.stringify((await diag.uploadCapture(registry, cloud, { consent: true })).body), JSON.stringify({ error: 'not-signed-in', reason: 'account-required' }), 'anonymous session → 401 account-required');
+  answer = { code: 429, body: { error: 'quota-exceeded', retryAfterSeconds: 3600 }, retryAfter: '3600' };
+  assertEqual(JSON.stringify((await diag.uploadCapture(registry, cloud, { consent: true })).body), JSON.stringify({ error: 'quota-exceeded', retryAfterSeconds: 3600 }), 'quota 429 kept apart');
+  answer = { code: 413, body: { error: 'too-large', stage: 'compressed', limit: 26214400 } };
+  const c413 = await diag.uploadCapture(registry, cloud, { consent: true });
+  assertEqual(c413.code, 413, 'cloud 413 → 413');
+  assertEqual((c413.body as { stage?: string }).stage, 'compressed', 'cloud 413 stage passed on');
+  answer = { code: 200, body: { captureId: 'row-1', status: 'complete', deduped: true } };
+  assertEqual(((await diag.uploadCapture(registry, cloud, { consent: true })).body as { deduped?: boolean }).deduped, true, 'deduped passed on');
+}
+
+// ── 15b. the cloud upload flow (reserve → storage upload → finalize) over a fake wire ──
+async function uploadFlow(): Promise<void> {
+  const gz = Uint8Array.from([0x1f, 0x8b, 1, 2, 3]);
+  const meta = { captureId: 'dc-20261121T000000Z-abcd', model: FM3, firmware: '13.0', app: { forgefx: '1', codec: '2' }, state: 'done', bytes: gz.length };
+  type Script = { reserve: { code: number; body: Record<string, unknown> }; uploads: Array<'ok' | 'net' | 'exists' | { status: number; message: string }>; finals: Array<{ code: number; body: Record<string, unknown> }> };
+  const rig = (sc: Script) => {
+    const log: string[] = [];
+    const posts: { path: string; body: unknown }[] = [];
+    const t: DiagnosticUploadTransport = {
+      post: async (path, body) => {
+        posts.push({ path, body });
+        log.push(path === 'diagnostic-captures' ? 'reserve' : 'finalize');
+        const a = path === 'diagnostic-captures' ? sc.reserve : (sc.finals.shift() ?? { code: 200, body: { status: 'complete' } });
+        return { ...a, retryAfter: a.code === 429 ? '60' : null };
+      },
+      upload: async (bucket, path, token, body) => {
+        log.push(`upload ${bucket}/${path}/${token}/${body.length}`);
+        const u = sc.uploads.shift() ?? 'ok';
+        if (u === 'net') throw new Error('fetch failed');
+        if (u === 'exists') return { status: 409, message: 'The resource already exists' };
+        return u === 'ok' ? null : u;
+      }
+    };
+    return { t, log, posts };
+  };
+  const slot = { captureId: 'uuid-1', status: 'pending', uploadUrl: 'https://x/upload', token: 'tok', path: 'u/dc.json.gz', bucket: 'diagnostic-captures', expiresIn: 7200 };
+  {
+    const r = rig({ reserve: { code: 200, body: slot }, uploads: ['ok'], finals: [{ code: 200, body: { captureId: 'uuid-1', status: 'complete' } }] });
+    const out = await runDiagnosticUpload(r.t, gz, meta);
+    assertEqual(out.code, 200, 'flow: 200');
+    assertEqual(JSON.stringify(out.body), JSON.stringify({ captureId: 'uuid-1', status: 'complete' }), 'flow: the cloud row id');
+    assertEqual(r.log.join(' | '), 'reserve | upload diagnostic-captures/u/dc.json.gz/tok/5 | finalize', 'flow: reserve → upload → finalize');
+    assertEqual(JSON.stringify(r.posts[0]!.body), JSON.stringify(meta), 'flow: reserve carries the metadata');
+    assertEqual(JSON.stringify(r.posts[1]!.body), JSON.stringify({ captureId: 'uuid-1' }), 'flow: finalize by row id');
+  }
+  {
+    const r = rig({ reserve: { code: 200, body: { captureId: 'uuid-2', status: 'complete', deduped: true } }, uploads: [], finals: [] });
+    const out = await runDiagnosticUpload(r.t, gz, meta);
+    assertEqual(r.log.join(' | '), 'reserve', 'deduped complete: nothing else');
+    assertEqual((out.body as { deduped?: boolean }).deduped, true, 'deduped flagged');
+  }
+  {
+    const r = rig({ reserve: { code: 200, body: { captureId: 'uuid-3', status: 'pending', deduped: true } }, uploads: [], finals: [] });
+    const out = await runDiagnosticUpload(r.t, gz, meta);
+    assertEqual(r.log.join(' | '), 'reserve | finalize', 'deduped pending without a slot: finalize only');
+    assertEqual(out.code, 200, 'finalized');
+  }
+  {
+    const r = rig({ reserve: { code: 200, body: slot }, uploads: ['net', 'ok'], finals: [] });
+    assertEqual((await runDiagnosticUpload(r.t, gz, meta)).code, 200, 'a network failure of the upload is retried once');
+    assertEqual(r.log.filter((x) => x.startsWith('upload')).length, 2, 'two upload attempts');
+  }
+  {
+    const r = rig({ reserve: { code: 200, body: slot }, uploads: ['net', 'net'], finals: [] });
+    const out = await runDiagnosticUpload(r.t, gz, meta);
+    assertEqual(out.code, 0, 'two network failures: give up (network)');
+    assert(!r.log.includes('finalize'), 'no finalize without an upload');
+  }
+  {
+    const r = rig({ reserve: { code: 200, body: slot }, uploads: ['ok', 'ok'], finals: [{ code: 409, body: { error: 'not-uploaded' } }, { code: 200, body: { status: 'complete' } }] });
+    assertEqual((await runDiagnosticUpload(r.t, gz, meta)).code, 200, 'finalize 409 not-uploaded: upload + finalize once more');
+    assertEqual(r.log.join(' | ').split(' | ').length, 5, 'reserve, upload, finalize, upload, finalize');
+  }
+  {
+    const r = rig({ reserve: { code: 200, body: slot }, uploads: ['exists'], finals: [] });
+    assertEqual((await runDiagnosticUpload(r.t, gz, meta)).code, 200, 'create-only conflict = already stored → finalize');
+  }
+  {
+    const r = rig({ reserve: { code: 429, body: { error: 'rate-limited', retryAfterSeconds: 60 } }, uploads: [], finals: [] });
+    const out = await runDiagnosticUpload(r.t, gz, meta);
+    assertEqual(out.code, 429, 'reserve 429 passed through');
+    assertEqual(out.retryAfter, '60', 'Retry-After passed through');
+    assertEqual(r.log.join(' | '), 'reserve', 'nothing uploaded when the reservation is refused');
+  }
+  {
+    const r = rig({ reserve: { code: 200, body: slot }, uploads: [{ status: 400, message: 'invalid' }], finals: [] });
+    const out = await runDiagnosticUpload(r.t, gz, meta);
+    assertEqual(out.code, 400, 'a storage HTTP error ends the flow');
+    assert(!r.log.includes('finalize'), 'no finalize after a refused upload');
+  }
 }
 
 // ── 16. telemetry held while a capture runs, resumed after ──
@@ -696,6 +790,7 @@ export async function runDiagnosticCaptureTests(): Promise<void> {
   await trimming();
   await gates();
   await upload();
+  await uploadFlow();
   await telemetryHold();
   await capsFlag();
   await httpRoutes();
