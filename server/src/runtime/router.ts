@@ -26,7 +26,7 @@ import { blockHelpBySlug, helpIndex } from '../help.js';
 import { createUnifiedHandlers, genericFlag } from './handlers.js';
 import { sendErrorStatus } from '../drivers/sendPolicy.js';
 import { putStoreDoc } from './services.js';
-import { FORBIDDEN_COLLECTION_BODY, isPrivateCollection } from './storeAccess.js';
+import { FORBIDDEN_COLLECTION_BODY, isPrivateCollection, isWriteProtectedCollection } from './storeAccess.js';
 import { createLocalService } from './localService.js';
 import type { FolderAdapter } from './folderAdapter.js';
 import type { ScanCachePersistence } from './localFolder.js';
@@ -513,6 +513,7 @@ export function createRouter(deps: RuntimeDeps): {
   // ── persistent store: documents (Axis config · library metadata · layouts) ──
   // Private collections (the auth sessions in `cloud`) are refused like on the server (storeAccess.ts).
   const refused = (c: Ctx): boolean => { if (!isPrivateCollection(c.params.c!)) return false; c.reply.code(403); return true; };
+  const refusedWrite = (c: Ctx): boolean => { if (!isWriteProtectedCollection(c.params.c!)) return false; c.reply.code(403); return true; };
   on('GET', '/store/:c', (c) => (refused(c) ? FORBIDDEN_COLLECTION_BODY : { docs: store.listDocs(c.params.c!) }));
   on('GET', '/store/:c/:id', (c) => {
     if (refused(c)) return FORBIDDEN_COLLECTION_BODY;
@@ -522,11 +523,11 @@ export function createRouter(deps: RuntimeDeps): {
   });
   // Config writes fan out to every live UI (router subscribers, like the host's SSE) — shared putStoreDoc.
   on('PUT', '/store/:c/:id', (c) => {
-    if (refused(c)) return FORBIDDEN_COLLECTION_BODY;
+    if (refusedWrite(c)) return FORBIDDEN_COLLECTION_BODY;
     const b = c.body as { data?: unknown; origin?: string } | undefined;
     return putStoreDoc(store, registry, c.params.c!, c.params.id!, b?.data, b?.origin);
   });
-  on('DELETE', '/store/:c/:id', (c) => { if (refused(c)) return FORBIDDEN_COLLECTION_BODY; store.delDoc(c.params.c!, c.params.id!); return { ok: true }; });
+  on('DELETE', '/store/:c/:id', (c) => { if (refusedWrite(c)) return FORBIDDEN_COLLECTION_BODY; store.delDoc(c.params.c!, c.params.id!); return { ok: true }; });
 
   // ── local storage folder (Presets/ library + Sync/ mirror; shared service — see localService.ts) ──
   on('GET', '/local/config', async (c) => send(c, await local.config()));

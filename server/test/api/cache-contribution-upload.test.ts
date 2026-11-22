@@ -52,7 +52,7 @@ interface FakeScript {
   signedIn: boolean;
   wanted: boolean | null;
   upload: (bytes: Uint8Array, body: EditorCacheReserveBody) => EditorCacheCloudOutcome;
-  del: (uploadId: string, via?: UploaderSession) => EditorCacheCloudOutcome;
+  del: (uploadId: string, via?: UploaderSession) => EditorCacheCloudOutcome | Promise<EditorCacheCloudOutcome>;
   /** The user id of the stored session per kind (what editorCacheUploader reports). */
   sessions: { account: string | null; anonymous: string | null };
 }
@@ -367,7 +367,7 @@ async function dryRunSwitches(): Promise<void> {
 }
 
 // ── 7. withdraw ──
-type WBody = { ok?: boolean; error?: string; reason?: string; uploadId?: string; via?: string | null; deleted?: boolean; uploads?: Array<{ uploadId: string; via: string | null; result: string }> };
+type WBody = { ok?: boolean; error?: string; reason?: string; uploadId?: string; via?: string | null; deleted?: boolean; remaining?: number; uploads?: Array<{ uploadId: string; via: string | null; result: string }> };
 async function withdraw(): Promise<void> {
   clean();
   const f = fakeCloud();
@@ -387,7 +387,7 @@ async function withdraw(): Promise<void> {
     // ok
     f.script.del = (uploadId) => ({ code: 200, body: { uploadId, deleted: true } });
     x = await w();
-    assertEqual(JSON.stringify(x.b), JSON.stringify({ ok: true, uploadId: UUID, via: 'anonymous', deleted: true, uploads: [{ uploadId: UUID, via: 'anonymous', result: 'deleted' }] }), '[withdraw] 200');
+    assertEqual(JSON.stringify(x.b), JSON.stringify({ ok: true, uploadId: UUID, via: 'anonymous', deleted: true, uploads: [{ uploadId: UUID, via: 'anonymous', result: 'deleted' }], remaining: 0 }), '[withdraw] 200');
     assertEqual(JSON.stringify(f.calls.deletes.at(-1)), JSON.stringify({ uploadId: UUID, via: 'anonymous' }), '[withdraw] deleted as the uploading session');
     assertEqual(decisionDoc()?.state, 'withdrawn', '[withdraw] recorded');
     let s = await statusOf(r.app);
@@ -471,9 +471,96 @@ async function withdrawHandles(): Promise<void> {
     assertEqual(JSON.stringify(x.b.uploads?.map((u) => u.result)), JSON.stringify(['deleted', 'failed']), '[handles] per-upload results');
     s = await statusOf(r.app);
     assertEqual(JSON.stringify(s.uploads.map((u) => u.uploadId)), JSON.stringify([UUID]), '[handles] only the failed one is left');
+    assertEqual(x.b.remaining, 1, '[handles] remaining count');
+    assertEqual(s.decision?.uploadId, UUID, '[handles] the decision no longer names the deleted row');
     f.script.del = (uploadId) => ({ code: 200, body: { uploadId, deleted: true } });
     x = await w();
     assertEqual(x.code, 200, '[handles] the rest withdrawn');
+  } finally { clean(); await r.app.close(); }
+}
+
+// ── 7c. races: an upload or a decision landing during a withdraw; two uploads finishing together ──
+async function races(): Promise<void> {
+  clean();
+  const f = fakeCloud();
+  const r = await rig({ cloud: f.cloud });
+  const w = async () => { const res = await post(r.app, '/device/cache/contribute/withdraw'); return { code: res.statusCode, b: res.json() as WBody }; };
+  try {
+    // an upload completes while the withdraw waits for the cloud's delete: it must survive the withdraw
+    assertEqual((await send(r.app)).statusCode, 200, '[race] first upload');
+    f.script.del = async (uploadId) => {
+      f.script.upload = () => ({ code: 200, body: { uploadId: UUID2, status: 'complete', covered: false }, via: 'account', uploaderId: 'acct-user-1' });
+      const up = await send(r.app); // interleaves: completes before the delete answers
+      assertEqual(up.statusCode, 200, '[race] the interleaved upload succeeded');
+      return { code: 200, body: { uploadId, deleted: true } };
+    };
+    let x = await w();
+    assertEqual(`${x.code} ${x.b.uploadId} ${x.b.remaining}`, `200 ${UUID} 1`, '[race] the first upload deleted, one left');
+    let doc = decisionDoc() as { state?: string; uploadId?: string; uploads?: Array<{ uploadId: string }> } | null;
+    assertEqual(doc?.state, 'uploaded', '[race] not recorded as withdrawn: the new upload is still in the cloud');
+    assertEqual(JSON.stringify(doc?.uploads?.map((h) => h.uploadId)), JSON.stringify([UUID2]), '[race] the interleaved upload stays listed');
+    assertEqual(doc?.uploadId, UUID2, '[race] the decision names the new upload');
+    assertEqual((await statusOf(r.app)).withdrawable, true, '[race] still withdrawable');
+
+    // a decision made during a (partial) withdraw is kept
+    clean();
+    f.script.upload = () => ({ code: 200, body: { uploadId: UUID, status: 'complete', covered: false }, via: 'anonymous', uploaderId: 'anon-user-1' });
+    assertEqual((await send(r.app)).statusCode, 200, '[race] upload A');
+    f.script.upload = () => ({ code: 200, body: { uploadId: UUID2, status: 'complete', covered: false }, via: 'account', uploaderId: 'acct-user-1' });
+    assertEqual((await send(r.app, { acceptFirmwareMismatch: '1' }, CACHE12.bytes, 'effectDefinitions_11_12p0.cache')).statusCode, 200, '[race] upload B');
+    f.script.del = async (uploadId) => {
+      if (uploadId === UUID) {
+        const d = await post(r.app, '/device/cache/contribute/decision', { decision: 'declined' });
+        assertEqual(d.statusCode, 200, '[race] the interleaved decision');
+        return { code: 200, body: { uploadId, deleted: true } };
+      }
+      return { code: 500, body: { error: 'internal' } };
+    };
+    x = await w();
+    assertEqual(`${x.code} ${x.b.remaining}`, '502 1', '[race] B failed, one left');
+    doc = decisionDoc() as { state?: string; uploads?: Array<{ uploadId: string }> } | null;
+    assertEqual(doc?.state, 'declined', '[race] the decision made meanwhile is kept');
+    assertEqual(JSON.stringify(doc?.uploads?.map((h) => h.uploadId)), JSON.stringify([UUID2]), '[race] only B left');
+
+    // two uploads finishing together never drop a handle (repeated: the old code lost one in most runs)
+    for (let round = 0; round < 5; round++) {
+      clean();
+      let n = 0;
+      f.script.upload = () => {
+        n++;
+        return { code: 200, body: { uploadId: `${'0'.repeat(8)}-0000-4000-8000-${String(round * 10 + n).padStart(12, '0')}`, status: 'complete', covered: false }, via: 'anonymous', uploaderId: 'anon-user-1' };
+      };
+      const [a, b] = await Promise.all([send(r.app), send(r.app, { acceptFirmwareMismatch: '1' }, CACHE12.bytes, 'effectDefinitions_11_12p0.cache')]);
+      assertEqual(`${a.statusCode} ${b.statusCode}`, '200 200', `[race] round ${round}: both uploads`);
+      const handles = ((decisionDoc() as { uploads?: unknown[] } | null)?.uploads ?? []).length;
+      assertEqual(handles, 2, `[race] round ${round}: both handles kept`);
+    }
+  } finally { clean(); await r.app.close(); }
+}
+
+// ── 7d. an entry with no session record: a "not found" is not proof it is gone ──
+async function unverifiedHandles(): Promise<void> {
+  clean();
+  const f = fakeCloud();
+  const r = await rig({ cloud: f.cloud });
+  try {
+    const at = new Date().toISOString();
+    store.defaultStore.putDoc(CONTRIBUTIONS_COLLECTION, KEY, { state: 'uploaded', at, uploadId: UUID, uploads: [{ uploadId: UUID, uploadedAt: at }] });
+    f.script.del = () => ({ code: 404, body: { error: 'not-found' } });
+    let res = await post(r.app, '/device/cache/contribute/withdraw');
+    let b = res.json() as WBody;
+    assertEqual(`${res.statusCode} ${b.error} ${b.uploads?.[0]?.result} ${b.remaining}`, '409 unverified unverified 1', '[unverified] 404 without an identity → 409, kept');
+    assertEqual(decisionDoc()?.state, 'uploaded', '[unverified] not recorded as withdrawn');
+    // the same entry recorded with a session kind but no uploader key: still unverified
+    store.defaultStore.putDoc(CONTRIBUTIONS_COLLECTION, KEY, { state: 'uploaded', at, uploadId: UUID, uploads: [{ uploadId: UUID, via: 'anonymous', uploadedAt: at }] });
+    res = await post(r.app, '/device/cache/contribute/withdraw');
+    assertEqual((res.json() as WBody).error, 'unverified', '[unverified] a session kind alone is not an identity');
+    // a delete that succeeds proves it was ours (the cloud deletes only the caller's own rows)
+    f.script.del = (uploadId) => ({ code: 200, body: { uploadId, deleted: true } });
+    res = await post(r.app, '/device/cache/contribute/withdraw');
+    b = res.json() as WBody;
+    assertEqual(`${res.statusCode} ${b.uploads?.[0]?.result}`, '200 deleted', '[unverified] deleted');
+    assertEqual(decisionDoc()?.state, 'withdrawn', '[unverified] withdrawn');
   } finally { clean(); await r.app.close(); }
 }
 
@@ -585,6 +672,8 @@ async function cloudSessions(): Promise<void> {
     if (!url.startsWith(SUPA)) throw new Error(`unexpected host ${url}`);
     const u = new URL(url);
     if (method === 'POST' && u.pathname === '/auth/v1/signup') return json(200, sessionJson(anonToken, true, 'anon-user'));
+    // a revoked account session: the refresh is refused for good (not retryable)
+    if (method === 'POST' && u.pathname === '/auth/v1/token') return json(400, { code: 'refresh_token_not_found', error: 'invalid_grant', error_description: 'Invalid Refresh Token: Refresh Token Not Found' });
     if (method === 'GET' && u.pathname === '/functions/v1/editor-caches') return json(200, { model: Number(u.searchParams.get('model')), firmware: u.searchParams.get('firmware'), wanted: true });
     if (method === 'POST' && u.pathname === '/functions/v1/editor-caches') return json(200, { uploadId: UUID, status: 'pending', uploadUrl: `${SUPA}/x`, token: 'up-tok', path: `anon-user/${'a'.repeat(64)}.cache`, bucket: 'editor-caches', expiresIn: 7200 });
     if (method === 'PUT' && u.pathname.startsWith('/storage/v1/object/upload/sign/editor-caches/')) return json(200, { Key: 'editor-caches/x' });
@@ -646,12 +735,26 @@ async function cloudSessions(): Promise<void> {
     assert(!reqs.some((r) => r.url.includes('/auth/v1/signup')), '[cloud] no anonymous sign-in while signed in');
     assertEqual(reqs.find((r) => r.method === 'POST')!.auth, `Bearer ${acctToken}`, '[cloud] reserve under the account session');
     assertEqual(s3.getDoc('cloud', ANONYMOUS_UPLOADER_STORAGE_KEY), null, '[cloud] no anonymous session created');
+
+    // a stored account session the server has revoked: supabase-js deletes it while loading it — the upload
+    // must fail as account-session-unavailable, not slip to an anonymous upload in the same request
+    const s4 = memStore();
+    const expired = { ...sessionJson(acctToken, false, 'acct-user'), expires_at: Math.floor(Date.now() / 1000) - 3600, expires_in: -3600 };
+    s4.putDoc('cloud', ACCOUNT_KEY, JSON.stringify(expired));
+    const revoked = createCloud({ url: SUPA, anonKey: 'anon-key' }, s4);
+    assertEqual(revoked.hasAccountSession(), true, '[cloud] (precondition) an account session is stored');
+    reqs.length = 0;
+    const ro = await revoked.editorCacheUpload(Uint8Array.from([9, 9, 9]), body);
+    assertEqual(`${ro.code} ${ro.via} ${(ro.body as { reason?: string }).reason}`, '401 account account-session-unavailable', `[cloud] revoked account → 401 account-session-unavailable (${JSON.stringify(ro.body)})`);
+    assert(!reqs.some((r) => r.url.includes('/auth/v1/signup')), '[cloud] no anonymous sign-in for a signed-in user whose session failed');
+    assert(!reqs.some((r) => r.url.includes('/functions/v1/editor-caches')), '[cloud] nothing reserved');
+    assertEqual(s4.getDoc('cloud', ANONYMOUS_UPLOADER_STORAGE_KEY), null, '[cloud] no anonymous session created');
   } finally {
     globalThis.fetch = realFetch;
   }
 }
 
-const CASES = [statusWanted, uploadSuccess, deduped, errorMapping, importCoupling, dryRunSwitches, withdraw, withdrawHandles, remoteRelay, signedUploadFlow, cloudSessions];
+const CASES = [statusWanted, uploadSuccess, deduped, errorMapping, importCoupling, dryRunSwitches, withdraw, withdrawHandles, races, unverifiedHandles, remoteRelay, signedUploadFlow, cloudSessions];
 export const CACHE_CONTRIBUTION_UPLOAD_CASE_COUNT = CASES.length;
 
 export async function runCacheContributionUploadTests(): Promise<void> {

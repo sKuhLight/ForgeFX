@@ -695,13 +695,13 @@ export async function contribute(
   const uploadId = typeof rb.uploadId === 'string' ? rb.uploadId : null;
   const covered = rb.covered === true;
   const at = new Date(now).toISOString();
+  // computed BEFORE the read: from reading the list to writing it back there must be no await, or two uploads
+  // finishing together (or a withdraw) would write from the same old list and drop a handle
+  const uploaderKey = r.uploaderId ? await uploaderKeyOf(r.uploaderId) : null;
   // every withdrawable upload stays listed: a later upload (or a duplicate with no row of ours) never drops one
   const uploads = handlesOf(readDoc(store, prep.key));
   if (uploadId && !uploads.some((h) => h.uploadId === uploadId)) {
-    uploads.push({
-      uploadId, ...(r.via ? { via: r.via } : {}), uploaderKey: r.uploaderId ? await uploaderKeyOf(r.uploaderId) : null,
-      uploadedAt: at, sha256: prep.sha256, fileName: prep.fileName
-    });
+    uploads.push({ uploadId, ...(r.via ? { via: r.via } : {}), uploaderKey, uploadedAt: at, sha256: prep.sha256, fileName: prep.fileName });
   }
   const doc: ContributionDoc = {
     state: 'uploaded', at, uploadId, sha256: prep.sha256, fileName: prep.fileName, consentVersion: reserveBody.consentVersion,
@@ -765,7 +765,9 @@ export async function setContributionDecision(store: Store, registry: DeviceRegi
 export interface WithdrawItem {
   uploadId: string;
   via: UploaderSession | null;
-  result: 'deleted' | 'gone' | 'session-mismatch' | 'not-signed-in' | 'failed';
+  /** `unverified`: the cloud has no such upload for the current session, and nothing recorded says which session
+   *  made it (an entry without a session record) — it may belong to another one, so it stays listed. */
+  result: 'deleted' | 'gone' | 'session-mismatch' | 'unverified' | 'not-signed-in' | 'failed';
   status?: number;
   reason?: string;
 }
@@ -776,12 +778,17 @@ export interface WithdrawItem {
  * left. Before a delete, the current session of that kind must be the one that uploaded (its user id is
  * compared with the stored key): a re-minted anonymous session or another signed-in account answers
  * `409 session-mismatch` and the upload stays listed — never a silent `withdrawn` for an upload still stored.
- * Answers (all carry `uploads: [{ uploadId, via, result }]`):
- *   200 `{ ok, uploadId, via, deleted: true }` — at least one deleted, none left;
- *   404 `not-found` — every one already gone in the cloud (still recorded as withdrawn);
- *   404 `nothing-to-withdraw`; 409 `session-mismatch`; 401 `not-signed-in` (the uploading session is gone);
- *   503 `cloud-disabled` / `no-device` / `firmware-unknown` / `dry-run` (server-wide dry run); 502 `cloud`.
- * On a partial failure the deleted ones are dropped from the list, the rest stay withdrawable.
+ * An entry with no session record cannot be checked: a delete that succeeds proves it was ours (the cloud only
+ * deletes the caller's own rows), a "not found" does not (`409 unverified`, it stays listed).
+ * Answers (all carry `uploads: [{ uploadId, via, result }]` and `remaining`, the uploads still listed):
+ *   200 `{ ok, uploadId, via, deleted: true }` — at least one deleted, none of ours failed;
+ *   404 `not-found` — every one already gone in the cloud;
+ *   404 `nothing-to-withdraw`; 409 `session-mismatch` / `unverified`; 401 `not-signed-in` (the uploading
+ *   session is gone); 503 `cloud-disabled` / `no-device` / `firmware-unknown` / `dry-run` (server-wide dry
+ *   run); 502 `cloud`.
+ * The deletes are awaited one by one; the doc is re-read AFTER them and only the handles that came back deleted
+ * or gone are dropped from it, so an upload or a decision that landed meanwhile is kept (`withdrawn` is
+ * recorded only when nothing is left). From that read to the write there is no await.
  */
 export async function withdrawContribution(
   store: Store,
@@ -791,33 +798,31 @@ export async function withdrawContribution(
 ): Promise<ContributionResult> {
   const k = await currentKey(registry);
   if (!('key' in k)) return k;
-  const doc = readDoc(store, k.key);
-  const handles = handlesOf(doc);
+  const handles = handlesOf(readDoc(store, k.key));
   if (!handles.length) return fail(404, { error: 'nothing-to-withdraw' });
   if (!cloudOn(cloud)) return fail(503, { error: 'cloud-disabled' });
   // a server-wide dry run never writes to the cloud: not even a delete
   if (opts.serverDryRun) return fail(503, { error: 'dry-run', message: 'server-wide dry run: nothing is deleted in the cloud' });
 
   const items: WithdrawItem[] = [];
-  const remaining: UploadHandle[] = [];
   let firstFailure: EditorCacheCloudOutcome | null = null;
   for (const h of handles) {
     const item: WithdrawItem = { uploadId: h.uploadId, via: h.via ?? null, result: 'deleted' };
     items.push(item);
     // is the session of that kind still the one that uploaded?
-    if (h.via && h.uploaderKey && cloud.editorCacheUploader) {
+    const checkable = !!(h.via && h.uploaderKey && cloud.editorCacheUploader);
+    if (checkable) {
       let current: string | null = null;
-      try { current = await cloud.editorCacheUploader(h.via); } catch { current = null; }
-      if (current === null) { item.result = 'not-signed-in'; item.reason = h.via === 'anonymous' ? 'anonymous-session-missing' : 'account-signed-out'; remaining.push(h); continue; }
-      if ((await uploaderKeyOf(current)) !== h.uploaderKey) { item.result = 'session-mismatch'; remaining.push(h); continue; }
+      try { current = await cloud.editorCacheUploader!(h.via!); } catch { current = null; }
+      if (current === null) { item.result = 'not-signed-in'; item.reason = h.via === 'anonymous' ? 'anonymous-session-missing' : 'account-signed-out'; continue; }
+      if ((await uploaderKeyOf(current)) !== h.uploaderKey) { item.result = 'session-mismatch'; continue; }
     }
     let r: EditorCacheCloudOutcome;
     try { r = await cloud.editorCacheDelete(h.uploadId, h.via); } catch (e) { r = { code: 0, body: { error: safeMessage(e) } }; }
     const rb = isObj(r.body) ? r.body : {};
-    if (!r.disabled && r.code >= 200 && r.code < 300) continue;
-    if (r.code === 404) { item.result = 'gone'; continue; }
-    remaining.push(h);
+    if (!r.disabled && r.code >= 200 && r.code < 300) continue; // the cloud deletes only the caller's own rows
     item.status = r.code;
+    if (r.code === 404) { item.result = checkable ? 'gone' : 'unverified'; continue; }
     if (r.code === 401 || (r.code === 403 && rb.error === 'account-required')) {
       item.result = 'not-signed-in';
       if (typeof rb.reason === 'string') item.reason = rb.reason;
@@ -827,23 +832,36 @@ export async function withdrawContribution(
     }
   }
 
+  // ── re-read, merge, write: no await from here to the putDoc ──
+  const done = new Set(items.filter((i) => i.result === 'deleted' || i.result === 'gone').map((i) => i.uploadId));
+  const fresh = readDoc(store, k.key);
+  const left = handlesOf(fresh).filter((h) => !done.has(h.uploadId));
   const at = new Date((opts.now ?? Date.now)()).toISOString();
-  if (!remaining.length) {
-    const next: ContributionDoc = { state: 'withdrawn', at, sha256: doc?.sha256, fileName: doc?.fileName, consentVersion: doc?.consentVersion };
-    store.putDoc(CONTRIBUTIONS_COLLECTION, k.key, next);
-    const deleted = items.find((i) => i.result === 'deleted');
-    if (deleted) return { code: 200, body: { ok: true, uploadId: deleted.uploadId, via: deleted.via, deleted: true, uploads: items } };
-    return fail(404, { error: 'not-found', uploadId: items[0]!.uploadId, via: items[0]!.via, uploads: items });
+  if (!left.length) {
+    store.putDoc(CONTRIBUTIONS_COLLECTION, k.key, { state: 'withdrawn', at, sha256: fresh?.sha256, fileName: fresh?.fileName, consentVersion: fresh?.consentVersion } satisfies ContributionDoc);
+  } else {
+    const { via: _legacyVia, uploadedAt: _legacyAt, ...rest } = fresh ?? {};
+    // the decision's "last upload" must not name a row that was just deleted
+    const lastId = typeof rest.uploadId === 'string' && done.has(rest.uploadId) ? left[left.length - 1]!.uploadId : rest.uploadId;
+    store.putDoc(CONTRIBUTIONS_COLLECTION, k.key, { ...rest, ...(lastId !== undefined ? { uploadId: lastId } : {}), uploads: left } satisfies ContributionDoc);
   }
-  // keep what is still stored (and withdrawable); the decision itself is unchanged
-  if (doc) store.putDoc(CONTRIBUTIONS_COLLECTION, k.key, { ...doc, uploads: remaining, ...(doc.via !== undefined ? { via: undefined, uploadedAt: undefined } : {}) });
+
+  const tail = { uploads: items, remaining: left.length };
   const mismatch = items.find((i) => i.result === 'session-mismatch');
   if (mismatch) {
-    return fail(409, { error: 'session-mismatch', uploadId: mismatch.uploadId, via: mismatch.via, uploads: items, message: 'the session that made this upload is no longer the current one; it was not deleted' });
+    return fail(409, { error: 'session-mismatch', uploadId: mismatch.uploadId, via: mismatch.via, message: 'the session that made this upload is no longer the current one; it was not deleted', ...tail });
+  }
+  const unverified = items.find((i) => i.result === 'unverified');
+  if (unverified) {
+    return fail(409, { error: 'unverified', uploadId: unverified.uploadId, via: unverified.via, message: 'the cloud has no such upload for the current session, and which session made it is not recorded; it stays listed', ...tail });
   }
   const unsigned = items.find((i) => i.result === 'not-signed-in');
-  if (unsigned) return fail(401, { error: 'not-signed-in', ...(unsigned.reason ? { reason: unsigned.reason } : {}), uploadId: unsigned.uploadId, via: unsigned.via, uploads: items });
-  const r = firstFailure ?? { code: 0, body: {} };
-  const e = cloudError(r);
-  return { code: e.code, body: { ...(e.body as object), uploads: items } };
+  if (unsigned) return fail(401, { error: 'not-signed-in', ...(unsigned.reason ? { reason: unsigned.reason } : {}), uploadId: unsigned.uploadId, via: unsigned.via, ...tail });
+  if (firstFailure) {
+    const e = cloudError(firstFailure);
+    return { code: e.code, body: { ...(e.body as object), ...tail } };
+  }
+  const deleted = items.find((i) => i.result === 'deleted');
+  if (deleted) return { code: 200, body: { ok: true, uploadId: deleted.uploadId, via: deleted.via, deleted: true, ...tail } };
+  return fail(404, { error: 'not-found', uploadId: items[0]!.uploadId, via: items[0]!.via, ...tail });
 }

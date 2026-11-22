@@ -38,7 +38,7 @@ import * as contribution from './services/cacheContribution.js';
 import * as store from './store.js';
 import { createUnifiedHandlers, genericFlag } from './runtime/handlers.js';
 import { putStoreDoc } from './runtime/services.js';
-import { FORBIDDEN_COLLECTION_BODY, isPrivateCollection } from './runtime/storeAccess.js';
+import { FORBIDDEN_COLLECTION_BODY, isPrivateCollection, isWriteProtectedCollection } from './runtime/storeAccess.js';
 import { registerLocalRoutes } from './localStore.js';
 import { registerHelpRoutes } from './help.js';
 import { telemetryStatus, uploadDebugReport, type DebugReport } from './telemetry.js';
@@ -314,6 +314,12 @@ export async function buildApp(registry: DeviceRegistry, opts: AppOptions = {}):
     if (typeof c === 'string' && isPrivateCollection(c)) return reply.code(403).send(FORBIDDEN_COLLECTION_BODY);
     return undefined;
   };
+  // writes: the private collections and the write-protected ones (state a dedicated API owns)
+  const protectedWrite = async (req: FastifyRequest, reply: FastifyReply): Promise<FastifyReply | undefined> => {
+    const c = (req.params as { c?: unknown }).c;
+    if (typeof c === 'string' && isWriteProtectedCollection(c)) return reply.code(403).send(FORBIDDEN_COLLECTION_BODY);
+    return undefined;
+  };
   app.get<{ Params: { c: string } }>('/store/:c', { onRequest: privateCollection }, (req) => ({ docs: store.listDocs(req.params.c) }));
   app.get<{ Params: { c: string; id: string } }>('/store/:c/:id', { onRequest: privateCollection }, (req, reply) => {
     const d = store.getDoc(req.params.c, req.params.id);
@@ -321,9 +327,9 @@ export async function buildApp(registry: DeviceRegistry, opts: AppOptions = {}):
     return d;
   });
   // Config writes fan out to every live UI (host SSE + remote relay) — see runtime/services.ts.
-  app.put<{ Params: { c: string; id: string }; Body: { data: unknown; origin?: string } }>('/store/:c/:id', { onRequest: privateCollection }, (req) =>
+  app.put<{ Params: { c: string; id: string }; Body: { data: unknown; origin?: string } }>('/store/:c/:id', { onRequest: protectedWrite }, (req) =>
     putStoreDoc(store.defaultStore, registry, req.params.c, req.params.id, req.body?.data, req.body?.origin));
-  app.delete<{ Params: { c: string; id: string } }>('/store/:c/:id', { onRequest: privateCollection }, (req) => { store.delDoc(req.params.c, req.params.id); return { ok: true }; });
+  app.delete<{ Params: { c: string; id: string } }>('/store/:c/:id', { onRequest: protectedWrite }, (req) => { store.delDoc(req.params.c, req.params.id); return { ok: true }; });
 
   // ── local storage folder (Presets/ library + Sync/ plain-syx mirror; see localStore.ts) ──
   registerLocalRoutes(app, decodeBytes);
@@ -827,18 +833,24 @@ export async function buildApp(registry: DeviceRegistry, opts: AppOptions = {}):
   });
 
   // ── cloud sync (GATED: only when AXIS_CLOUD=1; release builds never load supabase-js) ──
+  // Every /cloud/* and /remote/* route is origin-guarded (RELAXED: no Origin, a loopback origin, or the server's
+  // own origin, so a LAN/Docker UI served by this server keeps working): CORS reflects every origin, so without
+  // it any web page could sign this install into an account of its choosing, sign it out, delete the account,
+  // switch Remote on, or read who is signed in. Non-browser callers (Electron main, the Remote relay) send no
+  // Origin and are unaffected.
+  const cloudGuard = { onRequest: loopbackOrSameOriginGuard };
   if (process.env.AXIS_CLOUD === '1') {
     const { cloud } = await import('./cloud.js');
     diagCloud = cloud;
     contributionCloud = cloud;
     type Creds = { email: string; password: string };
-    app.get('/cloud/status', async () => cloud.status());
-    app.post<{ Body: Creds }>('/cloud/register', async (req, reply) => { try { return await cloud.register(req.body.email, req.body.password); } catch (e) { reply.code(400); return { error: (e as Error).message }; } });
-    app.post<{ Body: Creds }>('/cloud/login', async (req, reply) => { try { return await cloud.login(req.body.email, req.body.password); } catch (e) { reply.code(401); return { error: (e as Error).message }; } });
-    app.post('/cloud/logout', async () => cloud.logout());
-    app.post('/cloud/delete-account', async (_req, reply) => { try { return await cloud.deleteAccount(); } catch (e) { reply.code(500); return { error: (e as Error).message }; } });
-    app.post<{ Body: { scopes?: { config?: boolean; presets?: boolean } } }>('/cloud/sync', async (req, reply) => { try { return await cloud.sync(req.body?.scopes); } catch (e) { reply.code(503); return { error: (e as Error).message }; } });
-    app.get('/cloud/index', async (_req, reply) => { try { return await cloud.cloudIndex(); } catch (e) { reply.code(503); return { error: (e as Error).message }; } });
+    app.get('/cloud/status', cloudGuard, async () => cloud.status());
+    app.post<{ Body: Creds }>('/cloud/register', cloudGuard, async (req, reply) => { try { return await cloud.register(req.body.email, req.body.password); } catch (e) { reply.code(400); return { error: (e as Error).message }; } });
+    app.post<{ Body: Creds }>('/cloud/login', cloudGuard, async (req, reply) => { try { return await cloud.login(req.body.email, req.body.password); } catch (e) { reply.code(401); return { error: (e as Error).message }; } });
+    app.post('/cloud/logout', cloudGuard, async () => cloud.logout());
+    app.post('/cloud/delete-account', cloudGuard, async (_req, reply) => { try { return await cloud.deleteAccount(); } catch (e) { reply.code(500); return { error: (e as Error).message }; } });
+    app.post<{ Body: { scopes?: { config?: boolean; presets?: boolean } } }>('/cloud/sync', cloudGuard, async (req, reply) => { try { return await cloud.sync(req.body?.scopes); } catch (e) { reply.code(503); return { error: (e as Error).message }; } });
+    app.get('/cloud/index', cloudGuard, async (_req, reply) => { try { return await cloud.cloudIndex(); } catch (e) { reply.code(503); return { error: (e as Error).message }; } });
 
     // ── shared device-definition profiles (THIRD cache source; services/cloudProfiles.ts) ──
     app.get('/device/cache/cloud', async () => cloudProfiles.cloudCacheCheck(cloud, store.defaultStore, registry));
@@ -848,13 +860,13 @@ export async function buildApp(registry: DeviceRegistry, opts: AppOptions = {}):
     // ── Axis Cloud Remote — host agent (off by default; toggled by the Axis UI) ──
     const { RemoteHost } = await import('./remote.js');
     const remoteHost = new RemoteHost(app, () => cloud.remoteSession(), (fn) => registry.subscribe(fn));
-    app.get('/remote/status', async () => remoteHost.status());
-    app.post<{ Body: { on?: boolean } }>('/remote/enable', async (req, reply) => {
+    app.get('/remote/status', cloudGuard, async () => remoteHost.status());
+    app.post<{ Body: { on?: boolean } }>('/remote/enable', cloudGuard, async (req, reply) => {
       try { return await remoteHost.enable(!!req.body?.on); } catch (e) { reply.code(503); return { error: (e as Error).message }; }
     });
   } else {
-    app.get('/cloud/status', async () => ({ enabled: false, user: null })); // so Axis can gate its UI without erroring
-    app.get('/remote/status', async () => ({ enabled: false, connected: false, userId: null }));
+    app.get('/cloud/status', cloudGuard, async () => ({ enabled: false, user: null })); // so Axis can gate its UI without erroring
+    app.get('/remote/status', cloudGuard, async () => ({ enabled: false, connected: false, userId: null }));
     app.get('/device/cache/cloud', async () => ({ enabled: false, available: false })); // same non-erroring gate for the defs prompt
   }
 

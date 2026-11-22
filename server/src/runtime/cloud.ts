@@ -238,13 +238,16 @@ export class Cloud {
    *  must run as whoever uploaded. `prefer` pins the session kind (a delete of an anonymous upload). */
   async #uploaderSession(create: boolean, prefer?: UploaderSession): Promise<UploaderWho | EditorCacheCloudOutcome> {
     if (prefer !== 'anonymous') {
+      // read BEFORE getSession(): a refresh the server refuses (revoked session) makes supabase-js delete the stored
+      // session inside getSession(), and a check after it would then let the upload slip to the anonymous session
+      const storedAccount = this.hasAccountSession();
       const c = this.#c();
       const { data: s, error } = await c.auth.getSession();
       const session = s.session;
       if (session?.access_token && session.user?.is_anonymous !== true) return { client: c, token: session.access_token, via: 'account', uploaderId: session.user?.id ?? null };
       // a stored account session that cannot be loaded (refresh failed, offline): say so, never fall back to an
       // anonymous upload behind the signed-in user's back
-      if (this.hasAccountSession()) {
+      if (storedAccount) {
         return { code: 401, body: { error: 'not signed in', reason: 'account-session-unavailable', message: error?.message ?? 'the account session could not be loaded' }, via: 'account' };
       }
       if (prefer === 'account') return { code: 401, body: { error: 'not signed in', reason: 'account-signed-out' }, via: 'account' };

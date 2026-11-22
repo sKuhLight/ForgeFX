@@ -257,12 +257,18 @@ The upload request (also `wouldSend`) carries counts and version stamps only:
   upload stays withdrawable through any later decision.
 - Withdraw deletes **every** listed upload, each under the session that made it, and records `withdrawn`
   once none is left. Before a delete, the current session of that kind must be the one that uploaded (an
-  anonymous session that was re-minted, or another signed-in account, is refused). Answers carry
-  `uploads: [{ uploadId, via, result }]` (`deleted`, `gone`, `session-mismatch`, `not-signed-in`, `failed`):
+  anonymous session that was re-minted, or another signed-in account, is refused). An entry without a session
+  record is deleted only if the cloud confirms it (a "not found" is not proof: `unverified`, it stays listed).
+  Answers carry `uploads: [{ uploadId, via, result }]` (`deleted`, `gone`, `session-mismatch`, `unverified`,
+  `not-signed-in`, `failed`) and `remaining` (uploads still listed):
   `200 { "ok": true, "uploadId": "…", "via": "anonymous", "deleted": true }`; `404 nothing-to-withdraw`;
-  `404 not-found` (all already gone in the cloud, still recorded as withdrawn); `409 session-mismatch` (not
-  deleted, stays listed); `401 not-signed-in` (the session that uploaded is gone); `503 cloud-disabled` /
-  `dry-run`; `502 cloud`. On a partial failure the deleted uploads leave the list and the rest stay.
+  `404 not-found` (all already gone in the cloud, still recorded as withdrawn); `409 session-mismatch` /
+  `unverified` (not deleted, stays listed); `401 not-signed-in` (the session that uploaded is gone);
+  `503 cloud-disabled` / `dry-run`; `502 cloud`. Only the uploads that came back deleted or gone leave the list:
+  an upload or a decision that lands while a withdraw runs is kept, and `withdrawn` is recorded only when
+  nothing is left. The decision's `uploadId` never names a deleted row.
+- The decisions live in the `cacheContributions` store collection: the generic `/store` routes may read it but
+  refuse to write or delete it (`403 forbidden-collection`).
 
 ### Errors
 | Status | `error` |
@@ -271,7 +277,7 @@ The upload request (also `wouldSend`) carries counts and version stamps only:
 | 401 | `not-signed-in` (`reason`: `account-required`, `account-session-unavailable`, `account-signed-out`, `anonymous-sign-in-failed`, `anonymous-session-missing`) |
 | 403 | `forbidden-origin` |
 | 404 | `nothing-to-withdraw`, `not-found` |
-| 409 | `model-mismatch` `{expected, got}`, `firmware-differs` `{deviceFirmware, fileVersion, contentVersion, overridable}`, `not-wanted`, `firmware-limit` `{limit}`, `session-mismatch` (withdraw) |
+| 409 | `model-mismatch` `{expected, got}`, `firmware-differs` `{deviceFirmware, fileVersion, contentVersion, overridable}`, `not-wanted`, `firmware-limit` `{limit}`, `session-mismatch` / `unverified` (withdraw) |
 | 413 | `too-large` `{bytes, limit, stage?}` (outside 1 … 4 MiB, here or in the cloud) |
 | 422 | `cache-parse-failed` `{message}`, `renamed-cache`, `unrelated-cache` `{agreement, floor}`, `redaction-failed`, `invalid-cache` `{reason}` (refused by the cloud's own check) |
 | 429 | `rate-limited`, `quota-exceeded` `{retryAfterSeconds, scope?}` |

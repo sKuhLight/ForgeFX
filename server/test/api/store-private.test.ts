@@ -14,7 +14,7 @@ import { join } from 'node:path';
 import * as store from '../../src/store.js';
 import { createRouter } from '../../src/runtime/router.js';
 import { remoteAllowed, RemoteHost } from '../../src/remote.js';
-import { FORBIDDEN_COLLECTION, isPrivateCollection, isPrivateStorePath } from '../../src/runtime/storeAccess.js';
+import { FORBIDDEN_COLLECTION, isPrivateCollection, isPrivateStorePath, isWriteProtectedCollection } from '../../src/runtime/storeAccess.js';
 import { createStoreSessionStorage } from '../../src/runtime/sessionStorage.js';
 import { createStore } from '../../src/runtime/store.js';
 import { createFsStoreBackend, nodeCodec } from '../../src/runtime/fsStoreBackend.js';
@@ -37,7 +37,15 @@ const PATHS: Array<[string, boolean]> = [
   ['/cloudstore/cloud', false], ['/store', false]
 ];
 
-export const STORE_PRIVATE_CASE_COUNT = COLLECTIONS.length + PATHS.length + 6;
+// [path, allowed for a GET over the relay]: spellings that resolve to a refused area once normalised
+const REMOTE_GET: Array<[string, boolean]> = [
+  ['/x/../cloud/status', false], ['/preset/%2e%2e/cloud/status', false], ['/store/x/..%2fcloud', false], ['/%63loud/status', false],
+  ['/Cloud/status', false], ['/REMOTE/status', false], ['//evil.example/preset/grid', false], ['http://evil.example/preset/grid', false],
+  ['preset/grid', false], ['/store/config/../cloud/x', false], ['/debug/./raw', false], ['/preset\\..\\cloud', false],
+  ['/preset/grid', true], ['/device/cache/contribute?refresh=1', true], ['/store/config/layouts', true], ['/preset/blocks/58/params?generic=1', true]
+];
+
+export const STORE_PRIVATE_CASE_COUNT = COLLECTIONS.length + PATHS.length + REMOTE_GET.length + 7;
 
 function matrix(): void {
   for (const [c, want] of COLLECTIONS) assertEqual(isPrivateCollection(c), want, `[store-private] collection ${JSON.stringify(c)}`);
@@ -49,6 +57,12 @@ function matrix(): void {
     assert(!remoteAllowed('DELETE', `/store/${s}/${KEY}`), `[store-private] Remote refuses DELETE /store/${s}/<key>`);
   }
   assert(remoteAllowed('GET', '/store/config'), '[store-private] Remote still reads config');
+  for (const [p, want] of REMOTE_GET) assertEqual(remoteAllowed('GET', p), want, `[store-private] Remote GET ${p}`);
+  assertEqual(isWriteProtectedCollection('cacheContributions'), true, '[store-private] contribution handles are write-protected');
+  assertEqual(isWriteProtectedCollection('CacheContributions'), true, '[store-private] write protection folds case');
+  assertEqual(isWriteProtectedCollection('cloud'), true, '[store-private] private implies write-protected');
+  assertEqual(isWriteProtectedCollection('config'), false, '[store-private] config stays writable');
+  assertEqual(isPrivateCollection('cacheContributions'), false, '[store-private] contribution handles stay readable');
 }
 
 function seed(): { rev: number } {
@@ -93,6 +107,29 @@ async function routes(): Promise<void> {
     store.defaultStore.delDoc('config', 'store-private-probe');
   } finally {
     store.defaultStore.delDoc('cloud', KEY);
+    await t.app.close();
+  }
+}
+
+// ── contribution handles: readable, never written or deleted through the generic routes ──
+async function writeProtected(): Promise<void> {
+  store.defaultStore.putDoc('cacheContributions', '11_13p0', { state: 'uploaded', uploads: [{ uploadId: 'u-1', uploadedAt: 'x' }] });
+  const rev = store.defaultStore.getDoc('cacheContributions', '11_13p0')!.rev;
+  const t = await buildTestApp(0x11);
+  try {
+    const router = createRouter({ registry: t.registry, store: store.defaultStore });
+    for (const c of ['cacheContributions', 'CACHECONTRIBUTIONS']) {
+      const put = await t.app.inject({ method: 'PUT', url: `/store/${c}/11_13p0`, headers: { 'content-type': 'application/json' }, payload: JSON.stringify({ data: { uploads: [] } }) });
+      assertEqual(put.statusCode, 403, `[store-private] PUT /store/${c} → 403`);
+      const del = await t.app.inject({ method: 'DELETE', url: `/store/${c}/11_13p0` });
+      assertEqual(del.statusCode, 403, `[store-private] DELETE /store/${c} → 403`);
+      assertEqual((await router.handle('PUT', `/store/${c}/11_13p0`, JSON.stringify({ data: {} }))).status, 403, `[store-private] router PUT /store/${c} → 403`);
+      assertEqual((await router.handle('DELETE', `/store/${c}/11_13p0`)).status, 403, `[store-private] router DELETE /store/${c} → 403`);
+    }
+    assertEqual((await t.app.inject({ method: 'GET', url: '/store/cacheContributions/11_13p0' })).statusCode, 200, '[store-private] contribution handles stay readable');
+    assertEqual(store.defaultStore.getDoc('cacheContributions', '11_13p0')!.rev, rev, '[store-private] the handles are untouched');
+  } finally {
+    store.defaultStore.delDoc('cacheContributions', '11_13p0');
     await t.app.close();
   }
 }
@@ -195,6 +232,7 @@ export async function runStorePrivateTests(): Promise<void> {
   try {
     matrix();
     await routes();
+    await writeProtected();
     await relay();
     await removal();
   } finally {

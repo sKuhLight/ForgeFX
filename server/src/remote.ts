@@ -26,9 +26,12 @@ const GZIP_MIN = 2048;
  *  SysEx, cloud account (incl. the auth sessions in the private `cloud` store collection), port selection,
  *  store writes/deletes, telemetry uploads, remote-enable itself. */
 export function remoteAllowed(method: string, path: string): boolean {
-  const p = (path.split('?')[0] || '').replace(/\/+$/, '') || '/';
-  // never the auth sessions (the private `cloud` store collection), however the path is spelled
-  if (method === 'GET') return !p.startsWith('/cloud') && !p.startsWith('/remote') && p !== '/debug/raw' && !isPrivateStorePath(p);
+  const n = normaliseRemotePath(path);
+  if (!n) return false;
+  const p = n.raw;
+  // reads: refused when EITHER spelling (as dispatched, or decoded with its dot segments resolved) names a
+  // refused area — never the cloud account, the remote toggle, raw SysEx or the auth sessions
+  if (method === 'GET') return !deniedRead(n.raw) && !deniedRead(n.decoded);
   if (method === 'PUT')
     return (
       /^\/preset\/blocks\/\d+\/params(\/\d+)?$/.test(p) ||
@@ -53,6 +56,32 @@ export function remoteAllowed(method: string, path: string): boolean {
       /^\/am4\/(bypass|scene|preset)$/.test(p)
     );
   return false;
+}
+
+/** The path a relayed request reaches, the way the in-process inject resolves it (WHATWG URL against a local
+ *  base: dot segments, also percent-encoded ones, resolved; query dropped), plus a decoded spelling with the dot
+ *  segments the decoding revealed resolved and empty segments dropped. Null (refused): not an origin-relative
+ *  path (`//host/…`, an absolute URL, no leading slash) or not decodable. */
+export function normaliseRemotePath(path: string): { raw: string; decoded: string } | null {
+  if (typeof path !== 'string' || !path.startsWith('/') || path.startsWith('//') || path.includes('\\')) return null;
+  let u: URL;
+  try { u = new URL(path, 'http://remote.local'); } catch { return null; }
+  if (u.origin !== 'http://remote.local') return null;
+  const raw = u.pathname.replace(/\/+$/, '') || '/';
+  let dec: string;
+  try { dec = decodeURIComponent(u.pathname); } catch { return null; }
+  const segs: string[] = [];
+  for (const s of dec.split(/[\/\\]/)) {
+    if (s === '' || s === '.') continue;
+    if (s === '..') segs.pop(); else segs.push(s);
+  }
+  return { raw, decoded: '/' + segs.join('/') };
+}
+
+/** A read the relay never serves (matched case-insensitively). */
+function deniedRead(p: string): boolean {
+  const l = p.toLowerCase();
+  return l.startsWith('/cloud') || l.startsWith('/remote') || l === '/debug/raw' || isPrivateStorePath(p);
 }
 
 const TEXTY = /json|text|javascript|xml|svg/i;
