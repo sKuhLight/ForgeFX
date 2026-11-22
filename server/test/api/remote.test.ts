@@ -9,6 +9,7 @@ const ALLOWED: [string, string][] = [
   ['GET', '/preset/grid'],
   ['GET', '/preset/blocks'],
   ['GET', '/preset/blocks/58/params'],
+  ['GET', '/preset/blocks/58/params?generic=1'], // the query is no part of the match: the generic response relays like the classic one
   ['GET', '/device'],
   ['GET', '/preset/locations'],
   ['GET', '/healthz'],

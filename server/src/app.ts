@@ -382,7 +382,10 @@ export async function buildApp(registry: DeviceRegistry): Promise<FastifyInstanc
 
   // ── live block params (addressed by the placed block's canonical address `addr`: gen-3 = the
   //    effect id, AM4 = the block's pidLow — exactly what each device's grid/blocks report) ──
-  app.get<{ Params: { eid: string } }>('/preset/blocks/:eid/params', async (req, reply) => blockParamsH(reply, Number(req.params.eid)));
+  app.get<{ Params: { eid: string }; Querystring: { generic?: string } }>(
+    '/preset/blocks/:eid/params',
+    async (req, reply) => blockParamsH(reply, Number(req.params.eid), { generic: req.query.generic === '1' })
+  );
   app.put<{ Params: { eid: string; paramId: string }; Body: { value: number; continuous?: boolean } }>(
     '/preset/blocks/:eid/params/:paramId',
     async (req, reply) => setParamH(reply, Number(req.params.eid), Number(req.params.paramId), req.body.value, req.body.continuous ?? true)

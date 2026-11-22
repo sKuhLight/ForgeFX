@@ -70,10 +70,12 @@ function makeFakeFm3(): DeviceDriver {
     }),
     blocksCatalog: () => [{ slug: 'amp', family: 'AMP', instance: 1, name: 'Amp 1', page: 0, paramCount: 2, typeCount: 1 }],
     blockTypes: () => [{ value: 1, name: 'USA Lead', manufacturer: null, basedOn: null }],
-    blockParams: async (eid: number) => ({
+    // `opts.generic` (the `?generic=1` query) answers the generic shape: recognisable by its `definitions` block
+    blockParams: async (_eid: number, opts?: { generic?: boolean }) => ({
       block: 'Amp 1', slug: 'amp', page: 0,
       named: [{ id: 1, name: 'Gain', value: 5, norm: 0.5, min: 0, max: 10 }],
-      enums: [], type: { value: 1, name: 'USA Lead' }
+      enums: [], type: { value: 1, name: 'USA Lead' },
+      ...(opts?.generic ? { definitions: { family: 'DISTORT', profile: 'none', positional: true, channel: 0, persistentWrites: false, hidden: [] } } : {})
     }),
     setParam: async () => ({ ok: true }),
     setBypass: async () => ({ ok: true }),
@@ -118,6 +120,8 @@ const ROWS: Row[] = [
   { name: 'blocks catalog', method: 'GET', url: '/blocks' },
   { name: 'block types', method: 'GET', url: '/blocks/amp/types' },
   { name: 'block params', method: 'GET', url: '/preset/blocks/58/params' },
+  { name: 'block params generic', method: 'GET', url: '/preset/blocks/58/params?generic=1' },
+  { name: 'block params generic=0 (classic)', method: 'GET', url: '/preset/blocks/58/params?generic=0' },
   { name: 'set param', method: 'PUT', url: '/preset/blocks/58/params/7', body: { value: 0.42, continuous: true } },
   { name: 'bypass', method: 'POST', url: '/preset/blocks/58/bypass', body: { bypassed: true } },
   { name: 'channel', method: 'POST', url: '/preset/blocks/58/channel', body: { channel: 'B' } },
@@ -340,7 +344,14 @@ export async function runRouterParityTests(): Promise<void> {
     };
 
     for (const row of ROWS) {
-      await parity(row, row.name === 'store put' ? stripEnvelope : undefined);
+      const r = await parity(row, row.name === 'store put' ? stripEnvelope : undefined);
+      // the generic flag reaches the driver through BOTH surfaces (parity alone would pass if both dropped it):
+      // only `?generic=1` answers the generic shape, nothing else does
+      if (row.url.startsWith('/preset/blocks/58/params')) {
+        const generic = row.url.endsWith('generic=1');
+        assertEqual('definitions' in (r.appJson as object), generic, `${row.name}: the app answers the ${generic ? 'generic' : 'classic'} shape`);
+        assertEqual('definitions' in (JSON.parse(r.routed.body as string) as object), generic, `${row.name}: the router answers the ${generic ? 'generic' : 'classic'} shape`);
+      }
     }
 
     // 1 — the backup row stored exactly ONE version for slot 5 (the router call dedup'd by content)

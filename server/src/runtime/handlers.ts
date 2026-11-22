@@ -7,7 +7,7 @@
 // the router uses a tiny status recorder), so the exact same code produces the exact same
 // status+body on both surfaces. NO node:/fastify imports — this module must load in a browser.
 import type { DeviceRegistry } from '../drivers/registryCore.js';
-import { EmptyPresetError } from '../drivers/types.js';
+import { EmptyPresetError, type BlockParamsOpts } from '../drivers/types.js';
 import { presetDumpFramesViolation } from '../drivers/sendPolicy.js';
 
 /** The one reply capability the shared handlers need: set the response status. FastifyReply's
@@ -102,11 +102,13 @@ export function createUnifiedHandlers(registry: DeviceRegistry) {
       return await d.sceneState();
     } catch (e) { return decodeFail(reply, 'scene-state', e); }
   };
-  const blockParamsH = async (reply: StatusSink, addr: number) => {
+  // `opts.generic` (the `?generic=1` query on both surfaces) asks for the generic response; a driver without
+  // it ignores the flag and answers the classic shape.
+  const blockParamsH = async (reply: StatusSink, addr: number, opts?: BlockParamsOpts) => {
     try {
       const d = await driver();
       if (!d.blockParams) return unsupported(reply, 'blockParams');
-      return await d.blockParams(addr);
+      return await d.blockParams(addr, opts);
     } catch (e) { reply.code(404); return { error: (e as Error).message }; }
   };
   // Unified param write: {value, continuous}. continuous:true → the driver's normalized write

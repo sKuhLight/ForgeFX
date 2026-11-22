@@ -4,6 +4,9 @@
 // are optional and mirrored by `DriverCapabilities` so routes can answer 501 instead of guessing.
 import type { DecodedBlock } from 'forgefx-midi/devices/gen3';
 import type { TypeModel, DeviceLayout, DeviceProfile } from '../devices.js';
+import type {
+  HiddenParam, NameConfidence, NameSource, ParamKind, ParamSource, ParamWidget, ReadOnlyReason, WidgetSource, WriteMode
+} from './paramIndex.js';
 import type { Transport } from '../transport/types.js';
 import type { TelemetryMode, CadenceProfile } from './telemetryProfiles.js';
 
@@ -52,8 +55,105 @@ export interface GridCellDTO {
 }
 export interface PresetGridDTO { model: string; name: string; crcValid: boolean; rows: number; cols: number; scenes: string[]; cells: GridCellDTO[]; source: 'dump'; }
 export interface PresetBlockDTO { slug: string; name: string; effectId: number; row: number; col: number; fromRows: number[]; bypassed: boolean | null; channel: string | null; }
-export interface NamedParam { id: number; name: string; value: number; norm: number; unit?: string; min?: number; max?: number; log?: boolean; }
-export interface EnumParam { id: number; name: string; value: number; options: { value: number; label: string }[]; }
+/** Why a param has no resolved value. A value that was invented (a zero for a position the read did not
+ *  cover, a guessed channel) is never served as a reading: the generic response carries `null` and one of
+ *  these, the classic response keeps its number and adds the reason. */
+export type UnresolvedReason =
+  /** The block read threw or timed out. */
+  | 'read-failed'
+  /** A channel-bearing block whose active channel the status read did not report. */
+  | 'channel-unknown'
+  /** The family's body is indexed by record, not by param id (GLOBAL): a position says nothing about a pid. */
+  | 'non-positional'
+  /** The param's position lies beyond the body that arrived (a torn or short burst). */
+  | 'not-in-body'
+  /** The raw value decodes outside the param's range (an enum ordinal outside its bounds, a float above full scale). */
+  | 'out-of-range';
+export type { HiddenParam, ParamWidget };
+
+/** One continuous param of the classic response. `unresolved` is additive: set only on a value that was
+ *  invented (the number is kept for compatibility). */
+export interface NamedParam { id: number; name: string; value: number; norm: number; unit?: string; min?: number; max?: number; log?: boolean; unresolved?: UnresolvedReason; }
+/** One selector param of the classic response. */
+export interface EnumParam { id: number; name: string; value: number; options: { value: number; label: string }[]; unresolved?: UnresolvedReason; }
+
+/** What the generic response says about every param besides its value. */
+export interface ParamMeta {
+  /** Device-true kind of the effective row. */
+  kind: ParamKind;
+  /** Where the existence and range facts came from: the applied device profile or the bundled catalog. */
+  source: ParamSource;
+  /** No name is known: the name is `P<pid>`. */
+  generic: boolean;
+  /** The bundled catalog has no informative row for this family and pid. */
+  isNew?: true;
+  /** Generic params only: `isNew` gives 'new-in-firmware', else 'more'. */
+  pageHint?: 'new-in-firmware' | 'more';
+  nameSource: NameSource;
+  /** Absent on a generic param. */
+  nameConfidence?: NameConfidence;
+  /** `nameSource` 'catalog-moved': the catalog pid the name came from. */
+  movedFrom?: number;
+  /** Fingerprint of the effective row and labels ("1:xxxxxxxx"). */
+  fp: string;
+  widget: ParamWidget;
+  widgetSource: WidgetSource;
+  /** PUT body: `norm` = `{ value: 0..1, continuous: true }`, `ordinal` = `{ value: ordinal, continuous: false }`,
+   *  null = no verified write path (advisory: the server does not refuse it). */
+  write: WriteMode;
+  readOnlyReason?: ReadOnlyReason;
+  /** Display-unit step of a continuous param. */
+  step?: number;
+  unresolved?: UnresolvedReason;
+}
+export interface NamedParamV2 extends Omit<NamedParam, 'value' | 'norm' | 'unresolved'>, ParamMeta { value: number | null; norm: number | null; }
+export interface EnumParamV2 extends Omit<EnumParam, 'value' | 'unresolved'>, ParamMeta {
+  value: number | null;
+  /** The option list was cut at the cap. */
+  optionsTruncated?: true;
+}
+
+/** What the generic response says about the block as a whole. */
+export interface BlockDefinitionsMeta {
+  /** The catalog family the block resolved to; null for a block the device model has no family for. */
+  family: string | null;
+  /** What backs the family's rows: a byte-exact profile, a live-walk profile, or the bundled catalog alone
+   *  (no profile applied, the family is not in it, or the family was flagged as mis-assigned). */
+  profile: 'byte-exact' | 'live' | 'none';
+  /** The family's cache section was dropped by the assignment cross-check. */
+  suspect?: true;
+  /** The family's values are read by position (param id = index in the channel slice). */
+  positional: boolean;
+  /** Active channel (0-3) the values were sliced from; null when unknown or the block has no channels. */
+  channel: number | null;
+  /** Writes to this block are persistent settings, not edit-buffer changes (GLOBAL, FC). */
+  persistentWrites: boolean;
+  /** Informative rows that are not listed, with the reason. */
+  hidden: HiddenParam[];
+}
+
+/** `GET /preset/blocks/:eid/params` as classic clients know it. */
+export interface BlockParamsDTO {
+  block: string; slug: string; page: number;
+  named: NamedParam[]; enums: EnumParam[];
+  type: { value: number; name: string } | null;
+  layout?: DeviceLayout;
+}
+/** The generic response (`?generic=1`): every param the block has on the connected device, values that are
+ *  `null` where none could be resolved, and a `definitions` block. A client tells it from the classic one
+ *  by the presence of `definitions`. */
+export interface BlockParamsV2DTO extends Omit<BlockParamsDTO, 'named' | 'enums'> {
+  named: NamedParamV2[]; enums: EnumParamV2[];
+  definitions: BlockDefinitionsMeta;
+  /** The effect id maps to no family on this device model: nothing is listed. */
+  unknownBlock?: true;
+  /** The block read failed (every value is `read-failed`). */
+  readError?: string;
+}
+export interface BlockParamsOpts {
+  /** Serve the generic response. Drivers without it ignore the flag and answer the classic shape. */
+  generic?: boolean;
+}
 export interface MeterVal { norm: number; value: number; unit?: string; min?: number; max?: number; log?: boolean; }
 /** One side (tap/hold) of an FC switch as read by the sub-0x01 structured read. `present` = the
  *  device returned a record whose config/side echo matched the request; `raw` = the 78-byte response
@@ -293,7 +393,7 @@ export interface DeviceDriver {
   blockTypes?(slug: string): TypeModel[];
 
   // ── live block params ──
-  blockParams?(eid: number): Promise<{ block: string; slug: string; page: number; named: NamedParam[]; enums: EnumParam[]; type: { value: number; name: string } | null; layout?: DeviceLayout }>;
+  blockParams?(eid: number, opts?: BlockParamsOpts): Promise<BlockParamsDTO | BlockParamsV2DTO>;
   readParams?(eid: number, pids: number[]): Promise<Record<number, number>>;
   readRange?(eid: number, pids: number[]): Promise<Record<number, number>>;
   rawBlock?(eid: number): Promise<{ eid: number; values: Record<number, number> }>;

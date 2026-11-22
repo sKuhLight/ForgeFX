@@ -14,6 +14,11 @@ export { createRegistry, DeviceRegistry, type RegistryDeps, type ConnInfo } from
 export { createGen3Driver } from '../drivers/gen3.js';
 export { createAm4Driver, type Am4Driver } from '../drivers/am4.js';
 export type { DeviceDriver, DriverCapabilities, DriverCtx, DeviceEvent } from '../drivers/types.js';
+// the block-params DTOs (classic and generic) a client of the runtime types its responses with
+export type {
+  BlockParamsDTO, BlockParamsV2DTO, BlockParamsOpts, BlockDefinitionsMeta, NamedParam, EnumParam, NamedParamV2, EnumParamV2,
+  ParamMeta, ParamWidget, HiddenParam, UnresolvedReason
+} from '../drivers/types.js';
 export type { Transport, RequestOpts, Conn, ConnKind } from '../transport/types.js';
 // the request/completion engine of the Node transports, for in-page transports to share (browser-safe)
 export {
