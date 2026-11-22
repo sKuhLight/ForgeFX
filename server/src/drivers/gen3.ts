@@ -2120,10 +2120,12 @@ class Gen3Driver implements DeviceDriver {
    *  - 400: the id is no wire parameter (above 0x3FFF sit the editor's pseudo ids, e.g. the cab's
    *    `_BTN_` buttons; a negative or fractional id is none either);
    *  - 409: the block's family has a row at that id, the row is an unused slot (all-zero placeholder) on the
-   *    connected firmware (its effective row or the applied profile's row), and the catalog defines no param
-   *    there. A catalog param with a placeholder row (`MOD_MIN`/`MOD_MAX`/`MOD_PARAM`, the `*_GLOBALMIX`
-   *    toggles) is a real param and stays writable, and so does an id with no row at all (the FC block, a
-   *    cross-block write).
+   *    connected firmware, and the catalog defines no param there. "On the connected firmware" is the
+   *    effective row, and for a byte-exact profile also the profile's own row. A live profile's placeholder
+   *    rows are no information (the merge skips them, and the param index lists the effective row), so only
+   *    the effective row counts there. A catalog param with a placeholder row (`MOD_MIN`/`MOD_MAX`/`MOD_PARAM`,
+   *    the `*_GLOBALMIX` toggles) is a real param and stays writable, and so does an id with no row at all (the
+   *    FC block, a cross-block write).
    *  A param the generic response marks `write: null` is NOT refused: that mark is advice for the UI. */
   #guardParamWrite(eid: number, paramId: number): void {
     const refuse = (statusCode: number, message: string): never => {
@@ -2136,8 +2138,9 @@ class Gen3Driver implements DeviceDriver {
     if ((catalog.params[family] ?? []).some((d) => d.paramId === paramId)) return;
     const facts = this.#prof.profileFacts;
     const effective = this.#prof.ranges[family]?.[paramId];
-    // a suspect family's profile section belongs to another family: its rows say nothing about this one
-    const profiled = facts && !facts.suspectFamilies.includes(family) ? facts.ranges[family]?.[paramId] : undefined;
+    // a byte-exact profile's own row; a suspect family's profile section belongs to another family, so its rows
+    // say nothing about this one
+    const profiled = facts?.byteExact && !facts.suspectFamilies.includes(family) ? facts.ranges[family]?.[paramId] : undefined;
     if ((effective && isPlaceholderRow(effective)) || (profiled && isPlaceholderRow(profiled))) {
       refuse(409, `param ${paramId} of ${family} is an unused slot on this firmware; write refused`);
     }

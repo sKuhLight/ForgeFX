@@ -397,7 +397,7 @@ async function definitionsDriftWithoutProfile(): Promise<void> {
 
 // an applied runtime profile: provenance facts, and what it does to drift
 async function definitionsAppliedProfile(): Promise<void> {
-  // the maintainer's case: FM3 fw 13.0, a byte-exact editor-cache profile of 13.0
+  // a profile for a newer firmware than the catalog: FM3 fw 13.0, a byte-exact editor-cache profile of 13.0
   let r = await defsRig(0x11, [13, 0], { '11_13p0': docFor(0x11, '13.0') });
   try {
     const d = await definitionsOf(r);
