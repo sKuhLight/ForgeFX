@@ -5,6 +5,8 @@
 //   • AM4 gets a layout for the first time (family mapping via am4LayoutFor).
 import { PROFILES, am4LayoutFor, resolveLayoutPages, type DeviceLayout, type SelectorValues } from '../../src/devices.js';
 import { EDITOR_WIDGET_KINDS, type EditorLayoutPage } from 'forgefx-midi/gen3/fm3';
+import { mockBlockDevice, eidOfSlug } from '../helpers/blockRead.js';
+import { SLUG_FAMILY } from '../../src/devices.js';
 
 const fm3 = PROFILES[0x11]!;
 const fm9 = PROFILES[0x12]!;
@@ -226,10 +228,56 @@ const checks: Array<{ name: string; ok: () => boolean }> = [
     return labels.length === 2 && labels.join(',') === 'keep-plain,keep-gtet'; } },
 ];
 
-export const LAYOUTS_CASE_COUNT = checks.length;
+// ── served variants: which layout variant a block answers with, from the values it reads ──
+// A family with a type selector (<F>_MODEL / <F>_TYPE) picks its variant by the type value (the GEQ's band
+// layout); one without picks it by its variant selector: the cab by CABINET_MODE (Legacy / DynaCab), the plex by
+// PLEX_BASETYPE. The cab used to follow its preamp type (CABINET_PRETYPE, a param that merely ends in TYPE), so
+// a cab on DynaCab could get the Legacy pages and the other way round.
+const SERVED_VARIANT_CASES = 4;
 
-export function runLayoutsTests(): void {
+async function servedVariantChecks(): Promise<void> {
+  for (const profile of [fm3, fm9, axe3]) {
+    const served = async (slug: string, set: Record<string, number>) => {
+      const family = SLUG_FAMILY[slug]!;
+      const eid = eidOfSlug(slug);
+      const values = new Array<number>(profile.rangeSections[family]!.stride * 4).fill(0);
+      for (const [name, v] of Object.entries(set)) values[profile.params[family]!.find((p) => p.name === name)!.paramId] = v;
+      const { driver } = mockBlockDevice(profile, { [eid]: { values, channel: 0 } });
+      return [await driver.blockParams(eid)] as const;
+    };
+    // 1. the cab follows CABINET_MODE
+    for (const mode of [0, 1]) {
+      for (const r of await served('cab', { CABINET_MODE: mode })) {
+        if (r.layout?.variantValue !== String(mode)) throw new Error(`${profile.key}: cab layout variant for CABINET_MODE=${mode} is ${r.layout?.variantValue}`);
+      }
+    }
+    // 2. …and not the preamp type
+    for (const pre of [0, 5, 11]) {
+      for (const [mode, want] of [[0, '0'], [1, '1']] as const) {
+        for (const r of await served('cab', { CABINET_MODE: mode, CABINET_PRETYPE: pre })) {
+          if (r.layout?.variantValue !== want) throw new Error(`${profile.key}: cab variant moved with CABINET_PRETYPE=${pre} (mode ${mode} gave ${r.layout?.variantValue})`);
+        }
+      }
+    }
+    // 3. the plex follows PLEX_BASETYPE
+    for (const [base, name] of [[0, 'Plex Delay'], [3, 'Plex Verb'], [4, 'Shimmer Verb']] as const) {
+      for (const r of await served('plex', { PLEX_BASETYPE: base })) {
+        if (r.layout?.variantName !== name) throw new Error(`${profile.key}: plex variant for PLEX_BASETYPE=${base} is ${r.layout?.variantName}`);
+      }
+    }
+    // 4. a family with a type selector is unchanged: the GEQ's band layout follows GEQ_TYPE
+    for (const r of await served('geq', { GEQ_TYPE: 2 })) {
+      if (r.layout?.variantName !== '7 Band') throw new Error(`${profile.key}: GEQ variant for type 2 is ${r.layout?.variantName}`);
+    }
+  }
+  console.log('  drivers/layouts: served variants — cab by CABINET_MODE (not the preamp type), plex by PLEX_BASETYPE, GEQ by its type; FM3/FM9/III');
+}
+
+export const LAYOUTS_CASE_COUNT = checks.length + SERVED_VARIANT_CASES;
+
+export async function runLayoutsTests(): Promise<void> {
   for (const c of checks) {
     if (!c.ok()) throw new Error(`editor-layout check failed: ${c.name}`);
   }
+  await servedVariantChecks();
 }

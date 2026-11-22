@@ -27,8 +27,9 @@ import type { DeviceProfile } from '../../src/devices.js';
 import { effectRoster } from 'forgefx-midi/devices/gen3';
 import { createModernFractalCodec, packValue16 } from 'forgefx-midi/gen3/axe-fx-iii';
 import { MockTransport, assert, assertEqual } from '../helpers/mock.js';
+import { mockBlockDevice } from '../helpers/blockRead.js';
 
-export const FLOAT_ROW_SELECTORS_CASE_COUNT = 6;
+export const FLOAT_ROW_SELECTORS_CASE_COUNT = 8;
 
 const AXE3 = 0x10;
 const FM3 = 0x11;
@@ -281,4 +282,40 @@ export async function runFloatRowSelectorsTests(): Promise<void> {
     assertEqual(`${frame[6]!.toString(16).padStart(2, '0')}${frame[7]!.toString(16).padStart(2, '0')}`, '0900', 'discrete sub-action 09 00 (not the continuous 52 00)');
   }
   console.log('  drivers/float-row-selectors: the toggle writes as the discrete SET (sub 09 00, float32(ordinal))');
+
+  // ---- Case 7: a selector that merely ends in TYPE is a selector, not the family's type -------------
+  // The family type (the header's retype palette, left out of the enum list) is `<F>_MODEL` / `<F>_TYPE` by
+  // exact name. A guess at "the first enum whose name ends in TYPE" took CABINET_PRETYPE (the cab's Preamp Type),
+  // CONTROLLERS_LFO1TYPE, GLOBAL_CC_BYPASS_TYPE and PLEX_FILTERTYPE for it, so they dropped out of the lists.
+  const LOOKALIKES: [string, string, number | string][] = [
+    ['CABINET_PRETYPE', 'CABINET', eidOf('cab')], ['CONTROLLERS_LFO1TYPE', 'CONTROLLERS', 2],
+    ['GLOBAL_CC_BYPASS_TYPE', 'GLOBAL', 1], ['PLEX_FILTERTYPE', 'PLEX', eidOf('plex')],
+  ];
+  for (const dev of [fm3, fm9, iii]) {
+    for (const [name, family, eid] of LOOKALIKES) {
+      const pid = dev.params[family]!.find((p) => p.name === name)!.paramId;
+      assertEqual(dev.ranges[family]![pid]!.kind, 'enum', `${dev.key} ${name} is an enum row (the premise)`);
+      const values = new Array<number>(Math.max(dev.rangeSections[family]?.stride ?? 0, 256) * 4).fill(0);
+      const { driver } = mockBlockDevice(dev, { [Number(eid)]: { values, channel: 0 } });
+      const served = await driver.blockParams(Number(eid));
+      const e = served.enums.find((x) => x.id === pid);
+      assert(!!e && e.options.length >= 2, `${dev.key} ${name} is served as a selector`);
+      assertEqual(served.type, null, `${dev.key} ${family} has no type selector, so no type`);
+    }
+  }
+  console.log('  drivers/float-row-selectors: CABINET_PRETYPE, CONTROLLERS_LFO1TYPE, GLOBAL_CC_BYPASS_TYPE and PLEX_FILTERTYPE are served as selectors (FM3, FM9, III), no family type on them');
+
+  // A retype writes the family's type selector and nothing else: the cab has none, so a retype is refused and
+  // nothing goes out (it used to write the preamp type); a delay writes its model.
+  {
+    const cab = mockBlockDevice(fm3, {});
+    assertEqual(JSON.stringify(await cab.driver.setType(eidOf('cab'), 1)), JSON.stringify({ ok: false }), 'setType on the cab is refused');
+    assertEqual(cab.mock.sent.length, 0, 'and writes nothing');
+    const delay = mockBlockDevice(fm3, {});
+    assertEqual((await delay.driver.setType(eidOf('delay'), 4)).ok, true, 'setType on a delay writes its model');
+    assertEqual(delay.mock.sent.length, 1, 'one frame');
+    const modelPid = fm3.params['DELAY']!.find((p) => p.name === 'DELAY_MODEL')!.paramId;
+    assertEqual(compactHex(delay.mock.sent[0]!), compactHex(createModernFractalCodec(FM3).buildSetParameter(eidOf('delay'), modelPid, 4)), 'the frame sets DELAY_MODEL');
+  }
+  console.log('  drivers/float-row-selectors: setType is refused on the cab (nothing written) and writes DELAY_MODEL on a delay');
 }

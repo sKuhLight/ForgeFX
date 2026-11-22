@@ -24,6 +24,7 @@ import {
   type ModernFractalCodec
 } from 'forgefx-midi/gen3/axe-fx-iii';
 import { wireToDisplay } from 'forgefx-midi/shared';
+import { enumOrdinalBounds } from 'forgefx-midi/cache';
 import {
   parsePresetDump, decodeRawPatch, decodeGen3Body,
   readBlockParamsForModel, modelsFromBlocks,
@@ -32,7 +33,10 @@ import {
   type DecodedBlock
 } from 'forgefx-midi/devices/gen3';
 import { isTransportTimeout, type Transport } from '../transport/types.js';
-import { SLUG_FAMILY, isEnumOnAnyDevice, paramLabel, type DeviceProfile, type TypeModel, type DeviceLayout, type SelectorValues } from '../devices.js';
+import {
+  SLUG_FAMILY, isEnumOnAnyDevice, paramLabel, typeSelectorPid, variantSelectorPid,
+  type DeviceProfile, type TypeModel, type DeviceLayout, type RangeDef, type SelectorValues
+} from '../devices.js';
 import { EmptyPresetError } from './types.js';
 import type {
   DeviceDriver, DriverCapabilities, DriverCtx, DiagnosticDump, SelectPresetOpts,
@@ -461,6 +465,44 @@ function dedupeLabels(items: { name: string }[]): void {
       it.name = `${it.name} ${n}`;
     }
   }
+}
+
+// ── selector options and decoding, shared by every response that lists selectors ──
+
+/** Most options one selector lists. The longest real list (a CC list of GLOBAL) has 162 entries; the cap only
+ *  keeps a corrupt row from producing an unbounded list. */
+export const MAX_ENUM_OPTIONS = 4096;
+
+type EnumOption = { value: number; label: string };
+
+/** The options of a selector over the ordinals `lo..hi`. A label is the device's own list at `v - lo` (a list
+ *  starts at the row's first ordinal, not at 0), else the model overlay at `v`, else the bare ordinal. Cut at
+ *  MAX_ENUM_OPTIONS (`truncated`). */
+function buildEnumOptions(
+  lo: number, hi: number, labels: readonly string[] | undefined, overlay: Readonly<Record<number, string>> | undefined
+): { options: EnumOption[]; truncated: boolean } {
+  const options: EnumOption[] = [];
+  let v = lo;
+  for (; v <= hi && options.length < MAX_ENUM_OPTIONS; v++) options.push({ value: v, label: labels?.[v - lo] ?? overlay?.[v] ?? String(v) });
+  return { options, truncated: v <= hi };
+}
+
+/** A selector row read as the wire value `raw`: the ordinal range its options cover, the decoded ordinal, and
+ *  whether the reading lies inside the range. An enum-KIND row stores the ordinal; a value above the top ordinal
+ *  looks 16-bit scaled and is unscaled onto the ordinal range. A FLOAT row (a float-row selector) always
+ *  carries the normalised raw/65534 value, so it is always scaled onto its label range: guessing "ordinal or
+ *  scaled" there would read raw 1 (~0.0) as ON. The midpoint raw 32767 (exactly 0.5) rounds up, like Math.round
+ *  does for the rest of the decode. */
+function decodeSelector(range: Pick<RangeDef, 'kind' | 'displayMin' | 'displayMax' | 'scale' | 'enumCount'>, raw: number): { lo: number; hi: number; value: number; inRange: boolean } {
+  if (range.kind === 'float') {
+    const lo = Math.round(range.displayMin);
+    const hi = Math.round(range.displayMax);
+    const value = Math.min(hi, Math.max(lo, Math.round((raw / 65534) * (hi - lo)) + lo));
+    return { lo, hi, value, inRange: raw <= 65534 };
+  }
+  const { lo, hi } = enumOrdinalBounds(range);
+  const value = raw > hi ? Math.round((raw / 65534) * (hi - lo)) + lo : raw;
+  return { lo, hi, value, inRange: value >= lo && value <= hi };
 }
 
 class Gen3Driver implements DeviceDriver {
@@ -1072,7 +1114,7 @@ class Gen3Driver implements DeviceDriver {
     // enums = every discrete selector. The family TYPE selector is excluded (header retype palette),
     // plus the raw bypass flag; everything else (modes, slopes, mics, mic/cab pickers…) is shown, and so
     // are the float-row selectors (enumParams: the III's GLOBALMIX toggles).
-    const typeId = this.#paramId(family, 'type');
+    const typeId = typeSelectorPid(this.#prof, family);
     const enumDefs = enumParams(this.#prof, family, typeId);
     const named: NamedParam[] = [];
     const enums: EnumParam[] = [];
@@ -1097,19 +1139,9 @@ class Gen3Driver implements DeviceDriver {
         }
         for (const p of enumDefs) {
           const range = this.#prof.ranges[family]![p.paramId]!;
-          const max = Math.round(range.displayMax);
-          const min = Math.round(range.displayMin);
           const raw = bulk.values[base + p.paramId] ?? 0;
-          // An enum-KIND row stores the ordinal; if the wire value looks 16-bit-scaled, unscale it. A FLOAT
-          // row (the float-row selectors admitted by enumParams) always carries the normalized raw/65534
-          // value, so it is always scaled onto the label range: guessing "ordinal or scaled" there would
-          // read raw 1 (~0.0) as ON. Midpoint: raw 32767 (exactly 0.5) rounds up, like Math.round does
-          // for the rest of the decode.
-          const value =
-            range.kind === 'float'
-              ? Math.min(max, Math.max(min, Math.round((raw / 65534) * (max - min)) + min))
-              : raw > max ? Math.round((raw / 65534) * (max - min)) + min : raw;
-          enums.push({ id: p.paramId, name: paramLabel(p), value, options: this.#enumOptions(family, p.paramId, p.name, min, max) });
+          const dec = decodeSelector(range, raw);
+          enums.push({ id: p.paramId, name: paramLabel(p), value: dec.value, options: this.#enumOptions(family, p.paramId, p.name, dec.lo, dec.hi) });
         }
         // current model/type (for EQ band layout etc.)
         if (typeId != null) {
@@ -1138,9 +1170,12 @@ class Gen3Driver implements DeviceDriver {
       return valueByPid.get(pid);
     };
     // Re-resolve the layout to the variant selected by the block's CURRENT type value (EQ band count,
-    // amp firmware-pinned variant, etc.) and filter its pages to the current selector/firmware state;
-    // falls back to the null/first variant when type is unknown.
-    layout = this.#prof.layoutFor(family, type?.value, selectors);
+    // amp firmware-pinned variant, etc.) and filter its pages to the current selector/firmware state. A family
+    // without a type selector is told apart by its variant selector instead (the cab's Legacy / DynaCab mode,
+    // the plex's base type); falls back to the null/first variant when the value is unknown.
+    const variantPid = variantSelectorPid(this.#prof, family);
+    const variantValue = typeId != null ? type?.value : variantPid != null ? valueByPid.get(variantPid) : undefined;
+    layout = this.#prof.layoutFor(family, variantValue, selectors);
     // disambiguate repeated labels within a block (e.g. the cab's 4× "Low Cut", amp's two "Depth")
     // so identical names get a 1/2/3 suffix the UI can tell apart.
     dedupeLabels(named);
@@ -1592,16 +1627,11 @@ class Gen3Driver implements DeviceDriver {
     return { ok: true };
   }
 
-  /** Build dropdown options for an enum param. Labels come from fractal-midi's enum overlay
-   * (matched by device param name) where known; otherwise the bare ordinal. */
-  #enumOptions(family: string, paramId: number, name: string, min: number, max: number): { value: number; label: string }[] {
-    const cache = this.#prof.enumLabelsFor(family, paramId); // device-true labels from the editor cache
-    const ov = resolveEnumValues(name); // III overlay fallback
-    const out: { value: number; label: string }[] = [];
-    for (let v = min; v <= max && out.length < 128; v++) {
-      out.push({ value: v, label: cache?.[v] ?? ov?.values?.[v] ?? String(v) });
-    }
-    return out;
+  /** Build dropdown options for the enum param over the ordinals `min..max`. A label is the device's own list
+   * (the editor cache) at `v - min`, else fractal-midi's enum overlay (matched by device param name) where
+   * known, else the bare ordinal. */
+  #enumOptions(family: string, paramId: number, name: string, min: number, max: number): EnumOption[] {
+    return buildEnumOptions(min, max, this.#prof.enumLabelsFor(family, paramId), resolveEnumValues(name)?.values).options;
   }
 
   /** Map a raw 0..65534 wire value to {value, norm, unit, min, max, log} via the device-true FM3 range.
@@ -1644,24 +1674,15 @@ class Gen3Driver implements DeviceDriver {
     return { value: Math.round(norm * 1000) / 100, norm }; // 0..10 fallback
   }
 
-  /** Resolve a param name (display label) → device-true paramId. 'Type' → the model-selector,
-   *  in strict preference order:
-   *    1. `<FAM>_MODEL` — DELAY: its `DELAY_TYPE` is the 8-value MONO/STEREO routing enum, the
-   *       real model list lives on `DELAY_MODEL` (cache-confirmed FM3/FM9/III 2026-07-06);
-   *    2. the EXACT `<FAM>_TYPE` name regardless of unit — the FM3/FM9 device-true catalogs tag
-   *       it `unverified`, and the old `unit==='enum' && /TYPE$/` heuristic then matched a
-   *       DIFFERENT selector entirely (FUZZ → FUZZ_CLIPTYPE pid 10, PITCH → PITCH_XFADETYPE
-   *       pid 46; III DYNDIST → DYNDIST_BQTYPE) — so the Drive block's "type" read AND wrote
-   *       the clipping-diode param (the field-reported drive-type bug);
-   *    3. the enum-unit /TYPE$/ heuristic, as the last resort for families with neither. */
+  /** Resolve a param name (display label) → device-true paramId. 'Type' → the family's type selector
+   *  (`typeSelectorPid`): `<FAM>_MODEL` where it exists (DELAY: its `DELAY_TYPE` is the 8-value MONO/STEREO
+   *  routing enum, the real model list lives on `DELAY_MODEL`), else the EXACT `<FAM>_TYPE` name regardless of
+   *  unit (the catalogs tag it `unverified`; guessing "the first enum that ends in TYPE" picked a DIFFERENT
+   *  selector: FUZZ → FUZZ_CLIPTYPE, PITCH → PITCH_XFADETYPE, CABINET → CABINET_PRETYPE). A family with
+   *  neither has no type: its other selectors list like any param. */
   #paramId(family: string, name: string): number | undefined {
-    const defs = this.#prof.params[family] ?? [];
-    if (name.toLowerCase() === 'type') {
-      return (defs.find((p) => p.name === `${family}_MODEL`)
-        ?? defs.find((p) => p.name === `${family}_TYPE`)
-        ?? defs.find((p) => p.unit === 'enum' && /TYPE$/i.test(p.name)))?.paramId;
-    }
-    return defs.find((p) => p.displayLabel === name || p.name === name)?.paramId;
+    if (name.toLowerCase() === 'type') return typeSelectorPid(this.#prof, family);
+    return (this.#prof.params[family] ?? []).find((p) => p.displayLabel === name || p.name === name)?.paramId;
   }
 
   // ── device-edit push (capability deviceEditPush): reflect front-panel / editor edits the device
