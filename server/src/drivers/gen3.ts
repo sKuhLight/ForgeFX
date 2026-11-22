@@ -37,11 +37,13 @@ import {
   SLUG_FAMILY, isEnumOnAnyDevice, paramLabel, typeSelectorPid, variantSelectorPid,
   type DeviceProfile, type TypeModel, type DeviceLayout, type RangeDef, type SelectorValues
 } from '../devices.js';
+import { buildParamIndex, type BlockIndex, type ParamEntry } from './paramIndex.js';
 import { EmptyPresetError } from './types.js';
 import type {
   DeviceDriver, DriverCapabilities, DriverCtx, DiagnosticDump, SelectPresetOpts,
   PresetGridDTO, GridCellDTO, PresetBlockDTO, PresetSummary, NamedParam, EnumParam, MeterVal,
-  FcSwitchState, FcReadState, StoreReason
+  FcSwitchState, FcReadState, StoreReason,
+  BlockParamsDTO, BlockParamsV2DTO, BlockParamsOpts, NamedParamV2, EnumParamV2, ParamMeta, UnresolvedReason
 } from './types.js';
 import { validatedPresetDump } from './sendPolicy.js';
 
@@ -467,7 +469,7 @@ function dedupeLabels(items: { name: string }[]): void {
   }
 }
 
-// ── selector options and decoding, shared by every response that lists selectors ──
+// ── reading a block: geometry and value decoding shared by the classic and the generic response ──
 
 /** Most options one selector lists. The longest real list (a CC list of GLOBAL) has 162 entries; the cap only
  *  keeps a corrupt row from producing an unbounded list. */
@@ -503,6 +505,106 @@ function decodeSelector(range: Pick<RangeDef, 'kind' | 'displayMin' | 'displayMa
   const { lo, hi } = enumOrdinalBounds(range);
   const value = raw > hi ? Math.round((raw / 65534) * (hi - lo)) + lo : raw;
   return { lo, hi, value, inRange: value >= lo && value <= hi };
+}
+
+/** What one fn-0x1F read of a block gave, and how its body is laid out. */
+interface BlockRead {
+  /** The body (one wire value per record, all channels back to back); null when it was not read or failed. */
+  values: readonly number[] | null;
+  /** The read threw or timed out: `values` is null and this says why. */
+  readError?: string;
+  /** Active channel (0-3) of a channel-bearing block; null when the status read did not report the block, and
+   *  for a block without channels. */
+  channel: number | null;
+  /** One channel slice's width and where the active channel's slice starts. */
+  stride: number;
+  base: number;
+  /** The body is indexed by param id: every informative row of the family lies inside one slice. */
+  positional: boolean;
+}
+
+/** What the two response builders share about the block they serve. */
+interface BlockContext {
+  family: string;
+  slug: string;
+  blockName: string;
+  page: number;
+  hasChannels: boolean;
+  read: BlockRead;
+}
+
+/** What a param's slot of the read holds (a wire value), or the reason it holds nothing usable. */
+function readSlot(read: BlockRead, hasChannels: boolean, pid: number): number | UnresolvedReason {
+  if (!read.values) return 'read-failed';
+  if (!read.positional) return 'non-positional';
+  if (hasChannels && read.channel === null) return 'channel-unknown';
+  const at = read.base + pid;
+  return pid >= read.stride || at >= read.values.length ? 'not-in-body' : read.values[at]!;
+}
+
+/** Diagnostic hook, off by default: pids to serve as generic params whatever the catalog names them, from
+ *  `FORGEFX_DEFS_FORCE_GENERIC` ("FAMILY:pid" entries, comma-separated; for testing only). Read through a
+ *  guarded process access: a browser runtime has none and never forces anything. */
+function forcedGenericPids(family: string): ReadonlySet<number> | undefined {
+  const raw = typeof process !== 'undefined' ? process.env?.FORGEFX_DEFS_FORCE_GENERIC : undefined;
+  if (!raw) return undefined;
+  const pids = new Set<number>();
+  for (const entry of raw.split(',')) {
+    const [fam, pid] = entry.trim().split(':');
+    if (fam?.trim() === family && pid !== undefined && /^\d+$/.test(pid.trim())) pids.add(Number(pid));
+  }
+  return pids.size > 0 ? pids : undefined;
+}
+
+/** The meta every generic param carries besides its value (the `unresolved` reason is added by the caller). */
+function paramMetaOf(e: ParamEntry): ParamMeta {
+  return {
+    kind: e.kind,
+    source: e.source,
+    generic: e.generic,
+    ...(e.isNew ? { isNew: true as const } : {}),
+    ...(e.pageHint ? { pageHint: e.pageHint } : {}),
+    nameSource: e.nameSource,
+    ...(e.nameConfidence ? { nameConfidence: e.nameConfidence } : {}),
+    ...(e.movedFrom !== undefined ? { movedFrom: e.movedFrom } : {}),
+    fp: e.fp,
+    widget: e.widget,
+    widgetSource: e.widgetSource,
+    write: e.write,
+    ...(e.readOnlyReason ? { readOnlyReason: e.readOnlyReason } : {}),
+    ...(e.step !== undefined ? { step: e.step } : {}),
+  };
+}
+
+type LayoutControl = DeviceLayout['pages'][number]['rows'][number]['controls'][number];
+/** A layout button symbol `<F>_BTN_<X><n>` and the served param `<F>_<X><n>` it presses (`CABINET_BTN_MUTE1` →
+ *  `CABINET_MUTE1`). The button's own `paramId` is an editor pseudo id and stays as it is. */
+const BUTTON_SYMBOL = /^([A-Z0-9]+)_BTN_([A-Z]+\d*)$/;
+
+/** A copy of `layout` whose button controls carry `boundParamId`: the served param each one presses. Controls
+ *  that bind nothing served, and layouts without any, come back untouched. */
+function withBoundParams(layout: DeviceLayout, pidOfSymbol: (symbol: string) => number | undefined): DeviceLayout {
+  let touched = false;
+  const pages = layout.pages.map((page) => {
+    let pageTouched = false;
+    const rows = page.rows.map((row) => {
+      let rowTouched = false;
+      const controls = row.controls.map((c): LayoutControl => {
+        const m = c.paramName ? BUTTON_SYMBOL.exec(c.paramName) : null;
+        const bound = m ? pidOfSymbol(`${m[1]}_${m[2]}`) : undefined;
+        if (bound === undefined) return c;
+        rowTouched = true;
+        return { ...c, boundParamId: bound } as LayoutControl;
+      });
+      if (!rowTouched) return row;
+      pageTouched = true;
+      return { ...row, controls };
+    });
+    if (!pageTouched) return page;
+    touched = true;
+    return { ...page, rows };
+  });
+  return touched ? { ...layout, pages } : layout;
 }
 
 class Gen3Driver implements DeviceDriver {
@@ -569,7 +671,10 @@ class Gen3Driver implements DeviceDriver {
   /** Adopt a device-cache-derived runtime profile (device-true rosters / enum labels / ranges). The
    *  model byte is unchanged so the codec bound at construction stays valid; only the data the reads
    *  resolve through (#prof) is swapped. Idempotent — re-applying a fresh profile just replaces it. */
-  applyRuntimeProfile(profile: DeviceProfile): void { this.#prof = profile; }
+  applyRuntimeProfile(profile: DeviceProfile): void {
+    this.#prof = profile;
+    this.#nonPositional.clear(); // the new rows may lay a family out differently
+  }
 
   #gridCache: { grid: PresetGridDTO; at: number; gen: number } | null = null;
   #gridInflight: Promise<PresetGridDTO> | null = null;
@@ -1088,24 +1193,87 @@ class Gen3Driver implements DeviceDriver {
    * channelCount = values.length/stride (per-block, NOT always 4). `norm` = raw/65534
    * (knob position); `value`/`unit` are the device-true DISPLAY reading via this.#prof.ranges
    * (e.g. 1.2k Hz, -12 dB) where the cache has a range, else the 0..10 position.
+   *
+   * Two responses share one read. The classic one (default) lists the catalog's dials and selectors and always
+   * carries numbers; a value that had to be invented (a zero for a position the read did not cover, a guessed
+   * channel, a family whose body is not indexed by param id) keeps its number and gains `unresolved`. The generic
+   * one (`opts.generic`) lists every param the block has on the connected device (see buildParamIndex), serves
+   * `null` plus the `unresolved` reason where no value could be resolved, and adds a `definitions` block.
    */
-  async blockParams(eid: number): Promise<{ block: string; slug: string; page: number; named: NamedParam[]; enums: EnumParam[]; type: { value: number; name: string } | null; layout?: DeviceLayout }> {
+  blockParams(eid: number): Promise<BlockParamsDTO>;
+  blockParams(eid: number, opts: BlockParamsOpts & { generic: true }): Promise<BlockParamsV2DTO>;
+  blockParams(eid: number, opts?: BlockParamsOpts): Promise<BlockParamsDTO | BlockParamsV2DTO>;
+  async blockParams(eid: number, opts?: BlockParamsOpts): Promise<BlockParamsDTO | BlockParamsV2DTO> {
     this.#watchedEid = eid; // this is the block the user has open → the target the FM3 device-edit poll re-reads
+    const generic = opts?.generic === true;
     const codecSlug = slugForEffectId(eid) ?? ''; // audio blocks resolve via the codec
     // virtual effects (GLOBAL=1, Controllers=2, Modifier=3, FC=199) resolve via the profile's effectId map
     const family = SLUG_FAMILY[codecSlug.toLowerCase()] ?? this.#prof.familyForEffectId(eid);
     const hasChannels = !!SLUG_FAMILY[codecSlug.toLowerCase()]; // an audio block; the virtual effects have no channels A-D
     const slug = codecSlug || (family ? family.toLowerCase() : ''); // virtual effects key on the family name
     const meta = BLOCK_META[codecSlug];
-    const blockName = meta?.name ?? family ?? slug;
     const page = meta?.page ?? -1;
-    // Seed the editor-authentic layout with the family's fallback variant; once the block's CURRENT
-    // type is read below we re-resolve to the type-matched (or firmware-pinned) variant.
-    let layout = family ? this.#prof.layoutFor(family) : undefined;
     if (!family) {
-      return { block: blockName, slug, page, named: [], enums: [], type: null, layout }; // no device-true param family mapped
+      // no device-true param family mapped
+      if (!generic) return { block: meta?.name ?? slug, slug, page, named: [], enums: [], type: null, layout: undefined };
+      return {
+        block: meta?.name ?? `Block ${eid}`, slug, page, named: [], enums: [], type: null, unknownBlock: true,
+        definitions: { family: null, profile: 'none', positional: false, channel: null, persistentWrites: false, hidden: [] }
+      };
     }
-    const defs = this.#prof.params[family] ?? [];
+    const blockName = meta?.name ?? family;
+    const forced = generic ? forcedGenericPids(family) : undefined;
+    const index = buildParamIndex(this.#prof, family, forced ? { forceGeneric: forced } : undefined);
+    const read = await this.#readBlock(eid, family, hasChannels, index);
+    const shared = { family, slug, blockName, page, hasChannels, read };
+    return generic ? this.#paramsGeneric(shared, index) : this.#paramsClassic(shared);
+  }
+
+  /** The block's status (active channel) and its fn-0x1F body, sliced to the active channel. Primes the
+   *  device-edit baseline of a block whose body is indexed by param id; a family whose body is not (GLOBAL: one
+   *  record per param, in id order) has no per-param information to diff and is never watched. */
+  async #readBlock(eid: number, family: string, hasChannels: boolean, index: BlockIndex): Promise<BlockRead> {
+    const dev = await this.#conn();
+    let channel: number | null = null;
+    try {
+      // Read the block's CURRENT channel (A-D) so a channel switch actually reloads that channel's
+      // params/type: the fn-0x1F body is channel-blocked and holds ALL channels, so we must slice the
+      // active one, not always channel A. Costs one status round-trip per open — worth it for correctness.
+      const status = (await this.#statusByEffectId()).get(eid);
+      channel = hasChannels && status ? status.channel : null;
+      const activeCh = status?.channel ?? 0;
+      this.#watchedChannel = activeCh; // keep the device-edit-burst diff on the same channel (see decodeEditBurst)
+      const frames = await this.#bulkRead(dev, eid, dev.slow ? 8000 : 2500, dev.slow ? 600 : 120);
+      const bulk = this.#codec.assembleGen3BlockBulkRead(frames);
+      const { stride, base } = this.#channelSlice(family, bulk, activeCh, hasChannels);
+      const positional = this.#isPositional(index, bulk, stride, hasChannels);
+      if (positional) {
+        // Prime the device-edit-push baseline with the OPEN channel's values so a later front-panel
+        // edit's burst diffs cleanly to the moved param (no first-sight reload — see decodeEditBurst).
+        this.#editSnapshot.set(eid, bulk.values.slice(base, base + stride));
+        this.#nonPositional.delete(eid);
+      } else {
+        this.#nonPositional.add(eid);
+      }
+      return { values: bulk.values, channel, stride, base, positional };
+    } catch (e) {
+      return { values: null, readError: e instanceof Error ? e.message : String(e), channel, stride: 0, base: 0, positional: index.positional ?? false };
+    }
+  }
+
+  /** Is a family's body indexed by param id, i.e. does one channel slice hold every informative row? Either the
+   *  section stride the profile carries says so (the index's own answer) or the slice the reply actually shows
+   *  does: a table stride is only a hint (see #channelSlice) and may be too short for the connected firmware, and
+   *  a short body leaves the high pids `not-in-body`, not the family unreadable. A block without channels is one
+   *  slice, as wide as the body the device advertised. GLOBAL (pids up to 14879 over a 136-record body) is
+   *  neither. */
+  #isPositional(index: BlockIndex, bulk: { itemCount: number }, stride: number, hasChannels: boolean): boolean {
+    return index.positional === true || index.maxPid < Math.max(stride, hasChannels ? 0 : bulk.itemCount);
+  }
+
+  /** The classic response (see blockParams). */
+  #paramsClassic(c: BlockContext): BlockParamsDTO {
+    const { family, slug, hasChannels, read } = c;
     // knobs = every continuous param with a usable range: a float-kind range AND a continuous catalog
     // unit (KNOB_UNITS; this keeps selectors that carry a float-typed range record out of the dial
     // list). We expose ALL real controls (the UI organizes them); besides that only genuinely-dead
@@ -1119,42 +1287,42 @@ class Gen3Driver implements DeviceDriver {
     const named: NamedParam[] = [];
     const enums: EnumParam[] = [];
     let type: { value: number; name: string } | null = null;
-    {
-      const dev = await this.#conn();
-      try {
-        // Read the block's CURRENT channel (A-D) so a channel switch actually reloads that channel's
-        // params/type: the fn-0x1F body is channel-blocked and holds ALL channels, so we must slice the
-        // active one, not always channel A. Costs one status round-trip per open — worth it for correctness.
-        const activeCh = (await this.#statusByEffectId()).get(eid)?.channel ?? 0;
-        this.#watchedChannel = activeCh; // keep the device-edit-burst diff on the same channel (see decodeEditBurst)
-        const frames = await this.#bulkRead(dev, eid, dev.slow ? 8000 : 2500, dev.slow ? 600 : 120);
-        const bulk = this.#codec.assembleGen3BlockBulkRead(frames);
-        const { stride, base } = this.#channelSlice(family, bulk, activeCh, hasChannels);
-        // Prime the device-edit-push baseline with the OPEN channel's values so a later front-panel
-        // edit's burst diffs cleanly to the moved param (no first-sight reload — see decodeEditBurst).
-        this.#editSnapshot.set(eid, bulk.values.slice(base, base + stride));
-        for (const p of knobs) {
-          const raw = bulk.values[base + p.paramId] ?? 0;
-          named.push({ id: p.paramId, name: paramLabel(p), ...this.#display(family, p.paramId, raw) });
-        }
-        for (const p of enumDefs) {
-          const range = this.#prof.ranges[family]![p.paramId]!;
-          const raw = bulk.values[base + p.paramId] ?? 0;
-          const dec = decodeSelector(range, raw);
-          enums.push({ id: p.paramId, name: paramLabel(p), value: dec.value, options: this.#enumOptions(family, p.paramId, p.name, dec.lo, dec.hi) });
-        }
-        // current model/type (for EQ band layout etc.)
-        if (typeId != null) {
-          const roster = this.#prof.rosterFor(slug);
-          const max = Math.max(0, roster.length - 1);
-          const raw = bulk.values[base + typeId] ?? 0;
-          const tv = raw > max ? Math.round((raw / 65534) * max) : raw;
-          type = { value: tv, name: roster[tv]?.name ?? '' };
-        }
-      } catch {
-        named.length = 0; // a mid-loop throw left partial data — reset before the zeroed fallback
-        for (const p of knobs) named.push({ id: p.paramId, name: paramLabel(p), value: 0, norm: 0 });
+    if (read.values) {
+      const values = read.values;
+      // The number a param gets even when the read has nothing for it: the classic response falls back to
+      // whatever sits at the slot, else 0, and the entry says so through `unresolved`.
+      const rawOf = (slot: number | UnresolvedReason, pid: number): number => (typeof slot === 'number' ? slot : (values[read.base + pid] ?? 0));
+      for (const p of knobs) {
+        const slot = readSlot(read, hasChannels, p.paramId);
+        const raw = rawOf(slot, p.paramId);
+        const item: NamedParam = { id: p.paramId, name: paramLabel(p), ...this.#display(family, p.paramId, raw) };
+        const why = typeof slot === 'string' ? slot : raw > 65534 ? 'out-of-range' : undefined;
+        if (why) item.unresolved = why;
+        named.push(item);
       }
+      for (const p of enumDefs) {
+        const range = this.#prof.ranges[family]![p.paramId]!;
+        const slot = readSlot(read, hasChannels, p.paramId);
+        const dec = decodeSelector(range, rawOf(slot, p.paramId));
+        const item: EnumParam = {
+          id: p.paramId, name: paramLabel(p), value: dec.value,
+          options: this.#enumOptions(family, p.paramId, p.name, dec.lo, dec.hi)
+        };
+        const why = typeof slot === 'string' ? slot : dec.inRange ? undefined : 'out-of-range';
+        if (why) item.unresolved = why;
+        enums.push(item);
+      }
+      // current model/type (for EQ band layout etc.)
+      if (typeId != null) {
+        const roster = this.#prof.rosterFor(slug);
+        const max = Math.max(0, roster.length - 1);
+        const raw = rawOf(readSlot(read, hasChannels, typeId), typeId);
+        const tv = raw > max ? Math.round((raw / 65534) * max) : raw;
+        type = { value: tv, name: roster[tv]?.name ?? '' };
+      }
+    } else {
+      // the read failed: dials at rest (the selectors cannot be told apart from a lost read, so none are listed)
+      for (const p of knobs) named.push({ id: p.paramId, name: paramLabel(p), value: 0, norm: 0, unresolved: 'read-failed' });
     }
     // Current value of any page/control selector param, keyed by its editor symbol: the family type
     // selector answers with the type just decoded; other selectors (EQ type, drive type, …) with the
@@ -1175,12 +1343,108 @@ class Gen3Driver implements DeviceDriver {
     // the plex's base type); falls back to the null/first variant when the value is unknown.
     const variantPid = variantSelectorPid(this.#prof, family);
     const variantValue = typeId != null ? type?.value : variantPid != null ? valueByPid.get(variantPid) : undefined;
-    layout = this.#prof.layoutFor(family, variantValue, selectors);
+    const layout = this.#prof.layoutFor(family, variantValue, selectors);
     // disambiguate repeated labels within a block (e.g. the cab's 4× "Low Cut", amp's two "Depth")
     // so identical names get a 1/2/3 suffix the UI can tell apart.
     dedupeLabels(named);
     dedupeLabels(enums);
-    return { block: blockName, slug, page, named, enums, type, layout };
+    return { block: c.blockName, slug, page: c.page, named, enums, type, layout };
+  }
+
+  /** The generic response (see blockParams): one item per index entry, in index order. */
+  #paramsGeneric(c: BlockContext, index: BlockIndex): BlockParamsV2DTO {
+    const { family, slug, hasChannels, read } = c;
+    const named: NamedParamV2[] = [];
+    const enums: EnumParamV2[] = [];
+    const valueByPid = new Map<number, number>();
+    for (const e of index.entries) {
+      const slot = readSlot(read, hasChannels, e.pid);
+      const meta = paramMetaOf(e);
+      if (e.list === 'named') {
+        const why = typeof slot === 'string' ? slot : slot > 65534 ? 'out-of-range' : undefined;
+        const d = this.#displayRow(e.row, e.def?.unit, why ? 0 : (slot as number)); // no reading: the row's facts alone
+        named.push({
+          id: e.pid, name: e.name,
+          value: why ? null : d.value, norm: why ? null : d.norm,
+          ...(d.unit !== undefined ? { unit: d.unit } : {}),
+          ...(d.min !== undefined ? { min: d.min } : {}),
+          ...(d.max !== undefined ? { max: d.max } : {}),
+          ...(d.log ? { log: true } : {}),
+          ...meta,
+          ...(why ? { unresolved: why } : {}),
+        });
+        if (!why) valueByPid.set(e.pid, d.value);
+      } else {
+        const dec = decodeSelector(e.row, typeof slot === 'number' ? slot : 0);
+        const why = typeof slot === 'string' ? slot : dec.inRange ? undefined : 'out-of-range';
+        const { lo, hi } = e.options!;
+        const opts = buildEnumOptions(lo, hi, e.labels, e.def ? resolveEnumValues(e.def.name)?.values : undefined);
+        enums.push({
+          id: e.pid, name: e.name, value: why ? null : dec.value, options: opts.options,
+          ...meta,
+          ...(opts.truncated ? { optionsTruncated: true as const } : {}),
+          ...(why ? { unresolved: why } : {}),
+        });
+        if (!why) valueByPid.set(e.pid, dec.value);
+      }
+    }
+    // the type selector is hidden from the lists (the header retype palette shows it): read it on its own
+    let type: { value: number; name: string } | null = null;
+    const typeId = index.typePid;
+    if (typeId != null) {
+      const slot = readSlot(read, hasChannels, typeId);
+      if (typeof slot === 'number') {
+        const roster = this.#prof.rosterFor(slug);
+        const max = Math.max(0, roster.length - 1);
+        const tv = slot > max ? Math.round((slot / 65534) * max) : slot;
+        type = { value: tv, name: roster[tv]?.name ?? '' };
+      }
+    }
+    // The catalog symbols of the editor layout resolve to the pids that carry those names on this device: a name
+    // that moved with its row follows it, a selector that is gone resolves to nothing.
+    const defs = this.#prof.params[family] ?? [];
+    const catalogTypePid = typeSelectorPid(this.#prof, family);
+    const movedTo = new Map<number, number>();
+    for (const e of index.entries) if (e.movedFrom !== undefined) movedTo.set(e.movedFrom, e.pid);
+    const served = (catalogPid: number | undefined): number | undefined => {
+      if (catalogPid === undefined) return undefined;
+      if (catalogPid === catalogTypePid) return index.typePid;
+      const here = index.byPid.get(catalogPid);
+      if (here && here.nameSource === 'catalog' && here.def?.paramId === catalogPid) return catalogPid;
+      const moved = movedTo.get(catalogPid);
+      if (moved !== undefined) return moved;
+      return index.hidden.some((h) => h.id === catalogPid && h.reason !== 'removed') ? catalogPid : undefined;
+    };
+    const selectors: SelectorValues = (selectorParamName) => {
+      const pid = served(this.#paramId(family, selectorParamName));
+      if (pid == null) return undefined;
+      if (typeId != null && pid === typeId) return type?.value;
+      return valueByPid.get(pid);
+    };
+    const variantValue = typeId != null ? type?.value : index.variantPid != null ? valueByPid.get(index.variantPid) : undefined;
+    let layout = this.#prof.layoutFor(family, variantValue, selectors);
+    if (layout) {
+      layout = withBoundParams(layout, (symbol) => {
+        const pid = served(defs.find((d) => d.name === symbol)?.paramId);
+        return pid !== undefined && index.byPid.has(pid) ? pid : undefined;
+      });
+    }
+    dedupeLabels(named);
+    dedupeLabels(enums);
+    return {
+      block: c.blockName, slug, page: c.page, named, enums, type,
+      ...(layout ? { layout } : {}),
+      definitions: {
+        family,
+        profile: index.profile,
+        ...(index.suspect ? { suspect: true as const } : {}),
+        positional: read.positional,
+        channel: read.channel,
+        persistentWrites: family === 'GLOBAL' || family === 'FC',
+        hidden: index.hidden.map((h) => ({ id: h.id, reason: h.reason })),
+      },
+      ...(read.readError !== undefined ? { readError: read.readError } : {}),
+    };
   }
 
   /** Read specific paramIds of an effect via per-pid fn 0x01 GET (sub 01 00) — the path FM3-Edit
@@ -1638,8 +1902,14 @@ class Gen3Driver implements DeviceDriver {
    * Taper: a device-true explicit `range.taper` ('log'→log10; 'linear'|'flat'|'custom'→linear) wins;
    * absent it falls back to the typecode heuristic (middle nibble 4 = log10, e.g. freq cuts; every other nibble linear). */
   #display(family: string | undefined, paramId: number, raw: number): { value: number; norm: number; unit?: string; min?: number; max?: number; log?: boolean } {
-    const norm = clamp01(raw / 65534);
     const range = family ? this.#prof.ranges[family]?.[paramId] : undefined;
+    const unitCode = family ? this.#prof.params[family]?.find((x) => x.paramId === paramId)?.unit : undefined;
+    return this.#displayRow(range, unitCode, raw);
+  }
+
+  /** `#display` for a row the caller already holds, with the catalog unit code of the param it belongs to. */
+  #displayRow(range: RangeDef | undefined, unitCode: string | undefined, raw: number): { value: number; norm: number; unit?: string; min?: number; max?: number; log?: boolean } {
+    const norm = clamp01(raw / 65534);
     if (range && range.kind === 'float' && Number.isFinite(range.displayMin) && Number.isFinite(range.displayMax) && range.displayMin !== range.displayMax) {
       try {
         // Taper (log vs linear). A device-true explicit taper from the capture catalog WINS over the
@@ -1665,7 +1935,6 @@ class Gen3Driver implements DeviceDriver {
         // Prefer the DEVICE-TRUE unit captured by the live-walk (RangeDef.unit, view 0x00)
         // over the AM4-name-overlay catalog code; fall back to the overlay when absent
         // (byte-source/.cache profiles carry no device-true unit).
-        const unitCode = family ? this.#prof.params[family]?.find((x) => x.paramId === paramId)?.unit : undefined;
         return { value: round3(v), norm, unit: range.unit ?? ((unitCode && UNIT_LABEL[unitCode]) || undefined), min: range.displayMin, max: range.displayMax, log: log || undefined };
       } catch {
         /* fall through to 0..10 position */
@@ -1691,6 +1960,8 @@ class Gen3Driver implements DeviceDriver {
   // yields only the moved param(s). blockParams() primes the baseline when a block is opened. ──
   #editSnapshot = new Map<number, number[]>(); // effectId → last-known active-channel wire values
   #watchedEid: number | null = null; // FM3 poll target: the block Axis last opened (set in blockParams)
+  /** Blocks whose body is not indexed by param id (GLOBAL): nothing to diff, so the poll leaves them alone. */
+  #nonPositional = new Set<number>();
   #watchedChannel = 0; // active channel (0-3) of the watched block — the burst slice the poll diffs against
   #lastLocalEditAt = 0; // ms of the last local param write — the FM3 poll pauses briefly after (no self-echo)
 

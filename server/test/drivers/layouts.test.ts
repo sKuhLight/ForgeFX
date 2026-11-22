@@ -7,6 +7,7 @@ import { PROFILES, am4LayoutFor, resolveLayoutPages, type DeviceLayout, type Sel
 import { EDITOR_WIDGET_KINDS, type EditorLayoutPage } from 'forgefx-midi/gen3/fm3';
 import { mockBlockDevice, eidOfSlug } from '../helpers/blockRead.js';
 import { SLUG_FAMILY } from '../../src/devices.js';
+import type { BlockParamsV2DTO } from '../../src/drivers/types.js';
 
 const fm3 = PROFILES[0x11]!;
 const fm9 = PROFILES[0x12]!;
@@ -243,9 +244,9 @@ async function servedVariantChecks(): Promise<void> {
       const values = new Array<number>(profile.rangeSections[family]!.stride * 4).fill(0);
       for (const [name, v] of Object.entries(set)) values[profile.params[family]!.find((p) => p.name === name)!.paramId] = v;
       const { driver } = mockBlockDevice(profile, { [eid]: { values, channel: 0 } });
-      return [await driver.blockParams(eid)] as const;
+      return [await driver.blockParams(eid), (await driver.blockParams(eid, { generic: true })) as BlockParamsV2DTO] as const;
     };
-    // 1. the cab follows CABINET_MODE
+    // 1. the cab follows CABINET_MODE, in both responses
     for (const mode of [0, 1]) {
       for (const r of await served('cab', { CABINET_MODE: mode })) {
         if (r.layout?.variantValue !== String(mode)) throw new Error(`${profile.key}: cab layout variant for CABINET_MODE=${mode} is ${r.layout?.variantValue}`);
@@ -270,7 +271,7 @@ async function servedVariantChecks(): Promise<void> {
       if (r.layout?.variantName !== '7 Band') throw new Error(`${profile.key}: GEQ variant for type 2 is ${r.layout?.variantName}`);
     }
   }
-  console.log('  drivers/layouts: served variants — cab by CABINET_MODE (not the preamp type), plex by PLEX_BASETYPE, GEQ by its type; FM3/FM9/III');
+  console.log('  drivers/layouts: served variants — cab by CABINET_MODE (not the preamp type), plex by PLEX_BASETYPE, GEQ by its type; classic and generic, FM3/FM9/III');
 }
 
 export const LAYOUTS_CASE_COUNT = checks.length + SERVED_VARIANT_CASES;

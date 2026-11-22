@@ -28,8 +28,9 @@ import type { DeviceProfile } from '../../src/devices.js';
 import { effectRoster } from 'forgefx-midi/devices/gen3';
 import { createModernFractalCodec, packValue16 } from 'forgefx-midi/gen3/axe-fx-iii';
 import { MockTransport, assert, assertEqual } from '../helpers/mock.js';
+import { mockBlockDevice } from '../helpers/blockRead.js';
 
-export const KNOB_UNITS_CASE_COUNT = 8;
+export const KNOB_UNITS_CASE_COUNT = 9;
 
 const PROVISIONAL_UNITS = new Set(['unverified', 'count', 'pf']);
 /** Semantic selectors / non-dials that used to leak in as knobs when the provisional units were admitted. */
@@ -213,4 +214,25 @@ export async function runKnobUnitsTests(): Promise<void> {
     assert(!served.named.some((p) => p.id === pd!.paramId), `${name} is not served as a knob by blockParams()`);
   }
   console.log('  drivers/knob-units: blockParams() serves the pf knob and keeps CABINET_ZOOM, TENTAP_DECAYSTYLE and REVERB_BASETYPE out of the dials');
+
+  // ---- Case 9: the generic response lists every classic dial, classified by the row and not by the unit ----
+  // The classic rule (KNOB_UNITS + the provisional-unit vetting) decides which params are dials. The generic
+  // response classifies by the device row first (a float row without labels is a dial: knob, or stepper when
+  // its integral steps are detents), so it must list every classic dial under `named`, and never list an enum
+  // row there.
+  for (const dev of profs) {
+    for (const slug of ['amp', 'cab', 'reverb', 'delay'] as const) {
+      const family = SLUG_FAMILY[slug]!;
+      const eid = eidOf(slug);
+      const values = new Array<number>(dev.rangeSections[family]!.stride * 4).fill(0);
+      const { driver } = mockBlockDevice(dev, { [eid]: { values, channel: 0 } });
+      const classic = await driver.blockParams(eid);
+      const generic = await driver.blockParams(eid, { generic: true });
+      const genericNamed = new Set(generic.named.map((n) => n.id));
+      for (const n of classic.named) assert(genericNamed.has(n.id), `${dev.key} ${slug} ${n.name} (pid ${n.id}): a classic dial is a generic dial too`);
+      for (const n of generic.named) assertEqual(n.kind, 'float', `${dev.key} ${slug} ${n.name}: no enum row among the dials`);
+      assert(generic.named.length >= classic.named.length, `${dev.key} ${slug}: the generic response lists at least the classic dials`);
+    }
+  }
+  console.log('  drivers/knob-units: every classic dial of amp / cab / reverb / delay is a generic dial on FM3, FM9 and III; no enum row is');
 }
