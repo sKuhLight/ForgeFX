@@ -5,14 +5,14 @@
 // Tiny synthetic profiles for the rules; committed catalog data for the invariants. NO device.
 import { runtimeProfileFrom, isEnumOnAnyDevice, layoutWidgetIndex, PROFILES, type DeviceProfile, type ParamDef, type RangeDef } from '../../src/devices.js';
 import {
-  buildParamIndex, NOT_LISTED_BY_DESIGN, NAME_SHIFT_ENABLED, MAX_WIRE_PID,
+  buildParamIndex, NOT_LISTED_BY_DESIGN, NAME_SHIFT_ENABLED, MAX_WIRE_PID, MAX_STEPPER_DETENTS, CONTINUOUS_CATALOG_UNITS,
   type BlockIndex, type ParamEntry,
 } from '../../src/drivers/paramIndex.js';
 import { CACHE_SCHEMA, isInformativeRow, type BuiltCache } from 'forgefx-midi/cache';
 import { assert, assertEqual } from '../helpers/mock.js';
 import { catalogBuilt } from '../helpers/catalogProfile.js';
 
-export const PARAM_INDEX_CASE_COUNT = 22;
+export const PARAM_INDEX_CASE_COUNT = 24;
 
 // ── row and profile builders ──────────────────────────────────────────────────────────────────────
 const F = (min: number, max: number, tc = 0x31, o: Partial<RangeDef> = {}): RangeDef => ({ kind: 'float', displayMin: min, displayMax: max, scale: 1, step: 0.01, typecode: tc, ...o });
@@ -357,6 +357,98 @@ function layoutKnobWins(): void {
     if (fsb && p.ranges.GLOBAL![fsb.paramId]) assertEqual(widgetOf(named('GLOBAL', 'GLOBAL_FS_BRIGHTNESS')), 'knob/layout/norm', `${name}: footswitch brightness (100 steps)`);
     assertEqual(widgetOf(named('PITCH', 'PITCH_SHIFT1')), 'stepper/device/norm', `${name}: semitone shift`);
     assertEqual(widgetOf(named('DISTORT', 'DISTORT_LINEFREQ')), 'stepper/device/norm', `${name}: AC line frequency (14 steps of 5)`);
+  }
+}
+
+// ── 6c. a named row on a continuous catalog unit over a fine whole-step range: knob (catalog evidence) ──
+function catalogUnitKnobRule(): void {
+  const widgetOf = (e: ParamEntry) => `${e.widget}/${e.widgetSource}/${e.write}`;
+  const wide = F(1, 16000, 0x31, { step: 1 }); // 15999 whole steps, no layout evidence
+  const unitOf = (unit: string | undefined, row: RangeDef = wide, o: { layoutWidget?: string; fam?: string; name?: string } = {}) =>
+    oneParam(row, { def: D(5, o.name ?? `${o.fam ?? 'WW'}_PARAM`, unit), ...o });
+
+  // the premise: the set is what it says, and 64 is the detent limit
+  assertEqual([...CONTINUOUS_CATALOG_UNITS].sort().join(','), 'bipolar_percent,db,degrees,hz,knob_0_10,ms,percent,ratio,seconds', 'the continuous units');
+  assertEqual(MAX_STEPPER_DETENTS, 64, 'detent limit');
+
+  // every continuous unit: knob, source catalog, the step stays in the entry
+  for (const unit of CONTINUOUS_CATALOG_UNITS) {
+    const e = unitOf(unit);
+    assertEqual(widgetOf(e), 'knob/catalog/norm', `${unit}: a named row over ${wide.displayMax - wide.displayMin} whole steps is a knob`);
+    assertEqual(`${e.list}/${e.kind}/${e.step}`, 'named/float/1', `${unit}: still a named float row, step kept`);
+  }
+
+  // the detent boundary: 64 steps are detents, 65 are not
+  assertEqual(widgetOf(unitOf('ms', F(0, 64, 0x31, { step: 1 }))), 'stepper/device/norm', 'ms over exactly 64 steps: stepper');
+  assertEqual(widgetOf(unitOf('ms', F(0, 65, 0x31, { step: 1 }))), 'knob/catalog/norm', 'ms over 65 steps: knob');
+  assertEqual(widgetOf(unitOf('ms', F(0, 250, 0x31, { step: 1 }))), 'knob/catalog/norm', 'REVERBDELAY shape: 250 steps');
+  assertEqual(widgetOf(unitOf('hz', F(-24, 24, 0x31, { step: 1 }))), 'stepper/device/norm', '48 steps of a continuous unit stay detents');
+  assertEqual(widgetOf(unitOf('ms', F(0, 650, 0x31, { step: 10 }))), 'knob/catalog/norm', 'the step counts, not the span: 65 steps of 10');
+  assertEqual(widgetOf(unitOf('ms', F(0, 640, 0x31, { step: 10 }))), 'stepper/device/norm', 'and 64 steps of 10 are detents');
+
+  // units that prove nothing about continuity keep the stepper, whatever the span
+  for (const unit of ['numeric', 'count', 'unverified', 'pf', 'semitones', 'enum', undefined]) {
+    assertEqual(widgetOf(unitOf(unit)), 'stepper/device/norm', `${unit ?? 'no unit'}: no pure detent-count fallback`);
+  }
+  assertEqual(widgetOf(unitOf('numeric', F(0, 1023, 0x20, { step: 1 }), { fam: 'CABINET', name: 'CABINET_TYPE1' })), 'stepper/device/norm', 'a 0..1023 slot number stays a stepper');
+  assertEqual(widgetOf(unitOf('semitones', F(-100, 100, 0x31, { step: 1 }))), 'stepper/device/norm', 'semitones are intervals: stepper even over 200 steps');
+
+  // generic rows keep the stepper rule (no catalog unit to go by)
+  assertEqual(widgetOf(oneParam(wide, { def: null })), 'stepper/device/norm', 'a generic row without layout evidence is a stepper');
+
+  // layout evidence comes first (D5): a knob stays a layout knob, anything else keeps the stepper
+  assertEqual(widgetOf(unitOf('ms', wide, { layoutWidget: 'knob' })), 'knob/layout/norm', 'the editor draws a knob: knob from the layout');
+  assertEqual(widgetOf(unitOf('numeric', wide, { layoutWidget: 'knob' })), 'knob/layout/norm', 'the layout knob does not need a unit');
+  for (const w of ['dropdown', 'toggle', 'readout']) {
+    assertEqual(widgetOf(unitOf('ms', wide, { layoutWidget: w })), 'stepper/device/norm', `the editor draws a ${w}: the catalog unit does not outvote it`);
+  }
+  assertEqual(widgetOf(unitOf('ms', F(0, 64, 0x31, { step: 1 }), { layoutWidget: 'knob' })), 'stepper/device/norm', 'a layout knob over 64 steps or fewer is not a knob either');
+
+  // a selector on another device, or a log taper, are decided before the rule (and as before)
+  assert(isEnumOnAnyDevice('TENTAP', 'TENTAP_DECAYSTYLE'), 'premise: TENTAP_DECAYSTYLE is a selector on some device');
+  assertEqual(widgetOf(unitOf('ms', wide, { fam: 'TENTAP', name: 'TENTAP_DECAYSTYLE' })), 'stepper/device/norm', 'a catalog selector is never a catalog knob');
+  assertEqual(widgetOf(unitOf('ms', F(20, 20000, 0x241, { step: 1 }))), 'knob/device/norm', 'a log-tapered row is a device knob, not a catalog one');
+  // non-integral and fine-step rows are knobs as before, with their own source
+  assertEqual(widgetOf(unitOf('ms', F(0, 100, 0x31, { step: 0.1 }))), 'knob/device/norm', 'a fine display step: knob from the device row');
+  assertEqual(widgetOf(unitOf('ms', F(0, 100, 0x31, { step: 1 }), { layoutWidget: 'dropdown' })), 'stepper/device/norm', 'a whole-step row under a layout dropdown stays a stepper');
+}
+
+// ── 6d. the rule on the committed catalogs: exactly the time rows the contract names change ──
+function catalogUnitKnobCatalogs(): void {
+  const widgetOf = (e: ParamEntry) => `${e.widget}/${e.widgetSource}/${e.list}/${e.write}/${e.step}`;
+  for (const [name, mid] of DEVICES) {
+    const staticP = PROFILES[mid]!;
+    for (const [mode, p] of [['catalog', staticP], ['byte-exact catalog profile', runtimeProfileFrom(catalogBuilt(mid), staticP)]] as const) {
+      const named = (fam: string, defName: string): ParamEntry | undefined => {
+        const pid = p.params[fam]?.find((d) => d.name === defName)?.paramId;
+        return pid === undefined ? undefined : buildParamIndex(p, fam).byPid.get(pid);
+      };
+      const label = `${name} ${mode}`;
+      assertEqual(widgetOf(named('DELAY', 'DELAY_TIME')!), 'knob/catalog/named/norm/1', `${label}: DELAY_TIME (ms, 1..16000) is a knob`);
+      assertEqual(widgetOf(named('REVERB', 'REVERB_REVERBDELAY')!), 'knob/catalog/named/norm/1', `${label}: REVERB_REVERBDELAY (ms, 0..250) is a knob`);
+      // unit numeric: stays a stepper (a long time field is a number, not proof of a dial)
+      for (const n of ['DELAY_TIMER', 'DELAY_SPLICETIME']) assertEqual(widgetOf(named('DELAY', n)!).split('/')[0], 'stepper', `${label}: ${n} stays a stepper`);
+      // the slot numbers stay steppers (a 0..1023 range is no knob)
+      for (const n of ['CABINET_TYPE1', 'CABINET_TYPE2', 'CABINET_TYPE3', 'CABINET_TYPE4']) {
+        const e = named('CABINET', n);
+        if (e) assertEqual(`${e.widget}/${e.widgetSource}`, 'stepper/device', `${label}: ${n} stays a stepper`);
+      }
+      // nothing else changed: the catalog knobs are exactly those two, all named, all on a continuous unit,
+      // all over more than 64 whole steps and none with layout evidence
+      const catalogKnobs: string[] = [];
+      for (const fam of Object.keys(p.ranges)) {
+        const lw = layoutWidgetIndex(p, fam);
+        for (const e of buildParamIndex(p, fam).entries) {
+          if (e.widget !== 'knob' || e.widgetSource !== 'catalog') continue;
+          catalogKnobs.push(e.def!.name);
+          assertEqual(e.generic, false, `${label} ${fam} ${e.pid}: a catalog knob is a named row`);
+          assert(CONTINUOUS_CATALOG_UNITS.has(e.def!.unit ?? ''), `${label} ${fam} ${e.pid}: on a continuous unit`);
+          assert((e.row.displayMax - e.row.displayMin) / e.step! > MAX_STEPPER_DETENTS, `${label} ${fam} ${e.pid}: over more than 64 steps`);
+          assertEqual(lw.get(e.pid), undefined, `${label} ${fam} ${e.pid}: no layout evidence`);
+        }
+      }
+      assertEqual(catalogKnobs.sort().join(','), 'DELAY_TIME,REVERB_REVERBDELAY', `${label}: the catalog knobs`);
+    }
   }
 }
 
@@ -766,6 +858,8 @@ export function runParamIndexTests(): void {
   suspectFamily();
   widgetTable();
   layoutKnobWins();
+  catalogUnitKnobRule();
+  catalogUnitKnobCatalogs();
   exclusions();
   positional();
   forceGeneric();

@@ -139,6 +139,25 @@ export const MAX_WIRE_PID = 0x3fff;
 /** Typecode of the knob rows whose step is not a real front-panel increment. */
 const KNOB_TYPECODE = 0x52;
 
+/** A whole-step range with more detents than this is too fine to read as a stepper (the limit
+ *  `looksDiscrete` in the legacy knob test uses). It is only ever the second half of a knob rule: layout
+ *  or catalog evidence has to say the param is continuous as well. */
+export const MAX_STEPPER_DETENTS = 64;
+
+/** Catalog unit codes that establish a CONTINUOUS control: a quantity the user sweeps (time, frequency,
+ *  level, amount, angle) rather than counts or picks. A named row on one of these units with whole-step
+ *  bounds and more than `MAX_STEPPER_DETENTS` detents is a knob when the editor layout does not say
+ *  otherwise (`DELAY_TIME` 1..16000 ms, `REVERB_REVERBDELAY` 0..250 ms). The set is the units the bundled
+ *  catalogs actually use, less the ones whose unit proves nothing about continuity:
+ *    - `numeric`, `count`, `unverified`, `pf`: plain or unconfirmed units, they carry counters, slot and
+ *      type numbers (`CABINET_TYPE1..4` 0..1023, `DELAY_TIMER`, `DELAY_SPLICETIME`) next to real dials;
+ *    - `enum`: a selector by the catalog's own account;
+ *    - `semitones`: musical intervals, discrete by nature (every catalog row spans 48 steps today).
+ *  There is deliberately NO pure detent-count fallback: a number of detents alone says nothing. */
+export const CONTINUOUS_CATALOG_UNITS: ReadonlySet<string> = new Set([
+  'ms', 'seconds', 'hz', 'db', 'percent', 'bipolar_percent', 'ratio', 'degrees', 'knob_0_10',
+]);
+
 // ── helpers ───────────────────────────────────────────────────────────────────────────────────────
 
 const tidy = (x: number): number => Number(x.toPrecision(6));
@@ -411,10 +430,14 @@ function computeIndex(profile: DeviceProfile, family: string, force: ReadonlySet
         const layoutKey = nameDef ? (movedFrom ?? pid) : defByPid.has(pid) ? undefined : pid;
         const layoutKind = layoutKey === undefined ? undefined : layoutWidgets.get(layoutKey);
         if (integral) {
-          // integral bounds with a whole step read as a stepper, unless the editor draws a knob over a
-          // range too fine to be detents (more than 64 steps; the limit the legacy knob test uses)
+          // integral bounds with a whole step read as a stepper, unless the range is too fine to be detents
+          // (more than MAX_STEPPER_DETENTS steps) AND something says it is continuous. Layout evidence comes
+          // first: the editor draws a knob → knob ('layout'); the editor draws anything else → stepper. With
+          // no layout evidence a NAMED row on an established continuous catalog unit is a knob ('catalog').
           const steps = (row.displayMax - row.displayMin) / ds;
-          if (layoutKind === 'knob' && steps > 64 && !catalogSelector) { widget = 'knob'; widgetSource = 'layout'; }
+          const fine = steps > MAX_STEPPER_DETENTS && !catalogSelector;
+          if (fine && layoutKind === 'knob') { widget = 'knob'; widgetSource = 'layout'; }
+          else if (fine && layoutKind === undefined && nameDef !== undefined && CONTINUOUS_CATALOG_UNITS.has(nameDef.unit ?? '')) { widget = 'knob'; widgetSource = 'catalog'; }
           else widget = 'stepper';
         } else if (catalogSelector) { widget = 'stepper'; widgetSource = 'catalog'; }
         else if (layoutKind === 'dropdown' || layoutKind === 'toggle') { widget = 'stepper'; widgetSource = 'layout'; }
