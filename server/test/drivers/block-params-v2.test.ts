@@ -13,7 +13,7 @@ import { assert, assertEqual } from '../helpers/mock.js';
 import { catalogBuilt } from '../helpers/catalogProfile.js';
 import { mockBlockDevice, eidOfSlug, compactHex } from '../helpers/blockRead.js';
 
-export const BLOCK_PARAMS_V2_CASE_COUNT = 19;
+export const BLOCK_PARAMS_V2_CASE_COUNT = 21;
 
 const FM3 = PROFILES[0x11]!;
 const FM9 = PROFILES[0x12]!;
@@ -360,39 +360,46 @@ export async function runBlockParamsV2Tests(): Promise<void> {
   }
 
   // ---- 14. a lost status reply is asked for once more before the channel counts as unknown -----------
-  {
-    const statusHex = compactHex(createModernFractalCodec(0x11).buildStatusDump());
-    /** A unit whose first `lost` status replies go missing; records every status request's timeout. */
-    const flaky = (lost: number, slow = false) => {
-      const dev = mockBlockDevice(FM3, { [DELAY]: { values: body(stride), channel: 2 } });
-      const answer = dev.mock.reply;
-      const timeouts: number[] = [];
-      if (slow) (dev.mock as unknown as { slow: boolean }).slow = true;
-      dev.mock.request = async (bytes, o) => {
-        dev.mock.sent.push([...bytes]);
-        if (compactHex(bytes) === statusHex) {
-          timeouts.push(o?.timeoutMs ?? -1);
-          if (timeouts.length <= lost) return [];
-        }
-        return answer(bytes);
-      };
-      return { driver: dev.driver, timeouts };
+  const statusHex = compactHex(createModernFractalCodec(0x11).buildStatusDump());
+  /** A unit whose first `lost` status replies go missing; records every status request's timeout. `hold()`
+   *  keeps status replies back until `release()`. */
+  const statusRig = (opts: { lost?: number; slow?: boolean } = {}) => {
+    const dev = mockBlockDevice(FM3, { [DELAY]: { values: body(stride), channel: 2 } });
+    const answer = dev.mock.reply;
+    const timeouts: number[] = [];
+    const gate: { held: Promise<void> | null; release: () => void } = { held: null, release: () => {} };
+    if (opts.slow) (dev.mock as unknown as { slow: boolean }).slow = true;
+    dev.mock.request = async (bytes, o) => {
+      dev.mock.sent.push([...bytes]);
+      if (compactHex(bytes) === statusHex) {
+        const n = timeouts.push(o?.timeoutMs ?? -1);
+        if (gate.held) await gate.held;
+        if (n <= (opts.lost ?? 0)) return [];
+      }
+      return answer(bytes);
     };
-    const once = flaky(1);
+    return {
+      driver: dev.driver, timeouts,
+      hold: () => { gate.held = new Promise<void>((resolve) => { gate.release = resolve; }); },
+      release: () => gate.release(),
+    };
+  };
+  {
+    const once = statusRig({ lost: 1 });
     const r = await once.driver.blockParams(DELAY, { generic: true });
     assertEqual(once.timeouts.length, 2, 'the status request is re-issued once after a lost reply');
     assertEqual(r.definitions.channel, 2, 'the second reply gives the channel');
     assert(allEntries(r).every((e) => e.value !== null && e.unresolved === undefined), 'every value resolves: no channel-unknown');
     assertEqual(once.timeouts.join(','), '1500,1500', 'a normal link waits 1.5 s per request');
-    const twice = flaky(2, true);
+    const twice = statusRig({ lost: 2, slow: true });
     const lost = await twice.driver.blockParams(DELAY, { generic: true });
-    assertEqual(twice.timeouts.join(','), '4000,4000', 'a slow link waits 4 s per request, and asks twice at most');
+    assertEqual(twice.timeouts.join(','), '4000,1500', 'a slow link waits 4 s for the first request, 1.5 s for the retry, and asks twice at most');
     assert(allEntries(lost).every((e) => e.unresolved === 'channel-unknown'), 'two lost replies: the channel is unknown');
-    // the routine channel-watch poll asks once: its next tick is the retry
-    const poll = flaky(1);
+    // the routine channel-watch poll asks once, with the fixed 1.5 s even on a slow link: its next tick is the retry
+    const poll = statusRig({ lost: 1, slow: true });
     assertEqual((await poll.driver.getActiveChannels()).size, 0, 'the poll reports nothing for a lost reply');
-    assertEqual(poll.timeouts.length, 1, 'and does not ask again');
-    console.log('  drivers/block-params-v2: the status read is retried once (1.5 s / slow link 4 s) before channel-unknown; the channel poll is not');
+    assertEqual(poll.timeouts.join(','), '1500', 'and asks once, 1.5 s');
+    console.log('  drivers/block-params-v2: the status read is retried once (slow link 4 s then 1.5 s) before channel-unknown; the channel poll asks once, 1.5 s');
   }
 
   // ---- 15. the classic type (and the meter tile's type name) is read where the type selector sits now --
@@ -423,14 +430,14 @@ export async function runBlockParamsV2Tests(): Promise<void> {
     delete SLUG_FAMILY['delay']; // the III maps no audio eid through its profile, so eid 70 now has no family
     try {
       const g = await v2Of(AXE3, DELAY, {});
-      assertEqual(`${g.block}|${g.slug}|${g.unknownBlock}`, `Block ${DELAY}||true`, 'generic: "Block <eid>", no slug, marked unknown');
+      assertEqual(`${g.block}|${g.slug}|${g.page}|${g.unknownBlock}`, `Block ${DELAY}||-1|true`, 'generic: "Block <eid>", no slug, no page, marked unknown');
       assertEqual(g.definitions.family, null, 'generic: no family');
       const c = (await mockBlockDevice(AXE3, {}).driver.blockParams(DELAY)) as BlockParamsDTO;
-      assertEqual(`${c.block}|${c.slug}`, 'Delay|delay', 'classic: unchanged (the codec name and slug)');
+      assertEqual(`${c.block}|${c.slug}|${c.page}`, `Delay|delay|${DELAY}`, 'classic: unchanged (the codec name, slug and page)');
     } finally {
       SLUG_FAMILY['delay'] = prior!;
     }
-    console.log('  drivers/block-params-v2: an unmapped block with a codec slug — generic "Block <eid>" / slug "", classic unchanged');
+    console.log('  drivers/block-params-v2: an unmapped block with a codec slug — generic "Block <eid>" / slug "" / page -1, classic unchanged');
   }
 
   // ---- 17. the diagnostic hook is parsed strictly; a malformed value warns once ----------------------
@@ -485,5 +492,48 @@ export async function runBlockParamsV2Tests(): Promise<void> {
     await dev.driver.blockParams(GLOBAL_EID);
     assert(dev.mock.sent.length > 0, 'the classic response still reads the block');
     console.log('  drivers/block-params-v2: generic GLOBAL — served from the definitions alone, no device read');
+  }
+
+  // ---- 20. concurrent status reads share one request; each caller keeps its own retry ------------------
+  {
+    const settle = () => new Promise((resolve) => setTimeout(resolve, 20));
+    const ok = statusRig();
+    ok.hold();
+    const both = Promise.all([ok.driver.sceneState(), ok.driver.getActiveChannels()]);
+    await settle();
+    ok.release();
+    const [scene, chans] = await both;
+    assertEqual(ok.timeouts.length, 1, 'two callers while one request is pending: one request');
+    assertEqual(chans.get(DELAY), 2, 'the poll gets the shared answer');
+    assert(scene.some((s) => s.effectId === DELAY && s.channel === 'C'), 'and so does the scene read');
+    // the shared reply is lost: the scene read retries on its own, the poll does not
+    const lostOne = statusRig({ lost: 1 });
+    lostOne.hold();
+    const again = Promise.all([lostOne.driver.sceneState(), lostOne.driver.getActiveChannels()]);
+    await settle();
+    lostOne.release();
+    const [scene2, chans2] = await again;
+    assertEqual(chans2.size, 0, 'the poll takes the lost reply as it is');
+    assert(scene2.some((s) => s.effectId === DELAY && s.channel === 'C'), 'the scene read asked again and got the channel');
+    assertEqual(lostOne.timeouts.length, 2, 'one shared request plus the scene read\'s own retry');
+    // a request issued after the shared one settled is a new one
+    await ok.driver.getActiveChannels();
+    assertEqual(ok.timeouts.length, 2, 'a later caller asks again');
+    console.log('  drivers/block-params-v2: concurrent status reads coalesce into one request; retries stay per caller');
+  }
+
+  // ---- 21. a block without channels is read without asking for the status ------------------------------
+  {
+    const dev = mockBlockDevice(FM3, {
+      [GLOBAL_EID]: { values: new Array<number>(136).fill(1234), channel: null },
+      2: { values: new Array<number>(130).fill(1000), channel: null },
+    });
+    await dev.driver.blockParams(GLOBAL_EID);
+    await dev.driver.blockParams(2);
+    const ctrl = await dev.driver.blockParams(2, { generic: true });
+    assertEqual(dev.mock.sent.filter((f) => compactHex(f) === statusHex).length, 0, 'no status request for GLOBAL or CONTROLLERS');
+    assertEqual(dev.mock.sent.length, 3, 'one body read per response');
+    assert(allEntries(ctrl).length > 0 && allEntries(ctrl).every((e) => e.value !== null), 'CONTROLLERS values still resolve');
+    console.log('  drivers/block-params-v2: channel-less blocks (GLOBAL classic, CONTROLLERS) send no status request');
   }
 }

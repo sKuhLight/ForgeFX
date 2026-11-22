@@ -640,6 +640,9 @@ function withBoundParams(layout: DeviceLayout, pidOfSymbol: (symbol: string) => 
   return touched ? { ...layout, pages } : layout;
 }
 
+/** The fn 0x13 status dump read: effect id → bypass flag and active channel (0-3). */
+type StatusMap = Map<number, { bypassed: boolean; channel: number }>;
+
 class Gen3Driver implements DeviceDriver {
   #prof: DeviceProfile;
   #codec: ModernFractalCodec;
@@ -1122,26 +1125,42 @@ class Gen3Driver implements DeviceDriver {
   /** Active channel and bypass per placed block, from the fn 0x13 status dump. An EMPTY map means the read
    *  failed: no reply in time, or a reply that lists no block, which a real preset never gives (it always has
    *  its Output blocks). Such a read is re-issued once, shortly after, before giving up: a scene switch leaves
-   *  the unit busy for a moment, and a slow link can miss one reply window. The routine channel-watch poll
-   *  passes `retry: false` (its next tick is the retry). */
-  async #statusByEffectId(opts: { retry?: boolean } = {}): Promise<Map<number, { bypassed: boolean; channel: number }>> {
+   *  the unit busy for a moment, and a slow link can miss one reply window. The first request waits longer on
+   *  a slow link, the retry the normal 1.5 s, so a lost reply costs at most ~5.7 s there before the caller's
+   *  next request (the queue is serialised, and Axis gives a request 12 s). The routine channel-watch poll
+   *  passes `retry: false`: one request with the fixed 1.5 s it always had (its next tick is the retry). */
+  async #statusByEffectId(opts: { retry?: boolean } = {}): Promise<StatusMap> {
     const dev = await this.#conn();
-    let map = await this.#readStatusDump(dev);
-    if (map.size === 0 && opts.retry !== false) {
+    const retry = opts.retry !== false;
+    let map = await this.#readStatusDump(dev, retry && dev.slow ? 4000 : 1500);
+    if (map.size === 0 && retry) {
       await new Promise<void>((resolve) => setTimeout(resolve, 200));
-      map = await this.#readStatusDump(dev);
+      map = await this.#readStatusDump(dev, 1500);
     }
     return map;
   }
 
-  /** One fn 0x13 status-dump request; an empty map when it failed or timed out. */
-  async #readStatusDump(dev: Transport): Promise<Map<number, { bypassed: boolean; channel: number }>> {
-    const map = new Map<number, { bypassed: boolean; channel: number }>();
+  /** The status-dump request in flight, if any: a caller that needs the status while one is pending awaits that
+   *  request instead of queueing another (each caller still decides on its own retry). */
+  #statusInflight: Promise<StatusMap> | null = null;
+
+  /** One fn 0x13 status-dump request (or the one already in flight); an empty map when it failed or timed out. */
+  #readStatusDump(dev: Transport, timeoutMs: number): Promise<StatusMap> {
+    if (this.#statusInflight) return this.#statusInflight;
+    const p: Promise<StatusMap> = this.#requestStatusDump(dev, timeoutMs).finally(() => {
+      if (this.#statusInflight === p) this.#statusInflight = null;
+    });
+    this.#statusInflight = p;
+    return p;
+  }
+
+  async #requestStatusDump(dev: Transport, timeoutMs: number): Promise<StatusMap> {
+    const map: StatusMap = new Map();
     try {
       // fractal-midi's isStatusDumpResponse is locked to model 0x10 (III), so match the
       // 0x13 frame ourselves (any model) and parse the id-id-dd triples inline.
       // fn-only matcher: the status dump carries no request id (polled by the channel watch)
-      const frames = await dev.request(this.#codec.buildStatusDump(), { timeoutMs: dev.slow ? 4000 : 1500, routine: true, match: (fs) => fs.some((f) => f[5] === 0x13) });
+      const frames = await dev.request(this.#codec.buildStatusDump(), { timeoutMs, routine: true, match: (fs) => fs.some((f) => f[5] === 0x13) });
       const f = frames.find((x) => x[5] === 0x13);
       if (f) {
         const payload = f.slice(6, f.length - 2);
@@ -1264,7 +1283,7 @@ class Gen3Driver implements DeviceDriver {
       if (!generic) return { block: meta?.name ?? slug, slug, page, named: [], enums: [], type: null, layout: undefined };
       // the generic response names an unknown block by its effect id alone, even where the codec has a slug for it
       return {
-        block: `Block ${eid}`, slug: '', page, named: [], enums: [], type: null, unknownBlock: true,
+        block: `Block ${eid}`, slug: '', page: -1, named: [], enums: [], type: null, unknownBlock: true,
         definitions: { family: null, profile: 'none', positional: false, channel: null, persistentWrites: false, hidden: [] }
       };
     }
@@ -1297,8 +1316,10 @@ class Gen3Driver implements DeviceDriver {
       // Read the block's CURRENT channel (A-D) so a channel switch actually reloads that channel's
       // params/type: the fn-0x1F body is channel-blocked and holds ALL channels, so we must slice the
       // active one, not always channel A. Costs one status round-trip per open — worth it for correctness.
-      const status = (await this.#statusByEffectId()).get(eid);
-      channel = hasChannels && status ? status.channel : null;
+      // A block without channels (the virtual effects: GLOBAL, CONTROLLERS, MODIFIER, MIDI block, FC) is one
+      // slice: its status says nothing the read needs, so it is not asked for.
+      const status = hasChannels ? (await this.#statusByEffectId()).get(eid) : undefined;
+      channel = status ? status.channel : null;
       const activeCh = status?.channel ?? 0;
       this.#watchedChannel = activeCh; // keep the device-edit-burst diff on the same channel (see decodeEditBurst)
       const frames = await this.#bulkRead(dev, eid, dev.slow ? 8000 : 2500, dev.slow ? 600 : 120);
