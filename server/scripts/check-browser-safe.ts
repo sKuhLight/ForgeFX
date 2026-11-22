@@ -17,6 +17,7 @@ import { build } from 'esbuild';
 
 const ENTRIES = [
   'src/runtime/index.ts',
+  'src/drivers/paramIndex.ts', // the pure param index: no runtime import path reaches it yet
 ];
 
 let failed = 0;
