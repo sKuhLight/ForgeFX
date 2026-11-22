@@ -52,7 +52,7 @@ import { createAm4Driver, type Am4Driver } from './am4.js';
 import { createGen2Driver } from './gen2.js';
 import { createGen1Driver } from './gen1.js';
 import { createVp4Driver } from './vp4.js';
-import type { DeviceDriver, DeviceEvent, DriverCtx, DriverCapabilities } from './types.js';
+import type { DeviceDriver, DeviceEvent, DriverCtx, DriverCapabilities, DefinitionsCaps } from './types.js';
 import { assertRawProbeAllowed } from './sendPolicy.js';
 import { cadenceFor, isTelemetryMode, TELEMETRY_MODES, type TelemetryMode, type CadenceProfile } from './telemetryProfiles.js';
 
@@ -228,6 +228,10 @@ export class DeviceRegistry {
   // Running firmware, populated best-effort during detect() on gen-3 units (fn 0x08). null until a
   // reply lands (silence/timeout/non-gen-3 keeps it null); surfaced via deviceInfo() + firmwareInfo().
   #firmware: { major: number; minor: number; version: string; build: string } | null = null;
+  // Device-cache key (`deviceCacheKey`) of the runtime profile applyRuntimeCache last layered over the bundled
+  // one; null while the bundled profile is live. Only meaningful together with `#prof.profileFacts` (a model
+  // switch replaces `#prof` with a static profile, which carries none): capabilities.definitions reads both.
+  #appliedProfileKey: string | null = null;
   // The active driver — set ONLY by detect() from a positively identified (or forced) model. No
   // identification → no active driver → the telemetry supervisor never fires a frame at an unknown
   // unit (this replaces the old `#modelId === -1` wait-loop AND every #isAm4() gate).
@@ -560,8 +564,37 @@ export class DeviceRegistry {
       restoreDump: !!d.restorePreset,
       versionStore: !!d.dumpRaw && !!d.loadPresetBytes,
       deviceParams: !!d.setParamByKey,
-      virtualEffects: grid ? GEN3_VIRTUAL_EFFECTS : []
+      virtualEffects: grid ? GEN3_VIRTUAL_EFFECTS : [],
+      // What the generic block-params response (`?generic=1`) can rely on: whether the driver serves it, the
+      // catalog's firmware, the applied runtime profile's provenance and whether the running firmware has
+      // definitions to go by. Present on every device (drivers without it say genericParams:false). Appended
+      // here, right after virtualEffects, so it lands before telemetryControl/supportsSave in
+      // #capabilitiesDto and the pretty-printed caps diff stays additive-only (its ordering contract).
+      definitions: this.#definitionsCaps(mid, d)
     };
+  }
+
+  /** `capabilities.definitions` for model `mid` served by driver `d`. Only a gen-3 grid driver serves the generic
+   *  block params and has a bundled catalog and a swappable runtime profile (the Axe-Fx II is a grid too, the
+   *  AM4 and VP4 are linear): the predicate applyRuntimeCache uses, plus the grid. Firmware strings are
+   *  compared as `formatFirmwareVersion` produced them ("13.0"): the running firmware, the profile document's
+   *  and the catalog baseline's all use that form. */
+  #definitionsCaps(mid: number, d: DeviceDriver): DefinitionsCaps {
+    const gen3Grid = d.capabilities.slotModel === 'grid' && d.capabilities.selfDescribe && !!d.applyRuntimeProfile;
+    const catalogFirmware = gen3Grid ? profileForModel(mid).catalogFirmware : null;
+    // the applied runtime profile: `#prof` is one only while it carries facts and belongs to this model (an
+    // AM4 detect keeps the previous gen-3 `#prof`, which must not leak into its caps)
+    const facts = gen3Grid && this.#prof.model === mid ? this.#prof.profileFacts : undefined;
+    const profile: DefinitionsCaps['profile'] = facts && this.#appliedProfileKey
+      ? { key: this.#appliedProfileKey, source: facts.source, byteExact: facts.byteExact, firmware: facts.firmware, suspectFamilies: [...facts.suspectFamilies] }
+      : null;
+    const running = this.#firmware?.version ?? null;
+    let drift: DefinitionsCaps['drift'];
+    if (running === null) drift = 'unknown';
+    else if (profile?.firmware === running || catalogFirmware === running) drift = 'none';
+    else if (!profile && catalogFirmware === null) drift = 'unknown';
+    else drift = 'unprofiled';
+    return { genericParams: gen3Grid, catalogFirmware, profile, drift };
   }
 
   /** The capabilities object /device and /device/detect serve: the curated descriptor subset
@@ -764,13 +797,15 @@ export class DeviceRegistry {
     const mid = this.#modelId;
     if (mid < 0 || !d || !d.capabilities.selfDescribe || !d.applyRuntimeProfile) return;
     let built: BuiltCache | null = null;
+    let key: string | null = null;
     if (this.#firmware) {
-      const key = deviceCacheKey(mid, this.#firmware.major, this.#firmware.minor);
+      key = deviceCacheKey(mid, this.#firmware.major, this.#firmware.minor);
       try { built = (await this.#deps.loadDeviceCache(key)) ?? null; } catch { built = null; }
     }
     const bundled = PROFILES[mid];
     if (!built || !checkProfileSchema(built).usable) {
       // no usable profile for this model+firmware: the bundled profile is the live one
+      this.#appliedProfileKey = null;
       if (bundled) {
         d.applyRuntimeProfile(bundled);
         this.#prof = bundled;
@@ -779,7 +814,10 @@ export class DeviceRegistry {
     }
     const runtime = runtimeProfileFrom(built, bundled ?? this.#prof);
     d.applyRuntimeProfile(runtime);
-    if (bundled) this.#prof = runtime; // keep /diag + reporting profile in sync for gen-3
+    if (bundled) {
+      this.#prof = runtime; // keep /diag + reporting profile in sync for gen-3
+      this.#appliedProfileKey = key;
+    }
   }
 
   /** Pause the telemetry supervisor for the duration of an exclusive operation (the device-cache

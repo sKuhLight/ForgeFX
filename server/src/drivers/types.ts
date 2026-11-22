@@ -3,7 +3,7 @@
 // must not drift. `DeviceDriver` is the per-device surface the routes call; methods a device lacks
 // are optional and mirrored by `DriverCapabilities` so routes can answer 501 instead of guessing.
 import type { DecodedBlock } from 'forgefx-midi/devices/gen3';
-import type { TypeModel, DeviceLayout, DeviceProfile } from '../devices.js';
+import type { TypeModel, DeviceLayout, DeviceProfile, ProfileSource } from '../devices.js';
 import type {
   HiddenParam, NameConfidence, NameSource, ParamKind, ParamSource, ParamWidget, ReadOnlyReason, WidgetSource, WriteMode
 } from './paramIndex.js';
@@ -130,6 +130,31 @@ export interface BlockDefinitionsMeta {
   persistentWrites: boolean;
   /** Informative rows that are not listed, with the reason. */
   hidden: HiddenParam[];
+}
+
+/** `capabilities.definitions` of `GET /device` and `/device/detect`: what the generic block-params
+ *  response can rely on for the attached unit. Served on every device; a client reads it, not the model. */
+export interface DefinitionsCaps {
+  /** `?generic=1` is understood (gen-3 grid drivers); false on drivers that ignore the flag. */
+  genericParams: boolean;
+  /** Firmware the bundled catalog was generated from (`"12.0"`), null when that is not settled or the
+   *  device has no catalog. Formatted like the running firmware (`formatFirmwareVersion`). */
+  catalogFirmware: string | null;
+  /** The APPLIED runtime profile (provenance only, no rows), null while the bundled catalog is live. */
+  profile: {
+    /** Device-cache key the profile was loaded under (`<model-hex>_<major>p<minor>`). */
+    key: string;
+    source: ProfileSource;
+    byteExact: boolean;
+    /** Firmware the profile document says it describes, null when it carries none. */
+    firmware: string | null;
+    /** Families whose cache section looked mis-assigned and were not merged. */
+    suspectFamilies: string[];
+  } | null;
+  /** Does the running firmware have definitions to go by? `none`: an applied profile of this firmware, or
+   *  the firmware the catalog was generated from. `unprofiled`: neither. `unknown`: the firmware is not
+   *  known, or there is no catalog firmware and no profile to compare against. */
+  drift: 'none' | 'unprofiled' | 'unknown';
 }
 
 /** `GET /preset/blocks/:eid/params` as classic clients know it. */

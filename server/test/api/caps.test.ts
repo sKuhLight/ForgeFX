@@ -4,10 +4,18 @@
 // Uses the REAL drivers (the caps DTO derives from DriverCapabilities + the optional-method surface;
 // nothing here touches the transport beyond the mocked handshake).
 import { fullCaptureAllowedOnFirmware } from '../../src/drivers/registryCore.js';
-import { buildTestApp } from '../helpers/api.js';
-import { assert, assertEqual } from '../helpers/mock.js';
+import { buildApp } from '../../src/app.js';
+import { __createRegistryForTest, type DeviceRegistry } from '../../src/drivers/registry.js';
+import type { DefinitionsCaps } from '../../src/drivers/types.js';
+import type { BuiltCache } from 'forgefx-midi/cache';
+import { FM3_CATALOG_BASELINE } from 'forgefx-midi/gen3/fm3';
+import { FM9_CATALOG_BASELINE } from 'forgefx-midi/gen3/fm9';
+import { AXE3_CATALOG_BASELINE } from 'forgefx-midi/gen3/axe-fx-iii';
+import { buildTestApp, firmwareVersionReply } from '../helpers/api.js';
+import { catalogBuilt } from '../helpers/catalogProfile.js';
+import { MockTransport, handshakeReply, isIdentifyBroadcast, assert, assertEqual } from '../helpers/mock.js';
 
-export const CAPS_CASE_COUNT = 6;
+export const CAPS_CASE_COUNT = 12;
 
 type Caps = {
   slotModel: string;
@@ -284,6 +292,264 @@ async function fullCaptureFirmwareGate(): Promise<void> {
   assertEqual(fullCaptureAllowedOnFirmware(0x11, { major: 0, minor: 0 }), false, 'policy: major 0 refused');
 }
 
+// ── capabilities.definitions ──────────────────────────────────────────────────────────────────────
+// A mocked unit whose firmware reply and stored device-cache docs the test controls. `docs` is read by the
+// registry's loadDeviceCache hook at every apply, so a test can add/remove a profile and re-apply.
+interface DefsRig {
+  registry: DeviceRegistry;
+  docs: Map<string, BuiltCache>;
+  fw: { v: [number, number] | null };
+  /** The model byte the mocked unit answers the handshake (and the firmware query) with. */
+  model: { v: number };
+  app: Awaited<ReturnType<typeof buildApp>>;
+}
+async function defsRig(modelId: number, firmware: [number, number] | null, docs: Record<string, BuiltCache> = {}): Promise<DefsRig> {
+  const mock = new MockTransport('serial', `mock-0x${modelId.toString(16)}`);
+  const fw: { v: [number, number] | null } = { v: firmware };
+  const model = { v: modelId };
+  mock.reply = (req) => {
+    if (isIdentifyBroadcast(req)) return [handshakeReply(model.v)];
+    if (fw.v && req[0] === 0xf0 && req[5] === 0x08) return [firmwareVersionReply(model.v, fw.v[0], fw.v[1])];
+    return [];
+  };
+  const store = new Map(Object.entries(docs));
+  const registry = __createRegistryForTest({
+    resolveConn: async () => ({ transport: 'serial', id: mock.label }),
+    openConn: () => mock,
+    loadDeviceCache: (key) => store.get(key) ?? null
+  });
+  await registry.detect();
+  const app = await buildApp(registry);
+  return { registry, docs: store, fw, model, app };
+}
+const definitionsOf = async (r: DefsRig): Promise<DefinitionsCaps> => {
+  const res = await r.app.inject({ method: 'GET', url: '/device' });
+  assertEqual(res.statusCode, 200, 'GET /device');
+  const caps = (res.json() as { capabilities: { definitions?: DefinitionsCaps } }).capabilities;
+  assert(caps.definitions !== undefined, 'capabilities.definitions is served');
+  return caps.definitions;
+};
+/** A profile doc for `model` that says it describes firmware `fw`, stored under that firmware's key. */
+const docFor = (model: number, fw: string, source: 'editor-cache' | 'live' | 'cloud' = 'editor-cache'): BuiltCache => ({ ...catalogBuilt(model, source), firmware: fw });
+function quiet<T>(fn: () => Promise<T>): Promise<T> {
+  const orig = console.warn;
+  console.warn = () => {};
+  return fn().finally(() => { console.warn = orig; });
+}
+
+// gen-3 grid drivers serve the generic params; every other driver says so with false (and nothing else)
+async function definitionsGenericFlag(): Promise<void> {
+  for (const [modelId, name] of [[0x10, 'Axe-Fx III'], [0x11, 'FM3'], [0x12, 'FM9']] as const) {
+    const r = await defsRig(modelId, null);
+    try { assertEqual((await definitionsOf(r)).genericParams, true, `${name} genericParams`); } finally { await r.app.close(); }
+  }
+  // AM4 (0x15), Axe-Fx II (0x07), VP4 (0x14: gen-3 codec but a linear front panel, no v2), gen-1 (0x01)
+  for (const [modelId, name] of [[0x15, 'AM4'], [0x07, 'Axe-Fx II'], [0x14, 'VP4'], [0x01, 'gen-1']] as const) {
+    const r = await defsRig(modelId, null);
+    try {
+      const d = await definitionsOf(r);
+      assertEqual(d.genericParams, false, `${name} genericParams`);
+      assertEqual(d.catalogFirmware, null, `${name} has no catalog firmware`);
+      assertEqual(d.profile, null, `${name} has no applied profile`);
+      assertEqual(d.drift, 'unknown', `${name} drift`);
+    } finally { await r.app.close(); }
+  }
+}
+
+// the catalog baseline each gen-3 device ships (codec baseline exports), as formatFirmwareVersion writes it
+async function definitionsCatalogFirmware(): Promise<void> {
+  for (const [modelId, name, baseline, literal] of [
+    [0x11, 'FM3', FM3_CATALOG_BASELINE.firmware, '12.0'],
+    [0x10, 'Axe-Fx III', AXE3_CATALOG_BASELINE.firmware, '32.6'],
+    [0x12, 'FM9', FM9_CATALOG_BASELINE.firmware, null]
+  ] as const) {
+    const r = await defsRig(modelId, [1, 0]);
+    try {
+      const d = await definitionsOf(r);
+      assertEqual(d.catalogFirmware, baseline, `${name} catalogFirmware is the codec baseline`);
+      assertEqual(d.catalogFirmware, literal, `${name} catalogFirmware`);
+    } finally { await r.app.close(); }
+  }
+}
+
+// the drift matrix while the bundled catalog is the live profile (profile null)
+async function definitionsDriftWithoutProfile(): Promise<void> {
+  const table: Array<{ model: number; name: string; fw: [number, number] | null; drift: DefinitionsCaps['drift'] }> = [
+    { model: 0x11, name: 'FM3 firmware not read', fw: null, drift: 'unknown' },
+    { model: 0x11, name: 'FM3 fw 12.0 = the catalog firmware', fw: [12, 0], drift: 'none' },
+    { model: 0x11, name: 'FM3 fw 13.0 without a profile', fw: [13, 0], drift: 'unprofiled' },
+    { model: 0x11, name: 'FM3 fw 12.1 (minor differs)', fw: [12, 1], drift: 'unprofiled' },
+    { model: 0x10, name: 'III fw 32.6 = the catalog firmware', fw: [32, 6], drift: 'none' },
+    { model: 0x10, name: 'III fw 32.7 without a profile', fw: [32, 7], drift: 'unprofiled' },
+    { model: 0x10, name: 'III firmware not read', fw: null, drift: 'unknown' },
+    { model: 0x12, name: 'FM9 fw 12.0: no catalog firmware, no profile', fw: [12, 0], drift: 'unknown' },
+    { model: 0x12, name: 'FM9 firmware not read', fw: null, drift: 'unknown' },
+  ];
+  for (const c of table) {
+    const r = await defsRig(c.model, c.fw);
+    try {
+      const d = await definitionsOf(r);
+      assertEqual(d.profile, null, `${c.name}: no profile applied`);
+      assertEqual(d.drift, c.drift, `${c.name}: drift`);
+    } finally { await r.app.close(); }
+  }
+}
+
+// an applied runtime profile: provenance facts, and what it does to drift
+async function definitionsAppliedProfile(): Promise<void> {
+  // the maintainer's case: FM3 fw 13.0, a byte-exact editor-cache profile of 13.0
+  let r = await defsRig(0x11, [13, 0], { '11_13p0': docFor(0x11, '13.0') });
+  try {
+    const d = await definitionsOf(r);
+    assertEqual(JSON.stringify(d.profile), JSON.stringify({ key: '11_13p0', source: 'editor-cache', byteExact: true, firmware: '13.0', suspectFamilies: [] }), 'FM3 13.0 profile facts');
+    assertEqual(d.drift, 'none', 'FM3 13.0 with a 13.0 profile: no drift');
+    assertEqual(d.catalogFirmware, '12.0', 'the catalog firmware is the bundled one, not the profile\'s');
+    assertEqual(d.genericParams, true, 'genericParams');
+    // /device/detect carries the same object
+    const det = await r.app.inject({ method: 'GET', url: '/device/detect' });
+    assertEqual(JSON.stringify((det.json() as { capabilities: { definitions: unknown } }).capabilities.definitions), JSON.stringify(d), '/device/detect mirrors definitions');
+  } finally { await r.app.close(); }
+
+  // provenance: a live walk is not byte-exact; a cloud profile says where it came from
+  r = await defsRig(0x11, [13, 0], { '11_13p0': docFor(0x11, '13.0', 'live') });
+  try {
+    const p = (await definitionsOf(r)).profile;
+    assertEqual(p?.source, 'live', 'live profile source');
+    assertEqual(p?.byteExact, false, 'live profile is not byte-exact');
+    assertEqual((await definitionsOf(r)).drift, 'none', 'a live profile of the running firmware: no drift');
+  } finally { await r.app.close(); }
+  r = await defsRig(0x11, [13, 0], { '11_13p0': docFor(0x11, '13.0', 'cloud') });
+  try {
+    const p = (await definitionsOf(r)).profile;
+    assertEqual(p?.source, 'cloud', 'cloud profile source');
+    assertEqual(p?.byteExact, false, 'a cloud profile without an origin is not byte-exact');
+  } finally { await r.app.close(); }
+
+  // the profile doc names another firmware than the running one (a forced import): drift
+  r = await defsRig(0x11, [13, 0], { '11_13p0': docFor(0x11, '12.5') });
+  try {
+    const d = await definitionsOf(r);
+    assertEqual(d.profile?.firmware, '12.5', 'the doc\'s firmware is reported as it is');
+    assertEqual(d.drift, 'unprofiled', 'profile firmware differs from the running one, and so does the catalog');
+  } finally { await r.app.close(); }
+
+  // the running firmware is the catalog's: no drift whatever the profile says
+  r = await defsRig(0x11, [12, 0], { '11_12p0': docFor(0x11, '13.0') });
+  try {
+    const d = await definitionsOf(r);
+    assertEqual(d.profile?.firmware, '13.0', 'profile firmware 13.0');
+    assertEqual(d.drift, 'none', 'running firmware equals the catalog firmware');
+  } finally { await r.app.close(); }
+
+  // FM9: no catalog firmware, so only a profile of the running firmware settles it
+  r = await defsRig(0x12, [12, 0], { '12_12p0': docFor(0x12, '12.0') });
+  try {
+    const d = await definitionsOf(r);
+    assertEqual(d.catalogFirmware, null, 'FM9 catalogFirmware null');
+    assertEqual(d.drift, 'none', 'FM9 with a profile of the running firmware');
+  } finally { await r.app.close(); }
+  r = await defsRig(0x12, [12, 0], { '12_12p0': catalogBuilt(0x12) }); // a doc that carries no firmware
+  try {
+    const d = await definitionsOf(r);
+    assertEqual(d.profile?.firmware, null, 'a doc without firmware reports null');
+    assertEqual(d.drift, 'unprofiled', 'catalog null, a profile applied that does not name the running firmware');
+  } finally { await r.app.close(); }
+
+  // suspect families ride along (sorted), whether or not the rest of the profile is usable
+  const swapped = docFor(0x11, '13.0');
+  const swap = <T>(o: Record<string, T>) => { const t = o.MIXER!; o.MIXER = o.OUTPUT!; o.OUTPUT = t; };
+  swap(swapped.ranges as Record<string, unknown>);
+  swap(swapped.enumOverrides as Record<string, unknown>);
+  swap(swapped.rangeSections as Record<string, unknown>);
+  r = await quiet(() => defsRig(0x11, [13, 0], { '11_13p0': swapped }));
+  try {
+    assertEqual((await definitionsOf(r)).profile?.suspectFamilies.join(','), 'MIXER,OUTPUT', 'suspect families are listed');
+  } finally { await r.app.close(); }
+}
+
+// the profile follows the registry: a delete, a firmware without a profile and a model switch all clear it
+async function definitionsFollowsRegistry(): Promise<void> {
+  const r = await defsRig(0x11, [13, 0], { '11_13p0': docFor(0x11, '13.0') });
+  try {
+    assertEqual((await definitionsOf(r)).profile?.key, '11_13p0', 'profile applied');
+
+    r.docs.delete('11_13p0'); // what deleteCache does, then re-applies
+    await r.registry.applyRuntimeCache();
+    let d = await definitionsOf(r);
+    assertEqual(d.profile, null, 'after the profile was deleted the bundled catalog is live again');
+    assertEqual(d.drift, 'unprofiled', 'and the running firmware 13.0 has no definitions');
+
+    r.docs.set('11_13p0', docFor(0x11, '13.0'));
+    await r.registry.applyRuntimeCache();
+    assertEqual((await definitionsOf(r)).profile?.key, '11_13p0', 'profile applied again');
+
+    r.fw.v = [13, 1]; // firmware update: no profile for 13.1
+    await r.registry.detect();
+    d = await definitionsOf(r);
+    assertEqual(d.profile, null, 'a firmware without a profile reverts to the bundled catalog');
+    assertEqual(d.drift, 'unprofiled', 'drift on 13.1');
+
+    r.fw.v = null; // the firmware read goes silent
+    await r.registry.detect();
+    d = await definitionsOf(r);
+    assertEqual(d.profile, null, 'unknown firmware: no profile');
+    assertEqual(d.drift, 'unknown', 'unknown firmware: drift unknown');
+
+    // the profile is a gen-3 grid fact: another unit attached over the same registry (an AM4 detect keeps the
+    // previous gen-3 profile object around) must not inherit it, and the FM3 gets it back on return
+    r.fw.v = [13, 0];
+    await r.registry.detect();
+    assertEqual((await definitionsOf(r)).profile?.key, '11_13p0', 'profile applied once more');
+    r.model.v = 0x15;
+    r.fw.v = null;
+    await r.registry.detect();
+    d = await definitionsOf(r);
+    assertEqual(d.genericParams, false, 'AM4 attached: no generic params');
+    assertEqual(d.profile, null, 'AM4 attached: the FM3 profile does not leak into its caps');
+    assertEqual(d.catalogFirmware, null, 'AM4 attached: no catalog firmware');
+    r.model.v = 0x11;
+    r.fw.v = [13, 0];
+    await r.registry.detect();
+    assertEqual((await definitionsOf(r)).profile?.key, '11_13p0', 'FM3 back: profile applied');
+  } finally { await r.app.close(); }
+}
+
+// Key order: `definitions` is appended after `virtualEffects` (before telemetryControl/supportsSave), so a
+// pretty-printed diff against the previous caps shape is additive-only: no existing line changes.
+const PREVIOUS_GRID_CAPS_KEYS = [
+  'slotModel', 'slotCount', 'grid', 'hasScenes', 'sceneCount', 'hasChannels', 'channelNames', 'channelBlocks',
+  'presets', 'gridRouting', 'gridCursorSelect', 'shuntBase', 'paramsWithoutPack', 'tempo', 'tuner', 'meters',
+  'sceneNamesWritable', 'fc', 'modifiers', 'cabIrs', 'selfDescribe', 'cacheImport', 'fullCapture', 'diagnosticCapture',
+  'editorLayouts', 'firmwareValidate', 'presetConvert', 'backupDump', 'restoreDump', 'versionStore', 'deviceParams',
+  'virtualEffects', 'telemetryControl', 'supportsSave'
+];
+async function definitionsKeyOrder(): Promise<void> {
+  for (const [modelId, name] of [[0x11, 'FM3'], [0x12, 'FM9'], [0x10, 'Axe-Fx III'], [0x15, 'AM4'], [0x01, 'gen-1']] as const) {
+    const r = await defsRig(modelId, modelId === 0x11 ? [13, 0] : null, modelId === 0x11 ? { '11_13p0': docFor(0x11, '13.0') } : {});
+    try {
+      const res = await r.app.inject({ method: 'GET', url: '/device' });
+      const caps = (res.json() as { capabilities: Record<string, unknown> }).capabilities;
+      const keys = Object.keys(caps);
+      // slotCount (grid models) and grid (linear ones) are undefined, hence absent from the JSON; every other key is always there
+      const previous = PREVIOUS_GRID_CAPS_KEYS.filter((k) => keys.includes(k) || (k !== 'slotCount' && k !== 'grid'));
+      assertEqual(keys.filter((k) => k !== 'definitions').join(','), previous.join(','), `${name}: every previous key keeps its place, none is added or dropped`);
+      assertEqual(keys[keys.indexOf('virtualEffects') + 1], 'definitions', `${name}: definitions follows virtualEffects`);
+      assertEqual(keys[keys.indexOf('definitions') + 1], 'telemetryControl', `${name}: definitions comes before telemetryControl`);
+      assertEqual(Object.keys(caps.definitions as object).join(','), 'genericParams,catalogFirmware,profile,drift', `${name}: definitions key order`);
+      // the pretty-printed diff against the previous shape only adds lines
+      const without = { ...caps };
+      delete without.definitions;
+      const before = JSON.stringify(without, null, 2).split('\n');
+      const after = JSON.stringify(caps, null, 2).split('\n');
+      const at = after.findIndex((l) => l.startsWith('  "definitions"'));
+      const added = after.length - before.length;
+      assert(at > 0 && added > 0, `${name}: definitions adds lines`);
+      assertEqual(after.slice(0, at).join('\n'), before.slice(0, at).join('\n'), `${name}: no line before the insertion changes`);
+      assertEqual(after.slice(at + added).join('\n'), before.slice(at).join('\n'), `${name}: no line after the insertion changes`);
+    } finally { await r.app.close(); }
+  }
+}
+
 export async function runCapsTests(): Promise<void> {
   await fm3();
   await fm9();
@@ -291,4 +557,10 @@ export async function runCapsTests(): Promise<void> {
   await am4();
   await gen1();
   await fullCaptureFirmwareGate();
+  await definitionsGenericFlag();
+  await definitionsCatalogFirmware();
+  await definitionsDriftWithoutProfile();
+  await definitionsAppliedProfile();
+  await definitionsFollowsRegistry();
+  await definitionsKeyOrder();
 }

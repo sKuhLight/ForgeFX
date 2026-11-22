@@ -17,7 +17,7 @@ export type { DeviceDriver, DriverCapabilities, DriverCtx, DeviceEvent } from '.
 // the block-params DTOs (classic and generic) a client of the runtime types its responses with
 export type {
   BlockParamsDTO, BlockParamsV2DTO, BlockParamsOpts, BlockDefinitionsMeta, NamedParam, EnumParam, NamedParamV2, EnumParamV2,
-  ParamMeta, ParamWidget, HiddenParam, UnresolvedReason
+  ParamMeta, ParamWidget, HiddenParam, UnresolvedReason, DefinitionsCaps
 } from '../drivers/types.js';
 export type { Transport, RequestOpts, Conn, ConnKind } from '../transport/types.js';
 // the request/completion engine of the Node transports, for in-page transports to share (browser-safe)
