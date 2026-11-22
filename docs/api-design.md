@@ -130,6 +130,11 @@ Notes for clients (Axis):
   (`5.2000001`); format with `step` (as many decimals as `step` has).
 - `value: null`: render a dash, never compute a relative edit from it; an absolute write is allowed when
   `write` is not `null`. A layout button that presses a served parameter carries `boundParamId`.
+- **Layout controls follow the device.** In the generic response a control whose parameter name now sits at
+  another id (the name followed its row) carries that id in `paramId` and the catalog id in `movedFrom`. A
+  control whose parameter the device no longer serves (dropped, or its name could not follow a shifted row)
+  keeps its `paramId` and carries `unbound: true`: disable it, the id may now hold another parameter. The
+  classic response serves the editor layout unchanged.
 - Generic ids appear in `param` events like any other; a non-positional block emits none.
 
 ### Write guards (`PUT /preset/blocks/:eid/params/:paramId`)
