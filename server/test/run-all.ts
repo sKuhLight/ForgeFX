@@ -29,6 +29,7 @@ import { runSelectorsTests, SELECTORS_CASE_COUNT } from './drivers/selectors.tes
 import { runParamIndexTests, PARAM_INDEX_CASE_COUNT } from './drivers/param-index.test.js';
 import { runBlockParamsV2Tests, BLOCK_PARAMS_V2_CASE_COUNT } from './drivers/block-params-v2.test.js';
 import { runEnumOptionsTests, ENUM_OPTIONS_CASE_COUNT } from './drivers/enum-options.test.js';
+import { runEditBurstGenericTests, EDIT_BURST_GENERIC_CASE_COUNT } from './drivers/edit-burst-generic.test.js';
 import { runTelemetryTests, TELEMETRY_CASE_COUNT } from './drivers/telemetry.test.js';
 import { runReflectionTests, REFLECTION_CASE_COUNT } from './drivers/reflection.test.js';
 import { runAliasParityTests, ALIAS_PARITY_CASE_COUNT } from './api/alias-parity.test.js';
@@ -75,6 +76,7 @@ const tests: Array<{ name: string; run: () => void | Promise<void> }> = [
   { name: `drivers/param-index (${PARAM_INDEX_CASE_COUNT} cases, catalog/profile reconciliation: the five cases + unnamed, name shift + guards, live never hides, byte-exact removal, suspect family, widget/write table, FM3 goldens, no enum in named over FM3/FM9/III; synthetic + catalog)`, run: runParamIndexTests },
   { name: `drivers/block-params-v2 (${BLOCK_PARAMS_V2_CASE_COUNT} cases, generic block params over a mocked status + bulk read: null values per reason (non-positional GLOBAL, torn body, read-failed, unknown channel, out-of-range), classification and fingerprints, hidden rows, de-duplication on copies, selectors and the cab layout variant, diagnostic hook, layout button binding; classic response markers; catalog data)`, run: runBlockParamsV2Tests },
   { name: `drivers/enum-options (${ENUM_OPTIONS_CASE_COUNT} cases, selector options on FM3/FM9/III, classic and generic: label of ordinal v = list[v - first ordinal] (DELAY_SVFTYPE), 138-option DISTORT_TONETYPE, PHASER_ORDER = six ordinals, 4096 cap + optionsTruncated, overlay / bare-ordinal fallback; catalog + synthetic rows)`, run: runEnumOptionsTests },
+  { name: `drivers/edit-burst-generic (${EDIT_BURST_GENERIC_CASE_COUNT} cases, device-edit events for generic params (burst and FM3 poll), unused slots and dropped rows silent, GLOBAL: no events / no baseline / no reload / not polled; catalog + one synthetic row, mocked)`, run: runEditBurstGenericTests },
   { name: `drivers/telemetry (${TELEMETRY_CASE_COUNT} cadence/traffic/echo-guard/yield cases)`, run: runTelemetryTests },
   { name: `drivers/reflection (${REFLECTION_CASE_COUNT} slow-link/scene-state/blockState/scene cases)`, run: runReflectionTests },
   { name: `api/alias-parity (${ALIAS_PARITY_CASE_COUNT} alias↔unified twins, mocked AM4)`, run: runAliasParityTests },

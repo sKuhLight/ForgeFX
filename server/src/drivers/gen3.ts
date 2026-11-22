@@ -1974,6 +1974,7 @@ class Gen3Driver implements DeviceDriver {
     const eid = this.#watchedEid;
     if (eid == null) return { changed: false }; // no block opened yet — nothing to watch
     if (Date.now() - this.#lastLocalEditAt < 2000) return { changed: false }; // mid local edit → skip (avoid echo)
+    if (this.#nonPositional.has(eid)) return { changed: false }; // no per-param information in that body to diff
     const dev = await this.#conn();
     let frames: number[][];
     try {
@@ -1992,23 +1993,38 @@ class Gen3Driver implements DeviceDriver {
     if (bulk.values.length === 0) return { events: [], reload: false }; // head-only / empty — nothing to read
     const audioFamily = SLUG_FAMILY[(slugForEffectId(eid) ?? '').toLowerCase()];
     const family = audioFamily ?? this.#prof.familyForEffectId(eid);
-    const defs = family ? (this.#prof.params[family] ?? []) : [];
-    if (!family || defs.length === 0) return { events: [], reload: false }; // no param family mapped
+    if (!family) return { events: [], reload: false }; // no param family mapped
+    const defs = this.#prof.params[family] ?? [];
+    const index = buildParamIndex(this.#prof, family);
+    if (defs.length === 0 && index.entries.length === 0) return { events: [], reload: false }; // nothing to report on
     // Slice the block's ACTIVE channel (the one blockParams surfaced) — the body is channel-blocked, so
     // diffing against channel A while the user has B-D open would flag every A/B-different param as "moved".
     const { stride, base } = this.#channelSlice(family, bulk, eid === this.#watchedEid ? this.#watchedChannel : 0, !!audioFamily);
+    // A body that is not indexed by param id (GLOBAL: one record per param) says nothing about any pid: no
+    // events, and no baseline to prime.
+    if (!this.#isPositional(index, bulk, stride, !!audioFamily)) {
+      this.#nonPositional.add(eid);
+      return { events: [], reload: false };
+    }
+    this.#nonPositional.delete(eid);
     const cur = bulk.values.slice(base, base + stride);
     const prev = this.#editSnapshot.get(eid);
     this.#editSnapshot.set(eid, cur);
     // First sight of this block (never opened) → we can't diff. Ask the registry for a full reload so the
     // edit isn't lost; subsequent edits on this block then diff per-param.
     if (!prev) return { events: [], reload: true };
+    // The params that can move: the catalog's (with a row) and everything the index lists, generic params
+    // included; not the rows the connected firmware no longer has.
+    const removed = new Set(index.hidden.filter((h) => h.reason === 'removed').map((h) => h.id));
+    const pids: number[] = [];
+    const seen = new Set<number>();
+    const add = (id: number) => { if (!seen.has(id) && !removed.has(id)) { seen.add(id); pids.push(id); } };
+    for (const p of defs) if (this.#prof.ranges[family]?.[p.paramId]) add(p.paramId); // only real controls (skip internal churn)
+    for (const e of index.entries) add(e.pid);
     const events: { effectId: number; paramId: number; norm: number }[] = [];
-    for (const p of defs) {
-      const id = p.paramId;
+    for (const id of pids) {
       if (id >= stride) continue;
       if (cur[id] === undefined || cur[id] === prev[id]) continue; // unchanged / truncated → skip
-      if (!this.#prof.ranges[family]?.[id]) continue; // only real controls (skip internal/bypass churn)
       events.push({ effectId: eid, paramId: id, norm: clamp01((cur[id] ?? 0) / 65534) });
     }
     return { events, reload: false };
@@ -2026,7 +2042,9 @@ class Gen3Driver implements DeviceDriver {
   /** Change a block's model/type (the family TYPE selector ordinal). */
   async setType(eid: number, value: number) {
     const family = SLUG_FAMILY[(slugForEffectId(eid) ?? '').toLowerCase()];
-    const tid = family ? this.#paramId(family, 'type') : undefined;
+    // the pid that carries the family's type selector on this device (it follows its name when the row moved);
+    // a family without one (CABINET, PLEX, …) has no type to set
+    const tid = family ? buildParamIndex(this.#prof, family).typePid : undefined;
     if (tid == null) return { ok: false };
     const r = await this.#write(this.#codec.buildSetParameter(eid, tid, value));
     this.#emit({ type: 'changed', scope: 'grid' });
