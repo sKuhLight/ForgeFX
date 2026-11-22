@@ -63,34 +63,44 @@ export function deviceCacheKey(modelId: number, major: number, minor: number): s
   return `${modelId.toString(16).padStart(2, '0')}_${major}p${minor}`;
 }
 
-/** Per gen-3 model, the HIGHEST firmware (major.minor) on which the cache build's FULL mode — the live
- *  self-describe walk that also taper-sweeps, i.e. WRITES to the device — is allowed. Each entry is a
- *  version on which a full capture was actually carried out successfully; anything newer is refused
- *  (fail closed) because a newer firmware may change the end-of-table behaviour the walk relies on —
- *  FM3 firmware 13.0 did: a walk without the table-end bound does not stop at the end of a block (the
- *  end-marker replies are counted as real records), so it runs for a very long time and would write sweep
- *  values to parameters that do not exist. The bounded walk is verified on FM3 13.0. Fractal numbers firmware per model (the Axe-Fx III is on 32.x while the
+/** A firmware version as the full-capture policy sees it (major.minor). */
+type FirmwareVersion = { readonly major: number; readonly minor: number };
+
+/** Per gen-3 model, the firmware RANGE (inclusive `min`..`max`, major.minor) on which the cache build's FULL
+ *  mode — the live self-describe walk that also taper-sweeps, i.e. WRITES to the device — is allowed. The
+ *  range is the span a full capture has actually been carried out on successfully (its ends are versions
+ *  that were each run): a firmware outside it is refused (fail closed) in BOTH directions. A newer firmware
+ *  may change the end-of-table behaviour the walk relies on — FM3 firmware 13.0 did: a walk without the
+ *  table-end bound does not stop at the end of a block (the end-marker replies are counted as real records),
+ *  so it runs for a very long time and would write sweep values to parameters that do not exist. The bounded
+ *  walk is verified on FM3 12.0 and 13.0. An older firmware is equally unverified: its tables, parameter
+ *  layout and write behaviour were never exercised by a full capture, and a sweep that writes to a device
+ *  we have not seen would be a guess. Fractal numbers firmware per model (the Axe-Fx III is on 32.x while the
  *  FM3/FM9 are on 12.x/13.x), so the table is keyed by model byte. A model without an entry is never
- *  allowed. Add or raise an entry only after a full capture has completed on that model and version.
+ *  allowed. Extend an entry (lower `min` / raise `max`) only after a full capture has completed on that model
+ *  at that version; a version strictly inside the range is covered by its two verified ends.
  *  The FM9 has NO entry: no full capture has completed on an FM9 yet (the attempts on firmware 12.0
  *  stopped responding part-way through the walk), so full mode stays off there until one does.
  *  Read-only mode is intentionally NOT governed by this table. */
-export const FULL_CAPTURE_MAX_VERIFIED_FW: Readonly<Record<number, { readonly major: number; readonly minor: number }>> = {
-  0x11: { major: 13, minor: 0 }, // FM3 (13.0 verified with the table-end-bounded walk)
-  0x10: { major: 32, minor: 6 }  // Axe-Fx III (a complete full capture exists on 32.6)
+export const FULL_CAPTURE_VERIFIED_FW: Readonly<Record<number, { readonly min: FirmwareVersion; readonly max: FirmwareVersion }>> = {
+  0x11: { min: { major: 12, minor: 0 }, max: { major: 13, minor: 0 } }, // FM3 (12.0 and 13.0 verified; 13.0 with the table-end-bounded walk)
+  0x10: { min: { major: 32, minor: 6 }, max: { major: 32, minor: 6 } }  // Axe-Fx III (a complete full capture exists on 32.6 only)
 };
 
 /** Whether FULL-mode capture is permitted for `modelId` on the given running firmware: only a KNOWN,
- *  well-formed firmware (major >= 1) that is at or below the model's entry in
- *  {@link FULL_CAPTURE_MAX_VERIFIED_FW} (major.minor comparison). Unknown firmware, an unknown model, or
- *  a version above the verified one is refused — full mode writes to the device, so it never runs
- *  against a version it has not been verified on. Shared by the cache-build service (the actual gate)
- *  and the capabilities DTO (so the UI does not offer it). */
+ *  well-formed firmware (major >= 1) that lies inside the model's verified range in
+ *  {@link FULL_CAPTURE_VERIFIED_FW} (inclusive `min`..`max`, major.minor comparison). Unknown firmware, an
+ *  unknown model, or a version below the range's minimum or above its maximum is refused — full mode writes
+ *  to the device, so it never runs against a version it has not been verified on. Shared by the cache-build
+ *  service (the actual gate), the diagnostic capture's full-walk step and the capabilities DTO (so the UI
+ *  does not offer it). */
 export function fullCaptureAllowedOnFirmware(modelId: number, fw: { major: number; minor: number } | null | undefined): boolean {
   if (fw == null || !Number.isInteger(fw.major) || !Number.isInteger(fw.minor) || fw.major < 1 || fw.minor < 0) return false;
-  const max = FULL_CAPTURE_MAX_VERIFIED_FW[modelId];
-  if (!max) return false;
-  return fw.major < max.major || (fw.major === max.major && fw.minor <= max.minor);
+  const range = FULL_CAPTURE_VERIFIED_FW[modelId];
+  if (!range) return false;
+  const atLeastMin = fw.major > range.min.major || (fw.major === range.min.major && fw.minor >= range.min.minor);
+  const atMostMax = fw.major < range.max.major || (fw.major === range.max.major && fw.minor <= range.max.minor);
+  return atLeastMin && atMostMax;
 }
 
 /** Whether the in-app diagnostic capture (POST /diagnostics/capture) may run on a device: gen-3 units whose
@@ -548,7 +558,7 @@ export class DeviceRegistry {
       // FULL-mode self-describe write-sweep (POST /device/cache/build with mode:'full'). True only for the
       // CaptureRig-proven gen-3 trio (III/FM3/FM9); false on VP4/AM4/gen-1/gen-2. Derived from the driver
       // cap so the DTO can't drift. Inserted after cacheImport (additive-only ordering — see #capabilitiesDto).
-      // Also firmware-gated per model (FULL_CAPTURE_MAX_VERIFIED_FW; unknown firmware = false): detect()
+      // Also firmware-gated per model (FULL_CAPTURE_VERIFIED_FW range; unknown firmware = false): detect()
       // populates #firmware before any caps DTO is served, so the UI never offers a mode the build route
       // would refuse. (The build route re-reads the firmware itself right before gating.)
       fullCapture: c.fullCapture && fullCaptureAllowedOnFirmware(mid, this.#firmware),

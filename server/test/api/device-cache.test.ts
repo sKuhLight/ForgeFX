@@ -551,11 +551,11 @@ async function walkBoundFromStoredCache(): Promise<void> {
   }
 }
 
-// ── 6b. FULL-mode firmware gate: full capture is allowed only on a firmware the model's full capture is
-//    verified on (FM3 <= 13.0 here), and refused above it and on unknown firmware (a firmware can move the
-//    table ends the walk relies on); read-only mode is never
-//    gated. Service-level, via the walkImpl seam. ──
-type GateOutcome = { code: number; body: Record<string, unknown>; walkCalls: number; walkModes: Array<string | undefined>; setFrames: number };
+// ── 6b. FULL-mode firmware gate: full capture is allowed only on a firmware inside the range the model's full
+//    capture is verified on (FM3 12.0 to 13.0 here), and refused below and above it and on unknown firmware (a
+//    firmware can move the table ends the walk relies on; an older one was never exercised); read-only mode is
+//    never gated. Service-level, via the walkImpl seam. ──
+type GateOutcome = { code: number; body: Record<string, unknown>; walkCalls: number; walkModes: Array<string | undefined>; setFrames: number; docStored: boolean };
 
 async function runGateScenario(fw: [number, number] | undefined, mode: 'full' | 'read-only'): Promise<GateOutcome> {
   const key = fw ? `11_${fw[0]}p${fw[1]}` : null;
@@ -573,7 +573,8 @@ async function runGateScenario(fw: [number, number] | undefined, mode: 'full' | 
     const r = await deviceCache.startCacheBuild(store.defaultStore, registry, { mode, walkImpl: walk });
     await deviceCache.cacheBuildPromise(registry);
     const k = (f: readonly number[]) => f.join(',');
-    return { code: r.code, body: r.body as Record<string, unknown>, walkCalls: walkModes.length, walkModes, setFrames: mock.sent.filter((f) => k(f) === k([...SET_FRAME])).length };
+    const docStored = key ? store.defaultStore.getDoc('deviceCaches', key) != null : false;
+    return { code: r.code, body: r.body as Record<string, unknown>, walkCalls: walkModes.length, walkModes, setFrames: mock.sent.filter((f) => k(f) === k([...SET_FRAME])).length, docStored };
   } finally {
     if (key) store.defaultStore.delDoc('deviceCaches', key);
     await app.close();
@@ -592,6 +593,30 @@ async function fullFirmwareGate(): Promise<void> {
   const ok13 = await runGateScenario([13, 0], 'full');
   assertEqual(ok13.code, 200, 'full on fw 13.0 → 200');
   assertEqual(ok13.walkModes.join(','), 'full', 'fw 13.0 walk runs in full mode');
+
+  // fw 11.99 (just below the FM3's verified range, which starts at 12.0) → refused: a range with a floor, not just a ceiling
+  const justBelow = await runGateScenario([11, 99], 'full');
+  assertEqual(justBelow.code, 501, 'full on fw 11.99 → 501');
+  assertEqual(justBelow.body.error, 'unsupported', 'fw 11.99 501 keeps the unsupported error code');
+  assertEqual(justBelow.body.capability, 'fullCapture', 'fw 11.99 501 names the fullCapture capability');
+  assertEqual(justBelow.body.reason, 'firmware', 'fw 11.99 refusal reason: firmware');
+  assertEqual(justBelow.body.firmware, '11.99', 'fw 11.99 501 reports the detected firmware');
+  assertEqual(justBelow.walkCalls, 0, 'fw 11.99 never walks');
+  assertEqual(justBelow.setFrames, 0, 'fw 11.99 writes nothing');
+
+  // fw 5.3 (a real tester firmware far below anything a full capture ran on) → refused the same way
+  const old = await runGateScenario([5, 3], 'full');
+  assertEqual(old.code, 501, 'full on fw 5.3 → 501');
+  assertEqual(old.body.error, 'unsupported', 'fw 5.3 501 keeps the unsupported error code');
+  assertEqual(old.body.capability, 'fullCapture', 'fw 5.3 501 names the fullCapture capability');
+  assertEqual(old.body.reason, 'firmware', 'fw 5.3 refusal reason: firmware');
+  assertEqual(old.body.firmware, '5.3', 'fw 5.3 501 reports the detected firmware');
+  const oldMsg = String(old.body.message);
+  assert(/verified/.test(oldMsg) && oldMsg.includes('5.3') && /use read-only/.test(oldMsg), 'fw 5.3 501 message names the firmware, says verified-only, and points at read-only');
+  assertEqual(old.walkCalls, 0, 'fw 5.3 never walks');
+  assertEqual(old.setFrames, 0, 'fw 5.3 writes nothing');
+  assertEqual(old.docStored, false, 'fw 5.3 refusal stored no device cache');
+  assertEqual(justBelow.docStored, false, 'fw 11.99 refusal stored no device cache');
 
   // fw 13.1 (just above the FM3's verified 13.0) → refused: allowlist, not "major < 14"
   const justAbove = await runGateScenario([13, 1], 'full');
@@ -636,6 +661,15 @@ async function fullFirmwareGate(): Promise<void> {
   assertEqual(ro.walkModes.length, 1, 'read-only walk ran once');
   assertEqual(ro.walkModes[0], undefined, 'read-only walk passes no mode');
   assertEqual(ro.setFrames, 0, 'read-only walk writes nothing');
+
+  // read-only on a below-range fw 5.3 stays allowed too: the range only governs the writing full mode
+  const roOld = await runGateScenario([5, 3], 'read-only');
+  assertEqual(roOld.code, 200, 'read-only on fw 5.3 → 200');
+  assertEqual(roOld.body.started, true, 'read-only on fw 5.3 starts the build');
+  assertEqual(roOld.walkModes.length, 1, 'fw 5.3 read-only walk ran once');
+  assertEqual(roOld.walkModes[0], undefined, 'fw 5.3 read-only walk passes no mode');
+  assertEqual(roOld.setFrames, 0, 'fw 5.3 read-only walk writes nothing');
+  assertEqual(roOld.docStored, true, 'fw 5.3 read-only build stored its device cache');
 }
 
 // Stale / unusable firmware: the full-capture gate never judges a version it did not just read.

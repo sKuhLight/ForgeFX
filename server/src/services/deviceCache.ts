@@ -27,7 +27,7 @@ export type WalkImpl = (transport: LiveTransport, opts: LiveWalkOptions) => Prom
 
 /** Build mode: 'read-only' is the HW-proven default sweep; 'full' adds the CaptureRig-parity write-sweep
  *  that recovers per-float knob tapers (requires the fullCapture capability + write hooks, and a firmware
- *  the model's full capture has been verified on — FULL_CAPTURE_MAX_VERIFIED_FW, see startCacheBuild). */
+ *  the model's full capture has been verified on — inside its FULL_CAPTURE_VERIFIED_FW range, see startCacheBuild). */
 export type BuildMode = 'read-only' | 'full';
 
 interface CacheJob {
@@ -548,10 +548,11 @@ export async function startCacheBuild(store: Store, registry: DeviceRegistry, op
 async function startClaimedBuild(store: Store, registry: DeviceRegistry, opts: { force?: boolean; mode?: BuildMode; walkImpl?: WalkImpl } | undefined): Promise<{ started: boolean; result: StartResult }> {
   const mode: BuildMode = opts?.mode === 'full' ? 'full' : 'read-only';
   const done = (result: StartResult) => ({ started: false, result });
-  // FULL mode WRITES to the device, so it additionally needs a firmware it has been verified on: per model, at
-  // or below FULL_CAPTURE_MAX_VERIFIED_FW (a firmware can move the table ends the walk relies on: on FM3 13.0 a walk
-  // without the table-end bound did not stop at a block's end and would have written sweep values to
-  // non-existent params). The firmware is RE-READ right before deciding (fn 0x08,
+  // FULL mode WRITES to the device, so it additionally needs a firmware it has been verified on: per model, inside the
+  // FULL_CAPTURE_VERIFIED_FW range, refused below its minimum as well as above its maximum (a firmware can move the
+  // table ends the walk relies on: on FM3 13.0 a walk without the table-end bound did not stop at a block's end and
+  // would have written sweep values to non-existent params; an older firmware was never exercised at all). The
+  // firmware is RE-READ right before deciding (fn 0x08,
   // the detect path) so a unit that changed firmware or went quiet since detect() is never judged on a stale
   // version; a silent unit is unknown and therefore refused (fail closed). Same 501/capability shape as the
   // gates above, plus additive `reason: 'firmware'` / `firmware` / `message` fields. Read-only mode is

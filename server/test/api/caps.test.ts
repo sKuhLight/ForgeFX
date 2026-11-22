@@ -43,7 +43,7 @@ type Caps = {
   supportsSave: boolean;
 };
 
-// fullCapture is firmware-gated per model (FULL_CAPTURE_MAX_VERIFIED_FW), so each gen-3 model's matrix is
+// fullCapture is firmware-gated per model (FULL_CAPTURE_VERIFIED_FW range), so each gen-3 model's matrix is
 // served for a unit reporting a firmware its full capture is verified on (FM3 12.0, Axe-Fx III 32.6); the
 // FM9 has no verified firmware at all, so its matrix carries fullCapture false on every version. The gate
 // itself is covered by fullCaptureFirmwareGate().
@@ -232,17 +232,19 @@ async function gen1(): Promise<void> {
   }
 }
 
-// fullCapture follows the firmware, per model: offered only on a known firmware at or below the model's
-// verified version (FM3 13.0, Axe-Fx III 32.6 — major.minor), withheld above it and when the firmware is
-// unknown / unusable. The FM9 has no verified version, so it is withheld on every firmware. The build route
-// refuses full mode in exactly those cases (see deviceCache.ts).
+// fullCapture follows the firmware, per model: offered only on a known firmware inside the model's verified
+// range (FM3 12.0 to 13.0, Axe-Fx III 32.6 to 32.6 — inclusive, major.minor), withheld below its minimum, above
+// its maximum and when the firmware is unknown / unusable. The FM9 has no verified version, so it is withheld on
+// every firmware. The build route refuses full mode in exactly those cases (see deviceCache.ts).
 async function fullCaptureFirmwareGate(): Promise<void> {
   type FwCase = { fw?: [number, number]; expected: boolean; label: string };
   const perModel: Array<{ modelId: number; name: string; cases: FwCase[] }> = [
     { modelId: 0x11, name: 'FM3', cases: [
-      { fw: [13, 0], expected: true, label: 'fw 13.0 (verified)' },
-      { fw: [12, 99], expected: true, label: 'fw 12.99 (lower major, high minor)' },
-      { fw: [12, 0], expected: true, label: 'fw 12.0' },
+      { fw: [13, 0], expected: true, label: 'fw 13.0 (verified, range max)' },
+      { fw: [12, 99], expected: true, label: 'fw 12.99 (inside the range, high minor)' },
+      { fw: [12, 0], expected: true, label: 'fw 12.0 (verified, range min)' },
+      { fw: [11, 99], expected: false, label: 'fw 11.99 (just below the range, high minor)' },
+      { fw: [5, 3], expected: false, label: 'fw 5.3 (an old firmware nobody verified)' },
       { fw: [13, 1], expected: false, label: 'fw 13.1' },
       { fw: [13, 99], expected: false, label: 'fw 13.99 (high minor boundary)' },
       { fw: [14, 0], expected: false, label: 'fw 14.0' }
@@ -255,8 +257,9 @@ async function fullCaptureFirmwareGate(): Promise<void> {
       { fw: [13, 0], expected: false, label: 'fw 13.0' }
     ] },
     { modelId: 0x10, name: 'Axe-Fx III', cases: [
-      { fw: [32, 6], expected: true, label: 'fw 32.6 (verified)' },
-      { fw: [31, 99], expected: true, label: 'fw 31.99 (lower major, high minor)' },
+      { fw: [32, 6], expected: true, label: 'fw 32.6 (verified: the only version with a completed full capture)' },
+      { fw: [32, 5], expected: false, label: 'fw 32.5 (just below the single verified version)' },
+      { fw: [31, 99], expected: false, label: 'fw 31.99 (below the verified version, high minor)' },
       { fw: [32, 7], expected: false, label: 'fw 32.7' },
       { fw: [32, 99], expected: false, label: 'fw 32.99 (high minor boundary)' },
       { fw: [33, 0], expected: false, label: 'fw 33.0' }
@@ -285,7 +288,13 @@ async function fullCaptureFirmwareGate(): Promise<void> {
   assertEqual(fullCaptureAllowedOnFirmware(0x12, { major: 12, minor: 0 }), false, 'FM9 (no allowlist entry) never allowed, not even on 12.0');
   assertEqual(fullCaptureAllowedOnFirmware(0x12, { major: 1, minor: 0 }), false, 'FM9 (no allowlist entry) never allowed on an old firmware either');
   assertEqual(fullCaptureAllowedOnFirmware(0x10, { major: 32, minor: 6 }), true, 'policy: Axe-Fx III 32.6 allowed');
-  assertEqual(fullCaptureAllowedOnFirmware(0x11, { major: 12, minor: 0 }), true, 'policy: FM3 12.0 allowed');
+  assertEqual(fullCaptureAllowedOnFirmware(0x10, { major: 32, minor: 5 }), false, 'policy: Axe-Fx III 32.5 refused (below the verified version)');
+  assertEqual(fullCaptureAllowedOnFirmware(0x10, { major: 32, minor: 7 }), false, 'policy: Axe-Fx III 32.7 refused (above the verified version)');
+  assertEqual(fullCaptureAllowedOnFirmware(0x11, { major: 12, minor: 0 }), true, 'policy: FM3 12.0 allowed (range min)');
+  assertEqual(fullCaptureAllowedOnFirmware(0x11, { major: 13, minor: 0 }), true, 'policy: FM3 13.0 allowed (range max)');
+  assertEqual(fullCaptureAllowedOnFirmware(0x11, { major: 11, minor: 99 }), false, 'policy: FM3 11.99 refused (below the range)');
+  assertEqual(fullCaptureAllowedOnFirmware(0x11, { major: 5, minor: 3 }), false, 'policy: FM3 5.3 refused (below the range)');
+  assertEqual(fullCaptureAllowedOnFirmware(0x11, { major: 13, minor: 1 }), false, 'policy: FM3 13.1 refused (above the range)');
   assertEqual(fullCaptureAllowedOnFirmware(0x11, null), false, 'policy: null firmware refused');
   assertEqual(fullCaptureAllowedOnFirmware(0x11, { major: NaN, minor: 0 }), false, 'policy: NaN major refused');
   assertEqual(fullCaptureAllowedOnFirmware(0x11, { major: 12, minor: -1 }), false, 'policy: negative minor refused');

@@ -743,7 +743,7 @@ async function unsavedEditsDiscard(): Promise<void> {
   }
 }
 
-// ── 6. full walk: gated (opt-in, capability, verified firmware) ──
+// ── 6. full walk: gated (opt-in, capability, firmware inside the verified range) ──
 async function fullWalkGate(): Promise<void> {
   {
     const { registry } = await makeRig(fakeState({ fw: [14, 0] }));
@@ -753,6 +753,26 @@ async function fullWalkGate(): Promise<void> {
     assertEqual(fw.status, 'skipped', 'full walk skipped on an unverified firmware');
     assert(/not verified on firmware 14\.0/.test(fw.note ?? ''), `skip note names the firmware (${fw.note})`);
     assertEqual(walks, 0, 'no full walk ran');
+  }
+  {
+    // below the verified range: refused in this direction too (an FM3 on fw 5.3 is a real tester firmware)
+    const { registry, state } = await makeRig(fakeState({ fw: [5, 3] }));
+    let walks = 0;
+    const b = await run(registry, { steps: ['info'], includeFullWalk: true }, { walkImpl: async () => { walks++; return seedRecords(); } });
+    const fw = stepOf(b, 'fullWalk');
+    assertEqual(fw.status, 'skipped', 'full walk skipped on a firmware below the verified range');
+    assert(/not verified on firmware 5\.3/.test(fw.note ?? ''), `skip note names the firmware (${fw.note})`);
+    assertEqual(walks, 0, 'no full walk ran');
+    assertEqual((state.stores ?? []).length + state.switches.length, 0, 'nothing stored, nothing switched');
+    assertEqual(b.device.firmware, '5.3', 'the bundle records the firmware read');
+  }
+  {
+    // the lowest verified firmware (the range minimum) still runs the full walk
+    const { registry } = await makeRig(fakeState({ fw: [12, 0] }));
+    let mode: string | undefined;
+    const b = await run(registry, { steps: [], includeFullWalk: true }, { walkImpl: async (_t, o) => { mode = o.mode; await o.write!.reloadPreset(); return seedRecords(); } });
+    assertEqual(stepOf(b, 'fullWalk').status, 'ok', 'full walk runs on FM3 12.0 (range minimum) with a clean edit buffer');
+    assertEqual(mode, 'full', 'the walk ran in full mode on 12.0');
   }
   {
     const { registry } = await makeRig(fakeState({ fw: [13, 0] }));
