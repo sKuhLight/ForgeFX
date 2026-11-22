@@ -237,9 +237,10 @@ function computeIndex(profile: DeviceProfile, family: string, force: ReadonlySet
     return c && e && !c.synthetic && paramFingerprint(c) === paramFingerprint(e) ? base.enumLabelsFor(family, pid) : undefined;
   };
   const catLabels = (pid: number) => base.enumLabelsFor(family, pid);
-  /** A live walk saw a row of the other kind than the catalog's: the merge kept the catalog row. */
+  /** A live walk saw a row of the other kind than the catalog's: the merge kept the catalog row. A suspect
+   *  family's profile section belongs to another family, so its rows say nothing about this one. */
   const liveKindConflict = (pid: number): boolean => {
-    if (!facts || facts.byteExact) return false;
+    if (!facts || facts.byteExact || suspect) return false;
     const walked = facts.ranges[family]?.[pid];
     const c = cat[pid];
     return !!walked && !!c && walked.displayMin !== walked.displayMax && walked.kind !== c.kind;
