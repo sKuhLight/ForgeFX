@@ -1,0 +1,102 @@
+{
+  "block": "Rotary",
+  "definitions": {"channel":0,"family":"ROTARY","hidden":[{"id":11,"reason":"bypass"}],"persistentWrites":false,"positional":true,"profile":"byte-exact"},
+  "enums": [
+    {"fp":"1:a81ff246","generic":false,"id":4,"kind":"enum","name":"Tempo","nameConfidence":"high","nameSource":"catalog","options":"#0","source":"profile","value":4,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:10a2c0d2","generic":false,"id":8,"kind":"enum","name":"Bypass Mode","nameConfidence":"high","nameSource":"catalog","options":"#1","source":"profile","value":2,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:85f7005e","generic":false,"id":20,"kind":"enum","movedFrom":19,"name":"Input Select","nameConfidence":"medium","nameSource":"catalog-moved","options":"#2","source":"profile","value":2,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:02a8ec0b","generic":false,"id":21,"isNew":true,"kind":"enum","movedFrom":20,"name":"Scene Ignore","nameConfidence":"medium","nameSource":"catalog-moved","options":"#3","source":"profile","value":1,"widget":"toggle","widgetSource":"device","write":"ordinal"}
+  ],
+  "layout": {
+    "editorName": "Rotary",
+    "family": "ROTARY",
+    "pages": [
+      {
+        "name": "Rotary",
+        "rows": [
+          {
+            "controls": [
+              {"label":"Rate","paramId":0,"paramName":"ROTARY_RATE","rawWidget":"knob","widget":"knob"},
+              {"label":"Tempo","paramId":4,"paramName":"ROTARY_TEMPO","rawWidget":"dropdown1","widget":"dropdown"},
+              {"label":"","paramId":null,"paramName":null,"rawWidget":"spacer","widget":"spacer"},
+              {"label":"Hi Depth","paramId":2,"paramName":"ROTARY_HFDEPTH","rawWidget":"knob","widget":"knob"},
+              {"label":"High Level","paramId":3,"paramName":"ROTARY_HFLEVEL","rawWidget":"knob","widget":"knob"},
+              {"label":"Hi Time Constant","paramId":15,"paramName":"ROTARY_HIGHTIME","rawWidget":"knob","widget":"knob"},
+              {"label":"Rotor\nLength","paramId":10,"paramName":"ROTARY_HFLENGTH","rawWidget":"knob","widget":"knob"},
+              {"label":"Mic\nSpacing","paramId":12,"paramName":"ROTARY_WIDTH","rawWidget":"knob","widget":"knob"}
+            ],
+            "section": "parameters"
+          },
+          {
+            "controls": [
+              {"label":"Drive","movedFrom":17,"paramId":18,"paramName":"ROTARY_DRIVE","rawWidget":"knob","widget":"knob"},
+              {"label":"","paramId":null,"paramName":null,"rawWidget":"spacer","widget":"spacer"},
+              {"label":"","paramId":null,"paramName":null,"rawWidget":"spacer","widget":"spacer"},
+              {"label":"Low Depth","paramId":1,"paramName":"ROTARY_LFDEPTH","rawWidget":"knob","widget":"knob"},
+              {"label":"","paramId":null,"paramName":null,"rawWidget":"spacer","widget":"spacer"},
+              {"label":"Low Time Constant","paramId":14,"paramName":"ROTARY_LOWTIME","rawWidget":"knob","widget":"knob"},
+              {"label":"Low Rate Mult","paramId":13,"paramName":"ROTARY_LOWRATE","rawWidget":"knob","widget":"knob"},
+              {"label":"Mic\nDistance","movedFrom":18,"paramId":19,"paramName":"ROTARY_MICDIST","rawWidget":"knob","widget":"knob"}
+            ],
+            "section": "parameters"
+          },
+          {
+            "controls": [
+              {"label":"Mix","paramId":5,"paramName":"ROTARY_MIX","rawWidget":"knob","widget":"knob"},
+              {"label":"Level","paramId":6,"paramName":"ROTARY_LEVEL","rawWidget":"knob","widget":"knob"},
+              {"label":"Balance","paramId":7,"paramName":"ROTARY_PAN","rawWidget":"knob","widget":"knob"}
+            ],
+            "section": "mixer"
+          },
+          {
+            "controls": [
+              {"label":"Stereo\nSpread","movedFrom":16,"paramId":17,"paramName":"ROTARY_SPREAD","rawWidget":"knob","widget":"knob"},
+              {"label":"Input\nSelect","movedFrom":19,"paramId":20,"paramName":"ROTARY_INPUTSELECT","rawWidget":"dropdown1Tight","widget":"dropdown"},
+              {"label":"Bypass\nMode","paramId":8,"paramName":"ROTARY_BYPASSMODE","rawWidget":"dropdown1Tight","widget":"dropdown"},
+              {"label":"Bypass","paramId":11,"paramName":"ROTARY_BYPASS","rawWidget":"btnBypass","widget":"button"},
+              {
+                "fw": {"gtet":"5,3"},
+                "label": "Scene\nIgnore",
+                "movedFrom": 20,
+                "paramId": 21,
+                "paramName": "ROTARY_SCENEIGNORE",
+                "rawWidget": "btnIgnoreScene",
+                "widget": "button"
+              }
+            ],
+            "section": "mixer"
+          }
+        ]
+      }
+    ],
+    "variantName": "Rotary",
+    "variantValue": null
+  },
+  "named": [
+    {"fp":"1:b8599dcf","generic":false,"id":0,"kind":"float","max":10,"min":0,"name":"Rate","nameConfidence":"high","nameSource":"catalog","norm":0,"source":"profile","step":0.01,"unit":"Hz","value":0,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:318ec60c","generic":false,"id":1,"kind":"float","max":100,"min":0,"name":"Low Depth","nameConfidence":"high","nameSource":"catalog","norm":0.0152134769737846,"source":"profile","step":0.1,"value":1.521,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:318ec60c","generic":false,"id":2,"kind":"float","max":100,"min":0,"name":"Hi Depth","nameConfidence":"high","nameSource":"catalog","norm":0.0304269539475692,"source":"profile","step":0.1,"value":3.043,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:1c845b46","generic":false,"id":3,"kind":"float","max":6,"min":-6,"name":"High Level","nameConfidence":"high","nameSource":"catalog","norm":0.0456404309213538,"source":"profile","step":0.012,"value":-5.452,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:98197bcd","generic":false,"id":5,"kind":"float","max":100,"min":0,"name":"Mix","nameConfidence":"high","nameSource":"catalog","norm":0.076067384868923,"source":"profile","step":0.1,"unit":"%","value":7.607,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:70f92dab","generic":false,"id":6,"kind":"float","max":20,"min":-80,"name":"Level","nameConfidence":"high","nameSource":"catalog","norm":0.0912808618427076,"source":"profile","step":0.1,"unit":"dB","value":-70.872,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:63434cb2","generic":false,"id":7,"kind":"float","max":100,"min":-100,"name":"Balance","nameConfidence":"high","nameSource":"catalog","norm":0.1064943388164922,"source":"profile","step":0.2,"unit":"%","value":-78.701,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:a10d5539","generic":false,"id":10,"kind":"float","max":100,"min":0.1,"name":"Rotor Length","nameConfidence":"high","nameSource":"catalog","norm":0.152134769737846,"source":"profile","step":0.1,"value":15.298,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:2aeccbf4","generic":false,"id":12,"kind":"float","max":100,"min":0,"name":"Mic Spacing","nameConfidence":"high","nameSource":"catalog","norm":0.1825617236854152,"source":"profile","step":0.1,"value":18.256,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:8f98e036","generic":false,"id":13,"kind":"float","log":true,"max":10,"min":0.1,"name":"Low Rate Mult","nameConfidence":"high","nameSource":"catalog","norm":0.19777520065919982,"source":"profile","value":0.249,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:744c0ed9","generic":false,"id":14,"kind":"float","log":true,"max":10,"min":0.1,"name":"Low Time Constant","nameConfidence":"high","nameSource":"catalog","norm":0.2129886776329844,"source":"profile","value":0.267,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:744c0ed9","generic":false,"id":15,"kind":"float","log":true,"max":10,"min":0.1,"name":"Hi Time Constant","nameConfidence":"high","nameSource":"catalog","norm":0.22820215460676901,"source":"profile","value":0.286,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:8597876b","generic":false,"id":17,"kind":"float","max":200,"min":-200,"movedFrom":16,"name":"Stereo Spread","nameConfidence":"medium","nameSource":"catalog-moved","norm":0.2586291085543382,"source":"profile","step":0.2,"value":-96.548,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:b606079b","generic":false,"id":18,"kind":"float","max":10,"min":0,"movedFrom":17,"name":"Drive","nameConfidence":"medium","nameSource":"catalog-moved","norm":0.2738425855281228,"source":"profile","value":2.738,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:ce3c0fe2","generic":false,"id":19,"kind":"float","log":true,"max":1,"min":0.01,"movedFrom":18,"name":"Mic Distance","nameConfidence":"medium","nameSource":"catalog-moved","norm":0.2890560625019074,"source":"profile","step":0.001,"value":0.038,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:7913885a","generic":true,"id":16,"kind":"float","max":1,"min":0,"name":"P16","nameSource":"generic","norm":0.2434156315805536,"pageHint":"more","source":"profile","step":0.01,"value":0.243,"widget":"knob","widgetSource":"device","write":"norm"}
+  ],
+  "page": 86,
+  "slug": "rotary",
+  "type": null,
+  "optionLists": [
+    [{"label":"NONE ","value":0},{"label":"1/64 TRIP","value":1},{"label":"1/64","value":2},{"label":"1/64 DOT","value":3},{"label":"1/32 TRIP","value":4},{"label":"1/32","value":5},{"label":"1/32 DOT","value":6},{"label":"1/16 TRIP","value":7},{"label":"1/16","value":8},{"label":"1/16 DOT","value":9},{"label":"1/8 TRIP","value":10},{"label":"1/8","value":11},{"label":"1/8 DOT","value":12},{"label":"1/4 TRIP","value":13},{"label":"1/4","value":14},{"label":"1/4 DOT","value":15},{"label":"1/2 TRIP","value":16},{"label":"1/2","value":17},{"label":"1/2 DOT","value":18},{"label":"1 TRIP","value":19},{"label":"1","value":20},{"label":"1 DOT","value":21},{"label":"2","value":22},{"label":"3","value":23},{"label":"4","value":24},{"label":"4/3","value":25},{"label":"5/4","value":26},{"label":"5/64","value":27},{"label":"7/64","value":28},{"label":"9/64","value":29},{"label":"10/64 (5/32)","value":30},{"label":"11/64","value":31},{"label":"13/64","value":32},{"label":"14/64 (7/32)","value":33},{"label":"15/64","value":34},{"label":"17/64","value":35},{"label":"18/64 (9/32)","value":36},{"label":"19/64","value":37},{"label":"20/64 (5/16)","value":38},{"label":"21/64","value":39},{"label":"22/64 (11/32)","value":40},{"label":"23/64","value":41},{"label":"25/64","value":42},{"label":"26/64 (13/32)","value":43},{"label":"27/64","value":44},{"label":"28/64 (7/16)","value":45},{"label":"29/64","value":46},{"label":"30/64 (15/32)","value":47},{"label":"31/64","value":48},{"label":"33/64","value":49},{"label":"34/64 (17/32)","value":50},{"label":"35/64","value":51},{"label":"36/64 (9/16)","value":52},{"label":"37/64","value":53},{"label":"38/64 (19/32)","value":54},{"label":"39/64","value":55},{"label":"40/64 (5/8)","value":56},{"label":"41/64","value":57},{"label":"42/64 (21/32)","value":58},{"label":"43/64","value":59},{"label":"44/64 (11/16)","value":60},{"label":"45/64","value":61},{"label":"46/64 (23/32)","value":62},{"label":"47/64","value":63},{"label":"49/64","value":64},{"label":"50/64 (25/32)","value":65},{"label":"51/64","value":66},{"label":"52/64 (13/16)","value":67},{"label":"53/64","value":68},{"label":"54/64 (27/32)","value":69},{"label":"55/64","value":70},{"label":"56/64 (7/8)","value":71},{"label":"57/64","value":72},{"label":"58/64 (29/32)","value":73},{"label":"59/64","value":74},{"label":"60/64 (15/16)","value":75},{"label":"61/64","value":76},{"label":"62/64 (31/32)","value":77},{"label":"63/64","value":78}],
+    [{"label":"THRU","value":0},{"label":"MUTE FX OUT","value":1},{"label":"MUTE OUT","value":2}],
+    [{"label":"L+R","value":0},{"label":"LEFT","value":1},{"label":"RIGHT","value":2}],
+    [{"label":"OFF","value":0},{"label":"ON","value":1}]
+  ]
+}

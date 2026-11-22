@@ -31,6 +31,8 @@ import { runBlockParamsV2Tests, BLOCK_PARAMS_V2_CASE_COUNT } from './drivers/blo
 import { runWriteGuardsTests, WRITE_GUARDS_CASE_COUNT } from './drivers/write-guards.test.js';
 import { runEnumOptionsTests, ENUM_OPTIONS_CASE_COUNT } from './drivers/enum-options.test.js';
 import { runEditBurstGenericTests, EDIT_BURST_GENERIC_CASE_COUNT } from './drivers/edit-burst-generic.test.js';
+import { runParamCoverageTests, PARAM_COVERAGE_CASE_COUNT } from './drivers/param-coverage.test.js';
+import { runNewerFirmwareGoldenTests, NEWER_FIRMWARE_GOLDEN_CASE_COUNT } from './drivers/newer-firmware-golden.test.js';
 import { runTelemetryTests, TELEMETRY_CASE_COUNT } from './drivers/telemetry.test.js';
 import { runReflectionTests, REFLECTION_CASE_COUNT } from './drivers/reflection.test.js';
 import { runAliasParityTests, ALIAS_PARITY_CASE_COUNT } from './api/alias-parity.test.js';
@@ -79,6 +81,8 @@ const tests: Array<{ name: string; run: () => void | Promise<void> }> = [
   { name: `drivers/write-guards (${WRITE_GUARDS_CASE_COUNT} cases, gen-3 param writes refused before the wire: no wire pid → 400, unused slot without a param (catalog, byte-exact; live: effective row only; suspect family exempt) → 409; MOD_MIN/MAX/PARAM, CHORUS_GLOBALMIX, FC and row-less ids, write:null stay writable; FM3/FM9/III; app↔router parity; catalog + synthetic rows)`, run: runWriteGuardsTests },
   { name: `drivers/enum-options (${ENUM_OPTIONS_CASE_COUNT} cases, selector options on FM3/FM9/III, classic and generic: label of ordinal v = list[v - first ordinal] (DELAY_SVFTYPE), 138-option DISTORT_TONETYPE, PHASER_ORDER = six ordinals, 4096 cap + optionsTruncated, overlay / bare-ordinal fallback; catalog + synthetic rows)`, run: runEnumOptionsTests },
   { name: `drivers/edit-burst-generic (${EDIT_BURST_GENERIC_CASE_COUNT} cases, device-edit events for generic params (burst and FM3 poll), unused slots and dropped rows silent, GLOBAL: no events / no baseline / no reload / not polled; catalog + one synthetic row, mocked)`, run: runEditBurstGenericTests },
+  { name: `drivers/param-coverage (${PARAM_COVERAGE_CASE_COUNT} cases, generic block params over every first-instance eid of FM3/FM9/III, catalog and byte-exact catalog profile: listed = informative - bypass - type - by design, listed + hidden = informative, per-device totals with their scope (FM3 1611/27, FM9 1685/49, III 1824|1814/30); a synthetic newer firmware, byte-exact and live: new params, unused slot (409), dropped param, inserted rows (names follow / ambiguous window), revised rows, swapped sections, unknown block; invariants; catalog + synthetic, mocked)`, run: runParamCoverageTests },
+  { name: `drivers/newer-firmware-golden (${NEWER_FIRMWARE_GOLDEN_CASE_COUNT} cases, exact goldens of the generic response for 8 FM3 blocks on the catalog profile and on a synthetic newer firmware, deterministic synthetic bodies, lossless stored form, size bound; UPDATE_GOLDEN=1 regenerates; catalog + synthetic, mocked)`, run: runNewerFirmwareGoldenTests },
   { name: `drivers/telemetry (${TELEMETRY_CASE_COUNT} cadence/traffic/echo-guard/yield cases)`, run: runTelemetryTests },
   { name: `drivers/reflection (${REFLECTION_CASE_COUNT} slow-link/scene-state/blockState/scene cases)`, run: runReflectionTests },
   { name: `api/alias-parity (${ALIAS_PARITY_CASE_COUNT} alias↔unified twins, mocked AM4)`, run: runAliasParityTests },

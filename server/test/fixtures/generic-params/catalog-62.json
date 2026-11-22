@@ -1,0 +1,531 @@
+{
+  "block": "Cab",
+  "definitions": {"channel":0,"family":"CABINET","hidden":[{"id":32,"reason":"bypass"}],"persistentWrites":false,"positional":true,"profile":"byte-exact"},
+  "enums": [
+    {"fp":"1:965de29e","generic":false,"id":0,"kind":"enum","name":"Bank 1","nameConfidence":"high","nameSource":"catalog","options":"#0","source":"profile","value":0,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:965de29e","generic":false,"id":1,"kind":"enum","name":"Bank 2","nameConfidence":"high","nameSource":"catalog","options":"#0","source":"profile","value":1,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:c37ffe22","generic":false,"id":24,"kind":"enum","name":"MUTE1","nameConfidence":"high","nameSource":"catalog","options":"#1","source":"profile","value":0,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:c37ffe22","generic":false,"id":25,"kind":"enum","name":"MUTE2","nameConfidence":"high","nameSource":"catalog","options":"#1","source":"profile","value":1,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:e87bd748","generic":false,"id":30,"kind":"enum","name":"Bypass Mode","nameConfidence":"high","nameSource":"catalog","options":"#2","source":"profile","value":0,"widget":"toggle","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:403cd6f3","generic":false,"id":31,"kind":"enum","name":"MODE","nameConfidence":"high","nameSource":"catalog","options":"#3","source":"profile","value":1,"widget":"toggle","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:b2c31c9a","generic":false,"id":42,"kind":"enum","name":"Input Mode","nameConfidence":"high","nameSource":"catalog","options":"#4","source":"profile","value":2,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:7288f6cb","generic":false,"id":43,"kind":"enum","name":"Preamp Type","nameConfidence":"high","nameSource":"catalog","options":"#5","source":"profile","value":7,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:6bc0cc89","generic":false,"id":47,"kind":"enum","name":"Preamp Mode","nameConfidence":"high","nameSource":"catalog","options":"#6","source":"profile","value":1,"widget":"toggle","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:d24f4110","generic":false,"id":56,"kind":"enum","name":"Room Shape","nameConfidence":"high","nameSource":"catalog","options":"#7","source":"profile","value":0,"widget":"toggle","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:1f79afd2","generic":false,"id":70,"kind":"enum","name":"IR Length 1","nameConfidence":"high","nameSource":"catalog","options":"#8","source":"profile","value":0,"widget":"toggle","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:1f79afd2","generic":false,"id":71,"kind":"enum","name":"IR Length 2","nameConfidence":"high","nameSource":"catalog","options":"#8","source":"profile","value":1,"widget":"toggle","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:9aaf80ae","generic":false,"id":74,"kind":"enum","name":"Low Slope 1","nameConfidence":"high","nameSource":"catalog","options":"#9","source":"profile","value":2,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:9aaf80ae","generic":false,"id":75,"kind":"enum","name":"Low Slope 2","nameConfidence":"high","nameSource":"catalog","options":"#9","source":"profile","value":3,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:9aaf80ae","generic":false,"id":78,"kind":"enum","name":"High Slope 1","nameConfidence":"high","nameSource":"catalog","options":"#9","source":"profile","value":2,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:9aaf80ae","generic":false,"id":79,"kind":"enum","name":"High Slope 2","nameConfidence":"high","nameSource":"catalog","options":"#9","source":"profile","value":3,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:9aaf80ae","generic":false,"id":82,"kind":"enum","name":"Low Cut Slope","nameConfidence":"high","nameSource":"catalog","options":"#9","source":"profile","value":2,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:9aaf80ae","generic":false,"id":83,"kind":"enum","name":"High Cut Slope","nameConfidence":"high","nameSource":"catalog","options":"#9","source":"profile","value":3,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:02a8ec0b","generic":false,"id":84,"kind":"enum","name":"Scene Ignore","nameConfidence":"high","nameSource":"catalog","options":"#10","source":"profile","value":0,"widget":"toggle","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:e9b97f37","generic":false,"id":85,"kind":"enum","name":"DYNACAB TYPE1","nameConfidence":"high","nameSource":"catalog","options":"#11","source":"profile","value":40,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:e9b97f37","generic":false,"id":86,"kind":"enum","name":"DYNACAB TYPE2","nameConfidence":"high","nameSource":"catalog","options":"#11","source":"profile","value":41,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:576ce497","generic":false,"id":89,"kind":"enum","name":"DYNACAB MIC1","nameConfidence":"high","nameSource":"catalog","options":"#12","source":"profile","value":1,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:576ce497","generic":false,"id":90,"kind":"enum","name":"DYNACAB MIC2","nameConfidence":"high","nameSource":"catalog","options":"#12","source":"profile","value":2,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:02a8ec0b","generic":false,"id":105,"kind":"enum","name":"Auto Align","nameConfidence":"high","nameSource":"catalog","options":"#10","source":"profile","value":1,"widget":"toggle","widgetSource":"device","write":"ordinal"}
+  ],
+  "layout": {
+    "editorName": "Cab",
+    "family": "CABINET",
+    "pages": [
+      {
+        "fw": {"gtet":"6,03"},
+        "name": "Cab",
+        "pageNum": 0,
+        "rows": [
+          {
+            "controls": [
+              {"label":"CAB 1","paramId":65284,"paramName":"CABINET_LABEL1","placement":{"positionExact":"303,25"},"rawWidget":"labelBold","widget":"label"},
+              {
+                "label": "",
+                "paramId": 85,
+                "paramName": "CABINET_DYNACAB_TYPE1",
+                "placement": {"positionExact":"359,25"},
+                "rawWidget": "dropdownCabDyna",
+                "widget": "dropdown"
+              },
+              {"label":"Mic","paramId":65284,"paramName":"CABINET_LABEL1","placement":{"positionExact":"320,58"},"rawWidget":"labelBold","widget":"label"},
+              {
+                "label": "",
+                "paramId": 89,
+                "paramName": "CABINET_DYNACAB_MIC1",
+                "placement": {"positionExact":"359,58"},
+                "rawWidget": "dropdownCabDyna",
+                "widget": "dropdown"
+              },
+              {
+                "boundParamId": 24,
+                "label": "M",
+                "paramId": 65286,
+                "paramName": "CABINET_BTN_MUTE1",
+                "placement": {"positionExact":"517,37"},
+                "rawWidget": "btnSquare",
+                "widget": "button"
+              },
+              {"label":"S","paramId":65288,"paramName":"CABINET_BTN_SOLO1","placement":{"positionExact":"551,37"},"rawWidget":"btnSquare","widget":"button"},
+              {
+                "label": "DynaCab",
+                "paramId": 93,
+                "paramName": "CABINET_DYNACAB_R1",
+                "placement": {"positionExact":"310,96"},
+                "rawWidget": "dynaCabControl",
+                "widget": "unknown"
+              },
+              {"label":"Pan","paramId":12,"paramName":"CABINET_PAN1","placement":{"positionExact":"564,91"},"rawWidget":"knobMiniReadout","widget":"knob"},
+              {
+                "label": "Low Slope",
+                "paramId": 74,
+                "paramName": "CABINET_LOSLOPE1",
+                "placement": {"positionExact":"564,203"},
+                "rawWidget": "dropdownMini",
+                "widget": "dropdown"
+              },
+              {
+                "label": "High Slope",
+                "paramId": 78,
+                "paramName": "CABINET_HISLOPE1",
+                "placement": {"positionExact":"647,203"},
+                "rawWidget": "dropdownMini",
+                "widget": "dropdown"
+              },
+              {"label":"Level","paramId":8,"paramName":"CABINET_LEVEL1","placement":{"positionExact":"315,295"},"rawWidget":"knobMiniReadout","widget":"knob"},
+              {
+                "label": "Position",
+                "paramId": 93,
+                "paramName": "CABINET_DYNACAB_R1",
+                "placement": {"positionExact":"398,295"},
+                "rawWidget": "knobMiniReadout",
+                "widget": "knob"
+              },
+              {
+                "label": "Distance",
+                "paramId": 97,
+                "paramName": "CABINET_DYNACAB_Z1",
+                "placement": {"positionExact":"481,295"},
+                "rawWidget": "knobMiniReadout",
+                "widget": "knob"
+              },
+              {
+                "label": "Low Cut",
+                "paramId": 62,
+                "paramName": "CABINET_LOCUT1",
+                "placement": {"positionExact":"564,295"},
+                "rawWidget": "knobMiniReadout",
+                "widget": "knob"
+              },
+              {
+                "label": "High Cut",
+                "paramId": 66,
+                "paramName": "CABINET_HICUT1",
+                "placement": {"positionExact":"647,295"},
+                "rawWidget": "knobMiniReadout",
+                "widget": "knob"
+              },
+              {"label":"Seperator","paramId":null,"paramName":null,"placement":{"positionExact":"733,25"},"rawWidget":"labelSeperator","widget":"label"},
+              {"label":"CAB 2","paramId":65285,"paramName":"CABINET_LABEL2","placement":{"positionExact":"735,25"},"rawWidget":"labelBold","widget":"label"},
+              {
+                "label": "",
+                "paramId": 86,
+                "paramName": "CABINET_DYNACAB_TYPE2",
+                "placement": {"positionExact":"791,25"},
+                "rawWidget": "dropdownCabDyna",
+                "widget": "dropdown"
+              },
+              {"label":"Mic","paramId":65285,"paramName":"CABINET_LABEL2","placement":{"positionExact":"752,58"},"rawWidget":"labelBold","widget":"label"},
+              {
+                "label": "",
+                "paramId": 90,
+                "paramName": "CABINET_DYNACAB_MIC2",
+                "placement": {"positionExact":"791,58"},
+                "rawWidget": "dropdownCabDyna",
+                "widget": "dropdown"
+              },
+              {
+                "boundParamId": 25,
+                "label": "M",
+                "paramId": 65287,
+                "paramName": "CABINET_BTN_MUTE2",
+                "placement": {"positionExact":"949,37"},
+                "rawWidget": "btnSquare",
+                "widget": "button"
+              },
+              {"label":"S","paramId":65289,"paramName":"CABINET_BTN_SOLO2","placement":{"positionExact":"983,37"},"rawWidget":"btnSquare","widget":"button"},
+              {
+                "label": "DynaCab",
+                "paramId": 94,
+                "paramName": "CABINET_DYNACAB_R2",
+                "placement": {"positionExact":"740,96"},
+                "rawWidget": "dynaCabControl",
+                "widget": "unknown"
+              },
+              {"label":"Pan","paramId":13,"paramName":"CABINET_PAN2","placement":{"positionExact":"994,91"},"rawWidget":"knobMiniReadout","widget":"knob"},
+              {
+                "label": "Low Slope",
+                "paramId": 75,
+                "paramName": "CABINET_LOSLOPE2",
+                "placement": {"positionExact":"994,203"},
+                "rawWidget": "dropdownMini",
+                "widget": "dropdown"
+              },
+              {
+                "label": "High Slope",
+                "paramId": 79,
+                "paramName": "CABINET_HISLOPE2",
+                "placement": {"positionExact":"1077,203"},
+                "rawWidget": "dropdownMini",
+                "widget": "dropdown"
+              },
+              {"label":"Level","paramId":9,"paramName":"CABINET_LEVEL2","placement":{"positionExact":"745,295"},"rawWidget":"knobMiniReadout","widget":"knob"},
+              {
+                "label": "Position",
+                "paramId": 94,
+                "paramName": "CABINET_DYNACAB_R2",
+                "placement": {"positionExact":"828,295"},
+                "rawWidget": "knobMiniReadout",
+                "widget": "knob"
+              },
+              {
+                "label": "Distance",
+                "paramId": 98,
+                "paramName": "CABINET_DYNACAB_Z2",
+                "placement": {"positionExact":"911,295"},
+                "rawWidget": "knobMiniReadout",
+                "widget": "knob"
+              },
+              {
+                "label": "Low Cut",
+                "paramId": 63,
+                "paramName": "CABINET_LOCUT2",
+                "placement": {"positionExact":"994,295"},
+                "rawWidget": "knobMiniReadout",
+                "widget": "knob"
+              },
+              {
+                "label": "High Cut",
+                "paramId": 67,
+                "paramName": "CABINET_HICUT2",
+                "placement": {"positionExact":"1077,295"},
+                "rawWidget": "knobMiniReadout",
+                "widget": "knob"
+              }
+            ],
+            "section": "parameters"
+          },
+          {"controls":[{"label":"Level","paramId":28,"paramName":"CABINET_LEVEL","rawWidget":"knobCompact","widget":"knob"}],"section":"mixer"},
+          {
+            "controls": [
+              {"label":"Balance","paramId":29,"paramName":"CABINET_PAN","placement":{"positionExact":"1179,185"},"rawWidget":"knobCompact","widget":"knob"},
+              {"label":"Bypass","paramId":32,"paramName":"CABINET_BYPASS","rawWidget":"btnBypass","widget":"button"},
+              {"label":"Scene\nIgnore","paramId":84,"paramName":"CABINET_SCENEIGNORE","rawWidget":"btnIgnoreScene","widget":"button"}
+            ],
+            "section": "mixer"
+          }
+        ]
+      },
+      {
+        "name": "Preamp",
+        "pageNum": 1,
+        "rows": [
+          {
+            "controls": [
+              {"label":"Preamp Type","paramId":43,"paramName":"CABINET_PRETYPE","rawWidget":"dropdown1p5","widget":"dropdown"},
+              {
+                "label": "Preamp Mode",
+                "paramId": 47,
+                "paramName": "CABINET_OVERSAMPLE",
+                "placement": {"positionExact":"435,50"},
+                "rawWidget": "dropdown1p5",
+                "widget": "dropdown"
+              },
+              {"label":"","paramId":null,"paramName":null,"rawWidget":"spacer","widget":"spacer"},
+              {"label":"","paramId":null,"paramName":null,"rawWidget":"spacer","widget":"spacer"},
+              {"label":"Drive","paramId":33,"paramName":"CABINET_DRIVE","rawWidget":"knob","widget":"knob"},
+              {"label":"Saturation","paramId":34,"paramName":"CABINET_BIAS","rawWidget":"knob","widget":"knob"},
+              {"label":"","paramId":null,"paramName":null,"rawWidget":"spacer","widget":"spacer"},
+              {"label":"","paramId":null,"paramName":null,"rawWidget":"spacer","widget":"spacer"},
+              {"label":"VU","paramId":61,"paramName":"CABINET_VUMETER","rawWidget":"meterVuVert","widget":"meter"}
+            ],
+            "section": "parameters"
+          },
+          {
+            "controls": [
+              {"label":"Bass","paramId":44,"paramName":"CABINET_BASS","rawWidget":"knob","widget":"knob"},
+              {"label":"Mid","paramId":45,"paramName":"CABINET_MID","rawWidget":"knob","widget":"knob"},
+              {"label":"Treble","paramId":46,"paramName":"CABINET_TREBLE","rawWidget":"knob","widget":"knob"},
+              {"label":"","paramId":null,"paramName":null,"rawWidget":"spacer","widget":"spacer"},
+              {"fw":{"gtet":"4"},"label":"Low\nCut","paramId":38,"paramName":"CABINET_LOCUT","placement":{"col":4},"rawWidget":"knob","widget":"knob"},
+              {
+                "fw": {"gtet":"4"},
+                "label": "Low Cut\nSlope",
+                "paramId": 82,
+                "paramName": "CABINET_PRELOSLOPE",
+                "placement": {"col":5},
+                "rawWidget": "dropdown1",
+                "widget": "dropdown"
+              },
+              {"fw":{"gtet":"4"},"label":"High\nCut","paramId":39,"paramName":"CABINET_HICUT","placement":{"col":6},"rawWidget":"knob","widget":"knob"},
+              {
+                "fw": {"gtet":"4"},
+                "label": "High Cut\nSlope",
+                "paramId": 83,
+                "paramName": "CABINET_PREHISLOPE",
+                "placement": {"col":7},
+                "rawWidget": "dropdown1",
+                "widget": "dropdown"
+              }
+            ],
+            "section": "parameters"
+          },
+          {
+            "controls": [
+              {"label":"Level","paramId":28,"paramName":"CABINET_LEVEL","rawWidget":"knob","widget":"knob"},
+              {"label":"Balance","paramId":29,"paramName":"CABINET_PAN","rawWidget":"knob","widget":"knob"}
+            ],
+            "section": "mixer"
+          },
+          {
+            "controls": [
+              {"label":"Input\nMode","paramId":42,"paramName":"CABINET_INPUTSEL","rawWidget":"dropdown1Tight","widget":"dropdown"},
+              {"label":"Bypass\nMode","paramId":30,"paramName":"CABINET_BYPASSMODE","rawWidget":"dropdown1Tight","widget":"dropdown"},
+              {"label":"Bypass","paramId":32,"paramName":"CABINET_BYPASS","rawWidget":"btnBypass","widget":"button"},
+              {"fw":{"gtet":"5,3"},"label":"Scene\nIgnore","paramId":84,"paramName":"CABINET_SCENEIGNORE","rawWidget":"btnIgnoreScene","widget":"button"}
+            ],
+            "section": "mixer"
+          }
+        ]
+      },
+      {
+        "name": "Room/Air",
+        "pageNum": 2,
+        "rows": [
+          {
+            "controls": [
+              {"label":"Room\nLevel","paramId":35,"paramName":"CABINET_ROOMMIX","rawWidget":"knob","widget":"knob"},
+              {"label":"Room\nSize","paramId":36,"paramName":"CABINET_ROOMSIZE","rawWidget":"knob","widget":"knob"},
+              {"label":"Room\nShape","paramId":56,"paramName":"CABINET_ROOMSHAPE","rawWidget":"dropdown1","widget":"dropdown"},
+              {"label":"Floor\nReflections","paramId":53,"paramName":"CABINET_FLOORLVL","rawWidget":"knob","widget":"knob"},
+              {"label":"Room\nDiffusion","paramId":59,"paramName":"CABINET_DIFFUSION","rawWidget":"knob","widget":"knob"},
+              {"label":"LF\nDamping","paramId":57,"paramName":"CABINET_LFDAMPING","rawWidget":"knob","widget":"knob"},
+              {"label":"HF\nDamping","paramId":58,"paramName":"CABINET_HFDAMPING","rawWidget":"knob","widget":"knob"},
+              {"label":"Mic\nSpacing","paramId":37,"paramName":"CABINET_MICSPACE","rawWidget":"knob","widget":"knob"}
+            ],
+            "section": "parameters"
+          },
+          {
+            "controls": [
+              {"label":"Air","paramId":54,"paramName":"CABINET_AIR","rawWidget":"knob","widget":"knob"},
+              {"label":"Frequency","paramId":55,"paramName":"CABINET_AIRFREQ","rawWidget":"knob","widget":"knob"},
+              {"label":"","paramId":null,"paramName":null,"rawWidget":"spacer","widget":"spacer"},
+              {"label":"Proximity\nFrequency","paramId":41,"paramName":"CABINET_PROXFREQ","rawWidget":"knob","widget":"knob"}
+            ],
+            "section": "parameters"
+          },
+          {
+            "controls": [
+              {"label":"Level","paramId":28,"paramName":"CABINET_LEVEL","rawWidget":"knob","widget":"knob"},
+              {"label":"Balance","paramId":29,"paramName":"CABINET_PAN","rawWidget":"knob","widget":"knob"}
+            ],
+            "section": "mixer"
+          },
+          {
+            "controls": [
+              {"label":"Input\nMode","paramId":42,"paramName":"CABINET_INPUTSEL","rawWidget":"dropdown1Tight","widget":"dropdown"},
+              {"label":"Bypass\nMode","paramId":30,"paramName":"CABINET_BYPASSMODE","rawWidget":"dropdown1Tight","widget":"dropdown"},
+              {"label":"Bypass","paramId":32,"paramName":"CABINET_BYPASS","rawWidget":"btnBypass","widget":"button"},
+              {"fw":{"gtet":"5,3"},"label":"Scene\nIgnore","paramId":84,"paramName":"CABINET_SCENEIGNORE","rawWidget":"btnIgnoreScene","widget":"button"}
+            ],
+            "section": "mixer"
+          }
+        ]
+      },
+      {
+        "fw": {"gtet":"6,03"},
+        "name": "Align",
+        "pageNum": 3,
+        "rows": [
+          {
+            "controls": [
+              {"label":"Zoom","paramId":40,"paramName":"CABINET_ZOOM","placement":{"positionExact":"196,230"},"rawWidget":"toggle","widget":"toggle"},
+              {
+                "fw": {"gtet":"12,00"},
+                "label": "Graph",
+                "paramId": null,
+                "paramName": null,
+                "placement": {"positionExact":"305,18"},
+                "rawWidget": "graph_cab_mm",
+                "widget": "graph"
+              },
+              {
+                "fw": {"gtet":"12,00"},
+                "label": "Graph",
+                "paramId": null,
+                "paramName": null,
+                "placement": {"positionExact":"305,18"},
+                "rawWidget": "graph_cabZoom_mm",
+                "widget": "graph"
+              },
+              {"label":"CAB 1","paramId":65284,"paramName":"CABINET_LABEL1","placement":{"positionExact":"303,223"},"rawWidget":"labelBold","widget":"label"},
+              {
+                "label": "",
+                "paramId": 85,
+                "paramName": "CABINET_DYNACAB_TYPE1",
+                "placement": {"positionExact":"359,223"},
+                "rawWidget": "dropdownCabDyna",
+                "widget": "dropdown"
+              },
+              {"label":"Mic","paramId":65284,"paramName":"CABINET_LABEL1","placement":{"positionExact":"320,256"},"rawWidget":"labelBold","widget":"label"},
+              {
+                "label": "",
+                "paramId": 89,
+                "paramName": "CABINET_DYNACAB_MIC1",
+                "placement": {"positionExact":"359,256"},
+                "rawWidget": "dropdownCabDyna",
+                "widget": "dropdown"
+              },
+              {
+                "boundParamId": 24,
+                "label": "M",
+                "paramId": 65286,
+                "paramName": "CABINET_BTN_MUTE1",
+                "placement": {"positionExact":"330,344"},
+                "rawWidget": "btnSquare",
+                "widget": "button"
+              },
+              {"label":"S","paramId":65288,"paramName":"CABINET_BTN_SOLO1","placement":{"positionExact":"366,344"},"rawWidget":"btnSquare","widget":"button"},
+              {
+                "fw": {"gtet":"12,00"},
+                "label": "Delay 1",
+                "paramId": 16,
+                "paramName": "CABINET_DELAY1",
+                "placement": {"positionExact":"416,282"},
+                "rawWidget": "knobMiniReadout",
+                "widget": "knob"
+              },
+              {"label":"Seperator","paramId":null,"paramName":null,"placement":{"positionExact":"518,245"},"rawWidget":"labelSeperator","widget":"label"},
+              {"label":"CAB 2","paramId":65285,"paramName":"CABINET_LABEL2","placement":{"positionExact":"520,223"},"rawWidget":"labelBold","widget":"label"},
+              {
+                "label": "",
+                "paramId": 86,
+                "paramName": "CABINET_DYNACAB_TYPE2",
+                "placement": {"positionExact":"576,223"},
+                "rawWidget": "dropdownCabDyna",
+                "widget": "dropdown"
+              },
+              {"label":"Mic","paramId":65285,"paramName":"CABINET_LABEL2","placement":{"positionExact":"537,256"},"rawWidget":"labelBold","widget":"label"},
+              {
+                "label": "",
+                "paramId": 90,
+                "paramName": "CABINET_DYNACAB_MIC2",
+                "placement": {"positionExact":"576,256"},
+                "rawWidget": "dropdownCabDyna",
+                "widget": "dropdown"
+              },
+              {
+                "boundParamId": 25,
+                "label": "M",
+                "paramId": 65287,
+                "paramName": "CABINET_BTN_MUTE2",
+                "placement": {"positionExact":"545,344"},
+                "rawWidget": "btnSquare",
+                "widget": "button"
+              },
+              {"label":"S","paramId":65289,"paramName":"CABINET_BTN_SOLO2","placement":{"positionExact":"581,344"},"rawWidget":"btnSquare","widget":"button"},
+              {
+                "fw": {"gtet":"12,00"},
+                "label": "Delay 2",
+                "paramId": 17,
+                "paramName": "CABINET_DELAY2",
+                "placement": {"positionExact":"631,282"},
+                "rawWidget": "knobMiniReadout",
+                "widget": "knob"
+              },
+              {"label":"Seperator","paramId":null,"paramName":null,"placement":{"positionExact":"733,245"},"rawWidget":"labelSeperator","widget":"label"},
+              {
+                "fw": {"gtet":"12,00"},
+                "label": "Auto Align",
+                "paramId": 105,
+                "paramName": "CABINET_AUTO_ALIGN",
+                "placement": {"positionExact":"1079,230"},
+                "rawWidget": "toggle",
+                "widget": "toggle"
+              }
+            ],
+            "section": "parameters"
+          },
+          {"controls":[{"label":"Level","paramId":28,"paramName":"CABINET_LEVEL","rawWidget":"knobCompact","widget":"knob"}],"section":"mixer"},
+          {
+            "controls": [
+              {"label":"Balance","paramId":29,"paramName":"CABINET_PAN","placement":{"positionExact":"1179,185"},"rawWidget":"knobCompact","widget":"knob"},
+              {"label":"Bypass","paramId":32,"paramName":"CABINET_BYPASS","rawWidget":"btnBypass","widget":"button"},
+              {"fw":{"gtet":"5,3"},"label":"Scene\nIgnore","paramId":84,"paramName":"CABINET_SCENEIGNORE","rawWidget":"btnIgnoreScene","widget":"button"}
+            ],
+            "section": "mixer"
+          }
+        ]
+      }
+    ],
+    "variantName": "1",
+    "variantValue": "1"
+  },
+  "named": [
+    {"fp":"1:09dc4a7f","generic":false,"id":4,"kind":"float","max":1023,"min":0,"name":"Type 1","nameConfidence":"high","nameSource":"catalog","norm":0.0608539078951384,"source":"profile","step":1,"value":62.254,"widget":"stepper","widgetSource":"device","write":"norm"},
+    {"fp":"1:09dc4a7f","generic":false,"id":5,"kind":"float","max":1023,"min":0,"name":"Type 2","nameConfidence":"high","nameSource":"catalog","norm":0.076067384868923,"source":"profile","step":1,"value":77.817,"widget":"stepper","widgetSource":"device","write":"norm"},
+    {"fp":"1:44df808b","generic":false,"id":8,"kind":"float","max":0,"min":-40,"name":"Level 1","nameConfidence":"high","nameSource":"catalog","norm":0.1217078157902768,"source":"profile","step":0.05,"value":-35.132,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:44df808b","generic":false,"id":9,"kind":"float","max":0,"min":-40,"name":"Level 2","nameConfidence":"high","nameSource":"catalog","norm":0.1369212927640614,"source":"profile","step":0.05,"value":-34.523,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:1069b0e9","generic":false,"id":12,"kind":"float","max":100,"min":-100,"name":"Pan 1","nameConfidence":"high","nameSource":"catalog","norm":0.1825617236854152,"source":"profile","step":0.2,"unit":"%","value":-63.488,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:1069b0e9","generic":false,"id":13,"kind":"float","max":100,"min":-100,"name":"Pan 2","nameConfidence":"high","nameSource":"catalog","norm":0.19777520065919982,"source":"profile","step":0.2,"unit":"%","value":-60.445,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:30af67ee","generic":false,"id":16,"kind":"float","max":1,"min":0,"name":"Distance 1","nameConfidence":"high","nameSource":"catalog","norm":0.2434156315805536,"source":"profile","step":0.001,"value":0.243,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:30af67ee","generic":false,"id":17,"kind":"float","max":1,"min":0,"name":"Distance 2","nameConfidence":"high","nameSource":"catalog","norm":0.2586291085543382,"source":"profile","step":0.001,"value":0.259,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:b8c6bac6","generic":false,"id":20,"kind":"float","max":10,"min":0,"name":"Proximity 1","nameConfidence":"high","nameSource":"catalog","norm":0.304269539475692,"source":"profile","step":0.01,"value":3.043,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:b8c6bac6","generic":false,"id":21,"kind":"float","max":10,"min":0,"name":"Proximity 2","nameConfidence":"high","nameSource":"catalog","norm":0.31948301644947663,"source":"profile","step":0.01,"value":3.195,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:28fb4fb7","generic":false,"id":28,"kind":"float","max":20,"min":-80,"name":"Level 3","nameConfidence":"high","nameSource":"catalog","norm":0.4259773552659688,"source":"profile","step":0.05,"value":-37.402,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:63434cb2","generic":false,"id":29,"kind":"float","max":100,"min":-100,"name":"Balance","nameConfidence":"high","nameSource":"catalog","norm":0.4411908322397534,"source":"profile","step":0.2,"unit":"%","value":-11.762,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:b606079b","generic":false,"id":33,"kind":"float","max":10,"min":0,"name":"Drive","nameConfidence":"high","nameSource":"catalog","norm":0.5020447401348919,"source":"profile","value":5.02,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:b8c6bac6","generic":false,"id":34,"kind":"float","max":10,"min":0,"name":"Saturation","nameConfidence":"high","nameSource":"catalog","norm":0.5172582171086764,"source":"profile","step":0.01,"value":5.173,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:318ec60c","generic":false,"id":35,"kind":"float","max":100,"min":0,"name":"Room Level","nameConfidence":"high","nameSource":"catalog","norm":0.532471694082461,"source":"profile","step":0.1,"value":53.247,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:c379361c","generic":false,"id":36,"kind":"float","log":true,"max":30,"min":3,"name":"Room Size","nameConfidence":"high","nameSource":"catalog","norm":0.5476851710562456,"source":"profile","value":10.588,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:ee0fa54a","generic":false,"id":37,"kind":"float","max":100,"min":0,"name":"Mic Spacing","nameConfidence":"high","nameSource":"catalog","norm":0.5628986480300302,"source":"profile","step":0.1,"value":56.29,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:8aff0c28","generic":false,"id":38,"kind":"float","log":true,"max":2000,"min":20,"name":"Low Cut 1","nameConfidence":"high","nameSource":"catalog","norm":0.5781121250038148,"source":"profile","value":286.586,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:e6e41b5f","generic":false,"id":39,"kind":"float","log":true,"max":20000,"min":200,"name":"High Cut 1","nameConfidence":"high","nameSource":"catalog","norm":0.5933256019775994,"source":"profile","value":3073.84,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:12e17c3f","generic":false,"id":40,"kind":"float","max":1,"min":0,"name":"Zoom","nameConfidence":"high","nameSource":"catalog","norm":0.608539078951384,"source":"profile","value":0.609,"widget":"stepper","widgetSource":"catalog","write":"norm"},
+    {"fp":"1:ac075c80","generic":false,"id":41,"kind":"float","log":true,"max":200,"min":20,"name":"Proximity Frequency","nameConfidence":"high","nameSource":"catalog","norm":0.6237525559251687,"source":"profile","value":84.097,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:8d5d048a","generic":false,"id":44,"kind":"float","max":12,"min":-12,"name":"Bass","nameConfidence":"high","nameSource":"catalog","norm":0.6693929868465224,"source":"profile","step":0.025,"value":4.065,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:8d5d048a","generic":false,"id":45,"kind":"float","max":12,"min":-12,"name":"Mid","nameConfidence":"high","nameSource":"catalog","norm":0.684606463820307,"source":"profile","step":0.025,"value":4.431,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:8d5d048a","generic":false,"id":46,"kind":"float","max":12,"min":-12,"name":"Treble","nameConfidence":"high","nameSource":"catalog","norm":0.6998199407940916,"source":"profile","step":0.025,"value":4.796,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:d8bffffb","generic":false,"id":53,"kind":"float","max":100,"min":-100,"name":"Floor Reflections","nameConfidence":"high","nameSource":"catalog","norm":0.8063142796105838,"source":"profile","step":0.2,"value":61.263,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:318ec60c","generic":false,"id":54,"kind":"float","max":100,"min":0,"name":"Air","nameConfidence":"high","nameSource":"catalog","norm":0.8215277565843684,"source":"profile","step":0.1,"value":82.153,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:38eefab0","generic":false,"id":55,"kind":"float","log":true,"max":20000,"min":2000,"name":"Frequency","nameConfidence":"high","nameSource":"catalog","norm":0.836741233558153,"source":"profile","value":13733.184,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:b8c6bac6","generic":false,"id":57,"kind":"float","max":10,"min":0,"name":"LF Damping","nameConfidence":"high","nameSource":"catalog","norm":0.8671681875057222,"source":"profile","step":0.01,"value":8.672,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:b8c6bac6","generic":false,"id":58,"kind":"float","max":10,"min":0,"name":"HF Damping","nameConfidence":"high","nameSource":"catalog","norm":0.8823816644795068,"source":"profile","step":0.01,"value":8.824,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:318ec60c","generic":false,"id":59,"kind":"float","max":100,"min":0,"name":"Room Diffusion","nameConfidence":"high","nameSource":"catalog","norm":0.8975951414532914,"source":"profile","step":0.1,"value":89.76,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:ac075c80","generic":false,"id":62,"kind":"float","log":true,"max":200,"min":20,"name":"Low Cut 2","nameConfidence":"high","nameSource":"catalog","norm":0.9432355723746452,"source":"profile","value":175.495,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:ac075c80","generic":false,"id":63,"kind":"float","log":true,"max":200,"min":20,"name":"Low Cut 3","nameConfidence":"high","nameSource":"catalog","norm":0.9584490493484298,"source":"profile","value":181.752,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:38eefab0","generic":false,"id":66,"kind":"float","log":true,"max":20000,"min":2000,"name":"High Cut 2","nameConfidence":"high","nameSource":"catalog","norm":0.004074221015045626,"source":"profile","value":2018.851,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:38eefab0","generic":false,"id":67,"kind":"float","log":true,"max":20000,"min":2000,"name":"High Cut 3","nameConfidence":"high","nameSource":"catalog","norm":0.019287697988830226,"source":"profile","value":2090.825,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:b8c6bac6","generic":false,"id":93,"kind":"float","max":10,"min":0,"name":"DynaCab 1","nameConfidence":"high","nameSource":"catalog","norm":0.4148380993072298,"source":"profile","step":0.01,"value":4.148,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:b8c6bac6","generic":false,"id":94,"kind":"float","max":10,"min":0,"name":"DynaCab 2","nameConfidence":"high","nameSource":"catalog","norm":0.4300515762810144,"source":"profile","step":0.01,"value":4.301,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:7a216951","generic":false,"id":97,"kind":"float","max":24,"min":0,"name":"Distance 1","nameConfidence":"high","nameSource":"catalog","norm":0.47569200720236826,"source":"profile","step":0.024,"value":11.417,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:7a216951","generic":false,"id":98,"kind":"float","max":24,"min":0,"name":"Distance 2","nameConfidence":"high","nameSource":"catalog","norm":0.4909054841761528,"source":"profile","step":0.024,"value":11.782,"widget":"knob","widgetSource":"device","write":"norm"}
+  ],
+  "page": 62,
+  "slug": "cab",
+  "type": null,
+  "optionLists": [
+    [{"label":"FACTORY 1","value":0},{"label":"FACTORY 2","value":1},{"label":"USER","value":2},{"label":"LEGACY","value":3},{"label":"SCRATCHPAD","value":4}],
+    [{"label":"--","value":0},{"label":"MUTE","value":1},{"label":"SOLO","value":2}],
+    [{"label":"THRU","value":0},{"label":"MUTE","value":1}],
+    [{"label":"LEGACY","value":0},{"label":"DYNA-CAB","value":1}],
+    [{"label":"STEREO","value":0},{"label":"LEFT","value":1},{"label":"RIGHT","value":2},{"label":"SUM L+R","value":3}],
+    [{"label":"NONE","value":0},{"label":"TUBE","value":1},{"label":"BIPOLAR","value":2},{"label":"FET I","value":3},{"label":"FET II","value":4},{"label":"TRANSFORMER","value":5},{"label":"TAPE 70us","value":6},{"label":"TAPE 50us","value":7},{"label":"TAPE 35us","value":8},{"label":"VINTAGE","value":9},{"label":"MODERN","value":10},{"label":"EXCITER","value":11}],
+    [{"label":"ECONOMY","value":0},{"label":"HIGH QUALITY","value":1}],
+    [{"label":"HALL","value":0},{"label":"ROOM","value":1}],
+    [{"label":"STANDARD","value":0},{"label":"ULTRA-RES","value":1}],
+    [{"label":"6 dB/OCT","value":0},{"label":"12 dB/OCT","value":1},{"label":"18 dB/OCT","value":2},{"label":"24 dB/OCT","value":3}],
+    [{"label":"OFF","value":0},{"label":"ON","value":1}],
+    [{"label":"1x8 5F1 TWEED","value":0},{"label":"1x8 PRINCETONE","value":1},{"label":"1x10 BF PRINCETONE","value":2},{"label":"1x10 METRO BLUES","value":3},{"label":"1x10 SF PRINCETONE","value":4},{"label":"1x12 AC20","value":5},{"label":"1x12 BLACK MAGICK","value":6},{"label":"1x12 CAR AMBLER","value":7},{"label":"1x12 DELUXE TWEED","value":8},{"label":"1x12 DELUXE VERB","value":9},{"label":"1x12 DIV13 CJ11","value":10},{"label":"1x12 G12T-100","value":11},{"label":"1x12 HOT KITTY","value":12},{"label":"1x12 JR BLUES","value":13},{"label":"1x12 NUCLEAR TONE","value":14},{"label":"1x12 SCHOLZ","value":15},{"label":"1x12 TWEED 20112","value":16},{"label":"1x12 VIBRATO LUX","value":17},{"label":"1x15 HEART KEY","value":18},{"label":"1x15 PORTABASS","value":19},{"label":"1x15 VIBROVERB","value":20},{"label":"2x10 HEART KEY","value":21},{"label":"2x10 SUPER 6G4","value":22},{"label":"2x12 5153 STEALTH","value":23},{"label":"2x12 65 BASSGUY","value":24},{"label":"2x12 CHIEFMAN","value":25},{"label":"2x12 CLASS-A 30W","value":26},{"label":"2x12 DOUBLE VERB","value":27},{"label":"2x12 LEAD 80","value":28},{"label":"2x12 TEXAS STAR","value":29},{"label":"4x10 BASSGUY RI","value":30},{"label":"4x12 1960TV","value":31},{"label":"4x12 5153","value":32},{"label":"4x12 5153 STEALTH","value":33},{"label":"4x12 CITRUS","value":34},{"label":"4x12 FRIEDMAN GB","value":35},{"label":"4x12 FRIEDMAN V30","value":36},{"label":"4x12 LERXST","value":37},{"label":"4x12 RECTO SLANT","value":38},{"label":"4x12 RECTO STRAIGHT","value":39},{"label":"4x12 RUMBLE EV12L","value":40},{"label":"4x12 RUMBLE EV12S","value":41},{"label":"4x12 SOLO 100","value":42},{"label":"4x12 USA MC90","value":43},{"label":"8x10 SV BASS","value":44}],
+    [{"label":"Condenser","value":0},{"label":"Ribbon","value":1},{"label":"Dynamic 1","value":2},{"label":"Dynamic 2","value":3}]
+  ]
+}
