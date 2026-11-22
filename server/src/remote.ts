@@ -86,6 +86,11 @@ function deniedRead(p: string): boolean {
 
 const TEXTY = /json|text|javascript|xml|svg/i;
 
+/** Device events the host bridges to a watching remote: discrete changes only (see `RemoteHost`). `definitions`
+ *  (stored device definitions changed, or the set of placed blocks without them) is rare and lets the remote
+ *  re-read caps and the open block. */
+export const RELAYED_EVENT_TYPES: ReadonlySet<string> = new Set(['param', 'changed', 'scene', 'tempo', 'config', 'telemetryConfig', 'definitions']);
+
 export class RemoteHost {
   #app: FastifyInstance;
   #getSession: () => Promise<Session | null>;
@@ -145,9 +150,8 @@ export class RemoteHost {
     // poll (~8×/s), which would flood the relay. Those live-telemetry streams are a Phase 1.5 item.
     // 'traffic' stays local-only: a 1 Hz stream would break the zero-idle-cost rule below; remote
     // clients keep mode control (PUT relays) and just lose the live rate readout.
-    const RELAYED = new Set(['param', 'changed', 'scene', 'tempo', 'config', 'telemetryConfig']);
     this.#devUnsub = this.#subscribe((e) => {
-      if (!RELAYED.has(e.type)) return;
+      if (!RELAYED_EVENT_TYPES.has(e.type)) return;
       // Only bridge events while a remote is actually watching — a remote pulls config + full state at
       // connect, so nothing is missed, and idle/local editing spends zero Realtime messages.
       if (this.#remotesPresent === 0) return;

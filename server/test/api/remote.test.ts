@@ -6,7 +6,7 @@
 // param write (400 / 409) travels back to the remote with its status and body, like any other answer.
 import '../helpers/env.js'; // MUST stay first — isolates ~/.forgefx-conn / data dir before transport loads
 import type { SupabaseClient } from '@supabase/supabase-js';
-import { remoteAllowed, RemoteHost } from '../../src/remote.js';
+import { remoteAllowed, RemoteHost, RELAYED_EVENT_TYPES } from '../../src/remote.js';
 import { buildTestApp } from '../helpers/api.js';
 import { eidOfSlug } from '../helpers/blockRead.js';
 import { assert, assertEqual } from '../helpers/mock.js';
@@ -117,6 +117,13 @@ export function fakeChannelSession() {
 async function relayCases(): Promise<void> {
   const t = await buildTestApp(0x11);
   const realLog = console.log;
+  // device events bridged to a watching remote: discrete changes incl. definitions; never the high-rate streams
+  for (const t of ['param', 'changed', 'scene', 'tempo', 'config', 'telemetryConfig', 'definitions']) {
+    assert(RELAYED_EVENT_TYPES.has(t), `[api/remote] the ${t} event is relayed to a remote`);
+  }
+  for (const t of ['meters', 'tuner', 'cpu', 'traffic', 'cacheBuild']) {
+    assert(!RELAYED_EVENT_TYPES.has(t), `[api/remote] the ${t} event stays local`);
+  }
   console.log = () => {}; // the host logs every relayed request
   try {
     const { session, relay } = fakeChannelSession();
