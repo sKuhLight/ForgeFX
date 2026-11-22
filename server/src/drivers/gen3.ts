@@ -24,7 +24,7 @@ import {
   type ModernFractalCodec
 } from 'forgefx-midi/gen3/axe-fx-iii';
 import { wireToDisplay } from 'forgefx-midi/shared';
-import { enumOrdinalBounds } from 'forgefx-midi/cache';
+import { enumOrdinalBounds, isPlaceholderRow } from 'forgefx-midi/cache';
 import {
   parsePresetDump, decodeRawPatch, decodeGen3Body,
   readBlockParamsForModel, modelsFromBlocks,
@@ -2094,8 +2094,37 @@ class Gen3Driver implements DeviceDriver {
     return { events, reload: false };
   }
 
+  /** Refuses a param write the connected device cannot take, before anything is sent (thrown with a
+   *  `statusCode`, which both the Fastify app and the runtime router keep):
+   *  - 400: the id is no wire parameter (above 0x3FFF sit the editor's pseudo ids, e.g. the cab's
+   *    `_BTN_` buttons; a negative or fractional id is none either);
+   *  - 409: the block's family has a row at that id, the row is an unused slot (all-zero placeholder) on the
+   *    connected firmware (its effective row or the applied profile's row), and the catalog defines no param
+   *    there. A catalog param with a placeholder row (`MOD_MIN`/`MOD_MAX`/`MOD_PARAM`, the `*_GLOBALMIX`
+   *    toggles) is a real param and stays writable, and so does an id with no row at all (the FC block, a
+   *    cross-block write).
+   *  A param the generic response marks `write: null` is NOT refused: that mark is advice for the UI. */
+  #guardParamWrite(eid: number, paramId: number): void {
+    const refuse = (statusCode: number, message: string): never => {
+      throw Object.assign(new Error(message), { statusCode });
+    };
+    if (!Number.isInteger(paramId) || paramId < 0 || paramId > MAX_WIRE_PID) refuse(400, `param id ${paramId} is not a wire parameter`);
+    const family = SLUG_FAMILY[(slugForEffectId(eid) ?? '').toLowerCase()] ?? this.#prof.familyForEffectId(eid);
+    if (!family) return;
+    const catalog = this.#prof.staticBase ?? this.#prof;
+    if ((catalog.params[family] ?? []).some((d) => d.paramId === paramId)) return;
+    const facts = this.#prof.profileFacts;
+    const effective = this.#prof.ranges[family]?.[paramId];
+    // a suspect family's profile section belongs to another family: its rows say nothing about this one
+    const profiled = facts && !facts.suspectFamilies.includes(family) ? facts.ranges[family]?.[paramId] : undefined;
+    if ((effective && isPlaceholderRow(effective)) || (profiled && isPlaceholderRow(profiled))) {
+      refuse(409, `param ${paramId} of ${family} is an unused slot on this firmware; write refused`);
+    }
+  }
+
   // ── writes (all address the exact placed instance by effect id) ──
   async setParam(eid: number, paramId: number, value: number, continuous: boolean) {
+    this.#guardParamWrite(eid, paramId); // throws (400/409) before anything goes on the wire
     // continuous knob writes stream at high frequency → fire-and-forget (instant);
     // a discrete write (enum) is rarer + worth confirming, so reject-watch it.
     const r = continuous ? await this.#send(this.#codec.buildSetParameterContinuous(eid, paramId, clamp01(value))) : await this.#write(this.#codec.buildSetParameter(eid, paramId, value));

@@ -2,7 +2,14 @@
 // a tight allowlist: live edits yes; anything that persists to a slot, moves dump/firmware bytes,
 // touches auth/hardware selection, or uploads stays local-only. Covers the unified twins added in
 // Phase 6 alongside the deprecated /am4 aliases (both allowed during the transition window).
-import { remoteAllowed } from '../../src/remote.js';
+// Plus the relay itself (RemoteHost over a fake private channel and the real app on a mocked FM3): a refused
+// param write (400 / 409) travels back to the remote with its status and body, like any other answer.
+import '../helpers/env.js'; // MUST stay first — isolates ~/.forgefx-conn / data dir before transport loads
+import type { SupabaseClient } from '@supabase/supabase-js';
+import { remoteAllowed, RemoteHost } from '../../src/remote.js';
+import { buildTestApp } from '../helpers/api.js';
+import { eidOfSlug } from '../helpers/blockRead.js';
+import { assert, assertEqual } from '../helpers/mock.js';
 
 const ALLOWED: [string, string][] = [
   // reads relay broadly
@@ -60,13 +67,79 @@ const REJECTED: [string, string][] = [
   ['DELETE', '/store/config/layouts'],
 ];
 
-export const REMOTE_CASE_COUNT = ALLOWED.length + REJECTED.length;
+// Requests relayed end to end, with the status the remote must receive.
+const RELAYED: { method: string; path: string; body?: unknown; status: number; message?: string }[] = [
+  { method: 'PUT', path: `/preset/blocks/${eidOfSlug('cab')}/params/87`, body: { value: 0.5, continuous: true }, status: 409, message: 'param 87 of CABINET is an unused slot on this firmware; write refused' },
+  { method: 'PUT', path: `/preset/blocks/${eidOfSlug('cab')}/params/65286`, body: { value: 1, continuous: false }, status: 400, message: 'param id 65286 is not a wire parameter' },
+  { method: 'PUT', path: `/preset/blocks/${eidOfSlug('chorus')}/params/14`, body: { value: 1, continuous: true }, status: 200 },
+];
 
-export function runRemoteTests(): void {
+export const REMOTE_CASE_COUNT = ALLOWED.length + REJECTED.length + RELAYED.length;
+
+type Res = { id: string; status: number; contentType: string; body: string; encoding: string };
+
+/** A private Realtime channel stand-in: subscribes at once, hands `req` broadcasts to the host's handler and
+ *  records what the host sends back. */
+function fakeChannelSession() {
+  const handlers = new Map<string, (msg: { payload?: unknown }) => void>();
+  const sent: { event: string; payload: unknown }[] = [];
+  const chan = {
+    on(type: string, filter: { event: string }, cb: (msg: { payload?: unknown }) => void) { if (type === 'broadcast') handlers.set(filter.event, cb); return chan; },
+    subscribe(cb: (status: string) => void) { cb('SUBSCRIBED'); return chan; },
+    presenceState: () => ({}),
+    send: async (m: { event: string; payload: unknown }) => { sent.push(m); return 'ok'; },
+    unsubscribe: async () => 'ok',
+  };
+  const client = { channel: () => chan } as unknown as SupabaseClient;
+  /** Relay one request and wait for the host's answer to it. */
+  const relay = async (id: string, method: string, path: string, body?: unknown): Promise<Res> => {
+    handlers.get('req')!({ payload: { id, method, path, ...(body !== undefined ? { body: JSON.stringify(body) } : {}) } });
+    for (let i = 0; i < 200; i++) {
+      const res = sent.find((m) => m.event === 'res' && (m.payload as Res).id === id);
+      if (res) return res.payload as Res;
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    throw new Error(`[api/remote] no relayed answer for ${method} ${path}`);
+  };
+  return { session: { client, userId: 'remote-test' }, relay };
+}
+
+async function relayCases(): Promise<void> {
+  const t = await buildTestApp(0x11);
+  const realLog = console.log;
+  console.log = () => {}; // the host logs every relayed request
+  try {
+    const { session, relay } = fakeChannelSession();
+    const host = new RemoteHost(t.app, async () => session, (fn) => t.registry.subscribe(fn));
+    await host.enable(true);
+    try {
+      for (const [i, c] of RELAYED.entries()) {
+        const res = await relay(`r${i}`, c.method, c.path, c.body);
+        assertEqual(res.status, c.status, `[api/remote] relayed ${c.method} ${c.path}: status`);
+        assertEqual(res.encoding, 'utf8', `[api/remote] relayed ${c.path}: a small JSON answer travels as text`);
+        const json = JSON.parse(res.body) as { message?: string; statusCode?: number };
+        if (c.message !== undefined) {
+          assertEqual(json.message, c.message, `[api/remote] relayed ${c.path}: the refusal's message`);
+          assertEqual(json.statusCode, c.status, `[api/remote] relayed ${c.path}: the envelope's statusCode`);
+        } else {
+          assert((json as { ok?: boolean }).ok === true, `[api/remote] relayed ${c.path}: the write's answer`);
+        }
+      }
+    } finally {
+      await host.enable(false);
+    }
+  } finally {
+    console.log = realLog;
+    await t.app.close();
+  }
+}
+
+export async function runRemoteTests(): Promise<void> {
   for (const [m, p] of ALLOWED) {
     if (!remoteAllowed(m, p)) throw new Error(`[api/remote] expected ALLOWED: ${m} ${p}`);
   }
   for (const [m, p] of REJECTED) {
     if (remoteAllowed(m, p)) throw new Error(`[api/remote] expected REJECTED: ${m} ${p}`);
   }
+  await relayCases();
 }

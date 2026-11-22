@@ -28,6 +28,7 @@ import { runProfileFactsTests, PROFILE_FACTS_CASE_COUNT } from './drivers/profil
 import { runSelectorsTests, SELECTORS_CASE_COUNT } from './drivers/selectors.test.js';
 import { runParamIndexTests, PARAM_INDEX_CASE_COUNT } from './drivers/param-index.test.js';
 import { runBlockParamsV2Tests, BLOCK_PARAMS_V2_CASE_COUNT } from './drivers/block-params-v2.test.js';
+import { runWriteGuardsTests, WRITE_GUARDS_CASE_COUNT } from './drivers/write-guards.test.js';
 import { runEnumOptionsTests, ENUM_OPTIONS_CASE_COUNT } from './drivers/enum-options.test.js';
 import { runEditBurstGenericTests, EDIT_BURST_GENERIC_CASE_COUNT } from './drivers/edit-burst-generic.test.js';
 import { runTelemetryTests, TELEMETRY_CASE_COUNT } from './drivers/telemetry.test.js';
@@ -74,19 +75,20 @@ const tests: Array<{ name: string; run: () => void | Promise<void> }> = [
   { name: `drivers/profile-facts (${PROFILE_FACTS_CASE_COUNT} cases, runtime-profile provenance + applied rows + section-assignment suspects, registry reverts to the bundled profile after a delete / a firmware without a profile / an unknown firmware; synthetic + catalog data, mocked)`, run: runProfileFactsTests },
   { name: `drivers/selectors (${SELECTORS_CASE_COUNT} cases, type vs variant selector per device, layout widget index: ownership, pseudo ids, conflicts, memo; catalog + synthetic)`, run: runSelectorsTests },
   { name: `drivers/param-index (${PARAM_INDEX_CASE_COUNT} cases, catalog/profile reconciliation: the five cases + unnamed, name shift + guards, live never hides, byte-exact removal, suspect family, widget/write table, FM3 goldens, no enum in named over FM3/FM9/III; synthetic + catalog)`, run: runParamIndexTests },
-  { name: `drivers/block-params-v2 (${BLOCK_PARAMS_V2_CASE_COUNT} cases, generic block params over a mocked status + bulk read: null values per reason (non-positional GLOBAL, torn body, read-failed, unknown channel, out-of-range), classification and fingerprints, hidden rows, de-duplication on copies, selectors and the cab layout variant, diagnostic hook, layout button binding; classic response markers; catalog data)`, run: runBlockParamsV2Tests },
+  { name: `drivers/block-params-v2 (${BLOCK_PARAMS_V2_CASE_COUNT} cases, generic block params over a mocked status + bulk read: null values per reason (non-positional GLOBAL, torn body, read-failed, unknown channel, out-of-range), classification and fingerprints, hidden rows, de-duplication on copies, selectors and the cab layout variant, diagnostic hook (strict parse, one warning), layout button binding, status read retried once, served channel, moved type selector (classic + meters), unmapped codec block, GLOBAL served without a read; classic response markers; catalog data)`, run: runBlockParamsV2Tests },
+  { name: `drivers/write-guards (${WRITE_GUARDS_CASE_COUNT} cases, gen-3 param writes refused before the wire: no wire pid → 400, unused slot without a param (catalog, byte-exact, live) → 409; MOD_MIN/MAX/PARAM, CHORUS_GLOBALMIX, FC and row-less ids, write:null stay writable; app↔router parity; catalog + synthetic rows)`, run: runWriteGuardsTests },
   { name: `drivers/enum-options (${ENUM_OPTIONS_CASE_COUNT} cases, selector options on FM3/FM9/III, classic and generic: label of ordinal v = list[v - first ordinal] (DELAY_SVFTYPE), 138-option DISTORT_TONETYPE, PHASER_ORDER = six ordinals, 4096 cap + optionsTruncated, overlay / bare-ordinal fallback; catalog + synthetic rows)`, run: runEnumOptionsTests },
   { name: `drivers/edit-burst-generic (${EDIT_BURST_GENERIC_CASE_COUNT} cases, device-edit events for generic params (burst and FM3 poll), unused slots and dropped rows silent, GLOBAL: no events / no baseline / no reload / not polled; catalog + one synthetic row, mocked)`, run: runEditBurstGenericTests },
   { name: `drivers/telemetry (${TELEMETRY_CASE_COUNT} cadence/traffic/echo-guard/yield cases)`, run: runTelemetryTests },
   { name: `drivers/reflection (${REFLECTION_CASE_COUNT} slow-link/scene-state/blockState/scene cases)`, run: runReflectionTests },
   { name: `api/alias-parity (${ALIAS_PARITY_CASE_COUNT} alias↔unified twins, mocked AM4)`, run: runAliasParityTests },
-  { name: `api/caps (${CAPS_CASE_COUNT} device capability matrices)`, run: runCapsTests },
+  { name: `api/caps (${CAPS_CASE_COUNT} cases, device capability matrices + capabilities.definitions: generic support, catalog firmware, applied profile, drift, key order)`, run: runCapsTests },
   { name: `api/telemetryConfig (${TELEMETRY_CONFIG_CASE_COUNT} GET/PUT mode + event + parity)`, run: runTelemetryConfigTests },
-  { name: `api/remote (${REMOTE_CASE_COUNT} whitelist decisions)`, run: runRemoteTests },
+  { name: `api/remote (${REMOTE_CASE_COUNT} cases, whitelist decisions + relayed refused/accepted param writes over a fake channel)`, run: runRemoteTests },
   { name: `api/send-policy (${SEND_POLICY_CASE_COUNT} cases, /debug/raw allowlist + read-poll identity, preset-dump load/restore validation, mocked FM3/AM4/II)`, run: runSendPolicyTests },
   { name: `api/local (${LOCAL_CASE_COUNT} local-folder cases, temp root)`, run: runLocalTests },
   { name: `api/syncplan (${SYNCPLAN_CASE_COUNT} free-tier reconcile plans, pure)`, run: runSyncPlanTests },
-  { name: `api/router (${ROUTER_PARITY_CASE_COUNT} app↔runtime-router parity twins, mocked FM3)`, run: runRouterParityTests },
+  { name: `api/router (${ROUTER_PARITY_CASE_COUNT} app↔runtime-router parity twins, mocked FM3 + a classic-only AM4 for ?generic=1)`, run: runRouterParityTests },
   { name: `api/device-cache (${DEVICE_CACHE_CASE_COUNT} cases, on-connect self-describe build, mocked FM3/AM4)`, run: runDeviceCacheTests },
   { name: `api/editor-cache-import (${EDITOR_CACHE_IMPORT_CASE_COUNT} cases, .cache byte-source import + disk discovery, mocked FM3/AM4)`, run: runEditorCacheImportTests },
   { name: `api/cloud-profiles (${CLOUD_PROFILES_CASE_COUNT} cases, shared profile check/pull/publish, mocked cloud)`, run: runCloudProfilesTests },
