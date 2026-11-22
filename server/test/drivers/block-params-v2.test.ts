@@ -3,15 +3,17 @@
 // on the connected device, values that are `null` with an `unresolved` reason instead of an invented number,
 // classification (kind / widget / write mode), fingerprints, hidden rows, and the classic response next to it
 // (same reads, numbers kept, additive `unresolved` markers). Committed catalog data and synthetic bodies only.
-import { PROFILES, SLUG_FAMILY, runtimeProfileFrom, type DeviceProfile } from '../../src/devices.js';
+import { PROFILES, SLUG_FAMILY, runtimeProfileFrom, type DeviceProfile, type RangeDef } from '../../src/devices.js';
 import { buildParamIndex } from '../../src/drivers/paramIndex.js';
-import type { BlockParamsDTO, BlockParamsV2DTO } from '../../src/drivers/types.js';
-import { isInformativeRow } from 'forgefx-midi/cache';
+import { parseForcedGeneric } from '../../src/drivers/gen3.js';
+import type { BlockParamsDTO, BlockParamsV2DTO, PresetGridDTO } from '../../src/drivers/types.js';
+import { isInformativeRow, type BuiltCache } from 'forgefx-midi/cache';
+import { createModernFractalCodec } from 'forgefx-midi/gen3/axe-fx-iii';
 import { assert, assertEqual } from '../helpers/mock.js';
 import { catalogBuilt } from '../helpers/catalogProfile.js';
-import { mockBlockDevice, eidOfSlug } from '../helpers/blockRead.js';
+import { mockBlockDevice, eidOfSlug, compactHex } from '../helpers/blockRead.js';
 
-export const BLOCK_PARAMS_V2_CASE_COUNT = 13;
+export const BLOCK_PARAMS_V2_CASE_COUNT = 19;
 
 const FM3 = PROFILES[0x11]!;
 const FM9 = PROFILES[0x12]!;
@@ -36,6 +38,27 @@ const classicOf = (p: DeviceProfile, eid: number, blocks: Parameters<typeof mock
   mockBlockDevice(p, blocks).driver.blockParams(eid) as Promise<BlockParamsDTO>;
 
 const allEntries = (r: BlockParamsV2DTO) => [...r.named, ...r.enums];
+
+/** The FM3 catalog as a byte-exact device profile with one row inserted into `fam` at `at`: the rows (and
+ *  labels) from `at` on move up by one pid, the section stride grows by one. */
+function insertedBuilt(fam: string, at: number): BuiltCache {
+  const b = catalogBuilt(0x11);
+  const rows = b.ranges[fam] as Record<number, RangeDef>;
+  const labels = (b.enumOverrides[fam] ?? {}) as Record<string, string[]>;
+  const nr: Record<number, RangeDef> = {};
+  const nl: Record<string, string[]> = {};
+  for (const pid of Object.keys(rows).map(Number)) {
+    const to = pid >= at ? pid + 1 : pid;
+    nr[to] = rows[pid]!;
+    if (labels[String(pid)]) nl[String(to)] = labels[String(pid)]!;
+  }
+  nr[at] = { kind: 'float', displayMin: 0, displayMax: 1, scale: 1, step: 0.01, typecode: 0x7f1 };
+  b.ranges[fam] = nr;
+  b.enumOverrides[fam] = nl;
+  const sec = b.rangeSections[fam]!;
+  b.rangeSections[fam] = { ...sec, stride: sec.stride + 1 };
+  return b;
+}
 
 export async function runBlockParamsV2Tests(): Promise<void> {
   const stride = strideOf(FM3, 'DELAY');
@@ -327,12 +350,140 @@ export async function runBlockParamsV2Tests(): Promise<void> {
     const muteOf = (n: number) => FM3.params['CABINET']!.find((p) => p.name === `CABINET_MUTE${n}`)!.paramId;
     for (const b of buttons) {
       const n = Number(/MUTE(\d)/.exec(b.paramName!)![1]);
-      assertEqual((b as { boundParamId?: number }).boundParamId, muteOf(n), `${b.paramName} → CABINET_MUTE${n}`);
+      assertEqual(b.boundParamId, muteOf(n), `${b.paramName} → CABINET_MUTE${n}`);
       assert(b.paramId !== muteOf(n), 'the control keeps its own pseudo id');
     }
     const classic = await classicOf(FM3, CAB, { [CAB]: { values: body(cabStride), channel: 0 } });
     const classicButtons = (classic.layout?.pages ?? []).flatMap((pg) => pg.rows.flatMap((row) => row.controls)).filter((c) => c.paramName?.includes('_BTN_'));
-    assert(classicButtons.every((b) => (b as { boundParamId?: number }).boundParamId === undefined), 'the classic layout is unchanged');
+    assert(classicButtons.every((b) => b.boundParamId === undefined), 'the classic layout is unchanged');
     console.log('  drivers/block-params-v2: layout buttons carry boundParamId (generic response only)');
+  }
+
+  // ---- 14. a lost status reply is asked for once more before the channel counts as unknown -----------
+  {
+    const statusHex = compactHex(createModernFractalCodec(0x11).buildStatusDump());
+    /** A unit whose first `lost` status replies go missing; records every status request's timeout. */
+    const flaky = (lost: number, slow = false) => {
+      const dev = mockBlockDevice(FM3, { [DELAY]: { values: body(stride), channel: 2 } });
+      const answer = dev.mock.reply;
+      const timeouts: number[] = [];
+      if (slow) (dev.mock as unknown as { slow: boolean }).slow = true;
+      dev.mock.request = async (bytes, o) => {
+        dev.mock.sent.push([...bytes]);
+        if (compactHex(bytes) === statusHex) {
+          timeouts.push(o?.timeoutMs ?? -1);
+          if (timeouts.length <= lost) return [];
+        }
+        return answer(bytes);
+      };
+      return { driver: dev.driver, timeouts };
+    };
+    const once = flaky(1);
+    const r = await once.driver.blockParams(DELAY, { generic: true });
+    assertEqual(once.timeouts.length, 2, 'the status request is re-issued once after a lost reply');
+    assertEqual(r.definitions.channel, 2, 'the second reply gives the channel');
+    assert(allEntries(r).every((e) => e.value !== null && e.unresolved === undefined), 'every value resolves: no channel-unknown');
+    assertEqual(once.timeouts.join(','), '1500,1500', 'a normal link waits 1.5 s per request');
+    const twice = flaky(2, true);
+    const lost = await twice.driver.blockParams(DELAY, { generic: true });
+    assertEqual(twice.timeouts.join(','), '4000,4000', 'a slow link waits 4 s per request, and asks twice at most');
+    assert(allEntries(lost).every((e) => e.unresolved === 'channel-unknown'), 'two lost replies: the channel is unknown');
+    // the routine channel-watch poll asks once: its next tick is the retry
+    const poll = flaky(1);
+    assertEqual((await poll.driver.getActiveChannels()).size, 0, 'the poll reports nothing for a lost reply');
+    assertEqual(poll.timeouts.length, 1, 'and does not ask again');
+    console.log('  drivers/block-params-v2: the status read is retried once (1.5 s / slow link 4 s) before channel-unknown; the channel poll is not');
+  }
+
+  // ---- 15. the classic type (and the meter tile's type name) is read where the type selector sits now --
+  {
+    const shifted = runtimeProfileFrom(insertedBuilt('ENHANCER', 3), FM3); // ENHANCER_TYPE moves from pid 6 to 7
+    assertEqual(buildParamIndex(shifted, 'ENHANCER').typePid, 7, 'premise: the type selector moved with its name');
+    const ENH = eidOfSlug('enhancer');
+    const values = new Array<number>(strideOf(shifted, 'ENHANCER') * 4).fill(0);
+    values[7] = 2; // the type ordinal where the type sits on this device (pid 6 now holds the moved bypass flag, 0)
+    const roster = shifted.rosterFor('enhancer');
+    const c = (await mockBlockDevice(shifted, { [ENH]: { values, channel: 0 } }).driver.blockParams(ENH)) as BlockParamsDTO;
+    assertEqual(JSON.stringify(c.type), JSON.stringify({ value: 2, name: roster[2]!.name }), 'classic: the type is read at its effective pid');
+    const v2 = await v2Of(shifted, ENH, { [ENH]: { values, channel: 0 } });
+    assertEqual(JSON.stringify(v2.type), JSON.stringify(c.type), 'classic and generic read the same type');
+    assertEqual(c.enums.some((e) => e.id === 6), false, 'classic: the entry set still leaves out the catalog\'s type pid, as before');
+    // the meter tile names the type from the same pid (meters() reads the grid; this one holds the enhancer alone)
+    const dev = mockBlockDevice(shifted, { [ENH]: { values, channel: 0 } });
+    const grid: PresetGridDTO = { model: 'fm3', name: 'T', crcValid: true, rows: 4, cols: 12, scenes: [], source: 'dump', cells: [{ row: 0, col: 0, effectId: ENH, name: 'Enhancer 1', isShunt: false, routeFlag: 0, fromRows: [] }] };
+    (dev.driver as unknown as { grid: () => Promise<PresetGridDTO> }).grid = async () => grid;
+    const tile = (await dev.driver.meters()).find((m) => m.effectId === ENH);
+    assertEqual(tile?.typeName, roster[2]!.name, 'meters: the type name comes from the effective pid');
+    console.log('  drivers/block-params-v2: a moved type selector is read at its new pid by the classic response and the meter tile');
+  }
+
+  // ---- 16. an effect id the codec knows but no family maps: the generic response names it by its id ---
+  {
+    const prior = SLUG_FAMILY['delay'];
+    delete SLUG_FAMILY['delay']; // the III maps no audio eid through its profile, so eid 70 now has no family
+    try {
+      const g = await v2Of(AXE3, DELAY, {});
+      assertEqual(`${g.block}|${g.slug}|${g.unknownBlock}`, `Block ${DELAY}||true`, 'generic: "Block <eid>", no slug, marked unknown');
+      assertEqual(g.definitions.family, null, 'generic: no family');
+      const c = (await mockBlockDevice(AXE3, {}).driver.blockParams(DELAY)) as BlockParamsDTO;
+      assertEqual(`${c.block}|${c.slug}`, 'Delay|delay', 'classic: unchanged (the codec name and slug)');
+    } finally {
+      SLUG_FAMILY['delay'] = prior!;
+    }
+    console.log('  drivers/block-params-v2: an unmapped block with a codec slug — generic "Block <eid>" / slug "", classic unchanged');
+  }
+
+  // ---- 17. the diagnostic hook is parsed strictly; a malformed value warns once ----------------------
+  {
+    const p = parseForcedGeneric('DELAY:3,5, CHORUS:8:9, 12, chorus:4, MIXER:99999, FUZZ:43,,');
+    const pids = Object.fromEntries([...p.pids].map(([f, s]) => [f, [...s]]));
+    assertEqual(JSON.stringify(pids), JSON.stringify({ DELAY: [3, 5], FUZZ: [43] }), 'FAMILY:pid entries, a bare pid joins the family before it');
+    assertEqual(JSON.stringify(p.malformed), JSON.stringify(['CHORUS:8:9', '12', 'chorus:4', 'MIXER:99999']), 'malformed: an extra field, a bare pid after a malformed entry, lower case, no wire pid');
+    assertEqual(JSON.stringify(parseForcedGeneric('8').malformed), JSON.stringify(['8']), 'a bare pid with no family before it');
+    const prior = process.env.FORGEFX_DEFS_FORCE_GENERIC;
+    const realWarn = console.warn;
+    const warnings: string[] = [];
+    console.warn = (...a: unknown[]) => { warnings.push(a.map(String).join(' ')); };
+    try {
+      process.env.FORGEFX_DEFS_FORCE_GENERIC = 'DELAY:3, CHORUS:8:9';
+      const r = await v2Of(FM3, DELAY, { [DELAY]: { values: body(stride), channel: 0 } });
+      await v2Of(FM3, DELAY, { [DELAY]: { values: body(stride), channel: 0 } });
+      assertEqual(r.enums.find((e) => e.id === 3)?.name, 'P3', 'the well-formed entry still applies');
+      assertEqual(warnings.length, 1, 'one warning for a malformed value, however often it is read');
+      assert(warnings[0]!.includes('"CHORUS:8:9"'), 'the warning names the malformed entry');
+      const chorus = eidOfSlug('chorus');
+      const ch = await v2Of(FM3, chorus, { [chorus]: { values: body(strideOf(FM3, 'CHORUS')), channel: 0 } });
+      assert(ch.enums.find((e) => e.id === 8)?.generic !== true, 'the malformed CHORUS entry forces nothing');
+    } finally {
+      console.warn = realWarn;
+      if (prior === undefined) delete process.env.FORGEFX_DEFS_FORCE_GENERIC;
+      else process.env.FORGEFX_DEFS_FORCE_GENERIC = prior;
+    }
+    console.log('  drivers/block-params-v2: FORGEFX_DEFS_FORCE_GENERIC — strict FAMILY:pid[,pid...] entries, malformed ones ignored with one warning');
+  }
+
+  // ---- 18. definitions.channel is the channel whose slice is served ----------------------------------
+  {
+    const values = body(stride, 2); // the body carries channels A and B only
+    const r = await v2Of(FM3, DELAY, { [DELAY]: { values, channel: 3 } });
+    assertEqual(r.definitions.channel, 1, 'status says D, the body ends at B: B is served and reported');
+    assertEqual(r.named.find((n) => n.id === 0)!.norm, values[stride + 0]! / 65534, 'the values are channel B\'s');
+    console.log('  drivers/block-params-v2: definitions.channel reports the clamped slice channel');
+  }
+
+  // ---- 19. the generic GLOBAL response reads nothing from the device -----------------------------------
+  {
+    const dev = mockBlockDevice(FM3, { [GLOBAL_EID]: { values: new Array<number>(136).fill(1234), channel: null } });
+    const r = (await dev.driver.blockParams(GLOBAL_EID, { generic: true })) as BlockParamsV2DTO;
+    assertEqual(dev.mock.sent.length, 0, 'no status read, no body read');
+    assertEqual(r.named.length + r.enums.length, 186, 'every GLOBAL param is still listed');
+    assert(allEntries(r).every((e) => e.value === null && e.unresolved === 'non-positional'), 'all null / non-positional');
+    assertEqual(r.readError, undefined, 'nothing failed');
+    assertEqual(r.definitions.positional, false, 'not positional');
+    await dev.driver.readDeviceEditState();
+    assertEqual(dev.mock.sent.length, 0, 'the device-edit poll leaves the block alone');
+    await dev.driver.blockParams(GLOBAL_EID);
+    assert(dev.mock.sent.length > 0, 'the classic response still reads the block');
+    console.log('  drivers/block-params-v2: generic GLOBAL — served from the definitions alone, no device read');
   }
 }

@@ -54,9 +54,18 @@ import {
 } from 'forgefx-midi/gen3/axe-fx-iii';
 import type {
   DeviceEditorLayouts, EditorBlockLayout, EditorLayoutVariant, EditorLayoutPage,
-  EditorLayoutRow, EditorFwRange, EditorWidgetKind,
+  EditorLayoutRow, EditorLayoutControl, EditorFwRange, EditorWidgetKind,
 } from 'forgefx-midi/gen3/fm3';
 import { AM4_LAYOUTS } from 'forgefx-midi/am4';
+
+/** One served layout control: the codec's control, plus (generic response only) `boundParamId`, the served
+ *  param a button control presses (`CABINET_BTN_MUTE1` → `CABINET_MUTE1`); the control's own `paramId` stays
+ *  the editor's pseudo id. */
+export type DeviceLayoutControl = EditorLayoutControl & { boundParamId?: number };
+/** One served layout row (the codec's row over served controls). */
+export type DeviceLayoutRow = Omit<EditorLayoutRow, 'controls'> & { controls: DeviceLayoutControl[] };
+/** One served layout page (the codec's page over served rows). */
+export type DeviceLayoutPage = Omit<EditorLayoutPage, 'rows'> & { rows: DeviceLayoutRow[] };
 
 // Editor-authentic UI layout (v2 schema — see forgefx-midi src/editorLayouts.ts). The wire `layout`
 // on /preset/blocks/:eid/params carries ONE resolved block-type/firmware variant of a block's editor
@@ -77,7 +86,7 @@ export type DeviceLayout = {
   /** True when the chosen variant is the firmware-current pinned one (amp DISTORT block). */
   pinned?: boolean;
   /** All pages of the chosen variant ONLY (editor display order); rows → controls verbatim from the codec. */
-  pages: EditorLayoutPage[];
+  pages: DeviceLayoutPage[];
 };
 // gen-3 shared virtual-effect effectIds (capture-confirmed on FM3; III reuses them since its package
 // ships layouts but no effectId table). Audio-block eids resolve via the codec (slugForEffectId).

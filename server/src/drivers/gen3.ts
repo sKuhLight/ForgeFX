@@ -35,9 +35,9 @@ import {
 import { isTransportTimeout, type Transport } from '../transport/types.js';
 import {
   SLUG_FAMILY, isEnumOnAnyDevice, paramLabel, typeSelectorPid, variantSelectorPid,
-  type DeviceProfile, type TypeModel, type DeviceLayout, type RangeDef, type SelectorValues
+  type DeviceProfile, type TypeModel, type DeviceLayout, type DeviceLayoutControl, type RangeDef, type SelectorValues
 } from '../devices.js';
-import { buildParamIndex, type BlockIndex, type ParamEntry } from './paramIndex.js';
+import { buildParamIndex, MAX_WIRE_PID, type BlockIndex, type ParamEntry } from './paramIndex.js';
 import { EmptyPresetError } from './types.js';
 import type {
   DeviceDriver, DriverCapabilities, DriverCtx, DiagnosticDump, SelectPresetOpts,
@@ -513,8 +513,9 @@ interface BlockRead {
   values: readonly number[] | null;
   /** The read threw or timed out: `values` is null and this says why. */
   readError?: string;
-  /** Active channel (0-3) of a channel-bearing block; null when the status read did not report the block, and
-   *  for a block without channels. */
+  /** Active channel (0-3) of a channel-bearing block, as served: the one the status read reported, clamped onto
+   *  the channels the body carries. Null when the status read did not report the block, and for a block without
+   *  channels. */
   channel: number | null;
   /** One channel slice's width and where the active channel's slice starts. */
   stride: number;
@@ -542,18 +543,51 @@ function readSlot(read: BlockRead, hasChannels: boolean, pid: number): number | 
   return pid >= read.stride || at >= read.values.length ? 'not-in-body' : read.values[at]!;
 }
 
+/** The value of the `FORGEFX_DEFS_FORCE_GENERIC` hook, parsed: family → pids, plus the entries that did not
+ *  parse. Entries are comma-separated. `FAMILY:pid` names a family (upper case, as the catalogs spell it) and a
+ *  pid; a bare `pid` adds one more pid to the family named just before it (`DELAY:3,5, CHORUS:8`). Anything
+ *  else is malformed and ignored: `CHORUS:8:9`, a lower-case family, a pid that is not a wire parameter, a
+ *  bare pid with no family before it, or one right after a malformed entry. */
+export function parseForcedGeneric(raw: string): { pids: ReadonlyMap<string, ReadonlySet<number>>; malformed: string[] } {
+  const pids = new Map<string, Set<number>>();
+  const malformed: string[] = [];
+  let family: string | undefined;
+  for (const token of raw.split(',')) {
+    const entry = token.trim();
+    if (entry === '') continue;
+    const m = /^(?:([A-Z][A-Z0-9_]*):)?(\d{1,5})$/.exec(entry);
+    const fam = m ? m[1] ?? family : undefined;
+    const pid = m ? Number(m[2]) : NaN;
+    if (fam === undefined || !(pid <= MAX_WIRE_PID)) {
+      malformed.push(entry);
+      family = undefined; // a bare pid after a malformed entry has no family to join
+      continue;
+    }
+    family = fam;
+    let set = pids.get(fam);
+    if (!set) pids.set(fam, (set = new Set()));
+    set.add(pid);
+  }
+  return { pids, malformed };
+}
+
+/** The last hook value parsed (re-parsed only when the variable changes, so a malformed value warns once). */
+let forcedGeneric: { raw: string; pids: ReadonlyMap<string, ReadonlySet<number>> } | undefined;
+
 /** Diagnostic hook, off by default: pids to serve as generic params whatever the catalog names them, from
- *  `FORGEFX_DEFS_FORCE_GENERIC` ("FAMILY:pid" entries, comma-separated; for testing only). Read through a
- *  guarded process access: a browser runtime has none and never forces anything. */
+ *  `FORGEFX_DEFS_FORCE_GENERIC` (see parseForcedGeneric; for testing only). Read through a guarded process
+ *  access: a browser runtime has none and never forces anything. */
 function forcedGenericPids(family: string): ReadonlySet<number> | undefined {
   const raw = typeof process !== 'undefined' ? process.env?.FORGEFX_DEFS_FORCE_GENERIC : undefined;
   if (!raw) return undefined;
-  const pids = new Set<number>();
-  for (const entry of raw.split(',')) {
-    const [fam, pid] = entry.trim().split(':');
-    if (fam?.trim() === family && pid !== undefined && /^\d+$/.test(pid.trim())) pids.add(Number(pid));
+  if (forcedGeneric?.raw !== raw) {
+    const parsed = parseForcedGeneric(raw);
+    if (parsed.malformed.length > 0) {
+      console.warn(`[forgefx] FORGEFX_DEFS_FORCE_GENERIC: ignored malformed ${parsed.malformed.length === 1 ? 'entry' : 'entries'} ${parsed.malformed.map((e) => JSON.stringify(e)).join(', ')} (expected FAMILY:pid[,pid...])`);
+    }
+    forcedGeneric = { raw, pids: parsed.pids };
   }
-  return pids.size > 0 ? pids : undefined;
+  return forcedGeneric.pids.get(family);
 }
 
 /** The meta every generic param carries besides its value (the `unresolved` reason is added by the caller). */
@@ -576,7 +610,6 @@ function paramMetaOf(e: ParamEntry): ParamMeta {
   };
 }
 
-type LayoutControl = DeviceLayout['pages'][number]['rows'][number]['controls'][number];
 /** A layout button symbol `<F>_BTN_<X><n>` and the served param `<F>_<X><n>` it presses (`CABINET_BTN_MUTE1` →
  *  `CABINET_MUTE1`). The button's own `paramId` is an editor pseudo id and stays as it is. */
 const BUTTON_SYMBOL = /^([A-Z0-9]+)_BTN_([A-Z]+\d*)$/;
@@ -589,12 +622,12 @@ function withBoundParams(layout: DeviceLayout, pidOfSymbol: (symbol: string) => 
     let pageTouched = false;
     const rows = page.rows.map((row) => {
       let rowTouched = false;
-      const controls = row.controls.map((c): LayoutControl => {
+      const controls = row.controls.map((c): DeviceLayoutControl => {
         const m = c.paramName ? BUTTON_SYMBOL.exec(c.paramName) : null;
         const bound = m ? pidOfSymbol(`${m[1]}_${m[2]}`) : undefined;
         if (bound === undefined) return c;
         rowTouched = true;
-        return { ...c, boundParamId: bound } as LayoutControl;
+        return { ...c, boundParamId: bound };
       });
       if (!rowTouched) return row;
       pageTouched = true;
@@ -1086,14 +1119,29 @@ class Gen3Driver implements DeviceDriver {
     return { len: body.length, hex: Buffer.from(body).toString('hex') };
   }
 
-  async #statusByEffectId(): Promise<Map<number, { bypassed: boolean; channel: number }>> {
+  /** Active channel and bypass per placed block, from the fn 0x13 status dump. An EMPTY map means the read
+   *  failed: no reply in time, or a reply that lists no block, which a real preset never gives (it always has
+   *  its Output blocks). Such a read is re-issued once, shortly after, before giving up: a scene switch leaves
+   *  the unit busy for a moment, and a slow link can miss one reply window. The routine channel-watch poll
+   *  passes `retry: false` (its next tick is the retry). */
+  async #statusByEffectId(opts: { retry?: boolean } = {}): Promise<Map<number, { bypassed: boolean; channel: number }>> {
     const dev = await this.#conn();
+    let map = await this.#readStatusDump(dev);
+    if (map.size === 0 && opts.retry !== false) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 200));
+      map = await this.#readStatusDump(dev);
+    }
+    return map;
+  }
+
+  /** One fn 0x13 status-dump request; an empty map when it failed or timed out. */
+  async #readStatusDump(dev: Transport): Promise<Map<number, { bypassed: boolean; channel: number }>> {
     const map = new Map<number, { bypassed: boolean; channel: number }>();
     try {
       // fractal-midi's isStatusDumpResponse is locked to model 0x10 (III), so match the
       // 0x13 frame ourselves (any model) and parse the id-id-dd triples inline.
       // fn-only matcher: the status dump carries no request id (polled by the channel watch)
-      const frames = await dev.request(this.#codec.buildStatusDump(), { timeoutMs: 1500, routine: true, match: (fs) => fs.some((f) => f[5] === 0x13) });
+      const frames = await dev.request(this.#codec.buildStatusDump(), { timeoutMs: dev.slow ? 4000 : 1500, routine: true, match: (fs) => fs.some((f) => f[5] === 0x13) });
       const f = frames.find((x) => x[5] === 0x13);
       if (f) {
         const payload = f.slice(6, f.length - 2);
@@ -1110,9 +1158,10 @@ class Gen3Driver implements DeviceDriver {
   }
 
   /** Live active-channel per placed block (effectId → channel 0-3), from the fn 0x13 status dump.
-   *  Feeds the registry's front-panel channel-change watch. One small round-trip. */
+   *  Feeds the registry's front-panel channel-change watch. One small round-trip (a failed one is not
+   *  repeated: the watch skips an empty answer and asks again on its next tick). */
   async getActiveChannels(): Promise<Map<number, number>> {
-    const status = await this.#statusByEffectId();
+    const status = await this.#statusByEffectId({ retry: false });
     const out = new Map<number, number>();
     for (const [eid, st] of status) out.set(eid, st.channel);
     return out;
@@ -1147,14 +1196,11 @@ class Gen3Driver implements DeviceDriver {
    *  and re-apply just this. One small round-trip; keeps scene changes snappy and OFF the heavy,
    *  crash-prone dump path (a full dump right after a scene switch hits the device mid-rebuild). */
   async sceneState(): Promise<{ effectId: number; bypassed: boolean; channel: string | null }[]> {
-    let status = await this.#statusByEffectId();
     // A scene switch leaves the unit busy rebuilding for a moment, so the first status read can come back
-    // empty even though the device is fine. Retry once shortly after before treating it as a failure — the
-    // alternative (503 → the client's full preset dump) lands on the device exactly while it is rebuilding.
-    if (status.size === 0) {
-      await new Promise<void>((resolve) => setTimeout(resolve, 200));
-      status = await this.#statusByEffectId();
-    }
+    // empty even though the device is fine. #statusByEffectId retries once shortly after before treating it
+    // as a failure — the alternative (503 → the client's full preset dump) lands on the device exactly while
+    // it is rebuilding.
+    const status = await this.#statusByEffectId();
     // An EMPTY status map means the fn-0x13 read failed/timed out (#statusByEffectId swallows the
     // error). A real preset always has ≥ Output blocks, so `[]` can never be a legitimate scene state —
     // returning it made the route answer 200 `[]` and Axis kept the previous scene's bypass/channel
@@ -1216,17 +1262,29 @@ class Gen3Driver implements DeviceDriver {
     if (!family) {
       // no device-true param family mapped
       if (!generic) return { block: meta?.name ?? slug, slug, page, named: [], enums: [], type: null, layout: undefined };
+      // the generic response names an unknown block by its effect id alone, even where the codec has a slug for it
       return {
-        block: meta?.name ?? `Block ${eid}`, slug, page, named: [], enums: [], type: null, unknownBlock: true,
+        block: `Block ${eid}`, slug: '', page, named: [], enums: [], type: null, unknownBlock: true,
         definitions: { family: null, profile: 'none', positional: false, channel: null, persistentWrites: false, hidden: [] }
       };
     }
     const blockName = meta?.name ?? family;
     const forced = generic ? forcedGenericPids(family) : undefined;
     const index = buildParamIndex(this.#prof, family, forced ? { forceGeneric: forced } : undefined);
-    const read = await this.#readBlock(eid, family, hasChannels, index);
+    // GLOBAL's body holds one record per param, not one per pid: the generic response can resolve no value from
+    // it (every one is `non-positional`), so it is not read at all. The classic response still reads it.
+    const read = generic && family === 'GLOBAL' && !hasChannels && index.positional === false
+      ? this.#unreadNonPositional(eid)
+      : await this.#readBlock(eid, family, hasChannels, index);
     const shared = { family, slug, blockName, page, hasChannels, read };
-    return generic ? this.#paramsGeneric(shared, index) : this.#paramsClassic(shared);
+    return generic ? this.#paramsGeneric(shared, index) : this.#paramsClassic(shared, index);
+  }
+
+  /** A block read that was skipped because its body says nothing about any pid: no values to resolve, and none
+   *  to watch for device edits. */
+  #unreadNonPositional(eid: number): BlockRead {
+    this.#nonPositional.add(eid);
+    return { values: [], channel: null, stride: 0, base: 0, positional: false };
   }
 
   /** The block's status (active channel) and its fn-0x1F body, sliced to the active channel. Primes the
@@ -1245,7 +1303,9 @@ class Gen3Driver implements DeviceDriver {
       this.#watchedChannel = activeCh; // keep the device-edit-burst diff on the same channel (see decodeEditBurst)
       const frames = await this.#bulkRead(dev, eid, dev.slow ? 8000 : 2500, dev.slow ? 600 : 120);
       const bulk = this.#codec.assembleGen3BlockBulkRead(frames);
-      const { stride, base } = this.#channelSlice(family, bulk, activeCh, hasChannels);
+      const { stride, base, channelCount } = this.#channelSlice(family, bulk, activeCh, hasChannels);
+      // the channel whose values are served: the reported one, clamped onto the channels the body carries
+      if (channel !== null) channel = Math.min(channel, channelCount - 1);
       const positional = this.#isPositional(index, bulk, stride, hasChannels);
       if (positional) {
         // Prime the device-edit-push baseline with the OPEN channel's values so a later front-panel
@@ -1272,7 +1332,7 @@ class Gen3Driver implements DeviceDriver {
   }
 
   /** The classic response (see blockParams). */
-  #paramsClassic(c: BlockContext): BlockParamsDTO {
+  #paramsClassic(c: BlockContext, index: BlockIndex): BlockParamsDTO {
     const { family, slug, hasChannels, read } = c;
     // knobs = every continuous param with a usable range: a float-kind range AND a continuous catalog
     // unit (KNOB_UNITS; this keeps selectors that carry a float-typed range record out of the dial
@@ -1281,9 +1341,12 @@ class Gen3Driver implements DeviceDriver {
     const knobs = knobParams(this.#prof, family);
     // enums = every discrete selector. The family TYPE selector is excluded (header retype palette),
     // plus the raw bypass flag; everything else (modes, slopes, mics, mic/cab pickers…) is shown, and so
-    // are the float-row selectors (enumParams: the III's GLOBALMIX toggles).
-    const typeId = typeSelectorPid(this.#prof, family);
-    const enumDefs = enumParams(this.#prof, family, typeId);
+    // are the float-row selectors (enumParams: the III's GLOBALMIX toggles). The entry set stays the
+    // catalog's; the type VALUE is read where the type selector sits on the connected device (it follows its
+    // name when the row moved, the pid setType writes), else at the catalog's pid.
+    const catalogTypeId = typeSelectorPid(this.#prof, family);
+    const typeId = index.typePid ?? catalogTypeId;
+    const enumDefs = enumParams(this.#prof, family, catalogTypeId);
     const named: NamedParam[] = [];
     const enums: EnumParam[] = [];
     let type: { value: number; name: string } | null = null;
@@ -1332,9 +1395,9 @@ class Gen3Driver implements DeviceDriver {
     for (const e of enums) valueByPid.set(e.id, e.value);
     for (const n of named) if (typeof n.value === 'number') valueByPid.set(n.id, n.value);
     const selectors: SelectorValues = (selectorParamName) => {
-      const pid = this.#paramId(family, selectorParamName);
+      const pid = this.#paramId(family, selectorParamName); // a catalog pid
       if (pid == null) return undefined;
-      if (typeId != null && pid === typeId) return type?.value;
+      if (pid === catalogTypeId) return type?.value;
       return valueByPid.get(pid);
     };
     // Re-resolve the layout to the variant selected by the block's CURRENT type value (EQ band count,
@@ -1771,7 +1834,8 @@ class Gen3Driver implements DeviceDriver {
           const d = this.#display(family, id, bulk.values[base + id] ?? 0);
           vals[id] = { norm: d.norm, value: d.value, unit: d.unit, min: d.min, max: d.max, log: d.log };
         }
-        const typeId = this.#paramId(family, 'type');
+        // the type selector where it sits on the connected device (see #paramsClassic), else the catalog's pid
+        const typeId = buildParamIndex(this.#prof, family).typePid ?? typeSelectorPid(this.#prof, family);
         if (typeId != null) {
           const roster = this.#prof.rosterFor(slug);
           const tmax = Math.max(0, roster.length - 1);
