@@ -3,17 +3,17 @@
 // on the connected device, values that are `null` with an `unresolved` reason instead of an invented number,
 // classification (kind / widget / write mode), fingerprints, hidden rows, and the classic response next to it
 // (same reads, numbers kept, additive `unresolved` markers). Committed catalog data and synthetic bodies only.
-import { PROFILES, SLUG_FAMILY, runtimeProfileFrom, type DeviceProfile, type RangeDef } from '../../src/devices.js';
+import { PROFILES, SLUG_FAMILY, runtimeProfileFrom, type DeviceLayout, type DeviceLayoutControl, type DeviceProfile, type ParamDef, type RangeDef, type SelectorValues } from '../../src/devices.js';
 import { buildParamIndex } from '../../src/drivers/paramIndex.js';
 import { parseForcedGeneric } from '../../src/drivers/gen3.js';
 import type { BlockParamsDTO, BlockParamsV2DTO, PresetGridDTO } from '../../src/drivers/types.js';
-import { isInformativeRow, type BuiltCache } from 'forgefx-midi/cache';
+import { CACHE_SCHEMA, isInformativeRow, type BuiltCache } from 'forgefx-midi/cache';
 import { createModernFractalCodec } from 'forgefx-midi/gen3/axe-fx-iii';
 import { assert, assertEqual } from '../helpers/mock.js';
-import { catalogBuilt } from '../helpers/catalogProfile.js';
+import { catalogBuilt, mockGen3Device } from '../helpers/catalogProfile.js';
 import { mockBlockDevice, eidOfSlug, compactHex } from '../helpers/blockRead.js';
 
-export const BLOCK_PARAMS_V2_CASE_COUNT = 21;
+export const BLOCK_PARAMS_V2_CASE_COUNT = 22;
 
 const FM3 = PROFILES[0x11]!;
 const FM9 = PROFILES[0x12]!;
@@ -536,4 +536,85 @@ export async function runBlockParamsV2Tests(): Promise<void> {
     assert(allEntries(ctrl).length > 0 && allEntries(ctrl).every((e) => e.value !== null), 'CONTROLLERS values still resolve');
     console.log('  drivers/block-params-v2: channel-less blocks (GLOBAL classic, CONTROLLERS) send no status request');
   }
+
+  // ---- 22. the generic layout follows names that moved; a name the device dropped leaves its control unbound ---
+  {
+    // a synthetic Rotary: a row inserted at pid 3 moves C and MODE (the variant selector) up one pid; the row
+    // at 2 became an unused slot; E and F are an identical pair, so E's name cannot follow its row
+    const ROT = eidOfSlug('rotary');
+    const F = (min: number, max: number, typecode: number): RangeDef => ({ kind: 'float', displayMin: min, displayMax: max, scale: 1, step: 0.01, typecode });
+    const unused: RangeDef = { kind: 'float', displayMin: 0, displayMax: 0, scale: 0, step: 0, typecode: 0 };
+    const mode: RangeDef = { kind: 'enum', displayMin: 0, displayMax: 2, scale: 1, step: 0, typecode: 0x10, enumCount: 3 };
+    const defs: ParamDef[] = [
+      { paramId: 0, name: 'ROTARY_MUTE1' }, { paramId: 1, name: 'ROTARY_A' }, { paramId: 2, name: 'ROTARY_B' }, { paramId: 3, name: 'ROTARY_C' },
+      { paramId: 4, name: 'ROTARY_MODE', unit: 'enum' }, { paramId: 5, name: 'ROTARY_E' }, { paramId: 6, name: 'ROTARY_F' },
+      { paramId: 0xff06, name: 'ROTARY_BTN_MUTE1', unit: 'enum' },
+    ];
+    const rows: Record<number, RangeDef> = { 0: F(0, 1, 0x21), 1: F(0, 10, 0x31), 2: F(0, 20, 0x41), 3: F(-5, 5, 0x51), 4: mode, 5: F(0, 100, 0x61), 6: F(0, 100, 0x61) };
+    const ctl = (paramName: string | null, paramId: number | null, extra: Partial<DeviceLayoutControl> = {}): DeviceLayoutControl =>
+      ({ label: paramName ?? '', paramName, paramId, widget: 'knob', rawWidget: 'knob', ...extra });
+    const editor: DeviceLayout = {
+      editorName: 'Rotary', family: 'ROTARY', variantName: 'v', variantValue: null,
+      pages: [{ name: 'p', rows: [{ section: 'parameters', controls: [
+        ctl('ROTARY_BTN_MUTE1', 0xff06, { widget: 'button', rawWidget: 'button' }),
+        ctl('ROTARY_A', 1), ctl('ROTARY_B', 2), ctl('ROTARY_C', 3), ctl('ROTARY_MODE', 4, { widget: 'dropdown', rawWidget: 'dropdown' }),
+        ctl('ROTARY_E', 5), ctl('ROTARY_F', 6),
+        ctl('DELAY_TIME', 3, { crossBlock: { effect: 'ID_DELAY1', family: 'DELAY', paramName: 'DELAY_TIME', paramId: 3 } }),
+        ctl('ROTARY_C', 3, { crossBlock: { effect: 'ID_ROTARY2', family: 'ROTARY', paramName: 'ROTARY_C', paramId: 3 } }),
+        ctl(null, null, { widget: 'spacer', rawWidget: 'spacer' }),
+      ] }] }],
+    };
+    const editorJson = JSON.stringify(editor);
+    const seen: Array<{ variant: number | undefined; mode: number | undefined }> = [];
+    const S = {
+      ...FM3,
+      params: { ...FM3.params, ROTARY: defs },
+      ranges: { ...FM3.ranges, ROTARY: rows },
+      rangeSections: { ...FM3.rangeSections, ROTARY: { stride: 7, recordCount: 7 } },
+      enumLabelsFor: (fam: string, pid: number) => (fam === 'ROTARY' ? (pid === 4 ? ['X', 'Y', 'Z'] : undefined) : FM3.enumLabelsFor(fam, pid)),
+      editorLayouts: undefined,
+      layoutFor: (fam: string, variant?: number, selectors?: SelectorValues) => {
+        if (fam !== 'ROTARY') return FM3.layoutFor(fam, variant, selectors);
+        seen.push({ variant, mode: selectors?.('ROTARY_MODE') });
+        return editor;
+      },
+    } as DeviceProfile;
+    const built = {
+      ranges: { ROTARY: { 0: rows[0], 1: rows[1], 2: unused, 3: F(0, 1, 0x71), 4: rows[3], 5: mode, 6: rows[5], 7: rows[6] } },
+      enumOverrides: { ROTARY: { 5: ['X', 'Y', 'Z'] } },
+      rangeSections: { ROTARY: { sectionTag: 1, stride: 8, recordCount: 8 } },
+      rosters: {}, cabIrs: {}, unmappedSections: [], unmappedFamilies: [], model: 0x11, firmware: '99.0',
+      meta: { schema: CACHE_SCHEMA, source: 'editor-cache', recordCount: 8 },
+    } as unknown as BuiltCache;
+    const P = runtimeProfileFrom(built, S);
+    const idx = buildParamIndex(P, 'ROTARY');
+    assertEqual([...idx.namedAt].sort((x, y) => x[0] - y[0]).map(([c, at]) => `${c}>${at}`).join(','), '0>0,1>1,3>4,4>5,6>6', 'premise: C and MODE moved, B was dropped, E lost its name');
+    assertEqual(`${idx.variantPid}/${idx.hidden.map((h) => `${h.id}:${h.reason}`).join(',')}`, '5/2:removed', 'premise: the variant selector followed its name; B is removed');
+
+    const dev = mockGen3Device(P, [ROT]);
+    const v2 = await dev.driver.blockParams(ROT, { generic: true });
+    const controls = v2.layout!.pages[0]!.rows[0]!.controls;
+    const show = (c: DeviceLayoutControl) =>
+      `${c.paramName}:${c.paramId}${c.movedFrom !== undefined ? `<${c.movedFrom}` : ''}${c.unbound ? ':unbound' : ''}${c.boundParamId !== undefined ? `=>${c.boundParamId}` : ''}${c.crossBlock ? `@${c.crossBlock.family}:${c.crossBlock.paramId}` : ''}`;
+    assertEqual(controls.map(show).join(' '),
+      'ROTARY_BTN_MUTE1:65286=>0 ROTARY_A:1 ROTARY_B:2:unbound ROTARY_C:4<3 ROTARY_MODE:5<4 ROTARY_E:5:unbound ROTARY_F:6 DELAY_TIME:3@DELAY:3 ROTARY_C:4<3@ROTARY:4 null:null',
+      'moved names are followed (movedFrom), dropped and lost names unbound, the button bound, another family untouched, a reference to this family followed');
+    assert(controls[1] === editor.pages[0]!.rows[0]!.controls[1], 'an untouched control is served as it is');
+    assertEqual(JSON.stringify(editor), editorJson, 'the editor layout itself is not modified');
+    // the variant and the page selectors are read where the names sit now: MODE's value is the one at pid 5
+    const modeEntry = v2.enums.find((e) => e.id === 5)!;
+    assertEqual(`${modeEntry.name}/${modeEntry.value}`, 'MODE/2', 'premise: the selector is served at 5 with value 2');
+    assertEqual(JSON.stringify(seen.at(-1)), JSON.stringify({ variant: 2, mode: 2 }), 'the layout variant and selector values come from pid 5');
+
+    // the classic response serves the editor layout exactly as it is
+    const classic = await dev.driver.blockParams(ROT);
+    assertEqual(JSON.stringify(classic.layout), editorJson, 'the classic layout is unchanged');
+    // without a profile nothing moved: only the button is bound
+    const plain = await mockGen3Device(S, [ROT]).driver.blockParams(ROT, { generic: true });
+    const plainControls = plain.layout!.pages[0]!.rows[0]!.controls;
+    assertEqual(plainControls.filter((c) => c.movedFrom !== undefined || c.unbound).length, 0, 'catalog only: no control moved or unbound');
+    assertEqual(plainControls[0]!.boundParamId, 0, 'catalog only: the button is bound');
+    console.log('  drivers/block-params-v2: generic layout follows moved names (movedFrom), unbinds dropped / lost names; buttons, other families and the classic layout unchanged');
+  }
 }
+

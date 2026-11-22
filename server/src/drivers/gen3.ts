@@ -24,7 +24,7 @@ import {
   type ModernFractalCodec
 } from 'forgefx-midi/gen3/axe-fx-iii';
 import { wireToDisplay } from 'forgefx-midi/shared';
-import { enumOrdinalBounds, isPlaceholderRow } from 'forgefx-midi/cache';
+import { enumOrdinalBounds, isInformativeRow, isPlaceholderRow } from 'forgefx-midi/cache';
 import {
   parsePresetDump, decodeRawPatch, decodeGen3Body,
   readBlockParamsForModel, modelsFromBlocks,
@@ -35,7 +35,7 @@ import {
 import { isTransportTimeout, type Transport } from '../transport/types.js';
 import {
   SLUG_FAMILY, isEnumOnAnyDevice, paramLabel, typeSelectorPid, variantSelectorPid,
-  type DeviceProfile, type TypeModel, type DeviceLayout, type DeviceLayoutControl, type RangeDef, type SelectorValues
+  type DeviceProfile, type ParamDef, type TypeModel, type DeviceLayout, type DeviceLayoutControl, type RangeDef, type SelectorValues
 } from '../devices.js';
 import { buildParamIndex, MAX_WIRE_PID, type BlockIndex, type ParamEntry } from './paramIndex.js';
 import { EmptyPresetError } from './types.js';
@@ -614,20 +614,18 @@ function paramMetaOf(e: ParamEntry): ParamMeta {
  *  `CABINET_MUTE1`). The button's own `paramId` is an editor pseudo id and stays as it is. */
 const BUTTON_SYMBOL = /^([A-Z0-9]+)_BTN_([A-Z]+\d*)$/;
 
-/** A copy of `layout` whose button controls carry `boundParamId`: the served param each one presses. Controls
- *  that bind nothing served, and layouts without any, come back untouched. */
-function withBoundParams(layout: DeviceLayout, pidOfSymbol: (symbol: string) => number | undefined): DeviceLayout {
+/** A copy of `layout` with every control passed through `fn`. A control `fn` returns as it is stays shared, and
+ *  so does every row, page and layout in which nothing changed. */
+function mapLayoutControls(layout: DeviceLayout, fn: (c: DeviceLayoutControl) => DeviceLayoutControl): DeviceLayout {
   let touched = false;
   const pages = layout.pages.map((page) => {
     let pageTouched = false;
     const rows = page.rows.map((row) => {
       let rowTouched = false;
       const controls = row.controls.map((c): DeviceLayoutControl => {
-        const m = c.paramName ? BUTTON_SYMBOL.exec(c.paramName) : null;
-        const bound = m ? pidOfSymbol(`${m[1]}_${m[2]}`) : undefined;
-        if (bound === undefined) return c;
-        rowTouched = true;
-        return { ...c, boundParamId: bound };
+        const out = fn(c);
+        if (out !== c) rowTouched = true;
+        return out;
       });
       if (!rowTouched) return row;
       pageTouched = true;
@@ -1485,20 +1483,9 @@ class Gen3Driver implements DeviceDriver {
       }
     }
     // The catalog symbols of the editor layout resolve to the pids that carry those names on this device: a name
-    // that moved with its row follows it, a selector that is gone resolves to nothing.
-    const defs = this.#prof.params[family] ?? [];
-    const catalogTypePid = typeSelectorPid(this.#prof, family);
-    const movedTo = new Map<number, number>();
-    for (const e of index.entries) if (e.movedFrom !== undefined) movedTo.set(e.movedFrom, e.pid);
-    const served = (catalogPid: number | undefined): number | undefined => {
-      if (catalogPid === undefined) return undefined;
-      if (catalogPid === catalogTypePid) return index.typePid;
-      const here = index.byPid.get(catalogPid);
-      if (here && here.nameSource === 'catalog' && here.def?.paramId === catalogPid) return catalogPid;
-      const moved = movedTo.get(catalogPid);
-      if (moved !== undefined) return moved;
-      return index.hidden.some((h) => h.id === catalogPid && h.reason !== 'removed') ? catalogPid : undefined;
-    };
+    // that moved with its row follows it (listed or hidden, the type selector too), a name the device no longer
+    // has resolves to nothing.
+    const served = (catalogPid: number | undefined): number | undefined => (catalogPid === undefined ? undefined : index.namedAt.get(catalogPid));
     const selectors: SelectorValues = (selectorParamName) => {
       const pid = served(this.#paramId(family, selectorParamName));
       if (pid == null) return undefined;
@@ -1507,12 +1494,7 @@ class Gen3Driver implements DeviceDriver {
     };
     const variantValue = typeId != null ? type?.value : index.variantPid != null ? valueByPid.get(index.variantPid) : undefined;
     let layout = this.#prof.layoutFor(family, variantValue, selectors);
-    if (layout) {
-      layout = withBoundParams(layout, (symbol) => {
-        const pid = served(defs.find((d) => d.name === symbol)?.paramId);
-        return pid !== undefined && index.byPid.has(pid) ? pid : undefined;
-      });
-    }
+    if (layout) layout = this.#servedLayout(layout, family, index);
     dedupeLabels(named);
     dedupeLabels(enums);
     return {
@@ -1529,6 +1511,43 @@ class Gen3Driver implements DeviceDriver {
       },
       ...(read.readError !== undefined ? { readError: read.readError } : {}),
     };
+  }
+
+  /** The generic response's layout: the editor layout with its controls bound to the params the connected device
+   *  serves (the classic response keeps the editor layout as it is).
+   *  - A button control (`<F>_BTN_<X><n>`, an editor pseudo id) gains `boundParamId`: the served param it presses.
+   *  - A control of this family whose catalog name now sits at another pid (the name followed its row) is pointed
+   *    there: `paramId` becomes that pid and `movedFrom` keeps the catalog pid.
+   *  - A control whose catalog name the device does not serve any more although the catalog has a row for it (a
+   *    byte-exact profile dropped it, or a shift left its name without a unique row) keeps its `paramId` and is
+   *    marked `unbound`, so it is not written to whatever sits at that pid now.
+   *  A cross-block control that references this family is treated like the family's own (its reference follows
+   *  too). Controls that address another family, pseudo ids and names that did not move stay as they are. */
+  #servedLayout(layout: DeviceLayout, family: string, index: BlockIndex): DeviceLayout {
+    const defByName = new Map<string, ParamDef>();
+    for (const d of this.#prof.params[family] ?? []) if (!defByName.has(d.name)) defByName.set(d.name, d);
+    const catalogRows = (this.#prof.staticBase ?? this.#prof).ranges[family] ?? {};
+    return mapLayoutControls(layout, (c) => {
+      if (!c.paramName) return c;
+      const button = BUTTON_SYMBOL.exec(c.paramName);
+      if (button) {
+        const catalogPid = defByName.get(`${button[1]}_${button[2]}`)?.paramId;
+        const bound = catalogPid === undefined ? undefined : index.namedAt.get(catalogPid);
+        return bound !== undefined && index.byPid.has(bound) ? { ...c, boundParamId: bound } : c;
+      }
+      if (c.crossBlock && c.crossBlock.family !== family) return c; // another family's param
+      if (c.paramId == null || c.paramId > MAX_WIRE_PID) return c;
+      const def = defByName.get(c.crossBlock?.paramName ?? c.paramName);
+      if (!def || def.paramId > MAX_WIRE_PID) return c; // not a symbol of this family
+      const at = index.namedAt.get(def.paramId);
+      if (at === def.paramId) return c;
+      if (at !== undefined) {
+        const crossBlock = c.crossBlock && c.crossBlock.paramId === def.paramId ? { crossBlock: { ...c.crossBlock, paramId: at } } : {};
+        return { ...c, paramId: at, movedFrom: def.paramId, ...crossBlock };
+      }
+      const row = catalogRows[def.paramId];
+      return row && isInformativeRow(row) ? { ...c, unbound: true } : c;
+    });
   }
 
   /** Read specific paramIds of an effect via per-pid fn 0x01 GET (sub 01 00) — the path FM3-Edit

@@ -121,6 +121,11 @@ export interface BlockIndex {
   /** The effective layout-variant selector: the type selector, else the pid carrying `<F>_BASETYPE` /
    *  `<F>_MODE`. Listed like any other param unless it is the type selector. */
   readonly variantPid: number | undefined;
+  /** Catalog pid → the pid that carries that catalog name on the connected device, listed or hidden (a name
+   *  that moved with its row is found where the row went; a pid the diagnostic hook serves as generic keeps its
+   *  own name's place). A catalog name the index serves nowhere (removed, or lost in a shift with no unique row
+   *  to follow, or a definition without an informative row) has no entry. */
+  readonly namedAt: ReadonlyMap<number, number>;
 }
 
 // ── configuration ─────────────────────────────────────────────────────────────────────────────────
@@ -346,6 +351,7 @@ function computeIndex(profile: DeviceProfile, family: string, force: ReadonlySet
   const catVariantPid = variantSelectorPid(profile, family);
   let typePid: number | undefined;
   let variantPid: number | undefined;
+  const namedAt = new Map<number, number>();
   const entries: ParamEntry[] = [];
   const orderKey = new Map<ParamEntry, number>();
 
@@ -379,6 +385,8 @@ function computeIndex(profile: DeviceProfile, family: string, force: ReadonlySet
       }
     }
     const generic = nameDef === undefined;
+    if (nameDef) namedAt.set(nameDef.paramId, pid);
+    else if (force?.has(pid) && natural && !movedOut.has(pid) && movedHere === undefined) namedAt.set(natural.paramId, pid);
 
     // the selectors follow their names: the pid that carries the catalog selector's name is the selector
     const isType = nameDef !== undefined && nameDef.paramId === catTypePid;
@@ -502,6 +510,7 @@ function computeIndex(profile: DeviceProfile, family: string, force: ReadonlySet
     maxPid,
     typePid,
     variantPid,
+    namedAt,
   };
   return Object.freeze(index);
 }
