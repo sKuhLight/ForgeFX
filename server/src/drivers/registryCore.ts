@@ -412,7 +412,7 @@ export class DeviceRegistry {
         // read over the previous one can no longer be trusted. Clear it rather than re-read here: the read
         // itself goes through transport() (it would recurse), and the next detect() redoes it. Null is the
         // safe value — the FM3 store-ack scope reads it as "unknown" (lenient), deviceInfo() reports no
-        // firmware, and applyRuntimeCache() simply does nothing (no cache key is built from a stale value).
+        // firmware, and applyRuntimeCache() falls back to the bundled profile (no cache key is built from a stale value).
         // (Today a dropped connection goes through selectConnection(), which clears it too; this keeps the
         // invariant for any other path that ends up opening a new transport.)
         this.#firmware = null;
@@ -751,23 +751,35 @@ export class DeviceRegistry {
     }
   }
 
-  /** Swap the active driver's profile for a device-cache-derived RUNTIME profile when a cache doc
-   *  exists for the attached model+firmware. Called on a fresh detect AND by the deviceCache service
-   *  after a build completes. No-op without a loadDeviceCache hook, a selfDescribe driver, known
-   *  firmware, or a stored cache this build may use (a profile with a missing/outdated/newer schema
-   *  is never applied — the static profile stays). Never throws. */
+  /** Make the active driver's profile match the stored device cache for the attached model+firmware:
+   *  swap in the device-cache-derived RUNTIME profile when a usable cache doc exists, and fall back to the
+   *  bundled static profile when none does (the doc was deleted, the firmware changed to one without a
+   *  profile, the firmware is unknown), so a profile of an earlier firmware never stays live. Called on a
+   *  fresh detect, by the deviceCache service after a build completes and after a delete. No-op without a
+   *  loadDeviceCache hook or a selfDescribe driver. A stored profile with a missing/outdated/newer schema
+   *  counts as none (it is never applied; the static profile stays). Never throws. */
   async applyRuntimeCache(): Promise<void> {
     if (!this.#deps.loadDeviceCache) return;
     const d = this.#active;
     const mid = this.#modelId;
-    if (mid < 0 || !d || !d.capabilities.selfDescribe || !d.applyRuntimeProfile || !this.#firmware) return;
-    const key = deviceCacheKey(mid, this.#firmware.major, this.#firmware.minor);
+    if (mid < 0 || !d || !d.capabilities.selfDescribe || !d.applyRuntimeProfile) return;
     let built: BuiltCache | null = null;
-    try { built = (await this.#deps.loadDeviceCache(key)) ?? null; } catch { built = null; }
-    if (!built || !checkProfileSchema(built).usable) return; // absent, or stale (see profileSchema.ts): keep the static profile
-    const runtime = runtimeProfileFrom(built, PROFILES[mid] ?? this.#prof);
+    if (this.#firmware) {
+      const key = deviceCacheKey(mid, this.#firmware.major, this.#firmware.minor);
+      try { built = (await this.#deps.loadDeviceCache(key)) ?? null; } catch { built = null; }
+    }
+    const bundled = PROFILES[mid];
+    if (!built || !checkProfileSchema(built).usable) {
+      // no usable profile for this model+firmware: the bundled profile is the live one
+      if (bundled) {
+        d.applyRuntimeProfile(bundled);
+        this.#prof = bundled;
+      }
+      return;
+    }
+    const runtime = runtimeProfileFrom(built, bundled ?? this.#prof);
     d.applyRuntimeProfile(runtime);
-    if (PROFILES[mid]) this.#prof = runtime; // keep /diag + reporting profile in sync for gen-3
+    if (bundled) this.#prof = runtime; // keep /diag + reporting profile in sync for gen-3
   }
 
   /** Pause the telemetry supervisor for the duration of an exclusive operation (the device-cache

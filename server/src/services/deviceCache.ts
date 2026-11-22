@@ -603,7 +603,8 @@ export function cancelCacheBuild(registry: DeviceRegistry): { ok: true } {
   return { ok: true };
 }
 
-/** DELETE /device/cache — drop the current key's stored doc. */
+/** DELETE /device/cache — drop the current key's stored doc, and with it the runtime profile layered from
+ *  it: the driver falls back to the bundled profile unless another usable doc still applies. */
 export async function deleteCache(store: Store, registry: DeviceRegistry): Promise<{ ok: true; deleted: boolean }> {
   await registry.driver(); // ensure detection ran so the key resolves
   const key = resolveCacheKey(store, registry);
@@ -611,6 +612,7 @@ export async function deleteCache(store: Store, registry: DeviceRegistry): Promi
   const doc = store.getDoc('deviceCaches', key);
   if (!doc || doc.deleted) return { ok: true, deleted: false };
   store.delDoc('deviceCaches', key);
+  await registry.applyRuntimeCache();
   return { ok: true, deleted: true };
 }
 

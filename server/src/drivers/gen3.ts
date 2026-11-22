@@ -32,7 +32,7 @@ import {
   type DecodedBlock
 } from 'forgefx-midi/devices/gen3';
 import { isTransportTimeout, type Transport } from '../transport/types.js';
-import { SLUG_FAMILY, PROFILES, type DeviceProfile, type TypeModel, type DeviceLayout, type SelectorValues } from '../devices.js';
+import { SLUG_FAMILY, isEnumOnAnyDevice, paramLabel, type DeviceProfile, type TypeModel, type DeviceLayout, type SelectorValues } from '../devices.js';
 import { EmptyPresetError } from './types.js';
 import type {
   DeviceDriver, DriverCapabilities, DriverCtx, DiagnosticDump, SelectPresetOpts,
@@ -360,21 +360,6 @@ const NOT_A_KNOB = new Set([
   'GLOBAL_CS_CHAN_BEGIN', // its paramId lies outside the fn-0x1F body, so the read-back is always the minimum
 ]);
 
-/** `FAMILY.NAME` of every param that is a selector ('enum' unit) on ANY gen-3 device's static catalog.
- *  The same param can carry a confirmed unit on one device and 'unverified' on another (TENTAP_DECAYSTYLE
- *  is a 2-way selector on the Axe-Fx III). Consulted only for the provisional units, whose catalog unit
- *  proves nothing on this device. */
-let enumElsewhere: Set<string> | undefined;
-function isEnumOnAnyDevice(family: string, name: string): boolean {
-  if (!enumElsewhere) {
-    enumElsewhere = new Set();
-    for (const prof of Object.values(PROFILES)) {
-      for (const [fam, list] of Object.entries(prof.params)) for (const q of list) if (q.unit === 'enum') enumElsewhere.add(`${fam}.${q.name}`);
-    }
-  }
-  return enumElsewhere.has(`${family}.${name}`);
-}
-
 /** A range that reads like a stepper or selector rather than a dial: integral bounds with either an
  *  integer step, or no step and a small span (<= 64 values). Deliberately conservative (it also hides
  *  a plain 0..1 range): used only to vet the provisional units, whose catalog unit proves nothing. */
@@ -476,10 +461,6 @@ function dedupeLabels(items: { name: string }[]): void {
       it.name = `${it.name} ${n}`;
     }
   }
-}
-/** Friendly param label: the catalog displayLabel, else tidy the raw NAME (strip family prefix, _→space). */
-function paramLabel(p: { displayLabel?: string; name: string }): string {
-  return p.displayLabel ?? p.name.replace(/^[A-Z0-9]+_/, '').replace(/_/g, ' ');
 }
 
 class Gen3Driver implements DeviceDriver {
