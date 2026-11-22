@@ -33,7 +33,7 @@ import * as editorCacheDiscovery from './services/editorCacheDiscovery.js';
 import * as cloudProfiles from './services/cloudProfiles.js';
 import * as diagnostics from './services/diagnosticCapture.js';
 import * as store from './store.js';
-import { createUnifiedHandlers } from './runtime/handlers.js';
+import { createUnifiedHandlers, genericFlag } from './runtime/handlers.js';
 import { putStoreDoc } from './runtime/services.js';
 import { registerLocalRoutes } from './localStore.js';
 import { registerHelpRoutes } from './help.js';
@@ -382,9 +382,9 @@ export async function buildApp(registry: DeviceRegistry): Promise<FastifyInstanc
 
   // ── live block params (addressed by the placed block's canonical address `addr`: gen-3 = the
   //    effect id, AM4 = the block's pidLow — exactly what each device's grid/blocks report) ──
-  app.get<{ Params: { eid: string }; Querystring: { generic?: string } }>(
+  app.get<{ Params: { eid: string }; Querystring: { generic?: string | string[] } }>(
     '/preset/blocks/:eid/params',
-    async (req, reply) => blockParamsH(reply, Number(req.params.eid), { generic: req.query.generic === '1' })
+    async (req, reply) => blockParamsH(reply, Number(req.params.eid), { generic: genericFlag(req.query.generic) })
   );
   app.put<{ Params: { eid: string; paramId: string }; Body: { value: number; continuous?: boolean } }>(
     '/preset/blocks/:eid/params/:paramId',

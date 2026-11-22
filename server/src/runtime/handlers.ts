@@ -14,6 +14,13 @@ import { presetDumpFramesViolation } from '../drivers/sendPolicy.js';
  *  `code()` matches; the runtime router records the status into its RouterResponse. */
 export interface StatusSink { code(statusCode: number): unknown }
 
+/** The `?generic=1` opt-in of GET /preset/blocks/:eid/params, parsed the same way on both surfaces: on iff
+ *  the FIRST value is `'1'`. Fastify hands a repeated key over as an array (`?generic=1&generic=0` →
+ *  `['1', '0']`), URLSearchParams.get returns its first value. */
+export function genericFlag(raw: unknown): boolean {
+  return (Array.isArray(raw) ? raw[0] : raw) === '1';
+}
+
 export function createUnifiedHandlers(registry: DeviceRegistry) {
   const driver = () => registry.driver();
 

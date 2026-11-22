@@ -22,7 +22,7 @@ import * as editorCacheImport from '../services/editorCacheImport.js';
 import * as cloudProfiles from '../services/cloudProfiles.js';
 import * as diagnostics from '../services/diagnosticCapture.js';
 import { blockHelpBySlug, helpIndex } from '../help.js';
-import { createUnifiedHandlers } from './handlers.js';
+import { createUnifiedHandlers, genericFlag } from './handlers.js';
 import { sendErrorStatus } from '../drivers/sendPolicy.js';
 import { putStoreDoc } from './services.js';
 import { createLocalService } from './localService.js';
@@ -290,7 +290,7 @@ export function createRouter(deps: RuntimeDeps): {
   });
 
   // ── live block params (addressed by the placed block's canonical address `addr`) ──
-  on('GET', '/preset/blocks/:eid/params', (c) => h.blockParamsH(c.reply, Number(c.params.eid), { generic: c.query.get('generic') === '1' }));
+  on('GET', '/preset/blocks/:eid/params', (c) => h.blockParamsH(c.reply, Number(c.params.eid), { generic: genericFlag(c.query.getAll('generic')) }));
   on('PUT', '/preset/blocks/:eid/params/:paramId', (c) => {
     const b = c.body as { value: number; continuous?: boolean };
     return h.setParamH(c.reply, Number(c.params.eid), Number(c.params.paramId), b.value, b.continuous ?? true);

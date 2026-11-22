@@ -100,7 +100,11 @@ function makeFakeFm3(): DeviceDriver {
   } as DeviceDriver;
 }
 
-interface Row { name: string; method: string; url: string; body?: unknown; octet?: boolean }
+interface Row {
+  name: string; method: string; url: string; body?: unknown; octet?: boolean;
+  /** Block-params rows: whether the driver must have been asked for the generic response. */
+  generic?: boolean;
+}
 
 // Representative endpoint matrix (2e): device info/detect, grid, blocks + catalog, blockParams,
 // setParam, bypass, channel, scene get/set, tempo, preset select/store, decode, versions/backups,
@@ -119,9 +123,12 @@ const ROWS: Row[] = [
   { name: 'blocks placed', method: 'GET', url: '/preset/blocks' },
   { name: 'blocks catalog', method: 'GET', url: '/blocks' },
   { name: 'block types', method: 'GET', url: '/blocks/amp/types' },
-  { name: 'block params', method: 'GET', url: '/preset/blocks/58/params' },
-  { name: 'block params generic', method: 'GET', url: '/preset/blocks/58/params?generic=1' },
-  { name: 'block params generic=0 (classic)', method: 'GET', url: '/preset/blocks/58/params?generic=0' },
+  { name: 'block params', method: 'GET', url: '/preset/blocks/58/params', generic: false },
+  { name: 'block params generic', method: 'GET', url: '/preset/blocks/58/params?generic=1', generic: true },
+  { name: 'block params generic=0 (classic)', method: 'GET', url: '/preset/blocks/58/params?generic=0', generic: false },
+  // a repeated key: the FIRST value decides on both surfaces (Fastify parses it to an array, the router reads URLSearchParams)
+  { name: 'block params generic=1&generic=0 (first value: generic)', method: 'GET', url: '/preset/blocks/58/params?generic=1&generic=0', generic: true },
+  { name: 'block params generic=0&generic=1 (first value: classic)', method: 'GET', url: '/preset/blocks/58/params?generic=0&generic=1', generic: false },
   { name: 'set param', method: 'PUT', url: '/preset/blocks/58/params/7', body: { value: 0.42, continuous: true } },
   { name: 'bypass', method: 'POST', url: '/preset/blocks/58/bypass', body: { bypassed: true } },
   { name: 'channel', method: 'POST', url: '/preset/blocks/58/channel', body: { channel: 'B' } },
@@ -190,9 +197,11 @@ const ROWS: Row[] = [
 
 // A capture on a self-describe unit through both surfaces (see diagnosticCaptureRunParity).
 const DIAGNOSTICS_RUN_CASES = 10;
+// A driver without the generic response (AM4) asked for it on both surfaces (see classicDriverGenericParity).
+const CLASSIC_DRIVER_CASES = 2;
 // dynamic follow-ups (need the version id from the backup row) + local rows + subscribe + the two
 // firmware-gate twins (full capture on fw 14.0 / unknown firmware) + the running-capture twins = extra cases
-export const ROUTER_PARITY_CASE_COUNT = ROWS.length + 10 + DIAGNOSTICS_RUN_CASES;
+export const ROUTER_PARITY_CASE_COUNT = ROWS.length + 10 + DIAGNOSTICS_RUN_CASES + CLASSIC_DRIVER_CASES;
 
 function deepEq(a: unknown, b: unknown): boolean {
   if (Object.is(a, b)) return true;
@@ -229,6 +238,46 @@ async function fullCaptureFirmwareGateParity(): Promise<void> {
     } finally {
       await app.close();
     }
+  }
+}
+
+// A driver that has no generic response (AM4, gen-1/2, VP4) ignores `?generic=1`: both surfaces answer the
+// classic body, without `definitions`, exactly as for the plain request. A fake AM4 whose blockParams takes the
+// address alone (the real AM4/gen-2 signature) records what it was handed.
+async function classicDriverGenericParity(): Promise<void> {
+  const calls: unknown[][] = [];
+  const classic = {
+    block: 'amp', slug: 'amp', page: -1,
+    named: [{ id: 1, name: 'Gain', value: 5, norm: 0.5, min: 0, max: 10 }],
+    enums: [{ id: 3, name: 'Bypass', value: 0, options: [{ value: 0, label: 'Engaged' }, { value: 1, label: 'Bypassed' }] }],
+    type: { value: 2, name: 'USA Lead' }
+  };
+  const fake = {
+    modelId: 0x15, key: 'am4', name: 'AM4',
+    capabilities: { ...CAPS, slotModel: 'linear', slotCount: 4, gridEdit: false, scenes: 4, channels: false, presetDump: false, blockParamDecode: false, fcModel: false, modBind: false, cabIrs: false },
+    blockParams: async (...args: unknown[]) => { calls.push(args); return classic; }
+  } as unknown as DeviceDriver;
+  const { app, registry } = await buildTestApp(0x15, fake);
+  try {
+    const router = createRouter({ registry, store: store.defaultStore });
+    const bodies: Record<string, unknown> = {};
+    for (const url of ['/preset/blocks/58/params', '/preset/blocks/58/params?generic=1']) {
+      const res = await app.inject({ method: 'GET', url });
+      const routed = await router.handle('GET', url);
+      assertEqual(res.statusCode, 200, `AM4 ${url}: app 200`);
+      assertEqual(routed.status, 200, `AM4 ${url}: router 200`);
+      const appJson = JSON.parse(res.payload) as Record<string, unknown>;
+      const routerJson = JSON.parse(routed.body as string) as Record<string, unknown>;
+      assert(deepEq(appJson, routerJson), `AM4 ${url}: body parity\napp:    ${res.payload}\nrouter: ${String(routed.body)}`);
+      assertEqual('definitions' in appJson, false, `AM4 ${url}: no definitions`);
+      bodies[url] = appJson;
+    }
+    assert(deepEq(bodies['/preset/blocks/58/params'], bodies['/preset/blocks/58/params?generic=1']), 'AM4: ?generic=1 answers the same body as the classic request');
+    assert(deepEq(bodies['/preset/blocks/58/params'], classic), 'AM4: the body is the driver\'s, untouched');
+    // the flag still reached the driver on both surfaces; the driver simply has no use for it
+    assertEqual(JSON.stringify(calls), JSON.stringify([[58, { generic: false }], [58, { generic: false }], [58, { generic: true }], [58, { generic: true }]]), 'AM4: the flag is handed to the driver on both surfaces');
+  } finally {
+    await app.close();
   }
 }
 
@@ -346,9 +395,9 @@ export async function runRouterParityTests(): Promise<void> {
     for (const row of ROWS) {
       const r = await parity(row, row.name === 'store put' ? stripEnvelope : undefined);
       // the generic flag reaches the driver through BOTH surfaces (parity alone would pass if both dropped it):
-      // only `?generic=1` answers the generic shape, nothing else does
-      if (row.url.startsWith('/preset/blocks/58/params')) {
-        const generic = row.url.endsWith('generic=1');
+      // only a first `generic` value of '1' answers the generic shape, nothing else does
+      if (row.generic !== undefined) {
+        const generic = row.generic;
         assertEqual('definitions' in (r.appJson as object), generic, `${row.name}: the app answers the ${generic ? 'generic' : 'classic'} shape`);
         assertEqual('definitions' in (JSON.parse(r.routed.body as string) as object), generic, `${row.name}: the router answers the ${generic ? 'generic' : 'classic'} shape`);
       }
@@ -380,6 +429,8 @@ export async function runRouterParityTests(): Promise<void> {
     await fullCaptureFirmwareGateParity();
     // + a running diagnostic capture on both twins
     await diagnosticCaptureRunParity();
+    // + a driver without the generic response, asked for it on both twins
+    await classicDriverGenericParity();
   } finally {
     await app.close();
     rmSync(localRoot, { recursive: true, force: true });
