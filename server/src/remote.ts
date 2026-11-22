@@ -7,6 +7,7 @@ import { gzipSync } from 'node:zlib';
 import type { FastifyInstance, InjectOptions } from 'fastify';
 import type { SupabaseClient, RealtimeChannel } from '@supabase/supabase-js';
 import type { DeviceEvent } from './drivers/types.js';
+import { isPrivateStorePath } from './runtime/storeAccess.js';
 
 type Session = { client: SupabaseClient; userId: string };
 type Subscribe = (fn: (e: DeviceEvent) => void) => () => void;
@@ -22,10 +23,12 @@ const GZIP_MIN = 2048;
  *  live performance edits (params, bypass, channel, type, scene, tempo, tuner, grid moves/cables). NEVER
  *  remotely reachable: preset store-to-slot (/preset/store), backups/restore (incl. the Phase-6
  *  /preset/backup + /preset/restore dump movers), /firmware/validate (flash-adjacent byte mover), raw
- *  SysEx, cloud account, port selection, store writes/deletes, telemetry uploads, remote-enable itself. */
+ *  SysEx, cloud account (incl. the auth sessions in the private `cloud` store collection), port selection,
+ *  store writes/deletes, telemetry uploads, remote-enable itself. */
 export function remoteAllowed(method: string, path: string): boolean {
   const p = (path.split('?')[0] || '').replace(/\/+$/, '') || '/';
-  if (method === 'GET') return !p.startsWith('/cloud') && !p.startsWith('/remote') && p !== '/debug/raw';
+  // never the auth sessions (the private `cloud` store collection), however the path is spelled
+  if (method === 'GET') return !p.startsWith('/cloud') && !p.startsWith('/remote') && p !== '/debug/raw' && !isPrivateStorePath(p);
   if (method === 'PUT')
     return (
       /^\/preset\/blocks\/\d+\/params(\/\d+)?$/.test(p) ||

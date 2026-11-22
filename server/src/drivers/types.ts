@@ -155,6 +155,10 @@ export interface DefinitionsCaps {
    *  the firmware the catalog was generated from. `unprofiled`: neither. `unknown`: the firmware is not
    *  known, or there is no catalog firmware and no profile to compare against. */
   drift: 'none' | 'unprofiled' | 'unknown';
+  /** This device can contribute its editor definitions cache (`/device/cache/contribute`): a gen-3 grid
+   *  driver that imports editor caches and whose firmware was read. Whether the cloud wants the file, and
+   *  whether a cloud is configured at all, is in the contribution status, not here. */
+  contribute: boolean;
 }
 
 /** `GET /preset/blocks/:eid/params` as classic clients know it. */

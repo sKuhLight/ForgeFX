@@ -30,6 +30,7 @@ import { slugForEffectId } from 'forgefx-midi/devices/gen3';
 import { PROFILES, SLUG_FAMILY, runtimeProfileFrom, type DeviceProfile, type RangeDef } from '../src/devices.js';
 import { buildParamIndex, MAX_WIRE_PID, type BlockIndex, type BlockProfileKind } from '../src/drivers/paramIndex.js';
 import { checkProfileSchema } from '../src/profileSchema.js';
+import { compareRows, type RowComparison } from '../src/drivers/profileCompare.js';
 
 // ── small utilities ───────────────────────────────────────────────────────────────────────────────
 
@@ -348,41 +349,7 @@ function sumUp(reps: FamilyReport[]): Totals {
   return t;
 }
 
-/** The profile's rows against the catalog's, row by row, before any naming rule is applied: how many
- *  informative profile rows carry the catalog row's fingerprint (exact), a compatible revision of it, an
- *  incompatible one, or have no informative catalog row at all (new). It also covers the rows the index
- *  hides (type, bypass) and the families no block reaches, so it is a wider count than the index histogram. */
-interface RowComparison { exact: number; compatible: number; incompatible: number; newRows: number; removed: number | null; skippedFamilies: string[]; newByFamily: Record<string, number[]> }
-function compareRows(built: BuiltCache, staticProfile: DeviceProfile, suspects: readonly string[], byteExact: boolean): RowComparison {
-  const base = staticProfile.staticBase ?? staticProfile;
-  const out: RowComparison = { exact: 0, compatible: 0, incompatible: 0, newRows: 0, removed: byteExact ? 0 : null, skippedFamilies: [...suspects], newByFamily: {} };
-  for (const [fam, rows] of Object.entries(built.ranges ?? {})) {
-    if (suspects.includes(fam)) continue;
-    const cat = base.ranges[fam] ?? {};
-    const own = built.enumOverrides?.[fam] ?? {};
-    for (const [k, e] of Object.entries(rows)) {
-      const pid = Number(k);
-      if (pid > MAX_WIRE_PID || !isInformativeRow(e)) continue;
-      const c = cat[pid];
-      if (!c || !isInformativeRow(c)) { out.newRows++; (out.newByFamily[fam] ??= []).push(pid); continue; }
-      if (c.synthetic) { if (c.kind === e.kind) out.compatible++; else out.incompatible++; continue; }
-      const ownLabels = own[String(pid)];
-      const catLabels = base.enumLabelsFor(fam, pid);
-      if (paramFingerprint(c, catLabels) === paramFingerprint(e, ownLabels)) out.exact++;
-      else if (rowsCompatible(c, catLabels, e, ownLabels)) out.compatible++;
-      else out.incompatible++;
-    }
-    if (byteExact) {
-      for (const [k, c] of Object.entries(cat)) {
-        const pid = Number(k);
-        if (pid > MAX_WIRE_PID || !isInformativeRow(c) || c.synthetic) continue;
-        const e = rows[pid];
-        if (!e || !isInformativeRow(e)) out.removed = (out.removed ?? 0) + 1;
-      }
-    }
-  }
-  return out;
-}
+// compareRows / RowComparison: src/drivers/profileCompare.ts (shared with the editor-cache contribution check).
 
 // ── layout controls that write another block's param ──────────────────────────────────────────────
 

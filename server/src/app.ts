@@ -20,7 +20,7 @@
 // shims, SSE, static UI and the Node-gated cloud/remote/telemetry surface.
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
 import cors from '@fastify/cors';
-import { existsSync, statSync, createReadStream, readFileSync } from 'node:fs';
+import { existsSync, statSync, createReadStream, readFileSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join, resolve, extname } from 'node:path';
 import type { DeviceRegistry } from './drivers/registry.js';
 import { parseHexBytes, sendErrorStatus } from './drivers/sendPolicy.js';
@@ -34,9 +34,11 @@ import type { DiscoverOpts } from './services/editorCacheDiscovery.js';
 import { FORBIDDEN_ORIGIN, isAllowedOrigin, loopbackOriginGuard, loopbackOrSameOriginGuard } from './services/originGuard.js';
 import * as cloudProfiles from './services/cloudProfiles.js';
 import * as diagnostics from './services/diagnosticCapture.js';
+import * as contribution from './services/cacheContribution.js';
 import * as store from './store.js';
 import { createUnifiedHandlers, genericFlag } from './runtime/handlers.js';
 import { putStoreDoc } from './runtime/services.js';
+import { FORBIDDEN_COLLECTION_BODY, isPrivateCollection } from './runtime/storeAccess.js';
 import { registerLocalRoutes } from './localStore.js';
 import { registerHelpRoutes } from './help.js';
 import { telemetryStatus, uploadDebugReport, type DebugReport } from './telemetry.js';
@@ -56,6 +58,22 @@ export interface AppOptions {
   /** Editor-cache disk access: where discovery looks (platform/home/env/fs) and how a discovered
    *  candidate is read. Tests point discovery at a temp or fake tree and spy on the reader. */
   editorCaches?: { discover?: DiscoverOpts; readFile?: (path: string) => { name: string; bytes: Uint8Array } };
+  /** Editor-cache contribution seams: a cloud client (tests pass a fake; production binds the AXIS_CLOUD one),
+   *  and the dry-run switches that otherwise come from FORGEFX_CONTRIBUTE_DRY_RUN / FORGEFX_CONTRIBUTE_DRY_RUN_DIR. */
+  contribute?: { cloud?: contribution.ContributionCloud | null; dryRun?: boolean; dryRunDir?: string | null };
+}
+
+/** Dry-run copy for a manual check: `<dir>/<sha256>.cache` (the redacted bytes, exactly what an upload would
+ *  send) and `<dir>/<sha256>.json` (the exact reserve body). Node-only; a failure is logged, never fatal. */
+function writeContributionDryRun(dir: string, a: NonNullable<contribution.ContributeResult['dryRunArtifacts']>, log: { info(msg: string): void; warn(msg: string): void }): void {
+  try {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, `${a.sha256}.cache`), a.redacted);
+    writeFileSync(join(dir, `${a.sha256}.json`), JSON.stringify(a.reserveBody, null, 2));
+    log.info(`[forgefx] contribution dry run: wrote ${a.sha256}.cache (${a.redacted.length} B) + .json`);
+  } catch (e) {
+    log.warn(`[forgefx] contribution dry run: could not write the copy: ${(e as Error).message}`);
+  }
 }
 
 export async function buildApp(registry: DeviceRegistry, opts: AppOptions = {}): Promise<FastifyInstance> {
@@ -191,6 +209,85 @@ export async function buildApp(registry: DeviceRegistry, opts: AppOptions = {}):
     return r.body;
   });
 
+  // ── editor-cache contribution (services/cacheContribution.ts; capability definitions.contribute) ──
+  // Send the editor's definitions cache for the connected firmware to Axis Cloud: validated, user names
+  // redacted, only the redacted copy uploaded. Every route is STRICT-origin guarded (the status lists local
+  // paths; a POST reads a local file and consent must come from the person at this machine, not a web page).
+  // Not on the Remote allowlist (remote.ts): the status GET is readable there, the POSTs are refused.
+  // The cloud client is late-bound (set in the AXIS_CLOUD block below); without one the status says
+  // cloud.enabled:false and an upload answers 503 cloud-disabled, while dry runs and decisions still work.
+  // Dry run server-wide: FORGEFX_CONTRIBUTE_DRY_RUN=1, or FORGEFX_CONTRIBUTE_DRY_RUN_DIR=<dir>, which also writes
+  // <dir>/<sha256>.cache (the redacted bytes) + <dir>/<sha256>.json (the exact reserve body) for a manual check.
+  let contributionCloud: contribution.ContributionCloud | null = null;
+  const contributionCloudOf = (): contribution.ContributionCloud | null =>
+    opts.contribute?.cloud !== undefined ? opts.contribute.cloud : contributionCloud;
+  const contributeDryRunDir = (): string | null =>
+    opts.contribute?.dryRunDir !== undefined ? opts.contribute.dryRunDir : (process.env.FORGEFX_CONTRIBUTE_DRY_RUN_DIR || null);
+  const contributeServerDryRun = (): boolean =>
+    (opts.contribute?.dryRun ?? process.env.FORGEFX_CONTRIBUTE_DRY_RUN === '1') || !!contributeDryRunDir();
+  app.get<{ Querystring: { refresh?: string } }>('/device/cache/contribute', { onRequest: loopbackOriginGuard }, async (req) =>
+    contribution.contributionStatus(store.defaultStore, registry, contributionCloudOf(), editorCacheDiscovery.discoverEditorCaches(discoverOpts), {
+      refresh: req.query.refresh === '1' || req.query.refresh === 'true'
+    }));
+  // Sources: JSON { source: { path }, consent, consentVersion, import?, acceptFirmwareMismatch?, dryRun?,
+  // axisVersion? } with a path from a FRESH discovery (400 not-a-discovered-cache otherwise; never opened or
+  // stat-ed), or the raw bytes as application/octet-stream + ?name=<file>&consent=1&consentVersion=2&... The
+  // consent gate runs before any file is read. Body limit: the 4 MiB cap plus room for a JSON envelope.
+  app.post<{ Body: Buffer | Record<string, unknown> | undefined; Querystring: Record<string, string | undefined> }>(
+    '/device/cache/contribute',
+    {
+      onRequest: loopbackOriginGuard,
+      bodyLimit: contribution.MAX_CONTRIBUTION_BYTES + 64 * 1024,
+      // a body over the limit never reaches the handler: answer it in the contract's 413 shape
+      errorHandler: (err: { statusCode?: number; code?: string }, req, reply) => {
+        if (err.statusCode === 413 || err.code === 'FST_ERR_CTP_BODY_TOO_LARGE') {
+          const r = contribution.bodyTooLarge(Number(req.headers['content-length'] ?? NaN));
+          return reply.code(r.code).send(r.body);
+        }
+        return reply.send(err);
+      }
+    },
+    async (req, reply) => {
+      const b = req.body;
+      const isBytes = Buffer.isBuffer(b);
+      const f = contribution.parseContributionFlags((isBytes ? req.query : b && typeof b === 'object' ? b : {}) as Record<string, unknown>, isBytes);
+      if (!f.ok) { reply.code(f.code); return f.body; }
+      let source: { bytes: Uint8Array; name: string };
+      if (isBytes) {
+        const name = req.query.name;
+        if (!name) { reply.code(400); return contribution.NO_SOURCE_BODY; }
+        source = { bytes: new Uint8Array(b), name };
+      } else {
+        const path = (b as { source?: { path?: unknown } } | undefined)?.source?.path;
+        if (typeof path !== 'string' || !path) { reply.code(400); return contribution.NO_SOURCE_BODY; }
+        const candidate = editorCacheDiscovery.findDiscoveredCandidate(path, discoverOpts);
+        if (!candidate) { reply.code(400); return contribution.NOT_A_DISCOVERED_CACHE_BODY; }
+        // the size discovery saw: never read a file the cap refuses anyway
+        const tooBig = contribution.sizeRefusal(candidate.size);
+        if (tooBig) { reply.code(tooBig.code); return tooBig.body; }
+        try { source = { bytes: readCandidate(candidate.path).bytes, name: candidate.file }; }
+        catch (e) { reply.code(400); return { error: 'cannot-read-file', message: (e as Error).message }; }
+      }
+      const r = await contribution.contribute(store.defaultStore, registry, contributionCloudOf(), source, f.flags, {
+        serverDryRun: contributeServerDryRun(), versions: { forgefx: FORGEFX_VERSION }
+      });
+      const dir = contributeDryRunDir();
+      if (r.dryRunArtifacts && dir) writeContributionDryRun(dir, r.dryRunArtifacts, req.log);
+      reply.code(r.code);
+      return r.body;
+    }
+  );
+  app.post<{ Body: unknown }>('/device/cache/contribute/decision', { onRequest: loopbackOriginGuard }, async (req, reply) => {
+    const r = await contribution.setContributionDecision(store.defaultStore, registry, req.body);
+    reply.code(r.code);
+    return r.body;
+  });
+  app.post('/device/cache/contribute/withdraw', { onRequest: loopbackOriginGuard }, async (_req, reply) => {
+    const r = await contribution.withdrawContribution(store.defaultStore, registry, contributionCloudOf(), { serverDryRun: contributeServerDryRun() });
+    reply.code(r.code);
+    return r.body;
+  });
+
   // ── unified handlers ──────────────────────────────────────────────────────────────────────────
   // Each capability-gated handler that a /am4/* alias folds into is a named function from
   // createUnifiedHandlers above: the unified route AND its alias call the SAME function (aliases
@@ -210,16 +307,23 @@ export async function buildApp(registry: DeviceRegistry, opts: AppOptions = {}):
   // Full per-block decoded params for one preset (every family/param) — deep-search + browser detail.
   app.get<{ Params: { n: string } }>('/presets/:n/params', async (req, reply) => presetParamsH(reply, req.params.n));
   // ── persistent store: documents (Axis config · library metadata · layouts) ──
-  app.get<{ Params: { c: string } }>('/store/:c', (req) => ({ docs: store.listDocs(req.params.c) }));
-  app.get<{ Params: { c: string; id: string } }>('/store/:c/:id', (req, reply) => {
+  // Private collections (the auth sessions in `cloud`) are refused on every method: 403 forbidden-collection,
+  // checked before the body is parsed and before anything is read or written (runtime/storeAccess.ts).
+  const privateCollection = async (req: FastifyRequest, reply: FastifyReply): Promise<FastifyReply | undefined> => {
+    const c = (req.params as { c?: unknown }).c;
+    if (typeof c === 'string' && isPrivateCollection(c)) return reply.code(403).send(FORBIDDEN_COLLECTION_BODY);
+    return undefined;
+  };
+  app.get<{ Params: { c: string } }>('/store/:c', { onRequest: privateCollection }, (req) => ({ docs: store.listDocs(req.params.c) }));
+  app.get<{ Params: { c: string; id: string } }>('/store/:c/:id', { onRequest: privateCollection }, (req, reply) => {
     const d = store.getDoc(req.params.c, req.params.id);
     if (!d) { reply.code(404); return { error: 'not found' }; }
     return d;
   });
   // Config writes fan out to every live UI (host SSE + remote relay) — see runtime/services.ts.
-  app.put<{ Params: { c: string; id: string }; Body: { data: unknown; origin?: string } }>('/store/:c/:id', (req) =>
+  app.put<{ Params: { c: string; id: string }; Body: { data: unknown; origin?: string } }>('/store/:c/:id', { onRequest: privateCollection }, (req) =>
     putStoreDoc(store.defaultStore, registry, req.params.c, req.params.id, req.body?.data, req.body?.origin));
-  app.delete<{ Params: { c: string; id: string } }>('/store/:c/:id', (req) => { store.delDoc(req.params.c, req.params.id); return { ok: true }; });
+  app.delete<{ Params: { c: string; id: string } }>('/store/:c/:id', { onRequest: privateCollection }, (req) => { store.delDoc(req.params.c, req.params.id); return { ok: true }; });
 
   // ── local storage folder (Presets/ library + Sync/ plain-syx mirror; see localStore.ts) ──
   registerLocalRoutes(app, decodeBytes);
@@ -726,6 +830,7 @@ export async function buildApp(registry: DeviceRegistry, opts: AppOptions = {}):
   if (process.env.AXIS_CLOUD === '1') {
     const { cloud } = await import('./cloud.js');
     diagCloud = cloud;
+    contributionCloud = cloud;
     type Creds = { email: string; password: string };
     app.get('/cloud/status', async () => cloud.status());
     app.post<{ Body: Creds }>('/cloud/register', async (req, reply) => { try { return await cloud.register(req.body.email, req.body.password); } catch (e) { reply.code(400); return { error: (e as Error).message }; } });

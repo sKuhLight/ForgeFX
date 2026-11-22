@@ -604,7 +604,9 @@ export class DeviceRegistry {
     else if (profile?.firmware === running || catalogFirmware === running) drift = 'none';
     else if (!profile && catalogFirmware === null) drift = 'unknown';
     else drift = 'unprofiled';
-    return { genericParams: gen3Grid, catalogFirmware, profile, drift };
+    // editor-cache contribution: the generic-params trio, an editor-cache importer, a firmware to key the file by
+    const contribute = gen3Grid && d.capabilities.cacheImport && running !== null;
+    return { genericParams: gen3Grid, catalogFirmware, profile, drift, contribute };
   }
 
   /** The capabilities object /device and /device/detect serve: the curated descriptor subset

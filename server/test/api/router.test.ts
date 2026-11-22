@@ -175,6 +175,14 @@ const ROWS: Row[] = [
   { name: 'diagnostics result (404)', method: 'GET', url: '/diagnostics/capture/result' },
   { name: 'diagnostics upload without consent (400)', method: 'POST', url: '/diagnostics/capture/upload', body: {} },
   { name: 'diagnostics upload without a result (404)', method: 'POST', url: '/diagnostics/capture/upload', body: { consent: true } },
+  // editor-cache contribution (four twins) — the fake FM3 has no generic params and no firmware: the consent
+  // gate and the source checks answer first, then the 501 / 503 gates. No discovery is reached (bytes bodies only).
+  { name: 'contribute without consent (400)', method: 'POST', url: '/device/cache/contribute', body: {} },
+  { name: 'contribute with consent v1 (400)', method: 'POST', url: '/device/cache/contribute', body: { consent: true, consentVersion: 1 } },
+  { name: 'contribute dry run without a source (400)', method: 'POST', url: '/device/cache/contribute', body: { dryRun: true } },
+  { name: 'contribution decision invalid (400)', method: 'POST', url: '/device/cache/contribute/decision', body: { decision: 'maybe' } },
+  { name: 'contribution decision without firmware (503)', method: 'POST', url: '/device/cache/contribute/decision', body: { decision: 'declined' } },
+  { name: 'contribution withdraw without firmware (503)', method: 'POST', url: '/device/cache/contribute/withdraw' },
   // version control (row order matters: backup first, listing after)
   { name: 'backup preset (dedup twin)', method: 'POST', url: '/backup/preset/5' },
   { name: 'versions', method: 'GET', url: '/versions' },

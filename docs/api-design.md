@@ -155,3 +155,129 @@ usual error body on both surfaces and over Remote:
 `capabilities.definitions` (`genericParams`, `catalogFirmware`, the applied `profile`, `drift`) and how
 rows are named are in [definitions.md](definitions.md). `server/scripts/profile-check.ts` (`npm run profile-check`)
 checks the response against a profile, offline or against a running server (GET only).
+
+---
+
+# ADR 0003 — Editor-cache contribution
+
+Status: accepted · 2026-11-22
+
+## Context
+A device on a firmware the bundled catalog does not describe is best served from the official editor's
+definitions file for that firmware. Users who have the file can send it, but the file also holds their own
+preset and cab names, and the endpoints that read local files must not be reachable from an arbitrary web
+page or over the Remote relay.
+
+## Decision
+Four additive routes, on the Fastify app and the browser runtime router (same shapes; the router has no
+disk discovery and takes the file's bytes). Gate on `capabilities.definitions.contribute`; a server without
+the routes answers 404.
+
+| Route | Purpose |
+|---|---|
+| `GET /device/cache/contribute[?refresh=1]` | offer or not, why, which local files qualify |
+| `POST /device/cache/contribute` | validate, redact, optionally import, then upload (or preview with `dryRun`) |
+| `POST /device/cache/contribute/decision` | `{ decision: "asked", days? }` (1..90, default 7) · `"declined"` · `"reset"` |
+| `POST /device/cache/contribute/withdraw` | delete this install's upload for the connected firmware |
+
+- **Origin:** every route is loopback-only (`loopbackOriginGuard`: no `Origin`, or an http(s) loopback
+  host); anything else is `403 { "error": "forbidden-origin" }` before any file is touched.
+- **Remote:** the status GET is readable over the relay; the three POSTs are not on its allowlist (consent
+  must come from the person at the machine whose file is read).
+- **No new SSE event.** A coupled import emits the existing `cacheBuild` `done` event.
+
+### Status
+```json
+{ "supported": true,
+  "device": { "model": 17, "modelHex": "11", "firmware": "13.0", "key": "11_13p0" },
+  "cloud": { "enabled": true, "signedIn": false, "wanted": true, "checkedAt": "2026-11-23T10:00:00.000Z" },
+  "decision": null, "withdrawable": false, "uploads": [], "offer": true, "reason": null,
+  "localProfile": "none", "discovery": "ok",
+  "candidates": [ { "path": "<editor dir>/effectDefinitions_11_13p0.cache", "file": "effectDefinitions_11_13p0.cache",
+                    "editor": "FM3-Edit", "size": 281000, "mtime": "2026-11-20T08:30:11.000Z", "fileVersion": "13.0", "match": "exact" } ],
+  "consentVersion": 2 }
+```
+- `cloud.wanted`: the cloud's public answer (`true`/`false`), `null` when there is no cloud or it could not
+  be reached; reused for 10 minutes per firmware (`?refresh=1` asks again). `signedIn` is a local check;
+  signing in is not required (an anonymous session is used).
+- `offer` = `supported` and a cloud that wants the file and no blocking decision. `reason` (when not
+  offered, first match): `no-device`, `unsupported`, `firmware-unknown`, `cloud-disabled`, `paused`,
+  `cloud-unreachable`, `not-wanted`, `declined`, `uploaded`, `withdrawn`, `asked` (while the snooze runs).
+- `candidates`: discovered editor files of the connected model only, exact firmware first, then newest.
+  The router answers `"discovery": "unavailable"` and no candidates.
+- `localProfile`: `byte-exact`, `live`, `cloud`, `stale` or `none` (the stored profile for this firmware).
+- `uploads`: this install's uploads for this firmware that can still be deleted, `[{ uploadId, via, uploadedAt }]`
+  (`via`: `account` or `anonymous`, the session that can delete it); `withdrawable` = any.
+- `consentVersion`: the disclosure text version a send must carry.
+
+### Sending
+JSON `{ "source": { "path": "<a candidates[].path>" }, "consent": true, "consentVersion": 2, "import": false,
+"acceptFirmwareMismatch": false, "dryRun": false, "axisVersion": "0.11.0" }`, or the raw bytes as
+`application/octet-stream` with the flags in the query (`?name=<file>&consent=1&consentVersion=2&import=1&
+acceptFirmwareMismatch=1&dryRun=1&axisVersion=…`). The path must be one of a fresh discovery's candidates
+(`400 not-a-discovered-cache` otherwise; never opened or stat-ed). Order: consent gate (nothing is read
+without it, unless `dryRun`) → source → validation → optional import → dry run answers here → upload → the
+decision `uploaded` is stored (also for a duplicate). The status of an error is the failing step's; error
+bodies after the validation carry the `import` sub-result, and `via` once a session was chosen. Size: 1 …
+4 MiB (`413 too-large { bytes, limit }` otherwise — an empty file too, a discovered file by its size before it
+is read, and a body over the route's limit in the same shape). Signed in but the account session cannot be
+loaded: `401 not-signed-in` `reason: account-session-unavailable` — never a silent anonymous upload.
+
+```json
+{ "ok": true, "dryRun": false,
+  "file": { "name": "effectDefinitions_11_13p0.cache", "bytes": 281000, "sha256": "<64 hex, of the redacted bytes>" },
+  "validation": { "model": 17, "deviceFirmware": "13.0", "fileVersion": "13.0", "contentVersion": "13.0", "firmwareMatch": "exact",
+    "buildDate": null, "deviceBuild": null, "sections": 45, "records": 2500, "unmappedSections": 4, "suspectFamilies": [],
+    "catalog": { "firmware": "12.0", "exact": 1600, "compatible": 70, "incompatible": 2, "newRows": 8, "agreement": 0.9988 } },
+  "redaction": { "version": 1, "tables": 2, "names": 1024, "presetNames": 512, "userCabNames": 512 },
+  "import": { "skipped": "not-requested" },
+  "upload": { "status": "complete", "uploadId": "<uuid>", "deduped": false, "covered": false, "via": "anonymous" } }
+```
+- A dry run answers `"dryRun": true, "upload": null, "wouldSend": { …the exact upload request… }`.
+- `import`: `{ "status": 200, "imported": true, "key": "11_13p0" }` or `{ "skipped": "not-requested" |
+  "firmware-differs" | "newer-profile" }` (never over a profile a newer build wrote). A failed import stops
+  before the upload (`500 import-failed`); a failed upload keeps a successful import.
+- `upload.uploadId` is `null` when the cloud already holds identical bytes from someone else (nothing of
+  this install's to withdraw; earlier uploads stay listed). `covered`: the firmware is no longer being
+  collected. `via`: the session the upload ran under.
+
+The upload request (also `wouldSend`) carries counts and version stamps only:
+```json
+{ "model": 17, "deviceFirmware": "13.0", "fileVersion": "13.0", "contentVersion": "13.0",
+  "fileName": "effectDefinitions_11_13p0.cache", "sha256": "…", "bytes": 281000,
+  "redaction": { "version": 1, "tables": 2, "names": 1024 },
+  "summary": { "sections": 45, "records": 2500, "unmappedSections": 4, "suspectFamilies": [], "newRows": 8, "incompatibleRows": 2, "agreement": 0.9988 },
+  "app": { "forgefx": "…", "codec": "…", "axis": "…" },
+  "consentAt": "2026-11-23T10:00:00.000Z", "consentVersion": 2 }
+```
+
+### Decisions and withdraw
+- Decision: `200 { "key": "11_13p0", "decision": { "state": "asked", "at": "…", "until": "…" } | null }`;
+  `400 invalid-request`; `503 no-device` / `firmware-unknown`. Decisions are per model and firmware; an
+  upload stays withdrawable through any later decision.
+- Withdraw deletes **every** listed upload, each under the session that made it, and records `withdrawn`
+  once none is left. Before a delete, the current session of that kind must be the one that uploaded (an
+  anonymous session that was re-minted, or another signed-in account, is refused). Answers carry
+  `uploads: [{ uploadId, via, result }]` (`deleted`, `gone`, `session-mismatch`, `not-signed-in`, `failed`):
+  `200 { "ok": true, "uploadId": "…", "via": "anonymous", "deleted": true }`; `404 nothing-to-withdraw`;
+  `404 not-found` (all already gone in the cloud, still recorded as withdrawn); `409 session-mismatch` (not
+  deleted, stays listed); `401 not-signed-in` (the session that uploaded is gone); `503 cloud-disabled` /
+  `dry-run`; `502 cloud`. On a partial failure the deleted uploads leave the list and the rest stay.
+
+### Errors
+| Status | `error` |
+|---|---|
+| 400 | `not-consented`, `unsupported-consent-version` `{consentVersion, supported}`, `invalid-request`, `not-an-editor-cache-name`, `not-a-discovered-cache`, `cannot-read-file` |
+| 401 | `not-signed-in` (`reason`: `account-required`, `account-session-unavailable`, `account-signed-out`, `anonymous-sign-in-failed`, `anonymous-session-missing`) |
+| 403 | `forbidden-origin` |
+| 404 | `nothing-to-withdraw`, `not-found` |
+| 409 | `model-mismatch` `{expected, got}`, `firmware-differs` `{deviceFirmware, fileVersion, contentVersion, overridable}`, `not-wanted`, `firmware-limit` `{limit}`, `session-mismatch` (withdraw) |
+| 413 | `too-large` `{bytes, limit, stage?}` (outside 1 … 4 MiB, here or in the cloud) |
+| 422 | `cache-parse-failed` `{message}`, `renamed-cache`, `unrelated-cache` `{agreement, floor}`, `redaction-failed`, `invalid-cache` `{reason}` (refused by the cloud's own check) |
+| 429 | `rate-limited`, `quota-exceeded` `{retryAfterSeconds, scope?}` |
+| 500 | `import-failed` |
+| 501 | `unsupported` `{capability: "contribute"}` |
+| 502 | `cloud` `{status, message}` |
+| 503 | `no-device`, `firmware-unknown`, `cloud-disabled`, `paused`, `dry-run` |
+
+Messages never quote the file's content.

@@ -90,7 +90,7 @@ Served by `GET /device` and `GET /device/detect` on every device:
 ```json
 "definitions": { "genericParams": true, "catalogFirmware": "12.0",
   "profile": { "key": "11_99p0", "source": "editor-cache", "byteExact": true, "firmware": "99.0", "suspectFamilies": [] },
-  "drift": "none" }
+  "drift": "none", "contribute": true }
 ```
 - `genericParams`: the device serves `?generic=1` (gen-3 grid devices with self-describe: Axe-Fx III, FM3,
   FM9). Others ignore the flag and answer the classic shape without a `definitions` block.
@@ -99,6 +99,9 @@ Served by `GET /device` and `GET /device/detect` on every device:
 - `drift`: `none` (an applied profile of the running firmware, or the running firmware is the catalog's),
   `unprofiled` (neither: the generic response may be missing newer parameters), `unknown` (firmware not
   read, or no catalog firmware and no profile to compare).
+- `contribute`: the device can contribute its editor definitions file (see below): a `genericParams` device
+  that imports editor caches and whose firmware was read. Whether the cloud wants the file is not a device
+  fact; it is in the contribution status.
 
 ## Checking it: `profile-check`
 `server/scripts/profile-check.ts` checks that every row a profile describes is listed or hidden, and that
@@ -130,3 +133,37 @@ npm run profile-check -- --url http://127.0.0.1:5056 [--eid 1] [--profile <file>
 `FORGEFX_DEFS_FORCE_GENERIC="CHORUS:8"` (comma-separated `FAMILY:pid`, a bare pid joins the previous
 family) serves the listed ids as generic parameters whatever the catalog knows. For testing only:
 default off, read from the process environment, never read by the browser runtime.
+
+## Contributing the editor's definitions file
+A firmware the bundled catalog does not describe yet is supported fastest from the official editor's
+definitions file for it. With the user's explicit consent, ForgeFX sends that file to Axis Cloud, where only
+the maintainer can read it (API: [api-design.md](api-design.md#adr-0003--editor-cache-contribution)).
+
+- **Only what is needed leaves the machine.** Next to the firmware's definitions, the file the editor writes
+  for a connected unit holds the owner's own **preset names** and **user cab names**. They are replaced by
+  placeholders (every character becomes `_`) before anything is sent, by the codec's redaction, which
+  re-checks its own output; ForgeFX checks it once more. Sizes, offsets and every other byte stay as they
+  are, so the copy is still a valid definitions file. Only that redacted copy is uploaded, with counts
+  (`redaction: { version, tables, names }`), never the names. Residue that remains: name lengths and the
+  number of entries.
+- **Validated locally first.** The file must carry the editor's own name for the connected model, the
+  version in its name must equal the version inside the file (a renamed file is refused), it must parse
+  completely, and its rows must agree with the device's bundled catalog (at least half of the comparable
+  rows). The firmware that counts is the one read from the device; a file for another firmware needs an
+  explicit confirmation and never counts as covering the device's firmware.
+- **Who sends it.** A signed-in Axis Cloud account, or, when nobody is signed in, an anonymous upload
+  session that ForgeFX creates on first use and keeps next to the account session in the local store. The
+  anonymous id is minted by the cloud's auth service; it is not, and is not derived from, the telemetry
+  instance id. The same session can delete the upload later; every upload this install made for a firmware
+  stays listed (with the session kind that made it) until it is withdrawn, and a withdraw refuses to run
+  under a session other than the one that uploaded. A signed-in user whose account session cannot be loaded
+  gets an error, never a silent anonymous upload.
+- **Asked once per firmware.** The status says whether the cloud still wants a file for the connected
+  model and firmware; the user's choice (later / never for this firmware / uploaded / withdrawn) is stored
+  locally in the `cacheContributions` collection, keyed like the device caches, without paths or names.
+- **Optionally used locally too.** `import: true` also applies the (original, unredacted) file as the
+  device profile, exactly like an editor-cache import, when its firmware matches the device's.
+- **Dry run.** `dryRun: true` does everything except the cloud writes and answers with the exact request it
+  would send (`wouldSend`). Server-wide: `FORGEFX_CONTRIBUTE_DRY_RUN=1`, or
+  `FORGEFX_CONTRIBUTE_DRY_RUN_DIR=<dir>`, which also writes `<dir>/<sha256>.cache` (the redacted copy) and
+  `<dir>/<sha256>.json` (the request body) so the redaction can be checked by hand. Node server only.

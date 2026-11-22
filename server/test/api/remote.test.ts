@@ -36,6 +36,8 @@ const ALLOWED: [string, string][] = [
   ['POST', '/mod/bind'],
   ['PUT', '/device/param'],
   ['GET', '/telemetry/config'],  // read relays broadly
+  ['GET', '/device/cache/contribute'], // editor-cache contribution status: readable by the same user, like /device/cache/sources
+  ['GET', '/device/cache/contribute?refresh=1'],
   ['PUT', '/telemetry/config'],  // benign cadence-mode control (no device data moves)
   // deprecated aliases stay relayable during the window
   ['PUT', '/am4/param'],
@@ -65,6 +67,14 @@ const REJECTED: [string, string][] = [
   ['PUT', '/store/library/someid'],  // only the config collection relays — never presets/backups/library docs
   ['PUT', '/store/backups/someid'],
   ['DELETE', '/store/config/layouts'],
+  ['GET', '/store/cloud'],             // the auth sessions (account + anonymous upload session) — never relayed
+  ['GET', '/store/cloud/sb-x-auth-token'],
+  ['GET', '/store/CLOUD/sb-x-auth-token'], // case-insensitive file systems map it to the same file
+  // editor-cache contribution: consent comes from the person at the machine whose file is read — never relayed
+  ['POST', '/device/cache/contribute'],
+  ['POST', '/device/cache/contribute?name=effectDefinitions_11_13p0.cache&consent=1&consentVersion=2'],
+  ['POST', '/device/cache/contribute/decision'],
+  ['POST', '/device/cache/contribute/withdraw'],
 ];
 
 // Requests relayed end to end, with the status the remote must receive.

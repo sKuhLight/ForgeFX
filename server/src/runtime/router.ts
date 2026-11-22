@@ -21,10 +21,12 @@ import * as deviceCache from '../services/deviceCache.js';
 import * as editorCacheImport from '../services/editorCacheImport.js';
 import * as cloudProfiles from '../services/cloudProfiles.js';
 import * as diagnostics from '../services/diagnosticCapture.js';
+import * as contribution from '../services/cacheContribution.js';
 import { blockHelpBySlug, helpIndex } from '../help.js';
 import { createUnifiedHandlers, genericFlag } from './handlers.js';
 import { sendErrorStatus } from '../drivers/sendPolicy.js';
 import { putStoreDoc } from './services.js';
+import { FORBIDDEN_COLLECTION_BODY, isPrivateCollection } from './storeAccess.js';
 import { createLocalService } from './localService.js';
 import type { FolderAdapter } from './folderAdapter.js';
 import type { ScanCachePersistence } from './localFolder.js';
@@ -171,6 +173,40 @@ export function createRouter(deps: RuntimeDeps): {
     c.reply.code(r.code);
     return r.body;
   }, { octet: true });
+  // ── editor-cache contribution (services/cacheContribution.ts). No discovery here: the status lists no
+  //    candidates (discovery:'unavailable') and a POST takes the bytes (file picker / remembered folder) as
+  //    application/octet-stream + ?name=&consent=1&consentVersion=2&...; a `{ source: { path } }` body gets the
+  //    same 400 as an undiscovered path on the server. No origin guard (an in-page call, no HTTP request).
+  //    deps.cloud absent → cloud.enabled:false in the status, 503 cloud-disabled on a non-dry send. ──
+  on('GET', '/device/cache/contribute', (c) => contribution.contributionStatus(store, registry, deps.cloud ?? null, null, {
+    refresh: c.query.get('refresh') === '1' || c.query.get('refresh') === 'true'
+  }));
+  on('POST', '/device/cache/contribute', async (c) => {
+    const isBytes = !!c.raw;
+    const f = contribution.parseContributionFlags(isBytes ? Object.fromEntries(c.query) : ((c.body ?? {}) as Record<string, unknown>), isBytes);
+    if (!f.ok) { c.reply.code(f.code); return f.body; }
+    const name = c.query.get('name');
+    if (!c.raw || !name) {
+      const path = (c.body as { source?: { path?: unknown } } | null)?.source?.path;
+      c.reply.code(400);
+      return !c.raw && typeof path === 'string' && path ? contribution.NOT_A_DISCOVERED_CACHE_BODY : contribution.NO_SOURCE_BODY;
+    }
+    const r = await contribution.contribute(store, registry, deps.cloud ?? null, { bytes: c.raw, name }, f.flags, {
+      versions: { forgefx: deps.versions?.forgefx, codec: deps.versions?.codec }
+    });
+    c.reply.code(r.code);
+    return r.body;
+  }, { octet: true });
+  on('POST', '/device/cache/contribute/decision', async (c) => {
+    const r = await contribution.setContributionDecision(store, registry, c.body);
+    c.reply.code(r.code);
+    return r.body;
+  });
+  on('POST', '/device/cache/contribute/withdraw', async (c) => {
+    const r = await contribution.withdrawContribution(store, registry, deps.cloud ?? null);
+    c.reply.code(r.code);
+    return r.body;
+  });
   // ── shared device-definition profiles (THIRD cache source; services/cloudProfiles.ts). deps.cloud is
   //    optional — absent (no cloud in this runtime) degrades to the same non-erroring disabled shape. ──
   on('GET', '/device/cache/cloud', () => cloudProfiles.cloudCacheCheck(deps.cloud ?? null, store, registry));
@@ -475,18 +511,22 @@ export function createRouter(deps: RuntimeDeps): {
   });
 
   // ── persistent store: documents (Axis config · library metadata · layouts) ──
-  on('GET', '/store/:c', (c) => ({ docs: store.listDocs(c.params.c!) }));
+  // Private collections (the auth sessions in `cloud`) are refused like on the server (storeAccess.ts).
+  const refused = (c: Ctx): boolean => { if (!isPrivateCollection(c.params.c!)) return false; c.reply.code(403); return true; };
+  on('GET', '/store/:c', (c) => (refused(c) ? FORBIDDEN_COLLECTION_BODY : { docs: store.listDocs(c.params.c!) }));
   on('GET', '/store/:c/:id', (c) => {
+    if (refused(c)) return FORBIDDEN_COLLECTION_BODY;
     const d = store.getDoc(c.params.c!, c.params.id!);
     if (!d) { c.reply.code(404); return { error: 'not found' }; }
     return d;
   });
   // Config writes fan out to every live UI (router subscribers, like the host's SSE) — shared putStoreDoc.
   on('PUT', '/store/:c/:id', (c) => {
+    if (refused(c)) return FORBIDDEN_COLLECTION_BODY;
     const b = c.body as { data?: unknown; origin?: string } | undefined;
     return putStoreDoc(store, registry, c.params.c!, c.params.id!, b?.data, b?.origin);
   });
-  on('DELETE', '/store/:c/:id', (c) => { store.delDoc(c.params.c!, c.params.id!); return { ok: true }; });
+  on('DELETE', '/store/:c/:id', (c) => { if (refused(c)) return FORBIDDEN_COLLECTION_BODY; store.delDoc(c.params.c!, c.params.id!); return { ok: true }; });
 
   // ── local storage folder (Presets/ library + Sync/ mirror; shared service — see localService.ts) ──
   on('GET', '/local/config', async (c) => send(c, await local.config()));

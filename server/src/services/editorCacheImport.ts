@@ -91,23 +91,48 @@ export async function importEditorCache(
 
   let built: BuiltCache;
   try {
-    const catalog = catalogForModel(model);
-    built = await buildCache(
-      { kind: 'bytes', buf: bytes },
-      catalog.params,
-      catalog.seeds,
-      { model, firmware: fileFw, builtAt: new Date().toISOString() },
-    );
+    built = await buildEditorCache(model, bytes, fileFw);
   } catch (e) {
     // A malformed/foreign cache throws a WalkError (or a seed-anchor failure) — surface it as a 422.
     return { code: 422, body: { error: 'cache-parse-failed', message: (e as Error).message } };
   }
 
+  return importBuiltCache(registry, store, built, info);
+}
+
+/** Build an editor cache's bytes through the codec BYTE source for `model` (strict walk), stamped with the
+ *  file's firmware and a build time. Throws a `WalkError` or a seed-anchor failure on a malformed/foreign
+ *  cache. Shared by the import and the contribution validation, so both build the same document. */
+export async function buildEditorCache(model: number, bytes: Uint8Array, fileFw: string): Promise<BuiltCache> {
+  const catalog = catalogForModel(model);
+  return buildCache(
+    { kind: 'bytes', buf: bytes },
+    catalog.params,
+    catalog.seeds,
+    { model, firmware: fileFw, builtAt: new Date().toISOString() },
+  );
+}
+
+/**
+ * Persist an already BUILT editor cache (`buildEditorCache`) as the device cache and swap the runtime
+ * profile — the second half of `importEditorCache`, split out so the contribution path imports the cache it
+ * validated without building it twice. The caller has already checked capability, model and firmware.
+ * `file` is the file name's identity (model + firmware), the key fallback when the device firmware is unknown.
+ */
+export async function importBuiltCache(
+  registry: DeviceRegistry,
+  store: Store,
+  built: BuiltCache,
+  file: EditorCacheFileInfo,
+): Promise<ImportResult> {
+  const model = file.model;
+  const fw = registry.firmwareInfo();
+  const fileFw = `${file.fwMajor}.${file.fwMinor}`;
   // Persist under the CONNECTED device's key so applyRuntimeCache (which reads by the device's own
   // firmware) picks it up immediately; fall back to the file's firmware only when the device's is
   // unknown (force path). Provenance rides in `meta.source` + `firmware`.
-  const keyMajor = fw?.major ?? info.fwMajor;
-  const keyMinor = fw?.minor ?? info.fwMinor;
+  const keyMajor = fw?.major ?? file.fwMajor;
+  const keyMinor = fw?.minor ?? file.fwMinor;
   const key = deviceCacheKey(model, keyMajor, keyMinor);
   // `built.meta.schema` is the codec's current stamp, so an import over a stale profile replaces it
   // with a usable one (the import never consults the stored profile, stale or not).

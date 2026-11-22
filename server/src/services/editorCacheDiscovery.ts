@@ -20,6 +20,8 @@ import { parseEditorCacheFilename } from './editorCacheImport.js';
 export interface EditorCacheCandidate {
   path: string;
   file: string;
+  /** The editor's directory name under `Fractal Audio/` (e.g. `FM3-Edit`): which editor wrote the file. */
+  editor: string;
   model: number;
   fwMajor: number;
   fwMinor: number;
@@ -88,7 +90,7 @@ export function discoverEditorCaches(opts: DiscoverOpts = {}): EditorCacheCandid
         const path = join(dir, file);
         let st: { size: number; mtimeMs: number };
         try { st = fs.statSync(path); } catch { continue; }
-        out.push({ path, file, model: info.model, fwMajor: info.fwMajor, fwMinor: info.fwMinor, size: st.size, mtime: new Date(st.mtimeMs).toISOString() });
+        out.push({ path, file, editor, model: info.model, fwMajor: info.fwMajor, fwMinor: info.fwMinor, size: st.size, mtime: new Date(st.mtimeMs).toISOString() });
       }
     }
   }

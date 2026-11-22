@@ -15,7 +15,7 @@ import { buildTestApp, firmwareVersionReply } from '../helpers/api.js';
 import { catalogBuilt } from '../helpers/catalogProfile.js';
 import { MockTransport, handshakeReply, isIdentifyBroadcast, assert, assertEqual } from '../helpers/mock.js';
 
-export const CAPS_CASE_COUNT = 12;
+export const CAPS_CASE_COUNT = 13;
 
 type Caps = {
   slotModel: string;
@@ -544,7 +544,7 @@ async function definitionsKeyOrder(): Promise<void> {
       assertEqual(keys.filter((k) => k !== 'definitions').join(','), previous.join(','), `${name}: every previous key keeps its place, none is added or dropped`);
       assertEqual(keys[keys.indexOf('virtualEffects') + 1], 'definitions', `${name}: definitions follows virtualEffects`);
       assertEqual(keys[keys.indexOf('definitions') + 1], 'telemetryControl', `${name}: definitions comes before telemetryControl`);
-      assertEqual(Object.keys(caps.definitions as object).join(','), 'genericParams,catalogFirmware,profile,drift', `${name}: definitions key order`);
+      assertEqual(Object.keys(caps.definitions as object).join(','), 'genericParams,catalogFirmware,profile,drift,contribute', `${name}: definitions key order`);
       // the pretty-printed diff against the previous shape only adds lines
       const without = { ...caps };
       delete without.definitions;
@@ -556,6 +556,21 @@ async function definitionsKeyOrder(): Promise<void> {
       assertEqual(after.slice(0, at).join('\n'), before.slice(0, at).join('\n'), `${name}: no line before the insertion changes`);
       assertEqual(after.slice(at + added).join('\n'), before.slice(at).join('\n'), `${name}: no line after the insertion changes`);
     } finally { await r.app.close(); }
+  }
+}
+
+// editor-cache contribution: the gen-3 grid trio (III/FM3/FM9) with a firmware read; false without one and on
+// every other device (AM4, Axe-Fx II, VP4, gen-1)
+async function definitionsContribute(): Promise<void> {
+  for (const [modelId, name, fw] of [[0x10, 'Axe-Fx III', [32, 6]], [0x11, 'FM3', [13, 0]], [0x12, 'FM9', [12, 0]]] as const) {
+    let r = await defsRig(modelId, [fw[0], fw[1]]);
+    try { assertEqual((await definitionsOf(r)).contribute, true, `${name} with firmware ${fw.join('.')}: contribute`); } finally { await r.app.close(); }
+    r = await defsRig(modelId, null);
+    try { assertEqual((await definitionsOf(r)).contribute, false, `${name} without a firmware read: no contribute`); } finally { await r.app.close(); }
+  }
+  for (const [modelId, name] of [[0x15, 'AM4'], [0x07, 'Axe-Fx II'], [0x14, 'VP4'], [0x01, 'gen-1']] as const) {
+    const r = await defsRig(modelId, [13, 0]);
+    try { assertEqual((await definitionsOf(r)).contribute, false, `${name}: no contribute`); } finally { await r.app.close(); }
   }
 }
 
@@ -572,4 +587,5 @@ export async function runCapsTests(): Promise<void> {
   await definitionsAppliedProfile();
   await definitionsFollowsRegistry();
   await definitionsKeyOrder();
+  await definitionsContribute();
 }

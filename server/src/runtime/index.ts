@@ -54,3 +54,15 @@ export { blockHelpBySlug, helpIndex, type BlockHelpDTO } from '../help.js';
 
 // ── cloud sync (optional router dep; supabase-js is isomorphic) ──
 export { createCloud, Cloud, type CloudConfig, type CloudService } from './cloud.js';
+export {
+  runSignedUpload, ANONYMOUS_UPLOADER_STORAGE_KEY,
+  type SignedUploadTransport, type SignedUploadSpec, type SignedUploadOutcome,
+  type EditorCacheReserveBody, type EditorCacheCloudOutcome, type UploaderSession
+} from './cloud.js';
+
+// ── editor-cache contribution (the shapes Axis' dialog consumes; the routes are in the router) ──
+export {
+  CONTRIBUTION_CONSENT_VERSION, SUPPORTED_CONSENT_VERSIONS, MAX_CONTRIBUTION_BYTES, CONTRIBUTIONS_COLLECTION,
+  type ContributionStatus, type ContributionCandidate, type ContributionDecision, type ContributionReason,
+  type ContributionImport, type ContributionCloud, type LocalProfileState, type ContributionUpload, type WithdrawItem
+} from '../services/cacheContribution.js';
