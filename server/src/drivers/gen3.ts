@@ -984,6 +984,13 @@ class Gen3Driver implements DeviceDriver {
   /** The unmapped set the last `definitions`/`unmapped-blocks` event (or the session start) reported, as a key. */
   #unmappedSig = '';
 
+  /** Effect ids of the blocks in the edit-buffer grid as last read (shunts and empty cells left out), sorted and
+   *  unique; null before the first grid read of the session. No device traffic. */
+  placedEffectIds(): number[] | null {
+    if (!this.#lastPlaced) return null;
+    return [...new Set(this.#lastPlaced.eids)].sort((a, b) => a - b);
+  }
+
   /** Effect ids of the last read edit-buffer grid that no param family describes, sorted and unique; null before
    *  the first grid read of the session. No device traffic: the capabilities report the runtime coverage gap
    *  `unmapped-block` from it. A block counts as described when:

@@ -142,7 +142,7 @@ export async function buildApp(registry: DeviceRegistry, opts: AppOptions = {}):
     presetSelectH, presetStoreH, presetNameH, locationsH,
     backupH, restoreH, fwValidateH, deviceParamH, modModelH,
     telemetryConfigH, telemetrySetH,
-    decodeH, decodeBytes
+    decodeH, decodeBytes, definitionsDiffH
   } = createUnifiedHandlers(registry);
 
   // ── deprecated-alias plumbing (the folded /am4/* routes) ──
@@ -217,6 +217,10 @@ export async function buildApp(registry: DeviceRegistry, opts: AppOptions = {}):
   app.post('/device/cache/cancel', () => deviceCache.cancelCacheBuild(registry));
   // Delete the current key's stored cache.
   app.delete('/device/cache', () => deviceCache.deleteCache(store.defaultStore, registry));
+  // Definitions diff: the bundled catalog against the applied profile (`family=` repeatable, `include=` parts). Reads
+  // state the registry holds — no detection, no device traffic (runtime/handlers.ts definitionsDiffH).
+  app.get<{ Querystring: { family?: string | string[]; include?: string | string[] } }>('/device/definitions/diff', (req, reply) =>
+    definitionsDiffH(reply, { family: req.query.family, include: req.query.include }));
 
   // ── editor-cache import (SECOND cache source: an official-editor effectDefinitions_*.cache file;
   //    capability cacheImport). See services/editorCacheImport.ts + editorCacheDiscovery.ts. ──

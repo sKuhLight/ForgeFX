@@ -153,6 +153,9 @@ export function createRouter(deps: RuntimeDeps): {
   });
   on('POST', '/device/cache/cancel', () => deviceCache.cancelCacheBuild(registry));
   on('DELETE', '/device/cache', () => deviceCache.deleteCache(store, registry));
+  // definitions diff (shared handler; an absent `include` is no `include`, like Fastify's missing key)
+  on('GET', '/device/definitions/diff', (c) =>
+    h.definitionsDiffH(c.reply, { family: c.query.getAll('family'), include: c.query.has('include') ? c.query.getAll('include') : undefined }));
   // ── editor-cache import (SECOND cache source; capability cacheImport). Disk discovery is Node-only,
   //    so the browser twin returns an empty candidate list (discovery:'unavailable') + octet-only import.
   //    No loopback-origin guard here (app.ts has one, FORGEFX-47): the router is an in-page function call

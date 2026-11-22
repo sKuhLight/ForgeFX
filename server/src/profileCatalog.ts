@@ -65,6 +65,14 @@ const MAX_EID = 255;
 /** The voter's roster selector per family: `<F>_TYPE`, except where the codec names another one. */
 const ROSTER_SELECTOR: Readonly<Record<string, string>> = { DELAY: 'DELAY_MODEL' };
 
+/** The catalog pid of `family`'s roster selector (the param whose labels are the family's model list: `<F>_TYPE`,
+ *  `DELAY_MODEL` for DELAY — the section voter's rule, as `profileCatalogFor(model).rosters` uses it), undefined when
+ *  the model's catalog has no such param. */
+export function rosterSelectorPid(model: number, family: string): number | undefined {
+  const name = ROSTER_SELECTOR[family] ?? `${family}_TYPE`;
+  return paramsForModel(model).find((p) => p.family === family && p.name === name)?.paramId;
+}
+
 const CATALOGS = new Map<number, ProfileCatalog>();
 
 /**

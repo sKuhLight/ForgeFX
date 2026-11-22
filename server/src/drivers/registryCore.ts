@@ -54,6 +54,7 @@ import { createGen2Driver } from './gen2.js';
 import { createGen1Driver } from './gen1.js';
 import { createVp4Driver } from './vp4.js';
 import type { DeviceDriver, DeviceEvent, DriverCtx, DriverCapabilities, DefinitionsCaps } from './types.js';
+import { definitionsDrift, type AppliedDefinitions } from './definitionsDiff.js';
 import { assertRawProbeAllowed } from './sendPolicy.js';
 import { cadenceFor, isTelemetryMode, TELEMETRY_MODES, type TelemetryMode, type CadenceProfile } from './telemetryProfiles.js';
 
@@ -244,6 +245,9 @@ export class DeviceRegistry {
   // what applyRuntimeCache last found stored under the running firmware's key (absent / usable / stale), so
   // capabilities.definitions can tell `partial` and `stale` from `none` and `unprofiled`.
   #appliedSummary: ProfileSummary | null = null;
+  // The stored document the applied runtime profile was layered from (with `#appliedProfileKey`): what the
+  // definitions diff compares against the catalog, without reading the store or the device again.
+  #appliedDoc: BuiltCache | null = null;
   #storedVerdict: { key: string; verdict: ProfileVerdict } | null = null;
   // The active driver — set ONLY by detect() from a positively identified (or forced) model. No
   // identification → no active driver → the telemetry supervisor never fires a frame at an unknown
@@ -596,12 +600,20 @@ export class DeviceRegistry {
    *  compared as `formatFirmwareVersion` produced them ("13.0"): the running firmware, the profile document's
    *  and the catalog baseline's all use that form. */
   #definitionsCaps(mid: number, d: DeviceDriver): DefinitionsCaps {
+    return this.#definitionsState(mid, d).caps;
+  }
+
+  /** `capabilities.definitions` for model `mid` served by driver `d`, plus the applied profile it describes (key,
+   *  stored document, runtime profile) — one computation for the capabilities and the definitions diff, so the
+   *  diff's `state` is the caps' `drift` of the same moment. No device traffic. */
+  #definitionsState(mid: number, d: DeviceDriver): { caps: DefinitionsCaps; applied: AppliedDefinitions | null } {
     const gen3Grid = d.capabilities.slotModel === 'grid' && d.capabilities.selfDescribe && !!d.applyRuntimeProfile;
     const catalogFirmware = gen3Grid ? profileForModel(mid).catalogFirmware : null;
     // the applied runtime profile: `#prof` is one only while it carries facts and belongs to this model (an
     // AM4 detect keeps the previous gen-3 `#prof`, which must not leak into its caps)
     const facts = gen3Grid && this.#prof.model === mid ? this.#prof.profileFacts : undefined;
     let profile: DefinitionsCaps['profile'] = null;
+    let applied: AppliedDefinitions | null = null;
     // the runtime gap: a block of the last read grid that no family describes (state != confirmed)
     let unmapped = false;
     if (facts && this.#appliedProfileKey) {
@@ -615,26 +627,37 @@ export class DeviceRegistry {
         sources: [...new Set((summary?.sources ?? []).map((s) => s.kind))],
         coverage: { complete: (summary?.coverage.complete ?? true) && !unmapped, gaps }
       };
+      if (this.#appliedDoc) applied = { key: this.#appliedProfileKey, doc: this.#appliedDoc, profile: this.#prof };
     }
     const running = this.#firmware?.version ?? null;
     const runningKey = running !== null && this.#firmware ? deviceCacheKey(mid, this.#firmware.major, this.#firmware.minor) : null;
     const storedStale = runningKey !== null && this.#storedVerdict?.key === runningKey && this.#storedVerdict.verdict.state === 'stale';
-    let drift: DefinitionsCaps['drift'];
-    if (running === null) drift = 'unknown';
-    else if (profile && (profile.firmware === running || catalogFirmware === running)) {
-      // an applied profile with a blocking gap (the document's own, e.g. unresolved replies of its walk, or the
-      // runtime unmapped-block) is partial — also on the catalog's own firmware: the profile is layered over the
-      // catalog and its gaps are real holes in what is applied (the codec only blocks the gaps the catalog cannot
-      // fill — high ids, rosters, blocks above 160 — when the firmware differs)
-      const docBlocking = !(this.#appliedSummary?.coverage.complete ?? true);
-      drift = unmapped || docBlocking ? 'partial' : 'none';
-    } else if (catalogFirmware === running) drift = 'none';
-    else if (storedStale) drift = 'stale';
-    else if (!profile && catalogFirmware === null) drift = 'unknown';
-    else drift = 'unprofiled';
+    const drift = definitionsDrift({
+      running, catalogFirmware, unmapped, storedStale,
+      applied: profile ? { firmware: profile.firmware, blocking: !(this.#appliedSummary?.coverage.complete ?? true) } : null
+    });
     // editor-cache contribution: the generic-params trio, an editor-cache importer, a firmware to key the file by
     const contribute = gen3Grid && d.capabilities.cacheImport && running !== null;
-    return { genericParams: gen3Grid, catalogFirmware, profile, drift, contribute };
+    return { caps: { genericParams: gen3Grid, catalogFirmware, profile, drift, contribute }, applied };
+  }
+
+  /** What `GET /device/definitions/diff` reads, all of it state the registry and the driver already hold (no
+   *  detection, no store read, no device traffic): the detected model, its `capabilities.definitions` of this moment,
+   *  the running firmware, the bundled profile, the applied runtime profile and its document, and the blocks of the
+   *  edit-buffer grid as last read. Null when no unit has been identified yet (detection is never triggered here),
+   *  or no driver serves the identified model. */
+  definitionsDiffContext(): {
+    model: number; caps: DefinitionsCaps; firmware: string | null; staticProfile: DeviceProfile; applied: AppliedDefinitions | null;
+    placedEids: number[] | null; unmappedEids: number[] | null;
+  } | null {
+    const mid = this.#modelId;
+    const d = mid >= 0 ? this.#driverFor(mid) : null;
+    if (mid < 0 || !d) return null;
+    const { caps, applied } = this.#definitionsState(mid, d);
+    return {
+      model: mid, caps, firmware: this.#firmware?.version ?? null, staticProfile: profileForModel(mid), applied,
+      placedEids: d.placedEffectIds?.() ?? null, unmappedEids: d.unmappedPlacedEffectIds?.() ?? null
+    };
   }
 
   /** The capabilities object /device and /device/detect serve: the curated descriptor subset
@@ -857,6 +880,7 @@ export class DeviceRegistry {
       // no usable profile for this model+firmware: the bundled profile is the live one
       this.#appliedProfileKey = null;
       this.#appliedSummary = null;
+      this.#appliedDoc = null;
       if (bundled) {
         d.applyRuntimeProfile(bundled);
         this.#prof = bundled;
@@ -869,6 +893,7 @@ export class DeviceRegistry {
       this.#prof = runtime; // keep /diag + reporting profile in sync for gen-3
       this.#appliedProfileKey = key;
       this.#appliedSummary = profileSummaryOf(built, mid);
+      this.#appliedDoc = built;
     }
   }
 

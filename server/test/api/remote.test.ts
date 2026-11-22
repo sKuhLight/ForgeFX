@@ -38,6 +38,8 @@ const ALLOWED: [string, string][] = [
   ['GET', '/telemetry/config'],  // read relays broadly
   ['GET', '/device/cache/contribute'], // editor-cache contribution status: readable by the same user, like /device/cache/sources
   ['GET', '/device/cache/contribute?refresh=1'],
+  ['GET', '/device/definitions/diff'], // the definitions diff: a read, relayed like the caps it explains
+  ['GET', '/device/definitions/diff?family=DISTORT&include=params,rosters'],
   ['PUT', '/telemetry/config'],  // benign cadence-mode control (no device data moves)
   // deprecated aliases stay relayable during the window
   ['PUT', '/am4/param'],

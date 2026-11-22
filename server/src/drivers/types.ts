@@ -8,7 +8,7 @@ import type {
   HiddenParam, NameConfidence, NameSource, ParamKind, ParamSource, ParamWidget, ReadOnlyReason, WidgetSource, WriteMode
 } from './paramIndex.js';
 import type { Transport } from '../transport/types.js';
-import type { CoverageGapKind, RawSourceKind } from 'forgefx-midi/cache';
+import type { CoverageGapKind, ProfileCoverage, RawSourceKind, SectionRole, SourceSummary } from 'forgefx-midi/cache';
 import type { TelemetryMode, CadenceProfile } from './telemetryProfiles.js';
 
 /** Thrown by a driver's verbatim-dump export when the slot is an unused (empty) preset slot: its dump is
@@ -172,6 +172,105 @@ export interface DefinitionsCaps {
    *  driver that imports editor caches and whose firmware was read. Whether the cloud wants the file, and
    *  whether a cloud is configured at all, is in the contribution status, not here. */
   contribute: boolean;
+}
+
+/** The parts of `GET /device/definitions/diff` a client can ask for (`include=`; default: all of them). */
+export type DefinitionsDiffPart = 'params' | 'rosters' | 'enums' | 'strides' | 'sections' | 'blocks' | 'instances';
+
+/** One param in the definitions diff: the device's row (added / changed) or the catalog's (removed). */
+export interface ParamDelta {
+  id: number;
+  /** The public catalog label the param index serves at this pid, or `P<pid>`. */
+  name: string;
+  kind: 'float' | 'enum';
+  /** `name` is a generic `P<pid>` name. */
+  generic: boolean;
+  /** Display range of a float row. */
+  min?: number;
+  max?: number;
+  /** Device-true display unit of the row, when the profile carries one. */
+  unit?: string;
+  /** Number of options of an enum-kind row (its labels, else its ordinal range). */
+  options?: number;
+  /** The param index moved `name` here with its row: the catalog pid the name came from (an `added` entry with it is a
+   *  param that moved, not a new one). */
+  movedFrom?: number;
+  /** `changed` only: how the device row relates to the catalog row at the same pid. */
+  change?: 'compatible' | 'incompatible';
+  fpBefore?: string;
+  fpAfter?: string;
+}
+
+/** A model list (roster selector labels) of a family, catalog against the device. */
+export interface RosterDelta {
+  /** The device pid of the roster selector (it follows the selector's name when the row moved). */
+  selectorId: number;
+  before: number;
+  after: number;
+  appended: string[];
+  inserted: Array<{ ordinal: number; label: string }>;
+  renamed: Array<{ ordinal: number; from: string; to: string }>;
+  removed: Array<{ ordinal: number; label: string }>;
+  /** A kept label sits at another ordinal now (stored selections change meaning). */
+  ordinalShift: boolean;
+}
+
+export interface FamilyDiff {
+  family: string;
+  /** The family's first effect id, null when it has none (not addressable). */
+  eid: number | null;
+  status: 'unchanged' | 'changed' | 'suspect' | 'disagreement' | 'catalog-only';
+  /** Absent when `include` leaves out `params`. One entry per pid in `added` / `changed` (the profile rows) and for every
+   *  catalog row the profile no longer has in `removed` — named `P<pid>` (generic) when the param index serves that
+   *  pid's catalog name at another pid. `removed` also lists, under its catalog name and pid, every catalog name the
+   *  index serves nowhere whose catalog row no profile row carries any more (the param vanished; its pid now holds
+   *  another one). `removed` is null where nothing can be said: the family's rows are not byte-exact, or a suspect
+   *  family was not compared. */
+  params?: { added: ParamDelta[]; changed: ParamDelta[]; removed: ParamDelta[] | null; moved: Array<{ name: string; from: number; to: number }> };
+  /** Present when the roster changed (and `include` has `rosters`). */
+  roster?: RosterDelta;
+  /** Changed label lists other than the roster. Absent when `include` leaves out `enums`. */
+  enums?: Array<{ id: number; name: string; before: number; after: number; change: 'appended' | 'renamed' | 'inserted' | 'removed' | 'replaced' }>;
+  /** Present when the section stride changed (and `include` has `strides`). */
+  stride?: { before: number; after: number };
+}
+
+/** An editor-cache section no catalog family took: one the catalog firmware lacks (`new`), one there is no inventory
+ *  to judge (`unclassified`), or any unassigned section a block is bound to. */
+export interface SectionDiff { tag: number; key: string; role: SectionRole; stride: number; informative: number; mappedEids: number[] }
+
+/** A block no catalog family places: a block-map entry of the applied profile, or a placed block nothing describes. */
+export interface UnknownBlockDiff {
+  eid: number;
+  /** In the edit-buffer grid as last read (false when no grid was read this session). */
+  placed: boolean;
+  state: 'confirmed' | 'likely' | 'candidates' | 'none';
+  key: string | null;
+  sectionTag: number | null;
+  /** Params a block read serves for it (the param index of `key`), 0 unless confirmed. */
+  params: number;
+}
+
+/** `GET /device/definitions/diff`: the bundled catalog against the applied profile of the running firmware. */
+export interface DefinitionsDiffDTO {
+  model: number;
+  firmware: string | null;
+  catalogFirmware: string | null;
+  /** Equal to `capabilities.definitions.drift` at the same moment. */
+  state: DefinitionsCaps['drift'];
+  profile: { key: string; source: ProfileSource; byteExact: boolean; format: 1 | 2; sources: SourceSummary[] } | null;
+  /** Over the whole profile, whatever `family` and `include` select. */
+  summary: {
+    /** Row counts (`compareRows`): `removed` counts catalog rows the profile no longer has. */
+    newParams: number; changed: { compatible: number; incompatible: number }; removed: number | null;
+    movedNames: number; rosterChanges: number; enumChanges: number; strideChanges: number;
+    newSections: number; unknownBlocks: number; suspects: string[]; disagreements: string[];
+  };
+  families: FamilyDiff[];
+  /** Absent when `include` leaves them out. */
+  sections?: SectionDiff[];
+  blocks?: UnknownBlockDiff[];
+  instances?: ProfileCoverage['instances'];
 }
 
 /** `GET /preset/blocks/:eid/params` as classic clients know it. */
@@ -409,6 +508,9 @@ export interface DeviceDriver {
    *  describes — not the current profile, not the model's static roster / effect-id spans, not a `confirmed`
    *  block-map entry of the applied document (no device traffic); null before the first grid read of the session. */
   unmappedPlacedEffectIds?(): number[] | null;
+  /** Gen-3 grid drivers: effect ids of the blocks in the edit-buffer grid as last read, sorted and unique (no device
+   *  traffic); null before the first grid read of the session. */
+  placedEffectIds?(): number[] | null;
   /** A (re)detect activated this driver: forget what it learned about the previous connection (gen-3: the
    *  dump-header strictness proven on it and the known current slot). Drivers keep no such state otherwise. */
   resetSession?(): void;
