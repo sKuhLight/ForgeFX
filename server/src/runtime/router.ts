@@ -152,12 +152,17 @@ export function createRouter(deps: RuntimeDeps): {
   on('POST', '/device/cache/cancel', () => deviceCache.cancelCacheBuild(registry));
   on('DELETE', '/device/cache', () => deviceCache.deleteCache(store, registry));
   // ── editor-cache import (SECOND cache source; capability cacheImport). Disk discovery is Node-only,
-  //    so the browser twin returns an empty candidate list (discovery:'unavailable') + octet-only import. ──
+  //    so the browser twin returns an empty candidate list (discovery:'unavailable') + octet-only import.
+  //    No loopback-origin guard here (app.ts has one, FORGEFX-47): the router is an in-page function call
+  //    with no HTTP request and no Origin, and it never touches a file path. A JSON `{ path }` body gets
+  //    the server's allowlist answer, since no path is a discovered cache when nothing is discovered. ──
   on('GET', '/device/cache/sources', async () => {
     const persisted = await editorCacheImport.isPersisted(store, registry);
     return { persisted, candidates: [], discovery: 'unavailable' };
   });
   on('POST', '/device/cache/import', async (c) => {
+    const path = (c.body as { path?: unknown } | null)?.path;
+    if (!c.raw && typeof path === 'string' && path) { c.reply.code(400); return { error: editorCacheImport.NOT_A_DISCOVERED_CACHE }; }
     if (!c.raw || !c.raw.length) { c.reply.code(400); return { error: 'POST the .cache bytes as application/octet-stream with ?name=<filename>' }; }
     const name = c.query.get('name');
     if (!name) { c.reply.code(400); return { error: 'missing ?name=<filename>' }; }

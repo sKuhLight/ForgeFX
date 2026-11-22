@@ -80,7 +80,7 @@ type Res = { id: string; status: number; contentType: string; body: string; enco
 
 /** A private Realtime channel stand-in: subscribes at once, hands `req` broadcasts to the host's handler and
  *  records what the host sends back. */
-function fakeChannelSession() {
+export function fakeChannelSession() {
   const handlers = new Map<string, (msg: { payload?: unknown }) => void>();
   const sent: { event: string; payload: unknown }[] = [];
   const chan = {

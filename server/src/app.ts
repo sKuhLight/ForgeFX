@@ -30,6 +30,8 @@ import type { ConverterPreset } from 'forgefx-midi/convert';
 import * as deviceCache from './services/deviceCache.js';
 import * as editorCacheImport from './services/editorCacheImport.js';
 import * as editorCacheDiscovery from './services/editorCacheDiscovery.js';
+import type { DiscoverOpts } from './services/editorCacheDiscovery.js';
+import { FORBIDDEN_ORIGIN, isAllowedOrigin, loopbackOriginGuard, loopbackOrSameOriginGuard } from './services/originGuard.js';
 import * as cloudProfiles from './services/cloudProfiles.js';
 import * as diagnostics from './services/diagnosticCapture.js';
 import * as store from './store.js';
@@ -49,7 +51,14 @@ const FORGEFX_VERSION: string = (() => {
   }
 })();
 
-export async function buildApp(registry: DeviceRegistry): Promise<FastifyInstance> {
+/** Optional seams for the API tests; production passes nothing (real disk, real discovery roots). */
+export interface AppOptions {
+  /** Editor-cache disk access: where discovery looks (platform/home/env/fs) and how a discovered
+   *  candidate is read. Tests point discovery at a temp or fake tree and spy on the reader. */
+  editorCaches?: { discover?: DiscoverOpts; readFile?: (path: string) => { name: string; bytes: Uint8Array } };
+}
+
+export async function buildApp(registry: DeviceRegistry, opts: AppOptions = {}): Promise<FastifyInstance> {
   const app = Fastify({ logger: { level: process.env.LOG_LEVEL ?? 'info' } });
   await app.register(cors, { origin: true });
   // tolerate an empty JSON body (no-body POSTs like /cloud/sync, /cloud/logout, /tempo/tap send
@@ -142,20 +151,33 @@ export async function buildApp(registry: DeviceRegistry): Promise<FastifyInstanc
 
   // ── editor-cache import (SECOND cache source: an official-editor effectDefinitions_*.cache file;
   //    capability cacheImport). See services/editorCacheImport.ts + editorCacheDiscovery.ts. ──
+  // Origin guards (FORGEFX-47, services/originGuard.ts): a foreign web page gets 403 before any fs
+  // access. Sources and the `{ path }` import read the disk or return local paths: STRICT (loopback or
+  // no Origin). The bytes import reads nothing local: RELAXED (also same-origin), so a LAN browser on a
+  // headless ForgeFX (Docker, Raspberry Pi) that serves the SPA can still drop a .cache file.
+  const discoverOpts = opts.editorCaches?.discover ?? {};
+  const readCandidate = opts.editorCaches?.readFile ?? editorCacheDiscovery.readCandidateFile;
   // Sources: is a cache already persisted for the attached device + which on-disk editor caches exist.
-  app.get('/device/cache/sources', async () => {
+  app.get('/device/cache/sources', { onRequest: loopbackOriginGuard }, async () => {
     const persisted = await editorCacheImport.isPersisted(store.defaultStore, registry);
-    return { persisted, candidates: editorCacheDiscovery.discoverEditorCaches() };
+    return { persisted, candidates: editorCacheDiscovery.discoverEditorCaches(discoverOpts) };
   });
   // Import: raw octet-stream of the .cache file + ?name=<filename> (& ?force=1), OR JSON { path } to
   // read a discovered candidate off disk. 501 no cacheImport, 409 model/firmware mismatch (force skips fw).
-  app.post<{ Body: Buffer | { path?: string }; Querystring: { name?: string; force?: string } }>('/device/cache/import', async (req, reply) => {
+  // The route-level hook is the relaxed guard; the `{ path }` branch re-checks the strict rule (403)
+  // before discovery runs. `{ path }` must then be one of a fresh discovery's candidates (400
+  // not-a-discovered-cache otherwise; the path is never opened or stat-ed); the read uses the
+  // candidate's own path.
+  app.post<{ Body: Buffer | { path?: string }; Querystring: { name?: string; force?: string } }>('/device/cache/import', { onRequest: loopbackOrSameOriginGuard }, async (req, reply) => {
     const force = req.query.force === '1' || req.query.force === 'true';
     const b = req.body;
     let bytes: Uint8Array;
     let name: string;
     if (b && !Buffer.isBuffer(b) && typeof b.path === 'string' && b.path) {
-      try { const read = editorCacheDiscovery.readCandidateFile(b.path); bytes = read.bytes; name = read.name; }
+      if (!isAllowedOrigin(req.headers.origin)) { reply.code(403); return { error: FORBIDDEN_ORIGIN }; }
+      const candidate = editorCacheDiscovery.findDiscoveredCandidate(b.path, discoverOpts);
+      if (!candidate) { reply.code(400); return { error: editorCacheImport.NOT_A_DISCOVERED_CACHE }; }
+      try { const read = readCandidate(candidate.path); bytes = read.bytes; name = read.name; }
       catch (e) { reply.code(400); return { error: 'cannot read path', message: (e as Error).message }; }
     } else if (Buffer.isBuffer(b)) {
       const nm = req.query.name;

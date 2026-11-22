@@ -13,7 +13,7 @@
 // hardcoded — every immediate subdir of a `Fractal Audio` base is scanned.
 import { existsSync, readdirSync, statSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { basename, join } from 'node:path';
+import { basename, join, resolve } from 'node:path';
 import { parseEditorCacheFilename } from './editorCacheImport.js';
 
 /** One discovered `.cache` file on disk, with its parsed identity + fs stat. */
@@ -95,8 +95,26 @@ export function discoverEditorCaches(opts: DiscoverOpts = {}): EditorCacheCandid
   return out;
 }
 
-/** Read a discovered candidate off disk (for the `{ path }` import body). Returns the basename +
- *  raw bytes; throws if the file is missing/unreadable. Node-only (real fs). */
+/** The allowlist compare key: absolute + normalised by string only (the client's path is never
+ *  stat-ed or realpath-ed), case-folded on Windows, whose file systems are case-insensitive. */
+function candidateKey(p: string, platform: NodeJS.Platform): string {
+  const abs = resolve(p);
+  return platform === 'win32' ? abs.toLowerCase() : abs;
+}
+
+/** Discovered-path allowlist (FORGEFX-47): the candidate of a FRESH discovery scan whose path equals
+ *  `path`, or null. Only the discovery roots are touched; the given path itself is never opened or
+ *  stat-ed, so a non-candidate can't be used to probe the disk. Callers read the returned
+ *  candidate's own `path`, never the client's string. */
+export function findDiscoveredCandidate(path: string, opts: DiscoverOpts = {}): EditorCacheCandidate | null {
+  if (typeof path !== 'string' || !path || path.includes('\0')) return null;
+  const platform = opts.platform ?? process.platform;
+  const want = candidateKey(path, platform);
+  return discoverEditorCaches(opts).find((c) => candidateKey(c.path, platform) === want) ?? null;
+}
+
+/** Read a discovered candidate off disk (for the `{ path }` import body, after the allowlist check
+ *  above). Returns the basename + raw bytes; throws if the file is missing/unreadable. Node-only. */
 export function readCandidateFile(path: string): { name: string; bytes: Uint8Array } {
   const buf = readFileSync(path);
   return { name: basename(path), bytes: new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength) };

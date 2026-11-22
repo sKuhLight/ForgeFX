@@ -45,6 +45,7 @@ import { runSyncPlanTests, SYNCPLAN_CASE_COUNT } from './api/syncplan.test.js';
 import { runRouterParityTests, ROUTER_PARITY_CASE_COUNT } from './api/router.test.js';
 import { runDeviceCacheTests, DEVICE_CACHE_CASE_COUNT } from './api/device-cache.test.js';
 import { runEditorCacheImportTests, EDITOR_CACHE_IMPORT_CASE_COUNT } from './api/editor-cache-import.test.js';
+import { runOriginGuardTests, ORIGIN_GUARD_CASE_COUNT } from './api/origin-guard.test.js';
 import { runCloudProfilesTests, CLOUD_PROFILES_CASE_COUNT } from './api/cloud-profiles.test.js';
 import { runProfileSchemaTests, PROFILE_SCHEMA_CASE_COUNT } from './api/profile-schema.test.js';
 import { runPresetConvertTests, PRESET_CONVERT_CASE_COUNT } from './api/preset-convert.test.js';
@@ -95,6 +96,7 @@ const tests: Array<{ name: string; run: () => void | Promise<void> }> = [
   { name: `api/router (${ROUTER_PARITY_CASE_COUNT} app↔runtime-router parity twins, mocked FM3 + a classic-only AM4 for ?generic=1)`, run: runRouterParityTests },
   { name: `api/device-cache (${DEVICE_CACHE_CASE_COUNT} cases, on-connect self-describe build, mocked FM3/AM4)`, run: runDeviceCacheTests },
   { name: `api/editor-cache-import (${EDITOR_CACHE_IMPORT_CASE_COUNT} cases, .cache byte-source import + disk discovery, mocked FM3/AM4)`, run: runEditorCacheImportTests },
+  { name: `api/origin-guard (${ORIGIN_GUARD_CASE_COUNT} cases, FORGEFX-47: loopback-origin guard on the editor-cache routes (foreign origin and null → 403 before any fs access; no Origin, loopback, Axis desktop + Vite dev origins allowed), discovered-path allowlist on the path import (400, never stat-ed or read; Windows case folding), LAN same-origin bytes import allowed (path import + listing stay 403, Origin/Host mismatch 403), router twin, Remote relay; temp trees, mocked FM3)`, run: runOriginGuardTests },
   { name: `api/cloud-profiles (${CLOUD_PROFILES_CASE_COUNT} cases, shared profile check/pull/publish, mocked cloud)`, run: runCloudProfilesTests },
   { name: `api/profile-schema (${PROFILE_SCHEMA_CASE_COUNT} cases, stale profile gate: runtime apply, status, build, import/sources, cloud check/pull/publish, walk limits, app↔router parity, mocked FM3)`, run: runProfileSchemaTests },
   { name: `api/preset-convert (${PRESET_CONVERT_CASE_COUNT} cases, cross-device convert offline/connected/501/caps, mocked)`, run: runPresetConvertTests },

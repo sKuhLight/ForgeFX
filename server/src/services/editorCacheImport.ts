@@ -24,6 +24,10 @@ export interface EditorCacheFileInfo { model: number; fwMajor: number; fwMinor: 
  *  deviceCache.StartResult so the routes stay one-liners over both twins. */
 export interface ImportResult { code: number; body: unknown }
 
+/** 400 error code for a `{ path }` import body naming a file that is not a discovered editor cache
+ *  (FORGEFX-47). The browser twin has no discovery, so every path gets it there. */
+export const NOT_A_DISCOVERED_CACHE = 'not-a-discovered-cache';
+
 // e.g. `effectDefinitions_11_12p0.cache` (FM3 fw 12.0), `effectDefinitions_15_2p1.cache` (AM4 fw 2.1).
 const FILENAME_RE = /^effectDefinitions_([0-9a-fA-F]{1,2})_(\d+)p(\d+)\.cache$/;
 
