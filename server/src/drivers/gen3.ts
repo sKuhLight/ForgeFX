@@ -614,6 +614,9 @@ function paramMetaOf(e: ParamEntry): ParamMeta {
  *  `CABINET_MUTE1`). The button's own `paramId` is an editor pseudo id and stays as it is. */
 const BUTTON_SYMBOL = /^([A-Z0-9]+)_BTN_([A-Z]+\d*)$/;
 
+/** Layout widgets that only display a value (a button is excluded: a scene-ignore button writes its param). */
+const DISPLAY_ONLY_WIDGETS: ReadonlySet<string> = new Set(['meter', 'readout', 'label', 'graph', 'spacer']);
+
 /** A copy of `layout` with every control passed through `fn`. A control `fn` returns as it is stays shared, and
  *  so does every row, page and layout in which nothing changed. */
 function mapLayoutControls(layout: DeviceLayout, fn: (c: DeviceLayoutControl) => DeviceLayoutControl): DeviceLayout {
@@ -1138,17 +1141,23 @@ class Gen3Driver implements DeviceDriver {
     return map;
   }
 
-  /** The status-dump request in flight, if any: a caller that needs the status while one is pending awaits that
-   *  request instead of queueing another (each caller still decides on its own retry). */
-  #statusInflight: Promise<StatusMap> | null = null;
+  /** The status-dump request in flight, if any, and how long it waits for its reply: a caller that needs the
+   *  status while one is pending awaits that request instead of queueing another, as long as it would not wait
+   *  longer itself (each caller still decides on its own retry). */
+  #statusInflight: { promise: Promise<StatusMap>; timeoutMs: number } | null = null;
 
-  /** One fn 0x13 status-dump request (or the one already in flight); an empty map when it failed or timed out. */
+  /** One fn 0x13 status-dump request; an empty map when it failed or timed out. A request already in flight is
+   *  joined when its timeout is at least `timeoutMs`. A caller that waits longer (the first request of a block
+   *  read on a slow link, 4 s, while the channel-watch poll's 1.5 s request is pending) issues its own, which the
+   *  serialised queue sends after the pending one: joining would cut its wait short exactly when the unit is
+   *  busy (after a scene switch). Later callers then join the longer request. */
   #readStatusDump(dev: Transport, timeoutMs: number): Promise<StatusMap> {
-    if (this.#statusInflight) return this.#statusInflight;
+    const pending = this.#statusInflight;
+    if (pending && pending.timeoutMs >= timeoutMs) return pending.promise;
     const p: Promise<StatusMap> = this.#requestStatusDump(dev, timeoutMs).finally(() => {
-      if (this.#statusInflight === p) this.#statusInflight = null;
+      if (this.#statusInflight?.promise === p) this.#statusInflight = null;
     });
-    this.#statusInflight = p;
+    this.#statusInflight = { promise: p, timeoutMs };
     return p;
   }
 
@@ -1518,9 +1527,10 @@ class Gen3Driver implements DeviceDriver {
    *  - A button control (`<F>_BTN_<X><n>`, an editor pseudo id) gains `boundParamId`: the served param it presses.
    *  - A control of this family whose catalog name now sits at another pid (the name followed its row) is pointed
    *    there: `paramId` becomes that pid and `movedFrom` keeps the catalog pid.
-   *  - A control whose catalog name the device does not serve any more although the catalog has a row for it (a
-   *    byte-exact profile dropped it, or a shift left its name without a unique row) keeps its `paramId` and is
-   *    marked `unbound`, so it is not written to whatever sits at that pid now.
+   *  - A control whose catalog name the device does not serve any more although the catalog has a device-mined row
+   *    for it (a byte-exact profile dropped it, or a shift left its name without a unique row) keeps its `paramId`
+   *    and is marked `unbound`, so it is not written to whatever sits at that pid now. Display-only controls
+   *    (meters, readouts, labels, graphs) and rows the catalog made up from inline bounds are never unbound.
    *  A cross-block control that references this family is treated like the family's own (its reference follows
    *  too). Controls that address another family, pseudo ids and names that did not move stay as they are. */
   #servedLayout(layout: DeviceLayout, family: string, index: BlockIndex): DeviceLayout {
@@ -1545,8 +1555,11 @@ class Gen3Driver implements DeviceDriver {
         const crossBlock = c.crossBlock && c.crossBlock.paramId === def.paramId ? { crossBlock: { ...c.crossBlock, paramId: at } } : {};
         return { ...c, paramId: at, movedFrom: def.paramId, ...crossBlock };
       }
+      // Only a row the catalog mined from the device proves the param existed: a row the III table made up from
+      // inline bounds (synthetic) is not in any device cache, so its absence from the profile says nothing (the
+      // gain-reduction meters). A control that only displays something writes nothing to protect.
       const row = catalogRows[def.paramId];
-      return row && isInformativeRow(row) ? { ...c, unbound: true } : c;
+      return row && isInformativeRow(row) && !row.synthetic && !DISPLAY_ONLY_WIDGETS.has(c.widget) ? { ...c, unbound: true } : c;
     });
   }
 

@@ -5,15 +5,17 @@
 // (same reads, numbers kept, additive `unresolved` markers). Committed catalog data and synthetic bodies only.
 import { PROFILES, SLUG_FAMILY, runtimeProfileFrom, type DeviceLayout, type DeviceLayoutControl, type DeviceProfile, type ParamDef, type RangeDef, type SelectorValues } from '../../src/devices.js';
 import { buildParamIndex } from '../../src/drivers/paramIndex.js';
-import { parseForcedGeneric } from '../../src/drivers/gen3.js';
+import { createGen3Driver, parseForcedGeneric } from '../../src/drivers/gen3.js';
+import { cadenceFor } from '../../src/drivers/telemetryProfiles.js';
 import type { BlockParamsDTO, BlockParamsV2DTO, PresetGridDTO } from '../../src/drivers/types.js';
 import { CACHE_SCHEMA, isInformativeRow, type BuiltCache } from 'forgefx-midi/cache';
 import { createModernFractalCodec } from 'forgefx-midi/gen3/axe-fx-iii';
 import { assert, assertEqual } from '../helpers/mock.js';
 import { catalogBuilt, mockGen3Device } from '../helpers/catalogProfile.js';
-import { mockBlockDevice, eidOfSlug, compactHex } from '../helpers/blockRead.js';
+import { mockBlockDevice, eidOfSlug, compactHex, enc14, sysex } from '../helpers/blockRead.js';
+import { VirtualClock, FakeLink, QueueTransport, track } from '../helpers/virtualLink.js';
 
-export const BLOCK_PARAMS_V2_CASE_COUNT = 22;
+export const BLOCK_PARAMS_V2_CASE_COUNT = 25;
 
 const FM3 = PROFILES[0x11]!;
 const FM9 = PROFILES[0x12]!;
@@ -558,7 +560,7 @@ export async function runBlockParamsV2Tests(): Promise<void> {
       pages: [{ name: 'p', rows: [{ section: 'parameters', controls: [
         ctl('ROTARY_BTN_MUTE1', 0xff06, { widget: 'button', rawWidget: 'button' }),
         ctl('ROTARY_A', 1), ctl('ROTARY_B', 2), ctl('ROTARY_C', 3), ctl('ROTARY_MODE', 4, { widget: 'dropdown', rawWidget: 'dropdown' }),
-        ctl('ROTARY_E', 5), ctl('ROTARY_F', 6),
+        ctl('ROTARY_E', 5), ctl('ROTARY_F', 6), ctl('ROTARY_B', 2, { widget: 'meter', rawWidget: 'meter' }),
         ctl('DELAY_TIME', 3, { crossBlock: { effect: 'ID_DELAY1', family: 'DELAY', paramName: 'DELAY_TIME', paramId: 3 } }),
         ctl('ROTARY_C', 3, { crossBlock: { effect: 'ID_ROTARY2', family: 'ROTARY', paramName: 'ROTARY_C', paramId: 3 } }),
         ctl(null, null, { widget: 'spacer', rawWidget: 'spacer' }),
@@ -597,8 +599,8 @@ export async function runBlockParamsV2Tests(): Promise<void> {
     const show = (c: DeviceLayoutControl) =>
       `${c.paramName}:${c.paramId}${c.movedFrom !== undefined ? `<${c.movedFrom}` : ''}${c.unbound ? ':unbound' : ''}${c.boundParamId !== undefined ? `=>${c.boundParamId}` : ''}${c.crossBlock ? `@${c.crossBlock.family}:${c.crossBlock.paramId}` : ''}`;
     assertEqual(controls.map(show).join(' '),
-      'ROTARY_BTN_MUTE1:65286=>0 ROTARY_A:1 ROTARY_B:2:unbound ROTARY_C:4<3 ROTARY_MODE:5<4 ROTARY_E:5:unbound ROTARY_F:6 DELAY_TIME:3@DELAY:3 ROTARY_C:4<3@ROTARY:4 null:null',
-      'moved names are followed (movedFrom), dropped and lost names unbound, the button bound, another family untouched, a reference to this family followed');
+      'ROTARY_BTN_MUTE1:65286=>0 ROTARY_A:1 ROTARY_B:2:unbound ROTARY_C:4<3 ROTARY_MODE:5<4 ROTARY_E:5:unbound ROTARY_F:6 ROTARY_B:2 DELAY_TIME:3@DELAY:3 ROTARY_C:4<3@ROTARY:4 null:null',
+      'moved names are followed (movedFrom), dropped and lost names unbound (not a display-only meter), the button bound, another family untouched, a reference to this family followed');
     assert(controls[1] === editor.pages[0]!.rows[0]!.controls[1], 'an untouched control is served as it is');
     assertEqual(JSON.stringify(editor), editorJson, 'the editor layout itself is not modified');
     // the variant and the page selectors are read where the names sit now: MODE's value is the one at pid 5
@@ -616,5 +618,98 @@ export async function runBlockParamsV2Tests(): Promise<void> {
     assertEqual(plainControls[0]!.boundParamId, 0, 'catalog only: the button is bound');
     console.log('  drivers/block-params-v2: generic layout follows moved names (movedFrom), unbinds dropped / lost names; buttons, other families and the classic layout unchanged');
   }
-}
 
+  // ---- 23. a byte-exact Axe-Fx III profile: the gain-reduction meters stay bound --------------------------------
+  {
+    // the III's static table makes rows up from inline bounds (synthetic) where its device cache has none; a
+    // byte-exact profile hides them as removed, but that says nothing about the device: the meters still work
+    const controlsOf = (r: BlockParamsV2DTO) => (r.layout?.pages ?? []).flatMap((pg) => pg.rows.flatMap((row) => row.controls));
+    const exact = runtimeProfileFrom(catalogBuilt(0x10), AXE3);
+    for (const [slug, fam, name] of [['comp', 'COMP', 'COMP_GAINMONITOR'], ['gate', 'GATE', 'GATE_GAINMONITOR']] as const) {
+      const eid = eidOfSlug(slug);
+      const pid = AXE3.params[fam]!.find((d) => d.name === name)!.paramId;
+      assertEqual(AXE3.ranges[fam]![pid]?.synthetic, true, `premise: ${name} has a row made up from inline bounds`);
+      const r = await mockGen3Device(exact, [eid]).driver.blockParams(eid, { generic: true });
+      assert(r.definitions.hidden.some((h) => h.id === pid && h.reason === 'removed'), `premise: ${name} is hidden as removed`);
+      const meters = controlsOf(r).filter((c) => c.paramName === name);
+      assert(meters.length > 0 && meters.every((c) => c.widget === 'meter'), `premise: the layout draws ${name} as a meter`);
+      assert(meters.every((c) => c.unbound === undefined && c.paramId === pid && c.movedFrom === undefined), `${name}: the meter stays bound to pid ${pid}`);
+    }
+    // a device-mined row the profile dropped still unbinds its control on the III
+    const comp = eidOfSlug('comp');
+    const plain = await mockGen3Device(exact, [comp]).driver.blockParams(comp, { generic: true });
+    const knob = controlsOf(plain).find((c) => {
+      const row = c.paramId !== null && c.paramId <= 0x3fff ? AXE3.ranges.COMP![c.paramId] : undefined;
+      return c.widget === 'knob' && !c.crossBlock && !!row && !row.synthetic && isInformativeRow(row);
+    });
+    assert(knob !== undefined, 'premise: the III Compressor layout has a knob on a device-mined row');
+    const b = catalogBuilt(0x10);
+    (b.ranges.COMP as Record<number, RangeDef>)[knob.paramId!] = { kind: 'float', displayMin: 0, displayMax: 0, scale: 0, step: 0, typecode: 0 };
+    const dropped = await mockGen3Device(runtimeProfileFrom(b, AXE3), [comp]).driver.blockParams(comp, { generic: true });
+    const gone = controlsOf(dropped).filter((c) => c.paramName === knob.paramName);
+    assert(gone.length > 0 && gone.every((c) => c.unbound === true), `${knob.paramName}: a device-mined row the profile dropped unbinds its control`);
+    console.log('  drivers/block-params-v2: byte-exact III — gain-reduction meters (inline-bound rows) stay bound; a dropped device row still unbinds');
+  }
+  // ---- 24. a pending status request is joined only by a caller that would not wait longer ------------------------
+  {
+    const settle = () => new Promise((resolve) => setTimeout(resolve, 20));
+    // slow link: the poll's 1.5 s request is pending when a block read wants its 4 s one; joining would cut the
+    // block read's wait to 1.5 s exactly when the unit is busy. It asks on its own (the queue sends it after the poll's).
+    const busy = statusRig({ lost: 1, slow: true });
+    busy.hold();
+    const poll = busy.driver.getActiveChannels();
+    await settle();
+    const read = busy.driver.blockParams(DELAY, { generic: true });
+    await settle();
+    busy.release();
+    const [chans, r] = await Promise.all([poll, read]);
+    assertEqual(busy.timeouts.join(','), '1500,4000', 'slow link: the block read does not join the poll\'s shorter request');
+    assertEqual(chans.size, 0, 'the poll takes its lost reply as it is');
+    assertEqual(r.definitions.channel, 2, 'the block read gets the channel from its own request, without a retry');
+    // a caller that waits no longer than the pending request joins it: the poll joins a block read's 4 s request
+    const joined = statusRig({ slow: true });
+    joined.hold();
+    const first = joined.driver.blockParams(DELAY, { generic: true });
+    await settle();
+    const second = joined.driver.getActiveChannels();
+    await settle();
+    joined.release();
+    const [r1, c2] = await Promise.all([first, second]);
+    assertEqual(joined.timeouts.join(','), '4000', 'the poll joins the pending longer request');
+    assertEqual(`${r1.definitions.channel}/${c2.get(DELAY)}`, '2/2', 'both get its answer');
+    // after the longer request settled, a new caller asks again
+    await joined.driver.getActiveChannels();
+    assertEqual(joined.timeouts.join(','), '4000,1500', 'a later caller asks again');
+    console.log('  drivers/block-params-v2: a pending status request is joined only by a caller with no longer timeout (slow link: block read 4 s beside the 1.5 s poll)');
+  }
+
+  // ---- 25. over the serialised queue: a status read after an awaited write never gets a reply from before it ------
+  {
+    const clock = new VirtualClock();
+    const link = new FakeLink(clock);
+    const queue = new QueueTransport(link); // ONE transport: the driver asks for it on every operation
+    const driver = createGen3Driver(FM3, { transport: async () => queue, emit: () => {}, getCadence: () => cadenceFor(0x11, 'balanced') });
+    // the unit answers each status request 40 ms later: channel A before the write, channel C after it
+    let statusRequests = 0;
+    let wrote = false;
+    link.device = (bytes, at) => {
+      if (bytes[5] === 0x01) wrote = true;
+      if (compactHex(bytes) !== statusHex) return;
+      statusRequests++;
+      link.emitAt(at + 40, sysex(0x11, 0x13, [...enc14(DELAY), (wrote ? 2 : 0) << 1]));
+    };
+    const poll = track(clock, driver.getActiveChannels()); // a status request goes out first and is pending...
+    const after = track(clock, (async () => {
+      await driver.setParam(DELAY, 0, 0.5, true); // ...when a caller writes and waits for the write,
+      return driver.getActiveChannels(); //            then reads the status again
+    })());
+    await clock.advanceTo(5000);
+    assert(poll.done && after.done, 'both callers finished');
+    assertEqual(poll.value!.get(DELAY), 0, 'the pending request gets the reply from before the write');
+    assertEqual(after.value!.get(DELAY), 2, 'the read after the awaited write gets a reply from after it');
+    assertEqual(statusRequests, 2, 'it issued its own request: the earlier one had settled before the write went out');
+    const order = link.sent.map((s) => (compactHex(s.bytes) === statusHex ? 'status' : s.bytes[5] === 0x01 ? 'write' : 'other')).join(',');
+    assertEqual(order, 'status,write,status', 'the queue serialises status, write, status');
+    console.log('  drivers/block-params-v2: over the serialised queue a status read after an awaited write asks again (never a reply from before the write)');
+  }
+}

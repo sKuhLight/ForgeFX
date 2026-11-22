@@ -156,11 +156,12 @@ function coverage(s: Sweep, label: string, backing: 'profile' | 'catalog'): void
     if (!fromProfile || p.model !== 0x10) assertEqual(removed.length, 0, `${at}: the catalog read back loses nothing`);
     else for (const h of removed) assert(staticP.ranges[fam]![h.id]?.synthetic === true, `${at} ${h.id}: only rows the III table made up from inline bounds are removed`);
     for (const e of entriesOf(r)) if (!e.generic) assertEqual(e.nameConfidence, 'high', `${at} ${e.id}: every name is confirmed`);
-    // the layout: no name moved; a control is unbound only where its row was removed
+    // the layout: no name moved, and no control is unbound. The only rows a catalog read back removes (on the III)
+    // are rows the bundled table made up from inline bounds, which prove nothing about the device (the
+    // gain-reduction meters), so their controls stay bound.
     const controls = (r.layout?.pages ?? []).flatMap((pg) => pg.rows.flatMap((row) => row.controls));
     assert(controls.every((c) => c.movedFrom === undefined), `${at}: no layout control moved`);
-    const removedIds = new Set(removed.map((h) => h.id));
-    for (const c of controls) if (c.unbound) assert(removedIds.has(c.paramId!), `${at} ${c.paramName}: unbound only where the row was removed`);
+    for (const c of controls) assert(!c.unbound, `${at} ${c.paramName}: no control is unbound`);
   }
 }
 
