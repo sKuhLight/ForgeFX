@@ -39,6 +39,9 @@ export {
   type StaleReason, type ProfileSchemaCheck, type StoredProfile, type ProfileFormat, type RederiveReason, type ProfileSummary
 } from '../profileSchema.js';
 
+// ── the portable definitions file (`.axisdefs`): the envelope's type and the names a file picker needs ──
+export { AXISDEFS_KIND, AXISDEFS_VERSION, AXISDEFS_EXTENSION, AXISDEFS_MAX_BYTES, type AxisDefsFile } from '../services/definitionsFile.js';
+
 // ── local storage folder (Presets/ library + Sync/ mirror) ──
 export type { FolderAdapter, FolderEntry } from './folderAdapter.js';
 export {

@@ -38,6 +38,7 @@ import { staticTarget } from './services/staticFiles.js';
 import * as cloudProfiles from './services/cloudProfiles.js';
 import * as diagnostics from './services/diagnosticCapture.js';
 import * as contribution from './services/cacheContribution.js';
+import * as definitionsFile from './services/definitionsFile.js';
 import * as store from './store.js';
 import { createUnifiedHandlers, genericFlag } from './runtime/handlers.js';
 import { putStoreDoc } from './runtime/services.js';
@@ -221,6 +222,38 @@ export async function buildApp(registry: DeviceRegistry, opts: AppOptions = {}):
   // state the registry holds — no detection, no device traffic (runtime/handlers.ts definitionsDiffH).
   app.get<{ Querystring: { family?: string | string[]; include?: string | string[] } }>('/device/definitions/diff', (req, reply) =>
     definitionsDiffH(reply, { family: req.query.family, include: req.query.include }));
+  // `.axisdefs` export / import (services/definitionsFile.ts; capability definitions.portable). The export is a plain GET
+  // (the Remote relay may read it) whose file name rides in `Content-Disposition`. The import is STRICT-origin guarded like
+  // the contribution routes (the person at this machine hands the file over, never a LAN page or a web page), takes the
+  // file as the JSON body (≤ 8 MiB, a larger one answers 413 `too-large` before it is read) and is not on the Remote
+  // allowlist. `?force=1` / `?replace=1` are the person's flags; a flag inside the file is not read.
+  app.get('/device/definitions/export', async (_req, reply) => {
+    const r = await definitionsFile.exportDefinitions(store.defaultStore, registry, { versions: { forgefx: FORGEFX_VERSION } });
+    reply.code(r.code);
+    if (r.filename) reply.header('content-disposition', definitionsFile.attachmentHeader(r.filename));
+    return r.body;
+  });
+  app.post<{ Body: unknown; Querystring: { force?: string | string[]; replace?: string | string[] } }>(
+    '/device/definitions/import',
+    {
+      onRequest: loopbackOriginGuard,
+      bodyLimit: definitionsFile.AXISDEFS_MAX_BYTES,
+      // a body over the limit never reaches the handler: answer it in the route's 413 shape
+      errorHandler: (err: { statusCode?: number; code?: string }, req, reply) => {
+        if (err.statusCode === 413 || err.code === 'FST_ERR_CTP_BODY_TOO_LARGE') {
+          return reply.code(413).send(definitionsFile.tooLargeBody(Number(req.headers['content-length'] ?? NaN)));
+        }
+        return reply.send(err);
+      }
+    },
+    async (req, reply) => {
+      const r = await definitionsFile.importDefinitions(store.defaultStore, registry, req.body, {
+        force: definitionsFile.flagOn(req.query.force), replace: definitionsFile.flagOn(req.query.replace)
+      });
+      reply.code(r.code);
+      return r.body;
+    }
+  );
 
   // ── editor-cache import (SECOND cache source: an official-editor effectDefinitions_*.cache file;
   //    capability cacheImport). See services/editorCacheImport.ts + editorCacheDiscovery.ts. ──

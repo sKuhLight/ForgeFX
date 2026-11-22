@@ -20,7 +20,7 @@
 //     new source that collides gets the lowest free `#n`).
 // Every NON-LOCAL ingress rewrites the origins of the sources it brings in (`foreignSources`): an origin read
 // from the wire is never trusted (a forged 'local' would widen walk bounds and hints). Today that is the cloud
-// pull ('cloud'); the definitions-file import of WP-F4 must use it too ('file').
+// pull ('cloud') and the definitions-file import ('file', services/definitionsFile.ts).
 // A build's `force` only skips the `already` check (deviceCache.ts): the walk then replaces the stored source of
 // its own kind like any other build — one source per (kind, origin), no history (contract O1).
 // The caller persists the result (`persistProfile`, privacy guard included) and swaps the runtime profile.

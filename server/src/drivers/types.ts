@@ -172,6 +172,10 @@ export interface DefinitionsCaps {
    *  driver that imports editor caches and whose firmware was read. Whether the cloud wants the file, and
    *  whether a cloud is configured at all, is in the contribution status, not here. */
   contribute: boolean;
+  /** The stored definitions can be exported to and imported from a `.axisdefs` file (`/device/definitions/export`,
+   *  `/device/definitions/import`): a gen-3 grid driver (the generic-params trio). Whether a profile is stored to
+   *  export is the route's answer (404 `no-profile`), not this flag's. */
+  portable: boolean;
 }
 
 /** The parts of `GET /device/definitions/diff` a client can ask for (`include=`; default: all of them). */

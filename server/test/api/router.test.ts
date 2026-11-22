@@ -183,6 +183,10 @@ const ROWS: Row[] = [
   { name: 'contribution decision invalid (400)', method: 'POST', url: '/device/cache/contribute/decision', body: { decision: 'maybe' } },
   { name: 'contribution decision without firmware (503)', method: 'POST', url: '/device/cache/contribute/decision', body: { decision: 'declined' } },
   { name: 'contribution withdraw without firmware (503)', method: 'POST', url: '/device/cache/contribute/withdraw' },
+  // `.axisdefs` export / import (two twins) — the fake FM3 is no gen-3 grid unit with self-describe: both answer 501
+  // (the whole behaviour is in test/api/definitions-file.test.ts)
+  { name: 'definitions export (501 not portable)', method: 'GET', url: '/device/definitions/export' },
+  { name: 'definitions import (501 not portable)', method: 'POST', url: '/device/definitions/import', body: {} },
   // version control (row order matters: backup first, listing after)
   { name: 'backup preset (dedup twin)', method: 'POST', url: '/backup/preset/5' },
   { name: 'versions', method: 'GET', url: '/versions' },

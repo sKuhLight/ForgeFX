@@ -28,6 +28,7 @@ import {
   readableRaw, rederiveReasonOf, staleFields, type StaleReason
 } from '../profileSchema.js';
 import { ProfileMergeRefused, foreignSources, mergeRefusal, mergeSourcesIntoStored, refusalBody } from './profileMerge.js';
+import { checkRawSources } from './rawValidation.js';
 import type { Store } from '../runtime/store.js';
 import type { ImportResult } from './editorCacheImport.js';
 
@@ -132,7 +133,9 @@ export function publishableProfile(data: Record<string, unknown>): Record<string
  *  readable raw sources is stored as derived tables only (`publishableProfile`).
  *   - A format-2 cloud doc (raw sources this build can read) contributes its raw sources to the stored doc,
  *     merged by the codec's precedence: a local source of the same kind always outranks it, so a pull never
- *     replaces a better local source. A source of another firmware is refused (409 `firmware-differs`). Refused
+ *     replaces a better local source. The row's raw sources must pass the strict shape check (rawValidation.ts, 422
+ *     `cloud profile malformed` with the offending path otherwise); they are stored as the sanitized copies it returns.
+ *     A source of another firmware is refused (409 `firmware-differs`). Refused
  *     merges (profileMerge.ts `mergeRefusal`, unless `replace`): a stored doc without raw sources that outranks
  *     every cloud source (e.g. a legacy local editor-cache import) → 409 `local-profile-better`; a doc a newer
  *     build wrote → 409 `newer-profile`. Over a stale doc whose sources do not derive, the cloud sources are
@@ -161,7 +164,11 @@ export async function cloudCachePull(cloud: DeviceProfileCloud | null, store: St
   let kept = 0;
   let stored: Record<string, unknown>;
   if (raw) {
-    const incoming = foreignSources(raw.sources, 'cloud');
+    // nothing a row says about its raw sources is trusted before it passed the strict shape check (rawValidation.ts):
+    // a malformed or hostile source set is refused like a malformed row, nothing stored
+    const checked = checkRawSources(raw.sources, 'raw.sources');
+    if (!checked.ok) return { code: 422, body: { error: 'cloud profile malformed', message: `${checked.path}: ${checked.message}` } };
+    const incoming = foreignSources(checked.sources, 'cloud');
     const foreign = incoming.find((s) => s.firmware !== null && s.firmware !== id.firmware);
     if (foreign) return { code: 409, body: { error: 'firmware-differs', expected: id.firmware, got: foreign.firmware } };
     try {

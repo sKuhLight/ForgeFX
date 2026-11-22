@@ -21,7 +21,7 @@ import { buildTestApp, firmwareVersionReply } from '../helpers/api.js';
 import { catalogBuilt } from '../helpers/catalogProfile.js';
 import { MockTransport, handshakeReply, isIdentifyBroadcast, assert, assertEqual } from '../helpers/mock.js';
 
-export const CAPS_CASE_COUNT = 14;
+export const CAPS_CASE_COUNT = 15;
 
 type Caps = {
   slotModel: string;
@@ -567,7 +567,7 @@ async function definitionsKeyOrder(): Promise<void> {
       assertEqual(keys.filter((k) => k !== 'definitions').join(','), previous.join(','), `${name}: every previous key keeps its place, none is added or dropped`);
       assertEqual(keys[keys.indexOf('virtualEffects') + 1], 'definitions', `${name}: definitions follows virtualEffects`);
       assertEqual(keys[keys.indexOf('definitions') + 1], 'telemetryControl', `${name}: definitions comes before telemetryControl`);
-      assertEqual(Object.keys(caps.definitions as object).join(','), 'genericParams,catalogFirmware,profile,drift,contribute', `${name}: definitions key order`);
+      assertEqual(Object.keys(caps.definitions as object).join(','), 'genericParams,catalogFirmware,profile,drift,contribute,portable', `${name}: definitions key order`);
       const profile = (caps.definitions as { profile: Record<string, unknown> | null }).profile;
       if (profile) {
         // the profile v2 fields are appended after the M2 ones (contract §7), coverage as { complete, gaps }
@@ -729,6 +729,21 @@ async function definitionsContribute(): Promise<void> {
   }
 }
 
+// `.axisdefs` export/import: on the gen-3 grid trio whether or not a firmware was read or a profile is stored (the routes
+// answer 404 / 503 for that), false on every other device
+async function definitionsPortable(): Promise<void> {
+  for (const [modelId, name] of [[0x10, 'Axe-Fx III'], [0x11, 'FM3'], [0x12, 'FM9']] as const) {
+    for (const fw of [[13, 0], null] as const) {
+      const r = await defsRig(modelId, fw ? [fw[0], fw[1]] : null);
+      try { assertEqual((await definitionsOf(r)).portable, true, `${name} (firmware ${fw ? fw.join('.') : 'unknown'}): portable`); } finally { await r.app.close(); }
+    }
+  }
+  for (const [modelId, name] of [[0x15, 'AM4'], [0x07, 'Axe-Fx II'], [0x14, 'VP4'], [0x01, 'gen-1']] as const) {
+    const r = await defsRig(modelId, [13, 0]);
+    try { assertEqual((await definitionsOf(r)).portable, false, `${name}: not portable`); } finally { await r.app.close(); }
+  }
+}
+
 export async function runCapsTests(): Promise<void> {
   await fm3();
   await fm9();
@@ -743,5 +758,6 @@ export async function runCapsTests(): Promise<void> {
   await definitionsFollowsRegistry();
   await definitionsKeyOrder();
   await definitionsContribute();
+  await definitionsPortable();
   await definitionsDriftV2();
 }

@@ -40,6 +40,7 @@ const ALLOWED: [string, string][] = [
   ['GET', '/device/cache/contribute?refresh=1'],
   ['GET', '/device/definitions/diff'], // the definitions diff: a read, relayed like the caps it explains
   ['GET', '/device/definitions/diff?family=DISTORT&include=params,rosters'],
+  ['GET', '/device/definitions/export'], // the .axisdefs export: raw definitions, no user data — a read like the diff
   ['PUT', '/telemetry/config'],  // benign cadence-mode control (no device data moves)
   // deprecated aliases stay relayable during the window
   ['PUT', '/am4/param'],
@@ -77,6 +78,10 @@ const REJECTED: [string, string][] = [
   ['POST', '/device/cache/contribute?name=effectDefinitions_11_13p0.cache&consent=1&consentVersion=2'],
   ['POST', '/device/cache/contribute/decision'],
   ['POST', '/device/cache/contribute/withdraw'],
+  // `.axisdefs` import: a file the person at the machine hands over — never relayed, whatever the flags
+  ['POST', '/device/definitions/import'],
+  ['POST', '/device/definitions/import?force=1'],
+  ['POST', '/device/definitions/import?replace=1'],
 ];
 
 // Requests relayed end to end, with the status the remote must receive.

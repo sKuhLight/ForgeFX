@@ -638,7 +638,8 @@ export class DeviceRegistry {
     });
     // editor-cache contribution: the generic-params trio, an editor-cache importer, a firmware to key the file by
     const contribute = gen3Grid && d.capabilities.cacheImport && running !== null;
-    return { caps: { genericParams: gen3Grid, catalogFirmware, profile, drift, contribute }, applied };
+    // `.axisdefs` export/import: the same gen-3 grid trio (stored sources to write, a catalog to derive against)
+    return { caps: { genericParams: gen3Grid, catalogFirmware, profile, drift, contribute, portable: gen3Grid }, applied };
   }
 
   /** What `GET /device/definitions/diff` reads, all of it state the registry and the driver already hold (no

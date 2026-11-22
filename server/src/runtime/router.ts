@@ -22,6 +22,7 @@ import * as editorCacheImport from '../services/editorCacheImport.js';
 import * as cloudProfiles from '../services/cloudProfiles.js';
 import * as diagnostics from '../services/diagnosticCapture.js';
 import * as contribution from '../services/cacheContribution.js';
+import * as definitionsFile from '../services/definitionsFile.js';
 import { blockHelpBySlug, helpIndex } from '../help.js';
 import { createUnifiedHandlers, genericFlag } from './handlers.js';
 import { sendErrorStatus } from '../drivers/sendPolicy.js';
@@ -37,6 +38,9 @@ export interface RouterResponse {
   status: number;
   contentType: string;
   body: string | Uint8Array;
+  /** Response headers beyond the content type, lower-case names (only present when a route set one: the export of
+   *  `GET /device/definitions/export` carries its `content-disposition` file name here, as Fastify sends it). */
+  headers?: Record<string, string>;
 }
 
 /** The /local/* bindings a runtime supplies (see runtime/localService.ts for each hook's contract).
@@ -71,7 +75,9 @@ export interface RuntimeDeps {
 /** Per-request status recorder — the StatusSink the shared handlers code() into. */
 class Reply {
   statusCode = 200;
+  headers: Record<string, string> = {};
   code(n: number): this { this.statusCode = n; return this; }
+  header(name: string, value: string): this { this.headers[name.toLowerCase()] = value; return this; }
 }
 
 interface Ctx {
@@ -85,7 +91,9 @@ interface Ctx {
 }
 
 type Handler = (ctx: Ctx) => unknown | Promise<unknown>;
-interface Route { method: string; segs: string[]; octet: boolean; handler: Handler }
+/** A route's request body limit (Fastify's `bodyLimit`): a body above `bytes` is refused before parsing, with `tooLarge`'s 413 body. */
+interface BodyLimit { bytes: number; tooLarge(size: number): unknown }
+interface Route { method: string; segs: string[]; octet: boolean; limit?: BodyLimit; handler: Handler }
 
 const JSON_TYPE = 'application/json; charset=utf-8';
 const OCTET_TYPE = 'application/octet-stream';
@@ -119,8 +127,8 @@ export function createRouter(deps: RuntimeDeps): {
   });
 
   const routes: Route[] = [];
-  const on = (method: string, path: string, handler: Handler, opts?: { octet?: boolean }) =>
-    routes.push({ method, segs: path.split('/').filter(Boolean), octet: !!opts?.octet, handler });
+  const on = (method: string, path: string, handler: Handler, opts?: { octet?: boolean; limit?: BodyLimit }) =>
+    routes.push({ method, segs: path.split('/').filter(Boolean), octet: !!opts?.octet, ...(opts?.limit ? { limit: opts.limit } : {}), handler });
 
   // ── system ──
   // /healthz carries the unified-API version handshake (mirrored as apiVersion on /device).
@@ -156,6 +164,23 @@ export function createRouter(deps: RuntimeDeps): {
   // definitions diff (shared handler; an absent `include` is no `include`, like Fastify's missing key)
   on('GET', '/device/definitions/diff', (c) =>
     h.definitionsDiffH(c.reply, { family: c.query.getAll('family'), include: c.query.has('include') ? c.query.getAll('include') : undefined }));
+  // `.axisdefs` export / import (services/definitionsFile.ts). The export's file name rides in the response headers
+  // (`content-disposition`, like Fastify's); the import is an in-page call, so it has no Origin guard (the server's
+  // loopback guard has nothing to check here) and its 8 MiB body limit is the route's `limit`. `force` / `replace`
+  // are query flags only: the body is the file, and a file never chooses them.
+  on('GET', '/device/definitions/export', async (c) => {
+    const r = await definitionsFile.exportDefinitions(store, registry, { versions: deps.versions });
+    c.reply.code(r.code);
+    if (r.filename) c.reply.header('content-disposition', definitionsFile.attachmentHeader(r.filename));
+    return r.body;
+  });
+  on('POST', '/device/definitions/import', async (c) => {
+    const r = await definitionsFile.importDefinitions(store, registry, c.body, {
+      force: definitionsFile.flagOn(c.query.getAll('force')), replace: definitionsFile.flagOn(c.query.getAll('replace'))
+    });
+    c.reply.code(r.code);
+    return r.body;
+  }, { limit: { bytes: definitionsFile.AXISDEFS_MAX_BYTES, tooLarge: definitionsFile.tooLargeBody } });
   // ── editor-cache import (SECOND cache source; capability cacheImport). Disk discovery is Node-only,
   //    so the browser twin returns an empty candidate list (discovery:'unavailable') + octet-only import.
   //    No loopback-origin guard here (app.ts has one, FORGEFX-47): the router is an in-page function call
@@ -634,10 +659,19 @@ export function createRouter(deps: RuntimeDeps): {
     return params;
   };
 
-  const respond = (status: number, body: unknown): RouterResponse =>
-    body instanceof Uint8Array
-      ? { status, contentType: OCTET_TYPE, body }
-      : { status, contentType: JSON_TYPE, body: JSON.stringify(body) };
+  const respond = (status: number, body: unknown, headers?: Record<string, string>): RouterResponse => {
+    const extra = headers && Object.keys(headers).length > 0 ? { headers: { ...headers } } : {};
+    return body instanceof Uint8Array
+      ? { status, contentType: OCTET_TYPE, body, ...extra }
+      : { status, contentType: JSON_TYPE, body: JSON.stringify(body), ...extra };
+  };
+
+  /** Size of a request body in bytes. A string that cannot exceed `limit` is reported by its length (the answer is only
+   *  used to compare with the limit and, over it, to report the size: exact then). */
+  const bodyBytes = (body: string | Uint8Array, limit: number): number => {
+    if (typeof body !== 'string') return body.byteLength;
+    return body.length * 3 <= limit ? body.length : new TextEncoder().encode(body).length; // UTF-8 is at most 3 bytes per UTF-16 unit
+  };
 
   const handle = async (method: string, path: string, body?: string | Uint8Array): Promise<RouterResponse> => {
     const m = method.toUpperCase();
@@ -651,6 +685,11 @@ export function createRouter(deps: RuntimeDeps): {
       const params = match(route, segs);
       if (!params) continue;
 
+      // A route's body limit: refused before anything is parsed, in the route's own 413 shape.
+      if (route.limit && body != null) {
+        const size = bodyBytes(body, route.limit.bytes);
+        if (size > route.limit.bytes) return respond(413, route.limit.tooLarge(size));
+      }
       // Body decode mirrors app.ts's parsers: Uint8Array = application/octet-stream on the raw-bytes
       // routes; everything else is JSON (empty/absent → {}, like the tolerant empty-JSON parser).
       let raw: Uint8Array | null = null;
@@ -667,7 +706,7 @@ export function createRouter(deps: RuntimeDeps): {
       const ctx: Ctx = { params, query, body: json, raw, reply: new Reply() };
       try {
         const out = await route.handler(ctx);
-        return respond(ctx.reply.statusCode, out);
+        return respond(ctx.reply.statusCode, out, ctx.reply.headers);
       } catch (e) {
         // uncaught handler error → Fastify's default error envelope: a thrown error carrying a 4xx/5xx
         // `statusCode` (a driver's 400 "no such instance" / 409 "already placed") keeps it, anything else is a 500

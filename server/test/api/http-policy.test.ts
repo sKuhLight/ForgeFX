@@ -327,6 +327,7 @@ const COMMON_ROUTES = [
   'GET /local/config', 'PUT /local/config', 'GET /local/presets/file', 'POST /local/presets', 'POST /local/sync', 'POST /local/restore',
   'GET /backups', 'GET /versions', 'GET /version/:id/syx', 'POST /version/:id/restore', 'POST /backup/device',
   'GET /device/cache/sources', 'POST /device/cache/import', 'GET /device/cache/contribute', 'POST /device/cache/build', 'GET /device/cache/cloud',
+  'GET /device/definitions/export', 'POST /device/definitions/import',
   'POST /preset/select', 'POST /preset/store', 'PUT /preset/blocks/:eid/params/:paramId', 'PUT /preset/grid/cell', 'POST /scene', 'POST /tuner',
   'POST /preset/load', 'POST /firmware/validate', 'POST /diagnostics/capture', 'POST /telemetry/report', 'GET /events',
   'GET /cloud/status', 'GET /remote/status', 'POST /am4/preset/store', 'OPTIONS *'
@@ -455,7 +456,8 @@ async function strictPeer(): Promise<void> {
     { method: 'GET', url: '/device/cache/contribute' },
     { method: 'POST', url: '/device/cache/contribute', body: { source: { path: '/x.cache' }, consent: true, consentVersion: 2 } },
     { method: 'POST', url: '/device/cache/contribute/decision', body: { decision: 'declined' } },
-    { method: 'POST', url: '/device/cache/contribute/withdraw', body: {} }
+    { method: 'POST', url: '/device/cache/contribute/withdraw', body: {} },
+    { method: 'POST', url: '/device/definitions/import', body: {} } // the .axisdefs import: the person at this machine hands the file over
   ];
   const send = (r: (typeof STRICT_ROUTES)[number], remoteAddress: string | undefined, headers: Headers = {}) =>
     app.inject({
