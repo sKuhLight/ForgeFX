@@ -18,7 +18,10 @@
  * family's editor page that addresses a different family), and flag the ones the write guard would
  * refuse; `--probe FAMILY:pid` shows one row and the guard's verdict for it.
  *
- * Exit code: 0 all invariants hold, 1 an invariant failed, 2 usage / input / connection error.
+ * Exit code: 0 all invariants hold; 1 an invariant failed (a block request the server answered with a status
+ * other than 200 counts as one); 2 a usage or input error, a server that cannot be checked (GET /device or
+ * /preset/blocks not answered with 200, no generic support), or any request that failed at the transport level
+ * (connection refused, timeout, redirect).
  * Run with --help for the options.
  */
 import { readFileSync } from 'node:fs';
@@ -39,6 +42,8 @@ interface Finding { code: string; where: string; message: string }
 const failures: Finding[] = [];
 const warnings: Finding[] = [];
 const fail = (code: string, where: string, message: string): void => { failures.push({ code, where, message }); };
+/** Requests that failed at the transport level (the server was never heard): exit code 2, not a finding. */
+const transportErrors: Finding[] = [];
 const warn = (code: string, where: string, message: string): void => { warnings.push({ code, where, message }); };
 
 function table(header: string[], rows: string[][], align: ('l' | 'r')[]): string {
@@ -60,7 +65,7 @@ Options
   --profile <file>   a store file (deviceCaches.json: a map of cache key -> document), one stored document
                      ({ id, collection, data, ... }), a { key: { data } } bundle, or a bare profile document
   --model <m>        0x10 | 0x11 | 0x12, or iii | fm3 | fm9 (default: the document's own model or its key)
-  --key <k>          which entry of a store file to use, e.g. 11_13p0 (default: the only one, or the one for --model)
+  --key <k>          which entry of a store file to use, e.g. 11_99p0 (default: the only one, or the one for --model)
   --allow-stale      check a profile whose schema stamp the server would refuse to use (it would not be applied)
   --url <base>       a running ForgeFX server; only GET requests are sent (/device, /preset/blocks,
                      /preset/blocks/<eid>/params?generic=1, /store/deviceCaches/<key>)
@@ -79,7 +84,11 @@ Invariants (a failure makes the exit code 1)
   - no value with unresolved 'channel-unknown' (or 'read-failed') in the served response
   - no family flagged as suspect by the section-assignment cross-check
   - the served response lists the same ids, hidden items and fingerprints as the profile predicts
-Exit codes: 0 ok, 1 invariant failed, 2 usage / input / connection error`;
+Exit codes
+  0  all invariants hold
+  1  an invariant failed (a block request the server answered with a status other than 200 counts as one)
+  2  usage or input error; the server cannot be checked (GET /device or /preset/blocks not answered with 200,
+     no generic support); or any request failed at the transport level (connection refused, timeout, redirect)`;
 
 interface Args {
   profile?: string; key?: string; model?: number; allowStale: boolean;
@@ -265,7 +274,8 @@ function hiddenConfidence(profile: DeviceProfile, family: string, pid: number): 
   const c = base.ranges[family]?.[pid];
   if (!e) return undefined;
   if (!facts || !(facts.appliedRows[family]?.has(pid) ?? false)) {
-    const walked = facts?.ranges[family]?.[pid];
+    // a suspect family's profile section belongs to another family: its rows say nothing about this one
+    const walked = facts && !facts.suspectFamilies.includes(family) ? facts.ranges[family]?.[pid] : undefined;
     return !facts?.byteExact && walked && c && walked.displayMin !== walked.displayMax && walked.kind !== c.kind ? 'medium' : 'high';
   }
   if (!c || !isInformativeRow(c)) return 'low';
@@ -593,7 +603,7 @@ const READ_ONLY_PATHS: RegExp[] = [
 
 async function httpGet(base: string, path: string, timeoutMs: number): Promise<{ status: number; body: unknown }> {
   if (!READ_ONLY_PATHS.some((re) => re.test(path))) throw new Error(`refusing to request ${path}: not on the read-only list`);
-  const res = await fetch(base + path, { method: 'GET', headers: { accept: 'application/json' }, signal: AbortSignal.timeout(timeoutMs) });
+  const res = await fetch(base + path, { method: 'GET', redirect: 'error', headers: { accept: 'application/json' }, signal: AbortSignal.timeout(timeoutMs) });
   const text = await res.text();
   let body: unknown = text;
   try { body = JSON.parse(text); } catch { /* keep the text */ }
@@ -738,11 +748,13 @@ async function runOnline(args: Args, fileProfile: DeviceProfile | null): Promise
     try {
       res = await httpGet(base, `/preset/blocks/${eid}/params?generic=1`, args.timeoutMs);
     } catch (e) {
-      fail('request-failed', `eid ${eid}`, (e as Error).message);
-      blocks.push({ eid, block: '?', family: null, status: 'fail', listed: 0, named: 0, enums: 0, hidden: 0, removed: 0, rows: null, generic: 0, isNew: 0, unresolved: {}, problems: [`request-failed: ${(e as Error).message}`] });
+      // the server was not heard (connection refused, timeout, redirect): no finding about it, exit code 2
+      transportErrors.push({ code: 'transport-error', where: `eid ${eid}`, message: (e as Error).message });
+      blocks.push({ eid, block: '?', family: null, status: 'fail', listed: 0, named: 0, enums: 0, hidden: 0, removed: 0, rows: null, generic: 0, isNew: 0, unresolved: {}, problems: [`transport-error: ${(e as Error).message}`] });
       continue;
     }
     if (res.status !== 200 || !isObj(res.body)) {
+      // the server answered, but not with a block: that is a finding about the server
       fail('request-failed', `eid ${eid}`, `answered ${res.status}`);
       blocks.push({ eid, block: '?', family: null, status: 'fail', listed: 0, named: 0, enums: 0, hidden: 0, removed: 0, rows: null, generic: 0, isNew: 0, unresolved: {}, problems: [`request-failed: answered ${res.status}`] });
       continue;
@@ -793,8 +805,8 @@ async function main(): Promise<void> {
   }
   if (args.json) {
     console.log(JSON.stringify({
-      ok: failures.length === 0,
-      failures, warnings,
+      ok: failures.length === 0 && transportErrors.length === 0,
+      failures, warnings, transportErrors,
       offline: offline?.report ?? null,
       online: online?.report ?? null,
     }, null, 2));
@@ -810,8 +822,12 @@ async function main(): Promise<void> {
     console.log(failures.length === 0 ? '\nRESULT: all invariants hold' : `\nRESULT: ${failures.length} invariant failure(s)`);
     for (const f of failures.slice(0, 60)) console.log(`  FAIL [${f.code}] ${f.where}: ${f.message}`);
     if (failures.length > 60) console.log(`  ... and ${failures.length - 60} more (use --json for all)`);
+    if (transportErrors.length) {
+      console.log(`\nTRANSPORT: ${transportErrors.length} request(s) failed before the server answered (exit code 2)`);
+      for (const t of transportErrors) console.log(`  ${t.where}: ${t.message}`);
+    }
   }
-  process.exitCode = failures.length === 0 ? 0 : 1;
+  process.exitCode = transportErrors.length > 0 ? 2 : failures.length === 0 ? 0 : 1;
 }
 
 main().catch((e: unknown) => {

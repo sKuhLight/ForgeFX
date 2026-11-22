@@ -111,7 +111,7 @@ report), `non-positional` (the block's body is indexed by record, not by paramet
                  "hidden": [ { "id": 0, "reason": "type" }, { "id": 41, "reason": "bypass" } ] }
 ```
 - `family`: the catalog family (`null` for an effect id with no family: the response is then
-  `{ block: "Block <eid>", slug: "", named: [], enums: [], type: null, unknownBlock: true }`).
+  `{ block: "Block <eid>", slug: "", page: -1, named: [], enums: [], type: null, unknownBlock: true }`).
 - `profile`: `byte-exact`, `live` or `none` (no profile applied, the family is not in it, or it was
   flagged `suspect`, which the block then also says: `"suspect": true`).
 - `positional`: values are read by position (parameter id = index in the channel slice). `channel`: the

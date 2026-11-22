@@ -43,7 +43,7 @@ catalog has no name for still appears, as `P<pid>`, instead of vanishing.
 
 ## Profiles
 `GET /device/cache` and `GET /store/deviceCaches/<key>` (key `<model-hex>_<major>p<minor>`, e.g.
-`11_13p0`) show what is stored; a profile is **applied** only when its schema stamp is current
+`11_99p0` for an FM3 on a firmware 99.0) show what is stored; a profile is **applied** only when its schema stamp is current
 (`GET /device/cache` reports `stale` otherwise) and one is stored for the running firmware.
 `capabilities.definitions.profile` (see below) says which one is live. Three sources:
 
@@ -73,6 +73,7 @@ list; not unit, taper or default).
 | differs, still the same kind of parameter (labels appended, a range revised) | the catalog name, `"medium"` |
 | differs, no longer compatible | the catalog name, `"low"` (a client should show a warning) |
 | the row moved to another id (the name follows it when exactly one row now carries its fingerprint) | the catalog name at the new id, `nameSource: "catalog-moved"`, `movedFrom`, `"medium"` |
+| in the profile only, at an id the catalog names but has no row for (or only an unused-slot row) | the catalog name, `nameConfidence: "low"`, `isNew: true` (there is no catalog row to compare it with) |
 | in the profile only, no catalog name | **generic**: name `P<pid>`, `generic: true`, `isNew: true`, `pageHint: "new-in-firmware"` |
 | in the catalog only, no name (a row the catalog never labelled) | **generic**, `pageHint: "more"` |
 | in the catalog only, named | shown as before; `hidden` reason `removed` when a byte-exact profile of the family no longer has it |
@@ -88,7 +89,7 @@ with two labels, else a `dropdown` with `write: null`. `write` says how to write
 Served by `GET /device` and `GET /device/detect` on every device:
 ```json
 "definitions": { "genericParams": true, "catalogFirmware": "12.0",
-  "profile": { "key": "11_13p0", "source": "editor-cache", "byteExact": true, "firmware": "13.0", "suspectFamilies": [] },
+  "profile": { "key": "11_99p0", "source": "editor-cache", "byteExact": true, "firmware": "99.0", "suspectFamilies": [] },
   "drift": "none" }
 ```
 - `genericParams`: the device serves `?generic=1` (gen-3 grid devices with self-describe: Axe-Fx III, FM3,
@@ -104,7 +105,7 @@ Served by `GET /device` and `GET /device/detect` on every device:
 the served response agrees with it. It reads files or a running server and prints to the terminal; keep
 profile files out of the repository.
 ```
-npm run profile-check -- --profile <file> [--model 0x11] [--key 11_13p0] [--allow-stale]   # offline
+npm run profile-check -- --profile <file> [--model 0x11] [--key 11_99p0] [--allow-stale]   # offline
 npm run profile-check -- --url http://127.0.0.1:5056 [--eid 1] [--profile <file>]           # online, GET only
 ```
 - **Offline** builds the runtime profile the way the server does and prints one line per family
@@ -119,8 +120,11 @@ npm run profile-check -- --url http://127.0.0.1:5056 [--eid 1] [--profile <file>
   `--list FAMILY` lists what is served; `--json` prints one JSON document.
 - Exit code 1 when an invariant fails: listed + hidden (other than `removed`) differs from the profile's
   informative rows; an enum-kind entry in `named`; a value `unresolved: "channel-unknown"` or
-  `"read-failed"`; a suspect family; the response disagrees with the profile. Exit code 2: usage,
-  unreadable input or connection error.
+  `"read-failed"`; a suspect family; the response disagrees with the profile; a block request the server
+  answered with a status other than 200. Exit code 2: a usage or input error (bad options, an unreadable or
+  stale profile), a server that cannot be checked (`/device` or `/preset/blocks` not answered with 200, no
+  generic support), or any request that failed at the transport level (connection refused, timeout,
+  redirect); requests never follow redirects.
 
 ## Testing hook
 `FORGEFX_DEFS_FORCE_GENERIC="CHORUS:8"` (comma-separated `FAMILY:pid`, a bare pid joins the previous
