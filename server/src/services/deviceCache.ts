@@ -1,29 +1,39 @@
 // Device-cache build orchestration — the runtime on-connect self-describe cache (FORGEFX-15 / A3).
 // One background build at a time per registry (module-level WeakMap job state), driving the codec's
-// live self-describe walk over the registry's shared transport into a `BuiltCache`, persisting it to
-// the `deviceCaches` store collection, and swapping the driver's profile to the device-true runtime
-// one. Progress is streamed as `cacheBuild` SSE events. Endpoints (both twins) are thin wrappers over
-// the exported functions here — all the logic lives in this module.
+// live self-describe walk over the registry's shared transport into a live RAW source, merging it into
+// the profile document of the `deviceCaches` store collection (profile v2: the doc keeps every raw source
+// and is derived from all of them, see services/profileMerge.ts), and swapping the driver's profile to the
+// device-true runtime one. Progress is streamed as `cacheBuild` SSE events. Endpoints (both twins) are thin
+// wrappers over the exported functions here — all the logic lives in this module.
 //
 // Browser-safe: the store + registry are type-only imports (a browser runtime supplies its own), and
 // the codec's cache subpath is itself browser-safe. NO node:/fastify/transport VALUE imports — this
 // module is in the runtime router's import graph (check-browser-safe.ts enforces it).
-import { buildCache, enumHintsFromRanges, HW_SEEDS, liveWalk, type BuiltCache, type CacheRecord, type DeviceParam, type LiveEnumHint, type LiveTransport, type LiveWalkOptions, type LiveWalkWriteHooks } from 'forgefx-midi/cache';
-import { FM3_EFFECT_ID_TABLE, FM3_PARAMS } from 'forgefx-midi/gen3/fm3';
-import { FM9_EFFECT_ID_TABLE, FM9_PARAMS } from 'forgefx-midi/gen3/fm9';
-import { AXE_FX_III_BLOCKS, PARAMS as AXE3_PARAMS } from 'forgefx-midi/gen3/axe-fx-iii';
+import {
+  RAW_FORMAT, buildProfileDoc, enumHintsFromRanges, liveWalkDetailed, rawFromLiveWalk,
+  type BuiltCache, type CacheRecord, type LiveEnumHint, type LiveSourceScope, type LiveTransport, type LiveWalkOptions,
+  type LiveWalkResult, type LiveWalkWriteHooks, type ProfileCoverage, type RawSourceKind, type SourceSummary
+} from 'forgefx-midi/cache';
 import { isFractalHeaderFrame } from 'forgefx-midi/shared';
-import { AM4_CACHE_PARAMS, AM4_SEEDS } from 'forgefx-midi/am4';
 import { deviceCacheKey, fullCaptureAllowedOnFirmware, type DeviceRegistry } from '../drivers/registryCore.js';
 import { claimDevice, deviceBusy, releaseDevice } from './deviceJobs.js';
-import { PROFILES, SLUG_FAMILY, isByteExactProfile, type DeviceProfile } from '../devices.js';
-import { CURRENT_CACHE_SCHEMA, loadStoredProfile, type StaleReason } from '../profileSchema.js';
+import { PROFILES, type DeviceProfile } from '../devices.js';
+import {
+  CURRENT_CACHE_SCHEMA, isLocalByteProfile, loadStoredProfile, persistProfile, profileFormatOf, profileSummaryOf, readableRaw,
+  upgradeStoredProfile, type ProfileFormat, type StaleReason, type StoredProfile
+} from '../profileSchema.js';
+import { catalogForModel, deriveOptionsFor, paramsForModel, staticRoster, type StaticBlockRef } from '../profileCatalog.js';
+import { mergeRefusal, mergeSourcesIntoStored, refusalBody, type MergeRefusal } from './profileMerge.js';
 import type { Store } from '../runtime/store.js';
 import type { Transport } from '../transport/types.js';
 
-/** Injectable walk (defaults to the codec's `liveWalk`) — tests fake it so they never septet-encode
- *  wire frames. Must resolve to the decoded `CacheRecord[]` `buildCache` consumes. */
-export type WalkImpl = (transport: LiveTransport, opts: LiveWalkOptions) => Promise<CacheRecord[]>;
+/** Injectable walk (defaults to the codec's `liveWalkDetailed`) — tests fake it so they never septet-encode
+ *  wire frames. Resolves to the walk result (records + reply-loss statistics, persisted with the raw source),
+ *  or to the bare decoded records (statistics then count as zero). */
+export type WalkImpl = (transport: LiveTransport, opts: LiveWalkOptions) => Promise<CacheRecord[] | LiveWalkResult>;
+
+/** Re-exported from profileCatalog.ts (their home since the profile store re-derives documents). */
+export { paramsForModel, catalogForModel };
 
 /** Build mode: 'read-only' is the HW-proven default sweep; 'full' adds the CaptureRig-parity write-sweep
  *  that recovers per-float knob tapers (requires the fullCapture capability + write hooks, and a firmware
@@ -37,9 +47,30 @@ interface CacheJob {
   /** The running firmware the job was started on (gates the enum hints, see `enumHintsVerifiedOn`). */
   fw: { major: number; minor: number };
   mode: BuildMode;
+  /** Requested walk scope ('extended' needs a verified firmware; none is verified yet, so it walks standard). */
+  scope: BuildScope;
+  /** Replace the whole stored doc instead of merging the new source into it. */
+  replace: boolean;
   controller: AbortController;
   progress: { done: number; total: number; phase: 'walking' | 'building' };
   promise: Promise<void>;
+}
+
+/** Walk scope of a build: 'standard' = ids 0..127 of blocks 0..160; 'extended' = also the ids above 127 of
+ *  known contiguous tables and the roster blocks above 160 — only on a (model, firmware) where that has been
+ *  verified (none in this build: an extended request walks the standard scope and reports `extension:
+ *  'skipped'`). */
+export type BuildScope = 'standard' | 'extended';
+
+/** Options of a build start (the route body plus the test seam). */
+export interface CacheBuildOptions {
+  /** Walk even when the stored doc already holds a complete source of the requested kind. */
+  force?: boolean;
+  mode?: BuildMode;
+  scope?: BuildScope;
+  /** Replace the whole stored doc (old behaviour) instead of merging the walk into it. */
+  replace?: boolean;
+  walkImpl?: WalkImpl;
 }
 
 /** At most ONE build per registry. Module-level so status/cancel see the running job without the
@@ -60,32 +91,23 @@ export interface CacheStatus {
     /** The stored profile's schema stamp (null = none). */
     schema: number | null;
   };
-  /** The stored profile is not usable by this build (schema missing / outdated / newer): it is not
-   *  applied at runtime, does not count as built, and must be re-read. False when nothing is stored. */
+  /** The stored profile is not usable by this build (schema missing / outdated / newer, or a re-derivation
+   *  that failed): it is not applied at runtime, does not count as built, and must be re-read. False when
+   *  nothing is stored. */
   stale: boolean;
   /** Why it is stale — only present when `stale`. */
   staleReason?: StaleReason;
   /** The schema this build writes and accepts. */
   currentSchema: number;
-}
-
-/** Gen-3 param catalog for the walk's section→family voter, by model byte. Only selfDescribe (gen-3
- *  grid) models reach here; FM3 is the defensive default. */
-export function paramsForModel(model: number): DeviceParam[] {
-  switch (model) {
-    case 0x12: return FM9_PARAMS as unknown as DeviceParam[];
-    case 0x10: return AXE3_PARAMS as unknown as DeviceParam[];
-    case 0x11:
-    default: return FM3_PARAMS as unknown as DeviceParam[];
-  }
-}
-
-/** Per-model catalog + seed anchors for buildCache. Gen-3 grid models share HW_SEEDS (cache-tag
- *  space); the AM4 has its own section tags and param model (cacheImport only, no live walk). The
- *  editor-cache import uses this so every cacheImport-capable model feeds buildCache correctly. */
-export function catalogForModel(model: number): { params: DeviceParam[]; seeds: Record<string, number> } {
-  if (model === 0x15) return { params: AM4_CACHE_PARAMS as unknown as DeviceParam[], seeds: AM4_SEEDS };
-  return { params: paramsForModel(model), seeds: HW_SEEDS };
+  /** Stored doc only: 1 = derived tables only (legacy), 2 = raw sources + derived tables. */
+  format?: ProfileFormat;
+  /** Stored doc only: one line per raw source (empty for a format-1 doc). */
+  sources?: SourceSummary[];
+  /** Usable doc only: document-level gaps and counts (a format-1 doc always reports `no-raw`). */
+  coverage?: ProfileCoverage;
+  /** This status read re-derived the stored doc from its raw sources (and wrote it back unless a newer
+   *  build wrote it). */
+  rederived?: true;
 }
 
 /** Inter-query pacing for the self-describe walk, in ms. NEVER 0: full-speed query flooding freezes
@@ -142,68 +164,23 @@ function lastLowContiguousId(sortedIds: readonly number[]): number {
   return last;
 }
 
-/** A block address of the model's static roster: its catalog family, which instance of the family it is
- *  (1-based) and the family's editor slug (undefined for families without one, e.g. GLOBAL). */
-export interface StaticBlockRef { family: string; instance: number; slug?: string }
-
-/** Catalog family -> editor slug (the inverse of `SLUG_FAMILY`). */
-const FAMILY_SLUG: Record<string, string> = Object.fromEntries(Object.entries(SLUG_FAMILY).map(([slug, family]) => [family, slug]));
-
-/** Number of reserved effect ids per first id in the shared gen-3 roster (the Axe-Fx III block table). */
-const GEN3_RESERVED_IDS: ReadonlyMap<number, number> = new Map(
-  AXE_FX_III_BLOCKS.filter((b) => b.firstId !== null).map((b) => [b.firstId as number, b.instances] as const)
-);
-
-const STATIC_ROSTERS = new Map<number, ReadonlyMap<number, StaticBlockRef>>();
-
-/** Block address -> family through the model's STATIC roster only, never a section→family vote of a walk
- *  (per-block walk options keyed through a vote would land on the wrong block whenever the vote is wrong).
- *  Shared by `walkBlockLimits` and `walkEnumHints`.
- *   - Placeable blocks: every family the model's family table classifies as a block (FM3 / FM9: their own
- *     tables; Axe-Fx III: the shared gen-3 families) maps its ids first..first+n-1, where n is the model's
- *     instance count for the family: the roster's (FM3/FM9 table, or the III block table on the III),
- *     raised to the unit's device-true count (`instanceLimits`) where the table lists fewer (the FM3/FM9
- *     table lists one Input and one Output; the units have more), never past the ids the gen-3 roster
- *     reserves for the family. So an Axe-Fx III fifth Input (41) is mapped, a fourth FM3/FM9 multiplexer
- *     (194) is not.
- *   - Everything else: the profile's virtual effect ids (GLOBAL 1, CONTROLLERS 2, MOD 3, ...). */
-export function staticRoster(model: number): ReadonlyMap<number, StaticBlockRef> {
-  const cached = STATIC_ROSTERS.get(model);
-  if (cached) return cached;
-  const out = new Map<number, StaticBlockRef>();
-  const profile: DeviceProfile | undefined = PROFILES[model];
-  const table = model === 0x11 ? FM3_EFFECT_ID_TABLE : model === 0x12 ? FM9_EFFECT_ID_TABLE : model === 0x10 ? FM3_EFFECT_ID_TABLE : undefined;
-  if (profile && table) {
-    for (const e of table) {
-      if (e.addressing !== 'block' || e.firstId === null) continue;
-      const slug = FAMILY_SLUG[e.family];
-      const reserved = GEN3_RESERVED_IDS.get(e.firstId) ?? e.instances;
-      const rosterCount = model === 0x10 ? reserved : e.instances;
-      const deviceCount = slug ? (profile.instanceLimits[slug] ?? profile.defaultInstances) : 0;
-      const n = Math.min(Math.max(rosterCount, deviceCount), reserved);
-      for (let i = 0; i < n; i++) out.set(e.firstId + i, { family: e.family, instance: i + 1, ...(slug ? { slug } : {}) });
-    }
-    for (let block = 0; block <= WALK_BOUND_MAX_BLOCK; block++) {
-      if (out.has(block)) continue;
-      const family = profile.familyForEffectId(block);
-      if (family !== undefined) out.set(block, { family, instance: 1 });
-    }
-  }
-  STATIC_ROSTERS.set(model, out);
-  return out;
-}
+/** The model's static roster (block address -> catalog family, instance, slug) lives in profileCatalog.ts, shared
+ *  with the gen-3 driver's runtime `unmapped-block` gap; re-exported here for the walk's other callers. */
+export { staticRoster, type StaticBlockRef };
 
 /** Known table size and hard ceiling per block for the live walk (see `WalkBlockLimits`).
  *
  *  Table size: the family's `stride` in `rangeSections`, the wire slot count (a table of N slots holds
  *  ids 0..N-1). NOT `recordCount`: that also counts special table records (ids >= 0xff00) that no walk
  *  reaches (FM3 CABINET: 110 records, ids 0..105). The sections are the STATIC catalog of the model,
- *  replaced per family by the stored cache of the attached firmware when that one is byte-exact
- *  (`byteExact`: editor-cache import / byte-sourced cloud profile, exact device data that wins outright,
- *  as in `runtimeProfileFrom`; an unusable stride in it falls back to the catalog's, the family is not
- *  dropped). A stored LIVE-walk profile is deliberately NOT used: its sizes are a heuristic (a pre-bound
- *  walk may have counted junk past the table end), and a bound must never come from the very junk it
- *  exists to stop.
+ *  replaced per family by the LOCAL editor-cache data of the stored profile of the attached firmware
+ *  (`localByteSource(stored)`: an editor-cache import made by this install, derived on its own — exact device
+ *  data that wins outright, as in `runtimeProfileFrom`; an unusable stride in it falls back to the catalog's, the
+ *  family is not dropped). A stored LIVE-walk profile is deliberately NOT used, nor the live sources merged into
+ *  a format-2 doc: their sizes are a heuristic (a pre-bound walk may have counted junk past the table end), and a
+ *  bound must never come from the very junk it exists to stop. Nor is a cloud or definitions-file profile or
+ *  source, whatever its origin claims: a bound is a promise about the device, and their provenance is another
+ *  install's claim.
  *
  *  Block to family is the model's static roster (`staticRoster`: each family's ids by the model's instance
  *  count, else the profile's virtual effect ids GLOBAL/CONTROLLERS/MOD). Per block:
@@ -222,11 +199,11 @@ export function staticRoster(model: number): ReadonlyMap<number, StaticBlockRef>
  *  The size is a floor, not a promise: the catalog may predate the connected firmware, which can append
  *  params to a table, so the bound leaves `WALK_BOUND_MARGIN` ids of headroom and the codec keeps its
  *  stop run beyond the known size. Mode cap: read-only 127 (HW-proven envelope), full 511. */
-export function walkBlockLimits(model: number, mode: BuildMode, byteExact?: BuiltCache | null): WalkBlockLimits {
+export function walkBlockLimits(model: number, mode: BuildMode, stored?: BuiltCache | null): WalkBlockLimits {
   const limits: WalkBlockLimits = { knownSize: {}, bound: {} };
   const profile: DeviceProfile | undefined = PROFILES[model];
   if (!profile) return limits; // no gen-3 catalog for this model: codec defaults everywhere
-  const exact = byteExact && isByteExactProfile(byteExact.meta) ? byteExact : null;
+  const exact = localByteSource(stored, model);
   const strides: Record<string, number> = {};
   for (const [family, meta] of Object.entries(profile.rangeSections)) {
     if (usableStride(meta.stride)) strides[family] = Math.floor(meta.stride);
@@ -265,11 +242,56 @@ export function walkBlockLimits(model: number, mode: BuildMode, byteExact?: Buil
   return limits;
 }
 
-/** A stored profile decoded from editor-cache bytes BY THIS INSTALL: `meta.source` 'editor-cache' (an
- *  editor-cache import) or 'bytes' (the codec's byte-source value). Unlike `isByteExactProfile` it refuses
- *  cloud profiles, whatever `meta.origin` claims. */
-export function isLocalByteProfile(meta: { source?: unknown } | undefined): boolean {
-  return meta?.source === 'editor-cache' || meta?.source === 'bytes';
+/** `isLocalByteProfile` lives in profileSchema.ts (the summary's `no-raw` fixes need it too); re-exported here. */
+export { isLocalByteProfile };
+
+/** Does a stored profile hold LOCAL editor-cache data (cheap: no derivation)? A format-1 doc: `isLocalByteProfile`;
+ *  a format-2 doc: an editor-cache raw source of origin 'local' in a raw envelope this build can read
+ *  (`readableRaw`) — sources this build cannot read (a newer or malformed envelope) are never trusted. Every
+ *  non-local ingress (cloud pull, and the definitions-file import of WP-F4) rewrites source origins on the way in,
+ *  so 'local' here is this install's own data. */
+export function hasLocalByteSource(doc: BuiltCache | null | undefined): boolean {
+  if (!doc) return false;
+  if (profileFormatOf(doc) !== 2) return isLocalByteProfile(doc.meta);
+  const raw = readableRaw(doc);
+  return !!raw && raw.sources.some((s) => s.kind === 'editor-cache' && s.origin === 'local');
+}
+
+const LOCAL_BYTE_SOURCE = new WeakMap<object, BuiltCache | null>();
+
+/** The LOCAL editor-cache data of a stored profile, derived on its own — the only data walk hints and bounds may
+ *  rely on (`walkEnumHints`, `walkBlockLimits`, the diagnostic label probe):
+ *   - a format-2 doc: its local editor-cache raw source(s) derived standalone (a merged doc's `meta.source`
+ *     'editor-cache' does not make every table byte-exact; merged live, cloud or file sources never widen a
+ *     bound or create a hint); null when it has none, when its raw envelope is one this build cannot read
+ *     (`readableRaw`: a newer or malformed envelope is never trusted, whatever origins it claims) or when that
+ *     derivation fails;
+ *   - a format-1 doc: the doc itself when `isLocalByteProfile`, else null.
+ *  The result keeps the persisted vocabulary (`meta.source: 'editor-cache'`). Memoised per doc object (a result
+ *  maps to itself), so repeated lookups of the same stored doc derive once. Pure, no device traffic. */
+export function localByteSource(doc: BuiltCache | null | undefined, model: number): BuiltCache | null {
+  if (!doc) return null;
+  const hit = LOCAL_BYTE_SOURCE.get(doc);
+  if (hit !== undefined) return hit;
+  let out: BuiltCache | null = null;
+  if (profileFormatOf(doc) !== 2) {
+    out = isLocalByteProfile(doc.meta) ? doc : null;
+  } else {
+    const sources = (readableRaw(doc)?.sources ?? []).filter((s) => s.kind === 'editor-cache' && s.origin === 'local');
+    if (sources.length > 0) {
+      try {
+        const { params, seeds } = catalogForModel(model);
+        const fw = typeof doc.firmware === 'string' ? doc.firmware : null;
+        const derived = buildProfileDoc({ format: RAW_FORMAT as 1, sources }, params, seeds, deriveOptionsFor(model, fw));
+        out = { ...derived, meta: { ...derived.meta, source: 'editor-cache' as BuiltCache['meta']['source'] } };
+        LOCAL_BYTE_SOURCE.set(out, out);
+      } catch {
+        out = null;
+      }
+    }
+  }
+  LOCAL_BYTE_SOURCE.set(doc, out);
+  return out;
 }
 
 /** The (model, firmware) pairs the walk's enum hints are verified on: a hinted label walk opens label
@@ -294,18 +316,19 @@ export function enumHintsVerifiedOn(model: number, fw: { major: number; minor: n
  *  (`enumHintsFromRanges`). The codec label-walks a definition whose default slot is non-zero ONLY on such
  *  a hint (type lists, tempo divisions, foot-controller assignments: otherwise they come back as floats).
  *
- *  Source per family: a LOCAL byte-exact stored cache of the attached firmware when it carries rows for the
- *  family (`isLocalByteProfile`: an editor-cache import made by this install; the caller passes only a
- *  usable-schema doc) — exact data for this firmware — else the static catalog's ranges. NEVER a cloud
- *  profile (not even one of byte origin: its provenance is a claim of another install) and never a stored
- *  live-walk profile or one of unknown provenance: a hint is a promise that the param HAS a label list, and
- *  a label query to a param without one is out of contract for the device. Models without a gen-3 catalog
- *  get no hints. Whether a build passes hints at all is gated by firmware (`enumHintsVerifiedOn`). */
-export function walkEnumHints(model: number, byteExact?: BuiltCache | null): Record<number, Record<number, LiveEnumHint>> {
+ *  Source per family: the LOCAL editor-cache data of the stored profile of the attached firmware when it
+ *  carries rows for the family (`localByteSource(stored)`: an editor-cache import made by this install, derived
+ *  on its own; the caller passes only a usable-schema doc) — exact data for this firmware — else the static
+ *  catalog's ranges. NEVER a cloud or definitions-file profile or source (not even one of byte origin: its
+ *  provenance is a claim of another install) and never a live walk (stored alone or merged into a format-2
+ *  doc) or a profile of unknown provenance: a hint is a promise that the param HAS a label list, and a label
+ *  query to a param without one is out of contract for the device. Models without a gen-3 catalog get no
+ *  hints. Whether a build passes hints at all is gated by firmware (`enumHintsVerifiedOn`). */
+export function walkEnumHints(model: number, stored?: BuiltCache | null): Record<number, Record<number, LiveEnumHint>> {
   const hints: Record<number, Record<number, LiveEnumHint>> = {};
   const profile: DeviceProfile | undefined = PROFILES[model];
   if (!profile) return hints;
-  const exact = byteExact && isLocalByteProfile(byteExact.meta) ? byteExact : null;
+  const exact = localByteSource(stored, model);
   const byFamily = new Map<string, Record<number, LiveEnumHint>>();
   const hintsOf = (family: string): Record<number, LiveEnumHint> => {
     let h = byFamily.get(family);
@@ -380,6 +403,8 @@ export function walkSetup(
   // firmware (force-rebuild over an editor-cache import) is exact device data and refines the catalog;
   // a stale one (outdated schema) is not trusted for that either.
   const stored = fw ? loadStoredProfile(store, deviceCacheKey(model, fw.major, fw.minor)) : null;
+  // Only the LOCAL editor-cache data of the stored doc refines limits and hints (walkBlockLimits / walkEnumHints
+  // take it through localByteSource): a merged live, cloud or file source never does.
   const usable = stored?.state === 'usable' ? stored.profile : null;
   const limits = walkBlockLimits(model, mode, usable);
   const hinted = enumHintsVerifiedOn(model, fw);
@@ -408,8 +433,26 @@ export function walkQueryBound(opts: Pick<LiveWalkOptions, 'paramBoundByBlock' |
   return opts.maxParamId ?? (opts.mode === 'full' ? WALK_MAX_PARAM_ID_FULL : WALK_MAX_PARAM_ID);
 }
 
-/** The detached build task: pause telemetry, walk → build → persist → swap profile, emit terminal
- *  event, resume telemetry. Never rejects (all outcomes are emitted, not thrown). */
+/** Highest effect id the codec's default live walk visits (its DEFAULT_MAX_BLOCK): the standard scope's
+ *  block range, recorded in the live raw source's scope. */
+const LIVE_WALK_MAX_BLOCK = 160;
+
+/** A walk result from a `WalkImpl`: the detailed result as is, bare records with zeroed statistics. */
+function walkResultOf(r: CacheRecord[] | LiveWalkResult): LiveWalkResult {
+  if (!Array.isArray(r)) return r;
+  return {
+    records: r, queries: 0, enumLabels: 0, lostReplies: 0, recoveredReplies: 0, unresolvedReplies: 0,
+    placeholderSlots: 0, missingSlots: 0, silentAddresses: 0, pseudoReplies: { endMarker: 0, duplicateId: 0, implausible: 0 }
+  };
+}
+
+/** The raw-source kind a build of `mode` produces. */
+const liveKindOf = (mode: BuildMode): Extract<RawSourceKind, 'live-full' | 'live-readonly'> => (mode === 'full' ? 'live-full' : 'live-readonly');
+
+/** The detached build task: pause telemetry, walk → raw source → merge into the stored doc → persist → swap
+ *  profile, emit terminal event, resume telemetry. Never rejects (all outcomes are emitted, not thrown). The
+ *  walk's records are kept as a live raw source (unresolved replies included: the coverage reports them as a
+ *  blocking gap), merged with the doc's other sources by the codec's precedence, unless `replace`. */
 async function runBuild(store: Store, registry: DeviceRegistry, job: CacheJob, walkImpl: WalkImpl): Promise<void> {
   const { key, model, firmware, fw, mode, controller } = job;
   const full = mode === 'full';
@@ -431,7 +474,7 @@ async function runBuild(store: Store, registry: DeviceRegistry, job: CacheJob, w
         reloadPreset: () => driver.reloadPreset?.() ?? Promise.resolve()
       };
     }
-    const { opts: walkOpts } = walkSetup(store, model, fw, mode, {
+    const setup = walkSetup(store, model, fw, mode, {
       signal: controller.signal,
       write,
       onProgress: (p) => {
@@ -445,17 +488,40 @@ async function runBuild(store: Store, registry: DeviceRegistry, job: CacheJob, w
         }
       }
     });
-    const built = await buildCache(
-      { kind: 'live', walk: () => walkImpl(adapter, walkOpts) },
-      paramsForModel(model),
-      HW_SEEDS,
-      { model, firmware, builtAt: new Date().toISOString() }
-    );
+    const walked = walkResultOf(await walkImpl(adapter, setup.opts));
     if (controller.signal.aborted) throw new Error('cancelled'); // a late abort discards the result
-    store.putDoc('deviceCaches', key, built);
+    const capturedAt = new Date().toISOString();
+    const scope: LiveSourceScope = {
+      blocks: Array.from({ length: LIVE_WALK_MAX_BLOCK + 1 }, (_, i) => i),
+      maxParamId: setup.opts.maxParamId ?? WALK_MAX_PARAM_ID,
+      bounds: { ...setup.limits.bound },
+      extended: false,
+      above160: false,
+      hinted: setup.hinted
+    };
+    // An extended request walks the standard scope until a firmware is verified for it (none yet).
+    const extension = job.scope === 'extended' ? ('skipped' as const) : undefined;
+    const source = rawFromLiveWalk(walked, scope, {
+      kind: liveKindOf(mode), capturedAt, firmware, origin: 'local', ...(extension ? { extension } : {})
+    });
+    const merged = mergeSourcesIntoStored(store, {
+      key, model, firmware, incoming: [source], replace: job.replace, extras: { builtAt: capturedAt }, now: capturedAt
+    });
+    if (controller.signal.aborted) throw new Error('cancelled');
+    persistProfile(store, key, merged.doc);
     await registry.applyRuntimeCache(); // adopt the freshly-built device-true profile immediately
     const total = job.progress.total;
-    registry.emitEvent({ type: 'cacheBuild', phase: 'done', done: total, total, key, model, firmware });
+    if (merged.derivationFailed !== undefined) {
+      // the stored doc was stale (its sources did not derive) and still does not derive with the walk added: the
+      // walk is kept with the other sources (nothing lost), the doc stays stale — a terminal error, not 'done'
+      registry.emitEvent({
+        type: 'cacheBuild', phase: 'error', done: total, total, key, model, firmware,
+        error: `derivation-failed: ${merged.derivationFailed} (the walk was stored next to the profile's other sources)`
+      });
+      return;
+    }
+    registry.emitEvent({ type: 'cacheBuild', phase: 'done', done: total, total, key, model, firmware, ...(extension ? { extension } : {}) });
+    if (merged.kept > 0) registry.emitEvent({ type: 'definitions', reason: 'merged', key });
   } catch (e) {
     const phase = controller.signal.aborted ? 'cancelled' : 'error';
     registry.emitEvent({ type: 'cacheBuild', phase, done: job.progress.done, total: job.progress.total, key, model, firmware, ...(phase === 'error' ? { error: (e as Error).message } : {}) });
@@ -487,12 +553,15 @@ export function resolveCacheKey(store: Store, registry: DeviceRegistry): string 
 }
 
 /** GET /device/cache — current key + existence + live build progress + stored-doc meta, plus whether
- *  the stored profile is stale (schema this build cannot use) and the current schema number. */
+ *  the stored profile is stale (schema this build cannot use, or a failed re-derivation) and the current
+ *  schema number. Additive v2 fields: `format`, `sources` (one line per raw source), `coverage` (usable doc:
+ *  document-level gaps + counts) and `rederived` (this read re-derived a format-2 doc from its raw sources and
+ *  wrote it back unless a newer build wrote it — no device traffic). */
 export async function cacheStatus(store: Store, registry: DeviceRegistry): Promise<CacheStatus> {
   await registry.driver(); // ensure detection ran so model/firmware are populated
   const key = resolveCacheKey(store, registry);
   const job = JOBS.get(registry);
-  const stored = key ? loadStoredProfile(store, key) : ({ state: 'absent' } as const);
+  const stored: StoredProfile = key ? upgradeStoredProfile(store, key) : { state: 'absent' };
   const exists = stored.state !== 'absent';
   const out: CacheStatus = { key, exists, building: !!job, stale: stored.state === 'stale', currentSchema: CURRENT_CACHE_SCHEMA };
   if (job) out.progress = { ...job.progress };
@@ -506,18 +575,66 @@ export async function cacheStatus(store: Store, registry: DeviceRegistry): Promi
       unmappedSections: data.unmappedSections?.length ?? 0,
       unmappedFamilies: data.unmappedFamilies?.length ?? 0,
       // Where the persisted profile came from: 'live' (A3 walk), 'editor-cache' (import), 'cloud'
-      // (pull). Axis surfaces this next to the device info.
+      // (pull), 'axisdefs' (definitions file). Axis surfaces this next to the device info.
       source: (data.meta as { source?: string } | undefined)?.source ?? 'live',
       schema: stored.check.schema
     };
+    out.format = stored.format;
+    if (stored.state === 'usable') {
+      const summary = profileSummaryOf(data, registry.detectedModelId >= 0 ? registry.detectedModelId : null);
+      out.sources = summary.sources;
+      out.coverage = summary.coverage;
+      if (stored.rederived) {
+        out.rederived = true;
+        if (stored.upgraded && key) registry.emitEvent({ type: 'definitions', reason: 'rederived', key });
+      }
+    } else {
+      const listed = (data.meta as { sources?: unknown } | undefined)?.sources;
+      out.sources = stored.format === 2 && Array.isArray(listed) ? (listed as SourceSummary[]).map((s) => ({ ...s })) : [];
+    }
   }
   return out;
 }
 
+/** Coverage fixes a repeat walk of the same kind and scope can deliver. A blocking gap whose fixes do not include
+ *  one of these (`high-ids` / `blocks-above-160` / `rosters` → `read-extended` / `import-editor-cache`,
+ *  `disagreement` → `import-editor-cache`) does not make a build walk again: the same walk would leave it open.
+ *  (`read-extended` joins once an extended scope is verified for a firmware, WP-F6.) */
+const REWALK_FIXES: ReadonlySet<string> = new Set(['read-from-device']);
+
+/** Does the stored profile already satisfy a build of `mode` (`already: true`, contract §4.1)? Only a format-2 doc
+ *  that holds a LOCAL live source of the requested kind (a read-only request is also satisfied by a full walk,
+ *  its superset) and whose coverage has no blocking gap a repeat walk could fix (`REWALK_FIXES`). A legacy
+ *  format-1 live doc holds no raw source: the build walks and writes a format-2 doc in its place (the `no-raw`
+ *  gap's `read-from-device` fix); a legacy local editor-cache import is handled before (`startClaimedBuild`).
+ *  Anything else walks and merges. */
+function buildSatisfied(stored: Extract<StoredProfile, { state: 'usable' }>, mode: BuildMode, model: number): boolean {
+  if (stored.format !== 2) return false;
+  const kinds: readonly RawSourceKind[] = mode === 'full' ? ['live-full'] : ['live-readonly', 'live-full'];
+  const summary = profileSummaryOf(stored.profile, model);
+  const rewalkGap = summary.coverage.gaps.some((g) => g.blocking && g.fix.some((f) => REWALK_FIXES.has(f)));
+  return summary.sources.some((s) => kinds.includes(s.kind) && s.origin === 'local') && !rewalkGap;
+}
+
+/** TEST-ONLY: the walk a build runs when its caller passes no `walkImpl` (a route has no way to pass one), per
+ *  registry — lets a suite drive the real build path through either twin's route. `null` restores the codec's. */
+const DEFAULT_WALKS = new WeakMap<DeviceRegistry, WalkImpl>();
+export function __setDefaultWalkForTest(registry: DeviceRegistry, walk: WalkImpl | null): void {
+  if (walk) DEFAULT_WALKS.set(registry, walk);
+  else DEFAULT_WALKS.delete(registry);
+}
+
 /** POST /device/cache/build — start a background build (or report already-built / gated). Returns
  *  immediately; the build runs detached. `mode` (default 'read-only') selects the HW-proven read-only
- *  sweep or the fullCapture-gated write-sweep (refused on unverified or unknown firmware). `walkImpl` is a test seam (defaults to the codec's liveWalk). */
-export async function startCacheBuild(store: Store, registry: DeviceRegistry, opts?: { force?: boolean; mode?: BuildMode; walkImpl?: WalkImpl }): Promise<StartResult> {
+ *  sweep or the fullCapture-gated write-sweep (refused on unverified or unknown firmware). The walk merges
+ *  into the stored doc (`replace: true` replaces it); `already: true` only when the doc already holds a
+ *  complete local source of the requested kind (`buildSatisfied`; `force` walks anyway and replaces that
+ *  source), or is a legacy (format-1) local editor-cache import (byte data a walk cannot improve and no raw to
+ *  merge with: `force` answers 409 `local-profile-better`, only `replace` walks over it). A doc a newer build
+ *  wrote answers 409 `newer-profile` unless `replace` (see profileMerge.ts `mergeRefusal`). `scope` 'extended'
+ *  walks the standard scope until a firmware is verified for more. `walkImpl` is a test seam (defaults to the
+ *  codec's liveWalkDetailed). */
+export async function startCacheBuild(store: Store, registry: DeviceRegistry, opts?: CacheBuildOptions): Promise<StartResult> {
   await registry.driver(); // ensure detection ran
   const caps = registry.activeCapabilities();
   if (!caps?.selfDescribe) return { code: 501, body: { error: 'unsupported', capability: 'selfDescribe' } };
@@ -545,9 +662,9 @@ export async function startCacheBuild(store: Store, registry: DeviceRegistry, op
 
 /** The rest of startCacheBuild, with the device claimed. `started` = a job now owns the claim (its task
  *  releases it when it settles); otherwise the caller releases it. */
-async function startClaimedBuild(store: Store, registry: DeviceRegistry, opts: { force?: boolean; mode?: BuildMode; walkImpl?: WalkImpl } | undefined): Promise<{ started: boolean; result: StartResult }> {
+async function startClaimedBuild(store: Store, registry: DeviceRegistry, opts: CacheBuildOptions | undefined): Promise<{ started: boolean; result: StartResult }> {
   const mode: BuildMode = opts?.mode === 'full' ? 'full' : 'read-only';
-  const done = (result: StartResult) => ({ started: false, result });
+  const done = (result: StartResult) => ({ started: false as const, result });
   // FULL mode WRITES to the device, so it additionally needs a firmware it has been verified on: per model, inside the
   // FULL_CAPTURE_VERIFIED_FW range, refused below its minimum as well as above its maximum (a firmware can move the
   // table ends the walk relies on: on FM3 13.0 a walk without the table-end bound did not stop at a block's end and
@@ -578,20 +695,37 @@ async function startClaimedBuild(store: Store, registry: DeviceRegistry, opts: {
   const fw = registry.firmwareInfo();
   if (model < 0 || !fw) return done({ code: 503, body: { error: 'no device detected or firmware unknown' } });
   const key = deviceCacheKey(model, fw.major, fw.minor);
-  // Only a USABLE profile counts as "already built": a stale one (outdated schema) is rebuilt without
-  // `force` and overwritten by the new build (it is never deleted up front, a cancelled/failed build leaves it).
-  if (loadStoredProfile(store, key).state === 'usable' && !opts?.force) {
+  const replace = opts?.replace === true;
+  // Only a USABLE profile can count as "already built" (a stale one is rebuilt without `force` and merged into or
+  // replaced by the new build; it is never deleted up front, a cancelled/failed build leaves it), and only when it
+  // already holds what this build would add (`buildSatisfied`).
+  const stored = loadStoredProfile(store, key);
+  const already = (): { started: false; result: StartResult } => {
     registry.emitEvent({ type: 'cacheBuild', phase: 'already-built', done: 0, total: 0, key, model, firmware: fw.version });
     return done({ code: 200, body: { ok: true, already: true } });
+  };
+  // A doc a newer build wrote, or a raw-less doc that outranks this walk, is never rewritten (409 unless `replace`).
+  const refusal: MergeRefusal | null = mergeRefusal(store, key, [{ kind: liveKindOf(mode), origin: 'local' }], { replace });
+  if (refusal?.error === 'newer-profile') return done({ code: 409, body: refusalBody(refusal) });
+  if (stored.state === 'usable' && !replace && !opts?.force) {
+    // A legacy (format-1) doc decoded from an editor cache (a local import, or a cloud / file profile of byte origin):
+    // byte-exact tables with no raw source to merge a walk into — a walk could only replace them with a live
+    // reconstruction. Already built; `force` is refused below (409 local-profile-better), `replace: true` replaces
+    // it (the old behaviour).
+    if (refusal) return already();
+    if (buildSatisfied(stored, mode, model)) return already();
   }
+  if (refusal) return done({ code: 409, body: refusalBody(refusal) });
   const job: CacheJob = {
     key, model, firmware: fw.version, fw: { major: fw.major, minor: fw.minor }, mode,
+    scope: opts?.scope === 'extended' ? 'extended' : 'standard',
+    replace,
     controller: new AbortController(),
     progress: { done: 0, total: 0, phase: 'walking' },
     promise: Promise.resolve()
   };
   JOBS.set(registry, job);
-  job.promise = runBuild(store, registry, job, opts?.walkImpl ?? liveWalk).finally(() => {
+  job.promise = runBuild(store, registry, job, opts?.walkImpl ?? DEFAULT_WALKS.get(registry) ?? liveWalkDetailed).finally(() => {
     if (JOBS.get(registry) === job) JOBS.delete(registry);
     releaseDevice(registry, 'cache-build');
   });

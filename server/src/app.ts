@@ -203,8 +203,13 @@ export async function buildApp(registry: DeviceRegistry, opts: AppOptions = {}):
   // Start a background build (501 no selfDescribe / no fullCapture; 501 reason:'firmware' for mode 'full' on a firmware
   // it has not been verified on — FAIL CLOSED: full mode on unknown/unreadable firmware is 501 too, no longer 503;
   // 503 no device/firmware for read-only; 409 already building). Read-only is never firmware-gated.
-  app.post<{ Body: { force?: boolean; mode?: 'read-only' | 'full' } }>('/device/cache/build', async (req, reply) => {
-    const r = await deviceCache.startCacheBuild(store.defaultStore, registry, { force: req.body?.force, mode: req.body?.mode });
+  // Profile v2: the walk MERGES into the stored doc (`replace: true` replaces it); `already` only when the doc holds
+  // a complete local source of the requested kind; `scope` 'standard' | 'extended' (extended walks standard until
+  // a firmware is verified for it; the terminal `done` event then carries `extension: 'skipped'`).
+  app.post<{ Body: { force?: boolean; mode?: 'read-only' | 'full'; scope?: 'standard' | 'extended'; replace?: boolean } }>('/device/cache/build', async (req, reply) => {
+    const r = await deviceCache.startCacheBuild(store.defaultStore, registry, {
+      force: req.body?.force, mode: req.body?.mode, scope: req.body?.scope, replace: req.body?.replace === true
+    });
     reply.code(r.code);
     return r.body;
   });
@@ -232,9 +237,12 @@ export async function buildApp(registry: DeviceRegistry, opts: AppOptions = {}):
   // The app-wide hook applies; the `{ path }` branch re-checks the strict rule (403) before discovery
   // runs. `{ path }` must then be one of a fresh discovery's candidates (400 not-a-discovered-cache
   // otherwise; the path is never opened or stat-ed); the read uses the candidate's own path.
-  app.post<{ Body: Buffer | { path?: string }; Querystring: { name?: string; force?: string } }>('/device/cache/import', async (req, reply) => {
+  // Profile v2: the editor cache MERGES into the stored doc; `?replace=1` (or `replace: true` next to `path`)
+  // replaces the whole doc instead.
+  app.post<{ Body: Buffer | { path?: string; replace?: boolean }; Querystring: { name?: string; force?: string; replace?: string } }>('/device/cache/import', async (req, reply) => {
     const force = req.query.force === '1' || req.query.force === 'true';
     const b = req.body;
+    const replace = req.query.replace === '1' || req.query.replace === 'true' || (!!b && !Buffer.isBuffer(b) && b.replace === true);
     let bytes: Uint8Array;
     let name: string;
     if (b && !Buffer.isBuffer(b) && typeof b.path === 'string' && b.path) {
@@ -250,7 +258,7 @@ export async function buildApp(registry: DeviceRegistry, opts: AppOptions = {}):
     } else {
       reply.code(400); return { error: 'POST the .cache bytes as application/octet-stream with ?name=<filename>, or JSON { path }' };
     }
-    const r = await editorCacheImport.importEditorCache(registry, store.defaultStore, bytes, { name, force });
+    const r = await editorCacheImport.importEditorCache(registry, store.defaultStore, bytes, { name, force, replace });
     reply.code(r.code);
     return r.body;
   });
@@ -920,7 +928,11 @@ export async function buildApp(registry: DeviceRegistry, opts: AppOptions = {}):
 
     // ── shared device-definition profiles (THIRD cache source; services/cloudProfiles.ts) ──
     app.get('/device/cache/cloud', async () => cloudProfiles.cloudCacheCheck(cloud, store.defaultStore, registry));
-    app.post('/device/cache/cloud/pull', async (_req, reply) => { const r = await cloudProfiles.cloudCachePull(cloud, store.defaultStore, registry); reply.code(r.code); return r.body; });
+    app.post<{ Body: { replace?: boolean } | undefined }>('/device/cache/cloud/pull', async (req, reply) => {
+      const r = await cloudProfiles.cloudCachePull(cloud, store.defaultStore, registry, { replace: req.body?.replace === true });
+      reply.code(r.code);
+      return r.body;
+    });
     app.post('/device/cache/cloud/publish', async (_req, reply) => { const r = await cloudProfiles.cloudCachePublish(cloud, store.defaultStore, registry); reply.code(r.code); return r.body; });
 
     // ── Axis Cloud Remote — host agent (off by default; toggled by the Axis UI) ──

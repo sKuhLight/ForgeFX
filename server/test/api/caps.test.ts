@@ -5,9 +5,15 @@
 // nothing here touches the transport beyond the mocked handshake).
 import { fullCaptureAllowedOnFirmware } from '../../src/drivers/registryCore.js';
 import { buildApp } from '../../src/app.js';
-import { __createRegistryForTest, type DeviceRegistry } from '../../src/drivers/registry.js';
-import type { DefinitionsCaps } from '../../src/drivers/types.js';
-import type { BuiltCache } from 'forgefx-midi/cache';
+import { __createRegistryForTest, __setDriverForTest, type DeviceRegistry } from '../../src/drivers/registry.js';
+import type { DefinitionsCaps, DeviceDriver } from '../../src/drivers/types.js';
+import { CACHE_SCHEMA, type BuiltCache } from 'forgefx-midi/cache';
+import { loadUsableProfile } from '../../src/profileSchema.js';
+import { profileCatalogFor } from '../../src/profileCatalog.js';
+import { createStore } from '../../src/runtime/store.js';
+import { createMemStoreBackend } from '../../src/runtime/memStoreBackend.js';
+import { nodeCodec } from '../../src/runtime/fsStoreBackend.js';
+import { clone, editorCacheSource, liveSeedRecords, liveSource, profileDoc } from '../helpers/profileDocs.js';
 import { FM3_CATALOG_BASELINE } from 'forgefx-midi/gen3/fm3';
 import { FM9_CATALOG_BASELINE } from 'forgefx-midi/gen3/fm9';
 import { AXE3_CATALOG_BASELINE } from 'forgefx-midi/gen3/axe-fx-iii';
@@ -15,7 +21,7 @@ import { buildTestApp, firmwareVersionReply } from '../helpers/api.js';
 import { catalogBuilt } from '../helpers/catalogProfile.js';
 import { MockTransport, handshakeReply, isIdentifyBroadcast, assert, assertEqual } from '../helpers/mock.js';
 
-export const CAPS_CASE_COUNT = 13;
+export const CAPS_CASE_COUNT = 14;
 
 type Caps = {
   slotModel: string;
@@ -410,7 +416,12 @@ async function definitionsAppliedProfile(): Promise<void> {
   let r = await defsRig(0x11, [13, 0], { '11_13p0': docFor(0x11, '13.0') });
   try {
     const d = await definitionsOf(r);
-    assertEqual(JSON.stringify(d.profile), JSON.stringify({ key: '11_13p0', source: 'editor-cache', byteExact: true, firmware: '13.0', suspectFamilies: [] }), 'FM3 13.0 profile facts');
+    // profile v2 fields appended after suspectFamilies: a legacy (format-1) doc has no raw sources and reports the
+    // non-blocking `no-raw` gap (plus the gaps of what it lacks), complete = no blocking gap
+    assertEqual(JSON.stringify(d.profile), JSON.stringify({
+      key: '11_13p0', source: 'editor-cache', byteExact: true, firmware: '13.0', suspectFamilies: [],
+      format: 1, sources: [], coverage: { complete: true, gaps: ['no-raw', 'no-units', 'no-tapers', 'no-cab-tables'] }
+    }), 'FM3 13.0 profile facts');
     assertEqual(d.drift, 'none', 'FM3 13.0 with a 13.0 profile: no drift');
     assertEqual(d.catalogFirmware, '12.0', 'the catalog firmware is the bundled one, not the profile\'s');
     assertEqual(d.genericParams, true, 'genericParams');
@@ -425,7 +436,19 @@ async function definitionsAppliedProfile(): Promise<void> {
     const p = (await definitionsOf(r)).profile;
     assertEqual(p?.source, 'live', 'live profile source');
     assertEqual(p?.byteExact, false, 'live profile is not byte-exact');
-    assertEqual((await definitionsOf(r)).drift, 'none', 'a live profile of the running firmware: no drift');
+    // profile v2 coverage: this live-only fixture carries no model lists, and on a firmware newer than the catalog
+    // that is the blocking `rosters` gap (the catalog's lists may be out of date): `partial`, not `none`
+    assertEqual((await definitionsOf(r)).drift, 'partial', 'a live profile of the running firmware without rosters: partial');
+    assert(p!.coverage.gaps.includes('rosters') && !p!.coverage.complete, 'the blocking rosters gap is listed');
+  } finally { await r.app.close(); }
+  const allRosters = Object.fromEntries(Object.keys(profileCatalogFor(0x11).rosters ?? {}).map((f) => [f, [{ value: 0, name: 'A', manufacturer: null, basedOn: null }]]));
+  assert(Object.keys(allRosters).length > 0, 'fixture: the FM3 catalog has roster families');
+  r = await defsRig(0x11, [13, 0], { '11_13p0': { ...docFor(0x11, '13.0', 'live'), rosters: allRosters } as BuiltCache });
+  try {
+    // with a model list for every catalog roster family the same live profile has no blocking gap
+    const d = await definitionsOf(r);
+    assert(!d.profile!.coverage.gaps.includes('rosters'), 'no rosters gap');
+    assertEqual(d.drift, 'none', 'a live profile of the running firmware with its rosters: no drift');
   } finally { await r.app.close(); }
   r = await defsRig(0x11, [13, 0], { '11_13p0': docFor(0x11, '13.0', 'cloud') });
   try {
@@ -545,6 +568,12 @@ async function definitionsKeyOrder(): Promise<void> {
       assertEqual(keys[keys.indexOf('virtualEffects') + 1], 'definitions', `${name}: definitions follows virtualEffects`);
       assertEqual(keys[keys.indexOf('definitions') + 1], 'telemetryControl', `${name}: definitions comes before telemetryControl`);
       assertEqual(Object.keys(caps.definitions as object).join(','), 'genericParams,catalogFirmware,profile,drift,contribute', `${name}: definitions key order`);
+      const profile = (caps.definitions as { profile: Record<string, unknown> | null }).profile;
+      if (profile) {
+        // the profile v2 fields are appended after the M2 ones (contract §7), coverage as { complete, gaps }
+        assertEqual(Object.keys(profile).join(','), 'key,source,byteExact,firmware,suspectFamilies,format,sources,coverage', `${name}: definitions.profile key order`);
+        assertEqual(Object.keys(profile.coverage as object).join(','), 'complete,gaps', `${name}: definitions.profile.coverage key order`);
+      }
       // the pretty-printed diff against the previous shape only adds lines
       const without = { ...caps };
       delete without.definitions;
@@ -557,6 +586,132 @@ async function definitionsKeyOrder(): Promise<void> {
       assertEqual(after.slice(at + added).join('\n'), before.slice(at).join('\n'), `${name}: no line after the insertion changes`);
     } finally { await r.app.close(); }
   }
+}
+
+// ── profile v2: drift `partial` / `stale` and the document's format, sources and coverage ──
+// A rig whose load hook is the real lookup (`loadUsableProfile` over a memory store), so the caps also see a profile
+// that is stored but not usable. `driver` replaces the real gen-3 driver (the runtime `unmapped-block` gap).
+async function storeRig(modelId: number, firmware: [number, number] | null, docs: Record<string, unknown>, driver?: DeviceDriver) {
+  const mock = new MockTransport('serial', `mock-0x${modelId.toString(16)}`);
+  mock.reply = (req) => {
+    if (isIdentifyBroadcast(req)) return [handshakeReply(modelId)];
+    if (firmware && req[0] === 0xf0 && req[5] === 0x08) return [firmwareVersionReply(modelId, firmware[0], firmware[1])];
+    return [];
+  };
+  const s = createStore(createMemStoreBackend(), nodeCodec);
+  for (const [k, v] of Object.entries(docs)) s.putDoc('deviceCaches', k, v);
+  const registry = __createRegistryForTest({
+    resolveConn: async () => ({ transport: 'serial', id: mock.label }),
+    openConn: () => mock,
+    loadDeviceCache: (key) => loadUsableProfile(s, key)
+  });
+  if (driver) __setDriverForTest(registry, modelId, driver);
+  await registry.detect();
+  const app = await buildApp(registry);
+  return { registry, store: s, app } as DefsRig & { store: typeof s };
+}
+
+/** A gen-3-grid-shaped fake driver whose last read grid holds the effect ids `unmapped.v` no family describes. */
+function unmappedFake(unmapped: { v: number[] | null }): DeviceDriver {
+  const capabilities = {
+    slotModel: 'grid', grid: { rows: 4, cols: 12 }, gridEdit: true, scenes: 8, channels: true,
+    presetDump: true, presetConvert: true, blockParamDecode: true,
+    telemetry: { tuner: false, outputMeters: false, cpu: false },
+    fcModel: false, fcLiveRead: false, modBind: false, cabIrs: false, editorLayouts: true,
+    supportsSave: true, selfDescribe: true, cacheImport: true, fullCapture: false,
+    deviceEditPush: false, deviceEditWatch: false
+  };
+  return {
+    modelId: 0x11, key: 'fm3', name: 'FM3', capabilities,
+    applyRuntimeProfile: () => {},
+    unmappedPlacedEffectIds: () => unmapped.v
+  } as unknown as DeviceDriver;
+}
+
+async function definitionsDriftV2(): Promise<void> {
+  const fw13 = { firmware: '13.0' };
+  const bytes13 = profileDoc([await editorCacheSource(undefined, fw13)], fw13);
+  const live13 = profileDoc([liveSource(liveSeedRecords(), fw13)], fw13);
+  const unresolved12 = profileDoc([liveSource(liveSeedRecords(), { stats: { unresolvedReplies: 3 } })]);
+  // stored but unusable: a legacy doc of an older schema, and a format-2 doc whose re-derivation fails
+  const legacyOld = (fw: string) => { const d = docFor(0x11, fw); return { ...d, meta: { ...d.meta, schema: CACHE_SCHEMA - 1 } }; };
+  const failing13 = clone(live13) as unknown as { meta: Record<string, unknown>; raw: { sources: unknown[] } };
+  failing13.meta.derivedRevision = 0; // must re-derive …
+  failing13.raw.sources.push(clone(failing13.raw.sources[0])); // … and cannot: two sources share one id
+
+  type Case = { name: string; fw: [number, number]; docs: Record<string, unknown>; drift: DefinitionsCaps['drift']; check?: (d: DefinitionsCaps) => void };
+  const table: Case[] = [
+    {
+      name: 'FM3 13.0, a format-2 editor-cache profile of 13.0', fw: [13, 0], docs: { '11_13p0': bytes13 }, drift: 'none',
+      check: (d) => {
+        assertEqual(d.profile?.format, 2, 'format 2');
+        assertEqual(d.profile?.sources.join(','), 'editor-cache', 'sources: the kinds of the raw sources');
+        assertEqual(d.profile?.coverage.complete, true, 'complete');
+        assertEqual(d.profile?.byteExact, true, 'byte-exact');
+      }
+    },
+    {
+      name: 'FM3 13.0, a live-only format-2 profile of 13.0 (ids > 127 missing, newer than the catalog)', fw: [13, 0], docs: { '11_13p0': live13 }, drift: 'partial',
+      check: (d) => {
+        assertEqual(d.profile?.sources.join(','), 'live-readonly', 'sources');
+        assertEqual(d.profile?.coverage.complete, false, 'not complete');
+        assert(d.profile!.coverage.gaps.includes('high-ids'), `the blocking high-ids gap is listed (${d.profile!.coverage.gaps.join(',')})`);
+      }
+    },
+    {
+      // an applied profile's blocking gap is a real hole also on the catalog's own firmware (contract R14:
+      // unresolved replies → blocking gap + drift partial)
+      name: 'FM3 12.0 = the catalog firmware, an applied live profile with unresolved replies', fw: [12, 0], docs: { '11_12p0': unresolved12 }, drift: 'partial',
+      check: (d) => {
+        assertEqual(d.profile?.coverage.complete, false, 'the document gap is reported');
+        assert(d.profile!.coverage.gaps.includes('unresolved-replies'), 'unresolved-replies listed');
+      }
+    },
+    {
+      name: 'FM3 12.0 = the catalog firmware, an applied live profile without a blocking gap', fw: [12, 0], docs: { '11_12p0': profileDoc([liveSource(liveSeedRecords())]) }, drift: 'none',
+      check: (d) => {
+        assertEqual(d.profile?.key, '11_12p0', 'applied');
+        assertEqual(d.profile?.coverage.complete, true, 'no blocking gap on the catalog firmware');
+      }
+    },
+    { name: 'FM3 13.0, a stored legacy profile of an older schema', fw: [13, 0], docs: { '11_13p0': legacyOld('13.0') }, drift: 'stale', check: (d) => assertEqual(d.profile, null, 'nothing applied') },
+    { name: 'FM3 13.0, a stored format-2 profile whose re-derivation fails', fw: [13, 0], docs: { '11_13p0': failing13 }, drift: 'stale', check: (d) => assertEqual(d.profile, null, 'nothing applied') },
+    { name: 'FM3 12.0 = the catalog firmware, a stale stored profile', fw: [12, 0], docs: { '11_12p0': legacyOld('12.0') }, drift: 'none' },
+    { name: 'FM3 13.0, nothing stored', fw: [13, 0], docs: {}, drift: 'unprofiled' },
+    { name: 'FM3 13.0, a stale profile of ANOTHER firmware only', fw: [13, 0], docs: { '11_12p0': legacyOld('12.0') }, drift: 'unprofiled' }
+  ];
+  for (const c of table) {
+    const r = await quiet(() => storeRig(0x11, c.fw, clone(c.docs)));
+    try {
+      const d = await definitionsOf(r);
+      assertEqual(d.drift, c.drift, `${c.name}: drift`);
+      c.check?.(d);
+    } finally { await r.app.close(); }
+  }
+
+  // runtime gap: a placed block no family describes makes an applied profile `partial` (unmapped-block), only
+  // while it is placed; without an applied profile the catalog-firmware answer stays
+  const unmapped: { v: number[] | null } = { v: [203] };
+  let r = await storeRig(0x11, [13, 0], { '11_13p0': clone(bytes13) }, unmappedFake(unmapped));
+  try {
+    let d = await definitionsOf(r);
+    assertEqual(d.drift, 'partial', 'an unmapped placed block: partial');
+    assertEqual(d.profile?.coverage.complete, false, 'unmapped block: not complete');
+    assertEqual(d.profile?.coverage.gaps.at(-1), 'unmapped-block', 'the runtime gap is appended');
+    unmapped.v = [];
+    d = await definitionsOf(r);
+    assertEqual(d.drift, 'none', 'no unmapped block: none');
+    assert(!d.profile!.coverage.gaps.includes('unmapped-block'), 'no runtime gap');
+    unmapped.v = null; // no grid read yet
+    assertEqual((await definitionsOf(r)).drift, 'none', 'before the first grid read: none');
+  } finally { await r.app.close(); }
+  unmapped.v = [203];
+  r = await storeRig(0x11, [12, 0], {}, unmappedFake(unmapped));
+  try {
+    const d = await definitionsOf(r);
+    assertEqual(d.profile, null, 'catalog firmware, nothing stored: no applied profile');
+    assertEqual(d.drift, 'none', 'no applied profile: the runtime gap does not apply');
+  } finally { await r.app.close(); }
 }
 
 // editor-cache contribution: the gen-3 grid trio (III/FM3/FM9) with a firmware read; false without one and on
@@ -588,4 +743,5 @@ export async function runCapsTests(): Promise<void> {
   await definitionsFollowsRegistry();
   await definitionsKeyOrder();
   await definitionsContribute();
+  await definitionsDriftV2();
 }

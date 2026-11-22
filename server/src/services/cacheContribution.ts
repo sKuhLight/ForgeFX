@@ -30,8 +30,8 @@ import type { DefinitionsCaps } from '../drivers/types.js';
 import { PROFILES, runtimeProfileFrom } from '../devices.js';
 import { catalogAgreement, compareRows } from '../drivers/profileCompare.js';
 import { buildEditorCache, importBuiltCache, parseEditorCacheFilename, NOT_A_DISCOVERED_CACHE, type EditorCacheFileInfo } from './editorCacheImport.js';
-import { isLocalByteProfile } from './deviceCache.js';
-import { loadStoredProfile } from '../profileSchema.js';
+import { hasLocalByteSource } from './deviceCache.js';
+import { hasNewerRaw, loadStoredProfile } from '../profileSchema.js';
 import type { Store } from '../runtime/store.js';
 import type { EditorCacheCloudOutcome, EditorCacheReserveBody, UploaderSession } from '../runtime/cloud.js';
 
@@ -360,10 +360,13 @@ export async function contributionStatus(
     out.uploads = handlesOf(doc).map(uploadView);
     out.withdrawable = out.uploads.length > 0;
     const stored = loadStoredProfile(store, key);
+    // 'cloud' = data of another install, grouped as `isByteExactProfile` groups them: a pulled cloud profile or an
+    // imported definitions file ('axisdefs'), whatever build kind its `origin` names
+    const src = stored.state === 'absent' ? undefined : (stored.profile.meta as { source?: unknown } | undefined)?.source;
     out.localProfile = stored.state === 'absent' ? 'none'
       : stored.state === 'stale' ? 'stale'
-      : isLocalByteProfile(stored.profile.meta) ? 'byte-exact'
-      : stored.profile.meta?.source === ('cloud' as string) ? 'cloud' : 'live';
+      : hasLocalByteSource(stored.profile) ? 'byte-exact'
+      : src === 'cloud' || src === 'axisdefs' ? 'cloud' : 'live';
   }
 
   let entry: WantedEntry | null = null;
@@ -628,7 +631,11 @@ export async function contribute(
   else if (prep.firmwareMatch !== 'exact') imp = { skipped: 'firmware-differs' };
   else {
     const stored = loadStoredProfile(store, prep.key);
-    if (stored.state === 'stale' && stored.check.reason === 'newer') imp = { skipped: 'newer-profile' };
+    // a profile a NEWER build wrote (stale format 1, a format-2 doc this build only re-derives in memory, or one whose
+    // raw envelope is of a newer format — the import's merge would refuse it, see profileMerge.ts `mergeRefusal`)
+    const storedDoc = store.getDoc('deviceCaches', prep.key);
+    const newerRaw = !!storedDoc && !storedDoc.deleted && hasNewerRaw(storedDoc.data);
+    if ((stored.state === 'stale' && stored.check.reason === 'newer') || (stored.state === 'usable' && stored.rederived === 'newer') || newerRaw) imp = { skipped: 'newer-profile' };
     else {
       try {
         const r = await importBuiltCache(registry, store, prep.built, prep.file);

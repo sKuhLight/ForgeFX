@@ -8,6 +8,7 @@ import type {
   HiddenParam, NameConfidence, NameSource, ParamKind, ParamSource, ParamWidget, ReadOnlyReason, WidgetSource, WriteMode
 } from './paramIndex.js';
 import type { Transport } from '../transport/types.js';
+import type { CoverageGapKind, RawSourceKind } from 'forgefx-midi/cache';
 import type { TelemetryMode, CadenceProfile } from './telemetryProfiles.js';
 
 /** Thrown by a driver's verbatim-dump export when the slot is an unused (empty) preset slot: its dump is
@@ -150,11 +151,23 @@ export interface DefinitionsCaps {
     firmware: string | null;
     /** Families whose cache section looked mis-assigned and were not merged. */
     suspectFamilies: string[];
+    /** Document format: 1 = derived tables only (legacy), 2 = raw sources + derived tables. */
+    format: 1 | 2;
+    /** Kinds of the document's raw sources, each once, in source order (empty for a format-1 doc). */
+    sources: RawSourceKind[];
+    /** Coverage of the applied profile: `complete` = no blocking gap, the document's own gaps plus the runtime
+     *  `unmapped-block` (a placed block no family describes). The gap kinds only; `GET /device/cache` has
+     *  the details. */
+    coverage: { complete: boolean; gaps: CoverageGapKind[] };
   } | null;
-  /** Does the running firmware have definitions to go by? `none`: an applied profile of this firmware, or
-   *  the firmware the catalog was generated from. `unprofiled`: neither. `unknown`: the firmware is not
-   *  known, or there is no catalog firmware and no profile to compare against. */
-  drift: 'none' | 'unprofiled' | 'unknown';
+  /** Does the running firmware have definitions to go by? `none`: an applied profile of this firmware without
+   *  a blocking gap, or the firmware the catalog was generated from with no profile applied (or an applied one
+   *  without a blocking gap). `partial`: an applied profile of this firmware with a blocking gap — the
+   *  document's own (`coverage.gaps`) or the runtime `unmapped-block` — also on the catalog's firmware.
+   *  `stale`: a profile of this firmware is stored but not usable. `unprofiled`: none of these. `unknown`: the
+   *  firmware is not known, or there is no catalog firmware and no profile to compare against. Clients treat
+   *  values they do not know like `unknown`. */
+  drift: 'none' | 'partial' | 'stale' | 'unprofiled' | 'unknown';
   /** This device can contribute its editor definitions cache (`/device/cache/contribute`): a gen-3 grid
    *  driver that imports editor caches and whose firmware was read. Whether the cloud wants the file, and
    *  whether a cloud is configured at all, is in the contribution status, not here. */
@@ -224,7 +237,16 @@ export type DeviceEvent =
    *  → 'done' (persisted) | 'cancelled' | 'error'; 'already-built' is emitted when a build was asked
    *  for but a cache already existed. `done`/`total` are the block-sweep counters; `key`/`model`/
    *  `firmware` identify the cache; `error` carries the failure message on 'error'. */
-  | { type: 'cacheBuild'; phase: 'walking' | 'building' | 'done' | 'error' | 'cancelled' | 'already-built'; done: number; total: number; key?: string; model?: number; firmware?: string; error?: string }
+  | { type: 'cacheBuild'; phase: 'walking' | 'building' | 'done' | 'error' | 'cancelled' | 'already-built'; done: number; total: number; key?: string; model?: number; firmware?: string; error?: string;
+      /** Terminal phases of a build that asked for the extended scope: whether the extension walk ran. */
+      extension?: 'done' | 'skipped' | 'aborted' }
+  /** The stored device-definition profile of `key` changed without a build walk of its own: re-derived from its
+   *  raw sources (`rederived`), new sources merged into it (`merged`), a definitions file imported
+   *  (`imported`), an unknown block probed (`block-probe`, with `eid`). Or (`unmapped-blocks`, gen-3 grid drivers)
+   *  the set of placed blocks no family describes changed — after a grid read or a profile swap — which moves
+   *  `capabilities.definitions.profile.coverage` (the runtime `unmapped-block` gap) and `drift`; `key` is the
+   *  running firmware's profile key, nothing in the store changed. Clients re-read caps / status. */
+  | { type: 'definitions'; reason: 'block-probe' | 'imported' | 'rederived' | 'merged' | 'unmapped-blocks'; key: string; eid?: number }
   /** A shared Axis config doc (layouts / swipe-quick-actions / tags / surface …) was written by one UI —
    *  streamed to the others so layouts/quick-actions/arrange stay in sync live, both directions. `origin` is
    *  the writer's client id so it can ignore its own echo (and not reload while it's mid-edit). */
@@ -383,6 +405,10 @@ export interface DeviceDriver {
    *  driver reads through the profile changes. Implemented by gen-3 (capability selfDescribe); absent
    *  on drivers whose profile is fixed. */
   applyRuntimeProfile?(profile: DeviceProfile): void;
+  /** Gen-3 grid drivers: effect ids of the blocks in the edit-buffer grid as last read that no param family
+   *  describes — not the current profile, not the model's static roster / effect-id spans, not a `confirmed`
+   *  block-map entry of the applied document (no device traffic); null before the first grid read of the session. */
+  unmappedPlacedEffectIds?(): number[] | null;
   /** A (re)detect activated this driver: forget what it learned about the previous connection (gen-3: the
    *  dump-header strictness proven on it and the known current slot). Drivers keep no such state otherwise. */
   resetSession?(): void;

@@ -25,7 +25,7 @@
  * Run with --help for the options.
  */
 import { readFileSync } from 'node:fs';
-import { isInformativeRow, isPlaceholderRow, paramFingerprint, rowsCompatible, type BuiltCache } from 'forgefx-midi/cache';
+import { isInformativeRow, isPlaceholderRow, isSyntheticFamilyKey, paramFingerprint, rowsCompatible, type BuiltCache } from 'forgefx-midi/cache';
 import { slugForEffectId } from 'forgefx-midi/devices/gen3';
 import { PROFILES, SLUG_FAMILY, runtimeProfileFrom, type DeviceProfile, type RangeDef } from '../src/devices.js';
 import { buildParamIndex, MAX_WIRE_PID, type BlockIndex, type BlockProfileKind } from '../src/drivers/paramIndex.js';
@@ -335,8 +335,10 @@ function analyseFamily(profile: DeviceProfile, family: string, reach: Map<string
   return rep;
 }
 
+/** The catalog families of a profile. A synthetic key (`section:<tag>` / `block:<eid>`: an unassigned section of a
+ *  profile document) is no catalog family: it is left out of the per-family report and its totals. */
 function familiesOf(profile: DeviceProfile): string[] {
-  return [...new Set([...Object.keys(profile.ranges), ...Object.keys(profile.params)])].sort();
+  return [...new Set([...Object.keys(profile.ranges), ...Object.keys(profile.params)])].filter((f) => !isSyntheticFamilyKey(f)).sort();
 }
 
 interface Totals { rows: number; shown: number; named: number; enums: number; hidden: number; removed: number; generic: number; isNew: number; high: number; medium: number; low: number }
@@ -446,7 +448,8 @@ function probe(profile: DeviceProfile, family: string, pid: number): ProbeReport
   const idx = buildParamIndex(profile, family);
   const entry = idx.byPid.get(pid);
   const hid = idx.hidden.find((h) => h.id === pid);
-  const known = familiesOf(profile).includes(family);
+  // a synthetic key is probed like a family when the profile holds rows under it
+  const known = familiesOf(profile).includes(family) || (isSyntheticFamilyKey(family) && profile.ranges[family] !== undefined);
   const guard = writeGuardVerdict(profile, family, pid);
   if (!known) warn('probe-family', family, `no family '${family}' in this profile or catalog; the driver would resolve the family from the effect id`);
   return {
@@ -517,7 +520,7 @@ function runOffline(args: Args): { report: OfflineReport; profile: DeviceProfile
     recordCount: typeof loaded.built.meta?.recordCount === 'number' ? loaded.built.meta.recordCount : null,
     suspectFamilies: [...facts.suspectFamilies],
     families, totals: sumUp(reachable), unreachable: sumUp(unreachable),
-    rowComparison: compareRows(loaded.built, staticProfile, facts.suspectFamilies, facts.byteExact),
+    rowComparison: compareRows(loaded.built, staticProfile, facts.suspectFamilies, facts.isByteExactFamily),
     layout, probes: args.probes.map((p) => probe(profile, p.family, p.pid)),
   };
   return { report, profile };

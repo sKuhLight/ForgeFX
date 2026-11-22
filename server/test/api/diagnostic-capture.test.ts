@@ -19,7 +19,9 @@ import type { DeviceEvent } from '../../src/drivers/types.js';
 import { createRouter } from '../../src/runtime/router.js';
 import type { RequestOpts } from '../../src/transport/types.js';
 import { MockTransport, handshakeReply, isIdentifyBroadcast, assert, assertEqual, sleep } from '../helpers/mock.js';
-import { fakeCacheDoc, seedRecords } from './device-cache.test.js';
+import { fakeCacheDoc } from './device-cache.test.js';
+// the capture builds its own v1 profile (unrestricted vote) from the walk: the historic cache-tag seed fixture
+import { seedRecords } from '../helpers/cacheBytes.js';
 import { runDiagnosticUpload, type DiagnosticUploadTransport } from '../../src/runtime/cloud.js';
 
 export const DIAGNOSTIC_CAPTURE_CASE_COUNT = 25;

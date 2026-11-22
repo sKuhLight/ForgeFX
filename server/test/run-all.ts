@@ -16,6 +16,7 @@ import { runVp4Tests, VP4_CASE_COUNT } from './drivers/vp4.test.js';
 import { runModelByteTests, MODELBYTE_CASE_COUNT } from './drivers/modelbyte.test.js';
 import { runGen3StoreTests, GEN3_STORE_CASE_COUNT } from './drivers/gen3-store.test.js';
 import { runGen3PlaceGuardTests, GEN3_PLACE_GUARD_CASE_COUNT } from './drivers/gen3-place-guard.test.js';
+import { runUnmappedBlocksTests, UNMAPPED_BLOCKS_CASE_COUNT } from './drivers/unmapped-blocks.test.js';
 import { runWriteRejectionTests, WRITE_REJECTION_CASE_COUNT } from './drivers/write-rejection.test.js';
 import { runDefinitionCompletenessTests, DEFINITION_COMPLETENESS_CASE_COUNT } from './drivers/definition-completeness.test.js';
 import { runChannelSliceTests, CHANNEL_SLICE_CASE_COUNT } from './drivers/channel-slice.test.js';
@@ -52,6 +53,8 @@ import { runCacheContributionTests, CACHE_CONTRIBUTION_CASE_COUNT } from './api/
 import { runCacheContributionUploadTests, CACHE_CONTRIBUTION_UPLOAD_CASE_COUNT } from './api/cache-contribution-upload.test.js';
 import { runCloudProfilesTests, CLOUD_PROFILES_CASE_COUNT } from './api/cloud-profiles.test.js';
 import { runProfileSchemaTests, PROFILE_SCHEMA_CASE_COUNT } from './api/profile-schema.test.js';
+import { runProfileV2Tests, PROFILE_V2_CASE_COUNT } from './api/profile-v2.test.js';
+import { runProfileMergeTests, PROFILE_MERGE_CASE_COUNT } from './api/profile-merge.test.js';
 import { runPresetConvertTests, PRESET_CONVERT_CASE_COUNT } from './api/preset-convert.test.js';
 import { runPresetConvertExportTests, PRESET_CONVERT_EXPORT_CASE_COUNT } from './api/preset-convert-export.test.js';
 import { runEmptySlotTests, EMPTY_SLOT_CASE_COUNT } from './api/empty-slot.test.js';
@@ -72,6 +75,7 @@ const tests: Array<{ name: string; run: () => void | Promise<void> }> = [
   { name: `drivers/modelbyte (${MODELBYTE_CASE_COUNT} cases, wrong-model-byte guard)`, run: runModelByteTests },
   { name: `drivers/gen3-store (${GEN3_STORE_CASE_COUNT} cases, store waits for the device ack: ack/late ack/no ack/0x64, virtual-time transport)`, run: runGen3StoreTests },
   { name: `drivers/gen3-place-guard (${GEN3_PLACE_GUARD_CASE_COUNT} cases, placeCell refuses a block already in the grid: 409 + nothing written, cached hit confirmed fresh, same-cell no-op, Axis move flow, unreadable grid falls back, shunts exempt with zero reads, slow link never starts a read, III/FM3/FM9, app↔router parity; mocked)`, run: runGen3PlaceGuardTests },
+  { name: `drivers/unmapped-blocks (${UNMAPPED_BLOCKS_CASE_COUNT} cases, the runtime unmapped-block gap through the real gen-3 driver: only a placed block no family describes (profile, static roster/instance spans incl. III Input 5 and roster blocks, confirmed block map), SSE definitions/unmapped-blocks on a change only, forgotten on a new session or transport, grid → caps gap + drift partial/none through the registry; codec-authored synthetic grids, mocked III/FM3/FM9)`, run: runUnmappedBlocksTests },
   { name: `drivers/write-rejection (${WRITE_REJECTION_CASE_COUNT} cases, 0x64 attributed by echoed function, reject-only write timing over the real queue)`, run: runWriteRejectionTests },
   { name: `drivers/definition-completeness (${DEFINITION_COMPLETENESS_CASE_COUNT} cases, blockParams unit/taper passthrough)`, run: runDefinitionCompletenessTests },
   { name: `drivers/channel-slice (${CHANNEL_SLICE_CASE_COUNT} cases, fn-0x1F channel stride, cache overlay by provenance, channel-less edit diffs)`, run: runChannelSliceTests },
@@ -108,6 +112,8 @@ const tests: Array<{ name: string; run: () => void | Promise<void> }> = [
   { name: `api/cache-contribution-upload (${CACHE_CONTRIBUTION_UPLOAD_CASE_COUNT} cases, editor-cache contribution, cloud half: wanted → offer/reason + 10-min cache, upload of the redacted bytes + persisted decision, own/cross-uploader dedupe, error mapping (401/anonymous/403/429 scope/413/409/422 invalid-cache/503 paused/502), coupled import (kept on upload failure, stops the upload on failure, newer-profile, mismatch), dry-run env = zero cloud writes, withdraw (ok/401/404/502/reset keeps it), Remote relay refused, signed-upload flow, Cloud sessions over a faked Supabase (anonymous slot, account slot untouched); structural fake cloud, no network)`, run: runCacheContributionUploadTests },
   { name: `api/cloud-profiles (${CLOUD_PROFILES_CASE_COUNT} cases, shared profile check/pull/publish, mocked cloud)`, run: runCloudProfilesTests },
   { name: `api/profile-schema (${PROFILE_SCHEMA_CASE_COUNT} cases, stale profile gate: runtime apply, status, build, import/sources, cloud check/pull/publish, walk limits, app↔router parity, mocked FM3)`, run: runProfileSchemaTests },
+  { name: `api/profile-v2 (${PROFILE_V2_CASE_COUNT} cases, profile store v2 lifecycle: import writes format 2 without user name tables, an older derivation (schema, revision) re-derives on status and apply with no device traffic and is written back once, a newer build's doc only in memory, derivation-failed stays stored as stale, legacy format 1 usable with no-raw, publish strips raw, router twin + Browser Direct lookup parity; synthetic docs, mocked FM3)`, run: runProfileV2Tests },
+  { name: `api/profile-merge (${PROFILE_MERGE_CASE_COUNT} cases, profile v2 merge on build/import/pull: import then walk and walk then import (two sources, device units on intact byte rows, same tables either order), pull never replaces a local byte source (409 local-profile-better, replace, format-2 cloud doc ranked below local, unique ids, other firmware 409), force/replace, the already rule (only re-walkable gaps), unresolved replies kept as a blocking gap, router twin plumbing through the real build route; legacy format-1 fixtures: a build never replaces a legacy editor-cache profile (already / force 409 local-profile-better / no-raw fix = re-import), a format-2 pull never replaces a raw-less doc that outranks it, no wire origin trusted (rewritten to cloud, unreadable raw stored stripped, bounds unchanged), raw sources never dropped (still-failing stale doc keeps every source), newer-profile 409; byte-exactness per family; synthetic caches + canned walks, mocked FM3)`, run: runProfileMergeTests },
   { name: `api/preset-convert (${PRESET_CONVERT_CASE_COUNT} cases, cross-device convert offline/connected/501/caps, mocked)`, run: runPresetConvertTests },
   { name: `api/preset-convert-export (${PRESET_CONVERT_EXPORT_CASE_COUNT} cases, FM3→FM3 author round-trip + guards, mocked)`, run: runPresetConvertExportTests },
   { name: `api/empty-slot (${EMPTY_SLOT_CASE_COUNT} cases, unused-slot summary/params/decode/backup/convert/local folder on app + router, mocked FM3)`, run: runEmptySlotTests },

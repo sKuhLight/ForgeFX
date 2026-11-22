@@ -1,7 +1,7 @@
 // Row-by-row comparison of a built device profile against the bundled catalog (extracted from
 // scripts/profile-check.ts so the editor-cache contribution validation reuses the exact same count).
 // Pure and browser-safe: codec cache helpers + the param index's wire-pid bound, no I/O.
-import { isInformativeRow, paramFingerprint, rowsCompatible, type BuiltCache } from 'forgefx-midi/cache';
+import { isInformativeRow, isSyntheticFamilyKey, paramFingerprint, rowsCompatible, type BuiltCache } from 'forgefx-midi/cache';
 import type { DeviceProfile } from '../devices.js';
 import { MAX_WIRE_PID } from './paramIndex.js';
 
@@ -27,12 +27,17 @@ export interface RowComparison {
  *  informative profile rows carry the catalog row's fingerprint (exact), a compatible revision of it, an
  *  incompatible one, or have no informative catalog row at all (new). It also covers the rows the index
  *  hides (type, bypass) and the families no block reaches, so it is a wider count than the index histogram.
- *  `suspects` are skipped; `byteExact` also counts the catalog rows the profile no longer has. */
-export function compareRows(built: BuiltCache, staticProfile: DeviceProfile, suspects: readonly string[], byteExact: boolean): RowComparison {
+ *  `suspects` are skipped; for a byte-exact family it also counts the catalog rows the profile no longer has.
+ *  `byteExact`: the whole profile, or per family (`ProfileFacts.isByteExactFamily`: a merged profile document can
+ *  provide some families from a live walk only); `removed` stays null until a byte-exact family is compared. */
+export function compareRows(built: BuiltCache, staticProfile: DeviceProfile, suspects: readonly string[], byteExact: boolean | ((family: string) => boolean)): RowComparison {
   const base = staticProfile.staticBase ?? staticProfile;
-  const out: RowComparison = { exact: 0, compatible: 0, incompatible: 0, newRows: 0, removed: byteExact ? 0 : null, skippedFamilies: [...suspects], newByFamily: {} };
+  const isByte = typeof byteExact === 'function' ? byteExact : () => byteExact;
+  const out: RowComparison = { exact: 0, compatible: 0, incompatible: 0, newRows: 0, removed: byteExact === true ? 0 : null, skippedFamilies: [...suspects], newByFamily: {} };
   for (const [fam, rows] of Object.entries(built.ranges ?? {})) {
-    if (suspects.includes(fam)) continue;
+    // a synthetic family (`section:<tag>` / `block:<eid>`, an unassigned section of a profile v2 doc) is no
+    // catalog family: it has nothing to compare with, and its rows are not new rows of a known family
+    if (suspects.includes(fam) || isSyntheticFamilyKey(fam)) continue;
     const cat = base.ranges[fam] ?? {};
     const own = built.enumOverrides?.[fam] ?? {};
     for (const [k, e] of Object.entries(rows)) {
@@ -47,7 +52,8 @@ export function compareRows(built: BuiltCache, staticProfile: DeviceProfile, sus
       else if (rowsCompatible(c, catLabels, e, ownLabels)) out.compatible++;
       else out.incompatible++;
     }
-    if (byteExact) {
+    if (isByte(fam)) {
+      out.removed ??= 0;
       for (const [k, c] of Object.entries(cat)) {
         const pid = Number(k);
         if (pid > MAX_WIRE_PID || !isInformativeRow(c) || c.synthetic) continue;

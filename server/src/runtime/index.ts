@@ -35,7 +35,8 @@ export type { StoreBackend, StoreCodec, Doc, PresetVersion, Backup, JsonWriteOpt
 // ── device-definition profile schema gate (usable vs stale; the lookup behind every apply hook) ──
 export {
   CURRENT_CACHE_SCHEMA, checkProfileSchema, staleFields, loadStoredProfile, loadUsableProfile,
-  type StaleReason, type ProfileSchemaCheck, type StoredProfile
+  upgradeStoredProfile, profileFormatOf, profileSummaryOf, classifyProfile,
+  type StaleReason, type ProfileSchemaCheck, type StoredProfile, type ProfileFormat, type RederiveReason, type ProfileSummary
 } from '../profileSchema.js';
 
 // ── local storage folder (Presets/ library + Sync/ mirror) ──

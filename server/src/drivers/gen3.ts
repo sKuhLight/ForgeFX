@@ -38,6 +38,7 @@ import {
   type DeviceProfile, type ParamDef, type TypeModel, type DeviceLayout, type DeviceLayoutControl, type RangeDef, type SelectorValues
 } from '../devices.js';
 import { buildParamIndex, MAX_WIRE_PID, type BlockIndex, type ParamEntry } from './paramIndex.js';
+import { deviceCacheKey, staticFamilyForEffectId } from '../profileCatalog.js';
 import { EmptyPresetError } from './types.js';
 import type {
   DeviceDriver, DriverCapabilities, DriverCtx, DiagnosticDump, SelectPresetOpts,
@@ -711,6 +712,7 @@ class Gen3Driver implements DeviceDriver {
   applyRuntimeProfile(profile: DeviceProfile): void {
     this.#prof = profile;
     this.#nonPositional.clear(); // the new rows may lay a family out differently
+    this.#noteUnmappedChange(); // the new profile may describe a placed block the old one did not (or the reverse)
   }
 
   #gridCache: { grid: PresetGridDTO; at: number; gen: number } | null = null;
@@ -914,12 +916,19 @@ class Gen3Driver implements DeviceDriver {
    *  header, and the current slot when the driver knows it (set by presetRef / selectPreset). */
   #sessionState: { transport: Transport; learned: Set<'stored' | 'edit'>; currentSlot: number | null } | null = null;
   #session(dev: Transport) {
-    if (this.#sessionState?.transport !== dev) this.#sessionState = { transport: dev, learned: new Set(), currentSlot: null };
+    if (this.#sessionState?.transport !== dev) {
+      this.#sessionState = { transport: dev, learned: new Set(), currentSlot: null };
+      // a new connection: the placed blocks read on the old one say nothing about this one
+      if (this.#lastPlaced && this.#lastPlaced.transport !== dev) { this.#lastPlaced = null; this.#unmappedSig = ''; }
+    }
     return this.#sessionState;
   }
-  /** A fresh detect: forget what was learned about the connection. */
+  /** A fresh detect (a reconnect, a port or model switch): forget what was learned about the connection, including
+   *  the placed blocks of the last grid read. */
   resetSession(): void {
     this.#sessionState = null;
+    this.#lastPlaced = null;
+    this.#unmappedSig = '';
   }
   /** How a dump read of `target` judges headers on this connection. Starts from DUMP_HEADER_POLICY; a
    *  'prefer' kind becomes 'strict' once the device has named the requested number in a header (so a late dump
@@ -961,7 +970,53 @@ class Gen3Driver implements DeviceDriver {
   #slotGridInflight = new Map<number, Promise<PresetGridDTO>>();
 
   async #dumpGrid(): Promise<PresetGridDTO> {
-    return this.#gridFromDump(EDIT_BUFFER);
+    const dev = await this.#conn();
+    const g = await this.#gridFromDump(EDIT_BUFFER);
+    this.#lastPlaced = { transport: dev, eids: g.cells.filter((c) => !c.isShunt && c.effectId > 0 && c.effectId < GEN3_SHUNT_BASE).map((c) => c.effectId) };
+    this.#noteUnmappedChange();
+    return g;
+  }
+
+  /** Effect ids of the blocks in the edit-buffer grid as last read on `transport` (shunts and empty cells left out),
+   *  null before the first read of this session. Forgotten on a (re)detect (`resetSession`: a reconnect, a port or
+   *  model switch) and when the connection's transport changes (`#session`). */
+  #lastPlaced: { transport: Transport; eids: number[] } | null = null;
+  /** The unmapped set the last `definitions`/`unmapped-blocks` event (or the session start) reported, as a key. */
+  #unmappedSig = '';
+
+  /** Effect ids of the last read edit-buffer grid that no param family describes, sorted and unique; null before
+   *  the first grid read of the session. No device traffic: the capabilities report the runtime coverage gap
+   *  `unmapped-block` from it. A block counts as described when:
+   *   - the CURRENT profile resolves it like `blockParams` (the codec's audio-block slug, then the profile's own
+   *     effect-id map), or
+   *   - the model's STATIC tables place it (`staticFamilyForEffectId`: the static roster's instance slots and
+   *     virtual blocks, the catalog's effect-id spans — e.g. an Axe-Fx III fifth Input, or a III roster block such
+   *     as Vocoder that gets read-only service, WP-F5), or
+   *   - the applied profile document's persisted block map binds it with confidence `confirmed`
+   *     (`ProfileFacts.confirmedBlocks`).
+   *  Only a block none of these knows (a block a newer firmware added, no confirmed map) is unmapped. */
+  unmappedPlacedEffectIds(): number[] | null {
+    if (!this.#lastPlaced) return null;
+    const model = this.#prof.model;
+    const confirmed = this.#prof.profileFacts?.confirmedBlocks;
+    const out = new Set<number>();
+    for (const eid of this.#lastPlaced.eids) {
+      if (confirmed?.has(eid)) continue;
+      const family = SLUG_FAMILY[(slugForEffectId(eid) ?? '').toLowerCase()] ?? this.#prof.familyForEffectId(eid) ?? staticFamilyForEffectId(model, eid);
+      if (family === undefined) out.add(eid);
+    }
+    return [...out].sort((a, b) => a - b);
+  }
+
+  /** After a grid read or a profile swap: when the unmapped set changed, tell live UIs to re-read the capabilities
+   *  (SSE `definitions`, reason `unmapped-blocks`, keyed by the running firmware's profile key). Without a known
+   *  firmware there is no profile key and no applied profile, so the set cannot change the drift: nothing is sent. */
+  #noteUnmappedChange(): void {
+    const sig = (this.unmappedPlacedEffectIds() ?? []).join(',');
+    if (sig === this.#unmappedSig) return;
+    this.#unmappedSig = sig;
+    const fw = this.#ctx.getFirmware?.() ?? null;
+    if (fw) this.#emit({ type: 'definitions', reason: 'unmapped-blocks', key: deviceCacheKey(this.#prof.model, fw.major, fw.minor) });
   }
 
   /** Decode a preset dump (the edit buffer or a stored slot) into the routing-grid DTO. */
@@ -2170,9 +2225,10 @@ class Gen3Driver implements DeviceDriver {
     if ((catalog.params[family] ?? []).some((d) => d.paramId === paramId)) return;
     const facts = this.#prof.profileFacts;
     const effective = this.#prof.ranges[family]?.[paramId];
-    // a byte-exact profile's own row; a suspect family's profile section belongs to another family, so its rows
-    // say nothing about this one
-    const profiled = facts?.byteExact && !facts.suspectFamilies.includes(family) ? facts.ranges[family]?.[paramId] : undefined;
+    // a byte-exact profile's own row (byte-exact per family: a merged profile document can provide this family from
+    // a live walk only); a suspect family's profile section belongs to another family, so its rows say nothing about
+    // this one
+    const profiled = facts?.isByteExactFamily(family) && !facts.suspectFamilies.includes(family) ? facts.ranges[family]?.[paramId] : undefined;
     if ((effective && isPlaceholderRow(effective)) || (profiled && isPlaceholderRow(profiled))) {
       refuse(409, `param ${paramId} of ${family} is an unused slot on this firmware; write refused`);
     }

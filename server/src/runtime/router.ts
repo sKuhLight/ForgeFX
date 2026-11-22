@@ -146,8 +146,8 @@ export function createRouter(deps: RuntimeDeps): {
   // ── device cache (on-connect self-describe build; capability selfDescribe) ──
   on('GET', '/device/cache', () => deviceCache.cacheStatus(store, registry));
   on('POST', '/device/cache/build', async (c) => {
-    const body = c.body as { force?: boolean; mode?: 'read-only' | 'full' } | undefined;
-    const r = await deviceCache.startCacheBuild(store, registry, { force: !!body?.force, mode: body?.mode });
+    const body = c.body as { force?: boolean; mode?: 'read-only' | 'full'; scope?: 'standard' | 'extended'; replace?: boolean } | undefined;
+    const r = await deviceCache.startCacheBuild(store, registry, { force: !!body?.force, mode: body?.mode, scope: body?.scope, replace: body?.replace === true });
     c.reply.code(r.code);
     return r.body;
   });
@@ -169,7 +169,8 @@ export function createRouter(deps: RuntimeDeps): {
     const name = c.query.get('name');
     if (!name) { c.reply.code(400); return { error: 'missing ?name=<filename>' }; }
     const force = c.query.get('force') === '1' || c.query.get('force') === 'true';
-    const r = await editorCacheImport.importEditorCache(registry, store, c.raw, { name, force });
+    const replace = c.query.get('replace') === '1' || c.query.get('replace') === 'true';
+    const r = await editorCacheImport.importEditorCache(registry, store, c.raw, { name, force, replace });
     c.reply.code(r.code);
     return r.body;
   }, { octet: true });
@@ -211,7 +212,7 @@ export function createRouter(deps: RuntimeDeps): {
   //    optional — absent (no cloud in this runtime) degrades to the same non-erroring disabled shape. ──
   on('GET', '/device/cache/cloud', () => cloudProfiles.cloudCacheCheck(deps.cloud ?? null, store, registry));
   on('POST', '/device/cache/cloud/pull', async (c) => {
-    const r = await cloudProfiles.cloudCachePull(deps.cloud ?? null, store, registry);
+    const r = await cloudProfiles.cloudCachePull(deps.cloud ?? null, store, registry, { replace: (c.body as { replace?: unknown } | null)?.replace === true });
     c.reply.code(r.code);
     return r.body;
   });

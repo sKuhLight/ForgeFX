@@ -31,7 +31,7 @@
 // the upload goes through an injected cloud client. NO node:/fastify/transport VALUE imports beyond the
 // browser-safe transport types (check-browser-safe.ts enforces it).
 import {
-  buildCache, buildDefQuery, buildEnumQuery, decodeReply, parseDisplayValue, HW_SEEDS, liveWalkDetailed, VIEW_DEFINITION, VIEW_VALUE,
+  buildCache, buildDefQuery, buildEnumQuery, decodeReply, isSyntheticFamilyKey, parseDisplayValue, HW_SEEDS, liveWalkDetailed, VIEW_DEFINITION, VIEW_VALUE,
   type BuiltCache, type CacheRecord, type LiveDefinition, type LiveEnumHint, type LiveTransport, type LiveWalkOptions, type LiveWalkResult
 } from 'forgefx-midi/cache';
 import { DEVICE_MODELS } from 'forgefx-midi/shared';
@@ -44,7 +44,7 @@ import type { DiagnosticUploadMeta } from '../runtime/cloud.js';
 import type { Store } from '../runtime/store.js';
 import { isTransportTimeout, type Transport } from '../transport/types.js';
 import {
-  adaptRequest, enumHintsVerifiedOn, isLocalByteProfile, paramsForModel, staticRoster, walkBlockLimits, walkEnumHints, walkQueryBound, walkSetup,
+  adaptRequest, enumHintsVerifiedOn, localByteSource, paramsForModel, staticRoster, walkBlockLimits, walkEnumHints, walkQueryBound, walkSetup,
   WALK_PACING, type BuildMode
 } from './deviceCache.js';
 import { claimDevice, deviceBusy, releaseDevice } from './deviceJobs.js';
@@ -830,13 +830,17 @@ async function stepWalk(job: Job, step: StepRecord, mode: BuildMode): Promise<St
 }
 
 function profileSummary(built: BuiltCache): Record<string, unknown> {
+  // catalog families only: a synthetic key (`block:<eid>` / `section:<tag>`) is no family (the capture's own
+  // v1 build never has one; the filter keeps the counts comparable if it ever does)
   const enumParams: Record<string, number> = {};
-  for (const [family, rows] of Object.entries(built.ranges ?? {})) enumParams[family] = Object.values(rows).filter((r) => r.kind === 'enum').length;
+  for (const [family, rows] of Object.entries(built.ranges ?? {})) {
+    if (!isSyntheticFamilyKey(family)) enumParams[family] = Object.values(rows).filter((r) => r.kind === 'enum').length;
+  }
   return {
     schema: built.meta.schema ?? null,
     recordCount: built.meta.recordCount,
     walk: built.meta.walk ?? null,
-    families: Object.keys(built.rangeSections ?? {}).length,
+    families: Object.keys(built.rangeSections ?? {}).filter((f) => !isSyntheticFamilyKey(f)).length,
     sections: Object.fromEntries(Object.entries(built.rangeSections ?? {}).map(([f, m]) => [f, { tag: m.sectionTag, stride: m.stride, records: m.recordCount }])),
     enumParams,
     rosters: Object.fromEntries(Object.entries(built.rosters ?? {}).map(([f, r]) => [f, r.length])),
@@ -924,8 +928,11 @@ async function stepLabelProbe(job: Job, step: StepRecord): Promise<StepOutcome> 
   const limits = walkBlockLimits(model, 'read-only', usable);
   const bounds = { paramBoundByBlock: limits.bound, maxParamId: 127 };
   const roster = staticRoster(model);
-  const byteExactFamilies = usable && isLocalByteProfile(usable.meta)
-    ? Object.keys(usable.ranges ?? {}).filter((f) => Object.keys(usable.ranges[f] ?? {}).length > 0).sort()
+  // the families whose hints came from the local editor-cache data (localByteSource, as the walk takes them);
+  // synthetic keys (`section:<tag>`: an unassigned section of a profile document) are no catalog family
+  const localBytes = localByteSource(usable, model);
+  const byteExactFamilies = localBytes
+    ? Object.keys(localBytes.ranges ?? {}).filter((f) => !isSyntheticFamilyKey(f) && Object.keys(localBytes.ranges[f] ?? {}).length > 0).sort()
     : [];
   const counts = { walkDefinitions: walk.real.size, hinted: 0, defaultZero: 0, mismatch: 0, grownNotLabel: 0, targets: 0, labels: 0, emptyLabels: 0 };
   const entries: LabelProbeEntry[] = [];

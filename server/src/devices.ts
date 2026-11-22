@@ -1,7 +1,7 @@
 // Per-device profile: everything that differs between gen-3 units (model byte, grid size, param
 // catalog, ranges, rosters, enum labels). The gen-3 effect codec itself is shared — only the data
 // changes — so the device client picks a profile by the detected model and is otherwise generic.
-import { familyAssignmentSuspects } from 'forgefx-midi/cache';
+import { familyAssignmentSuspects, isSyntheticFamilyKey } from 'forgefx-midi/cache';
 import type { BuiltCache, RangeDef as CodecRangeDef } from 'forgefx-midi/cache';
 import {
   FM3_RANGES,
@@ -409,17 +409,28 @@ export function paramLabel(p: { displayLabel?: string; name: string }): string {
 }
 
 /** Where a runtime profile came from, normalised from `built.meta.source`: an editor-cache import
- *  (the codec's raw byte-source value 'bytes' counts as one), a live walk, a pulled cloud profile, or
- *  anything else. */
-export type ProfileSource = 'editor-cache' | 'live' | 'cloud' | 'unknown';
+ *  (the codec's raw byte-source value 'bytes' counts as one), a live walk, a pulled cloud profile, an
+ *  imported definitions file (`.axisdefs`), or anything else. */
+export type ProfileSource = 'editor-cache' | 'live' | 'cloud' | 'axisdefs' | 'unknown';
 
 /** Provenance and raw rows of the runtime profile a `DeviceProfile` was layered from. Set only by
  *  `runtimeProfileFrom`; the static profiles carry none. The param index (drivers/paramIndex.ts) compares
  *  these against the bundled catalog to decide what is new, removed or renamed on the connected firmware. */
 export interface ProfileFacts {
   source: ProfileSource;
-  /** `isByteExactProfile(built.meta)`. */
+  /** `isByteExactProfile(built.meta)`: the document as a whole (its best source), what the capabilities show. Whether a
+   *  given family's rows are byte-exact is `isByteExactFamily` — every consumer of the rows asks that one. */
   byteExact: boolean;
+  /** Are the rows of `family` byte-exact device data (`familyByteExactness`)? A merged profile document decides per
+   *  family: the source that provides the family's existence facts (`provenance.existence`) is an editor cache (of
+   *  any origin — a cloud or file editor-cache source counts for display as `isByteExactProfile` counts cloud bytes;
+   *  walk bounds and hints never read this, see services/deviceCache.ts `localByteSource`). A family a live source
+   *  provides gets the live guards (no kind re-classification, no placeholder over a catalog row, no stride shrink).
+   *  A legacy (format-1) document: `byteExact` for every family. */
+  isByteExactFamily(family: string): boolean;
+  /** Effect ids the document's persisted block map binds with confidence `confirmed` (a block the catalog does not
+   *  place, matched to a section or walked live). Empty for a legacy document. */
+  confirmedBlocks: ReadonlySet<number>;
   /** `built.firmware`, when the doc carries one. */
   firmware: string | null;
   /** `built.ranges` verbatim (placeholder rows included). */
@@ -670,15 +681,19 @@ export const profileForKey = (key: string): DeviceProfile | undefined => Object.
  *   • 'cloud'        — a pulled profile (services/cloudProfiles.ts); the build kind it was published
  *                      from rides in `meta.origin` ('bytes' | 'live', normalised on publish), so it is
  *                      byte-exact only when that origin is a byte source;
+ *   • 'axisdefs'     — a profile imported from a definitions file; like 'cloud', the class of its best
+ *                      source rides in `meta.origin`;
  *   • 'bytes'        — the codec's raw byte-source value (never persisted as-is by ForgeFX, but it is
  *                      what a cloud profile's `origin` carries).
- * Anything else, including a missing source (GET /device/cache reports that as 'live' too), counts as
- * NOT byte-exact: unknown provenance gets the cautious live-walk treatment in runtimeProfileFrom.
+ * A merged (format-2) doc carries the class of its best-ranked source the same way (an editor-cache source
+ * outranks every live one). Anything else, including a missing source (GET /device/cache reports that as
+ * 'live' too), counts as NOT byte-exact: unknown provenance gets the cautious live-walk treatment in
+ * runtimeProfileFrom.
  */
 export function isByteExactProfile(meta: { source?: unknown; origin?: unknown } | undefined): boolean {
   const isByteKind = (v: unknown) => v === 'editor-cache' || v === 'bytes';
   if (!meta) return false;
-  return meta.source === 'cloud' ? isByteKind(meta.origin) : isByteKind(meta.source);
+  return meta.source === 'cloud' || meta.source === 'axisdefs' ? isByteKind(meta.origin) : isByteKind(meta.source);
 }
 
 // ── catalog reference for the section-assignment cross-check ─────────────────────────────────────────
@@ -726,21 +741,59 @@ function catalogTablesOf(staticProfile: DeviceProfile): CatalogTables {
 }
 
 /** Families of a built profile whose rows match another family's catalog rows clearly better than their
- *  own (`familyAssignmentSuspects`). A malformed document must never fail the profile swap, so a throw
- *  counts as "no suspects". */
+ *  own (`familyAssignmentSuspects`). A synthetic key (`section:<tag>` / `block:<eid>` of a profile document)
+ *  has no catalog rows of its own and is never listed. A malformed document must never fail the profile swap,
+ *  so a throw counts as "no suspects". */
 function suspectFamiliesOf(built: BuiltCache, staticProfile: DeviceProfile): string[] {
   try {
     return familyAssignmentSuspects(
       { ranges: built.ranges ?? {}, enumOverrides: built.enumOverrides ?? {} },
       catalogTablesOf(staticProfile.staticBase ?? staticProfile),
-    );
+    ).filter((f) => !isSyntheticFamilyKey(f));
   } catch {
     return [];
   }
 }
 
 const profileSourceOf = (src: unknown): ProfileSource =>
-  src === 'editor-cache' || src === 'bytes' ? 'editor-cache' : src === 'live' ? 'live' : src === 'cloud' ? 'cloud' : 'unknown';
+  src === 'editor-cache' || src === 'bytes' ? 'editor-cache' : src === 'live' ? 'live' : src === 'cloud' ? 'cloud' : src === 'axisdefs' ? 'axisdefs' : 'unknown';
+
+const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
+
+/**
+ * Per family: are its rows byte-exact device data? For a profile document (`meta.format: 2`) with provenance, the
+ * source that provides the family's existence facts (`provenance.existence[family]` → that source's kind, from the
+ * raw sources or `meta.sources`) decides: byte-exact only when it is an editor-cache source (any origin, like
+ * `isByteExactProfile` counts cloud bytes). A merged doc whose best source is an editor cache can still hold
+ * families only a live walk found — they keep the live-walk guards. A family the provenance does not name, a
+ * source it cannot resolve, and every family of a legacy (format-1) document: the document-level
+ * `isByteExactProfile(meta)`. Never throws.
+ */
+export function familyByteExactness(built: BuiltCache): (family: string) => boolean {
+  const docLevel = isByteExactProfile(built.meta);
+  const doc = built as unknown as { meta?: { format?: unknown; sources?: unknown }; raw?: { sources?: unknown }; provenance?: { existence?: unknown } };
+  const existence = doc.meta?.format === 2 && isRecord(doc.provenance) && isRecord(doc.provenance.existence) ? doc.provenance.existence : null;
+  if (!existence) return () => docLevel;
+  const kinds = new Map<string, string>();
+  for (const list of [doc.meta?.sources, isRecord(doc.raw) ? doc.raw.sources : undefined]) {
+    if (!Array.isArray(list)) continue;
+    for (const s of list) if (isRecord(s) && typeof s.id === 'string' && typeof s.kind === 'string' && !kinds.has(s.id)) kinds.set(s.id, s.kind);
+  }
+  return (family: string) => {
+    const winner = existence[family];
+    const kind = typeof winner === 'string' ? kinds.get(winner) : undefined;
+    return kind === undefined ? docLevel : kind === 'editor-cache';
+  };
+}
+
+/** Effect ids of a profile document's persisted block-map entries with confidence `confirmed` (empty when it has
+ *  none, or no block map at all — a legacy document). Never throws. */
+function confirmedBlocksOf(built: BuiltCache): ReadonlySet<number> {
+  const map = (built as unknown as { blockMap?: unknown }).blockMap;
+  const out = new Set<number>();
+  if (Array.isArray(map)) for (const e of map) if (isRecord(e) && e.confidence === 'confirmed' && Number.isInteger(e.eid)) out.add(e.eid as number);
+  return out;
+}
 
 /**
  * Overlay a device-cache-derived `BuiltCache` (from the on-connect self-describe walk) onto a static
@@ -749,10 +802,11 @@ const profileSourceOf = (src: unknown): ProfileSource =>
  *     mapped from slug via SLUG_FAMILY), with the STATIC roster's manufacturer/basedOn LINEAGE
  *     overlaid by value (the cache carries names only); families the walk didn't map fall back to static.
  *   • enumLabelsFor — `built.enumOverrides` first, else static.
- *   • ranges / rangeSections — the cache's per-family entries merged OVER the static ones. A profile
- *     that is not byte-exact (`isByteExactProfile`: a live walk, a cloud profile that came from one,
- *     unknown provenance) is the exception: it never re-classifies the kind of a catalog-known param,
- *     never overwrites a catalog range with a placeholder row (min === max), and never shrinks a
+ *   • ranges / rangeSections — the cache's per-family entries merged OVER the static ones. A family whose
+ *     rows are not byte-exact (`familyByteExactness`: a live walk, a cloud profile that came from one,
+ *     unknown provenance — per family in a merged profile document, where a live source can provide
+ *     families the editor cache lacks) is the exception: it never re-classifies the kind of a catalog-known
+ *     param, never overwrites a catalog range with a placeholder row (min === max), and never shrinks a
  *     catalog stride (see the comments in the body).
  *   • cabIrs — the cache's banks when non-empty, else static.
  *   • a family whose cache rows match another family's catalog rows clearly better than their own (a
@@ -768,12 +822,14 @@ export function runtimeProfileFrom(built: BuiltCache, staticProfile: DeviceProfi
   const builtEnums = built.enumOverrides ?? {};
   const builtCabIrs = built.cabIrs ?? {};
 
-  // Provenance decides how far the cache may override the static tables. A byte-exact profile (an
-  // editor cache import, or a cloud profile that was published from one) is exact device data for its
-  // firmware, possibly newer than the static catalog, so it always wins. Everything else is treated
-  // as a live-walk reconstruction (a heuristic), including a cloud profile that came from a walk and
-  // a profile of unknown provenance.
-  const live = !isByteExactProfile(built.meta);
+  // Provenance decides how far the cache may override the static tables. Byte-exact rows (an editor cache
+  // import, or a cloud profile that was published from one) are exact device data for their firmware,
+  // possibly newer than the static catalog, so they always win. Everything else is treated as a live-walk
+  // reconstruction (a heuristic), including a cloud profile that came from a walk and a profile of unknown
+  // provenance. Decided PER FAMILY (`familyByteExactness`): a merged profile document can hold families only
+  // a live walk provides next to the editor cache's.
+  const byteFamily = familyByteExactness(built);
+  const docByteExact = isByteExactProfile(built.meta);
 
   const suspectFamilies = suspectFamiliesOf(built, staticProfile);
   const suspects = new Set(suspectFamilies);
@@ -797,6 +853,7 @@ export function runtimeProfileFrom(built: BuiltCache, staticProfile: DeviceProfi
   for (const [fam, rows] of Object.entries(staticProfile.ranges)) mergedRanges[fam] = { ...rows };
   for (const [fam, rows] of Object.entries(built.ranges ?? {})) {
     if (suspects.has(fam)) continue;
+    const live = !byteFamily(fam);
     const dst = (mergedRanges[fam] ??= {});
     for (const [pidStr, row] of Object.entries(rows)) {
       const pid = Number(pidStr);
@@ -824,12 +881,14 @@ export function runtimeProfileFrom(built: BuiltCache, staticProfile: DeviceProfi
     if (suspects.has(fam)) continue;
     const cached = meta as unknown as RangeSections[string];
     const stat = mergedSections[fam];
-    mergedSections[fam] = live && stat ? { ...cached, stride: Math.max(stat.stride, cached.stride) } : cached;
+    mergedSections[fam] = !byteFamily(fam) && stat ? { ...cached, stride: Math.max(stat.stride, cached.stride) } : cached;
   }
 
   const profileFacts: ProfileFacts = {
     source: profileSourceOf(built.meta?.source),
-    byteExact: !live,
+    byteExact: docByteExact,
+    isByteExactFamily: byteFamily,
+    confirmedBlocks: confirmedBlocksOf(built),
     firmware: typeof built.firmware === 'string' ? built.firmware : null,
     ranges: built.ranges ?? {},
     enumLabels: builtEnums,

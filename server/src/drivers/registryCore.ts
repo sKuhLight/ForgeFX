@@ -46,7 +46,8 @@ import { AXEFX2_DESCRIPTOR } from 'forgefx-midi/devices/gen2';
 import { AXEFXGEN1_DESCRIPTOR } from 'forgefx-midi/devices/gen1';
 import { TRANSPORT_TIMEOUT_CODE, isTransportTimeout, type Transport, type Conn, type ConnKind } from '../transport/types.js';
 import { DEFAULT_PROFILE, PROFILES, profileForModel, profileForKey, runtimeProfileFrom, type DeviceProfile } from '../devices.js';
-import { checkProfileSchema } from '../profileSchema.js';
+import { checkProfileSchema, forgetProfileVerdict, lastProfileVerdict, profileSummaryOf, type ProfileSummary, type ProfileVerdict } from '../profileSchema.js';
+import { deviceCacheKey } from '../profileCatalog.js';
 import { createGen3Driver, GEN3_SHUNT_BASE } from './gen3.js';
 import { createAm4Driver, type Am4Driver } from './am4.js';
 import { createGen2Driver } from './gen2.js';
@@ -56,12 +57,9 @@ import type { DeviceDriver, DeviceEvent, DriverCtx, DriverCapabilities, Definiti
 import { assertRawProbeAllowed } from './sendPolicy.js';
 import { cadenceFor, isTelemetryMode, TELEMETRY_MODES, type TelemetryMode, type CadenceProfile } from './telemetryProfiles.js';
 
-/** Device-cache doc key for the deviceCaches store collection: `<model-hex>_<major>p<minor>`
- *  (e.g. FM3 fw 12.0 → `11_12p0`). Shared by the registry (runtime profile swap) + the deviceCache
- *  service (status / build / delete) so both address the exact same doc. */
-export function deviceCacheKey(modelId: number, major: number, minor: number): string {
-  return `${modelId.toString(16).padStart(2, '0')}_${major}p${minor}`;
-}
+/** Device-cache doc key for the deviceCaches store collection (`<model-hex>_<major>p<minor>`): defined in
+ *  profileCatalog.ts (the gen-3 driver keys its `definitions` events by it too), re-exported here for its callers. */
+export { deviceCacheKey };
 
 /** A firmware version as the full-capture policy sees it (major.minor). */
 type FirmwareVersion = { readonly major: number; readonly minor: number };
@@ -242,6 +240,11 @@ export class DeviceRegistry {
   // one; null while the bundled profile is live. Only meaningful together with `#prof.profileFacts` (a model
   // switch replaces `#prof` with a static profile, which carries none): capabilities.definitions reads both.
   #appliedProfileKey: string | null = null;
+  // Format, raw sources and document coverage of the applied runtime profile (with `#appliedProfileKey`), and
+  // what applyRuntimeCache last found stored under the running firmware's key (absent / usable / stale), so
+  // capabilities.definitions can tell `partial` and `stale` from `none` and `unprofiled`.
+  #appliedSummary: ProfileSummary | null = null;
+  #storedVerdict: { key: string; verdict: ProfileVerdict } | null = null;
   // The active driver — set ONLY by detect() from a positively identified (or forced) model. No
   // identification → no active driver → the telemetry supervisor never fires a frame at an unknown
   // unit (this replaces the old `#modelId === -1` wait-loop AND every #isAm4() gate).
@@ -430,6 +433,9 @@ export class DeviceRegistry {
         // (Today a dropped connection goes through selectConnection(), which clears it too; this keeps the
         // invariant for any other path that ends up opening a new transport.)
         this.#firmware = null;
+        // for the same reason the active driver forgets what it learned over the previous transport (gen-3: dump-header
+        // strictness, the known slot, the placed blocks behind the runtime `unmapped-block` gap); a first open has none
+        this.#active?.resetSession?.();
         return t;
       })().catch((e) => {
         this.#connecting = null; // allow a retry on the next request
@@ -595,13 +601,35 @@ export class DeviceRegistry {
     // the applied runtime profile: `#prof` is one only while it carries facts and belongs to this model (an
     // AM4 detect keeps the previous gen-3 `#prof`, which must not leak into its caps)
     const facts = gen3Grid && this.#prof.model === mid ? this.#prof.profileFacts : undefined;
-    const profile: DefinitionsCaps['profile'] = facts && this.#appliedProfileKey
-      ? { key: this.#appliedProfileKey, source: facts.source, byteExact: facts.byteExact, firmware: facts.firmware, suspectFamilies: [...facts.suspectFamilies] }
-      : null;
+    let profile: DefinitionsCaps['profile'] = null;
+    // the runtime gap: a block of the last read grid that no family describes (state != confirmed)
+    let unmapped = false;
+    if (facts && this.#appliedProfileKey) {
+      const summary = this.#appliedSummary;
+      unmapped = (d.unmappedPlacedEffectIds?.() ?? []).length > 0;
+      const gaps = (summary?.coverage.gaps ?? []).map((g) => g.kind);
+      if (unmapped && !gaps.includes('unmapped-block')) gaps.push('unmapped-block');
+      profile = {
+        key: this.#appliedProfileKey, source: facts.source, byteExact: facts.byteExact, firmware: facts.firmware, suspectFamilies: [...facts.suspectFamilies],
+        format: summary?.format ?? 1,
+        sources: [...new Set((summary?.sources ?? []).map((s) => s.kind))],
+        coverage: { complete: (summary?.coverage.complete ?? true) && !unmapped, gaps }
+      };
+    }
     const running = this.#firmware?.version ?? null;
+    const runningKey = running !== null && this.#firmware ? deviceCacheKey(mid, this.#firmware.major, this.#firmware.minor) : null;
+    const storedStale = runningKey !== null && this.#storedVerdict?.key === runningKey && this.#storedVerdict.verdict.state === 'stale';
     let drift: DefinitionsCaps['drift'];
     if (running === null) drift = 'unknown';
-    else if (profile?.firmware === running || catalogFirmware === running) drift = 'none';
+    else if (profile && (profile.firmware === running || catalogFirmware === running)) {
+      // an applied profile with a blocking gap (the document's own, e.g. unresolved replies of its walk, or the
+      // runtime unmapped-block) is partial — also on the catalog's own firmware: the profile is layered over the
+      // catalog and its gaps are real holes in what is applied (the codec only blocks the gaps the catalog cannot
+      // fill — high ids, rosters, blocks above 160 — when the firmware differs)
+      const docBlocking = !(this.#appliedSummary?.coverage.complete ?? true);
+      drift = unmapped || docBlocking ? 'partial' : 'none';
+    } else if (catalogFirmware === running) drift = 'none';
+    else if (storedStale) drift = 'stale';
     else if (!profile && catalogFirmware === null) drift = 'unknown';
     else drift = 'unprofiled';
     // editor-cache contribution: the generic-params trio, an editor-cache importer, a firmware to key the file by
@@ -810,14 +838,25 @@ export class DeviceRegistry {
     if (mid < 0 || !d || !d.capabilities.selfDescribe || !d.applyRuntimeProfile) return;
     let built: BuiltCache | null = null;
     let key: string | null = null;
+    this.#storedVerdict = null;
     if (this.#firmware) {
       key = deviceCacheKey(mid, this.#firmware.major, this.#firmware.minor);
+      // the hook goes through loadUsableProfile, which records what it found (absent / usable / stale) for the
+      // caps; forget the previous answer first so a hook that does not leaves no stale verdict behind
+      forgetProfileVerdict(key);
       try { built = (await this.#deps.loadDeviceCache(key)) ?? null; } catch { built = null; }
+      const verdict = lastProfileVerdict(key);
+      if (verdict) {
+        this.#storedVerdict = { key, verdict };
+        // the load re-derived the stored doc from its raw sources and wrote it back: tell live UIs
+        if (verdict.upgraded) this.emitEvent({ type: 'definitions', reason: 'rederived', key });
+      }
     }
     const bundled = PROFILES[mid];
     if (!built || !checkProfileSchema(built).usable) {
       // no usable profile for this model+firmware: the bundled profile is the live one
       this.#appliedProfileKey = null;
+      this.#appliedSummary = null;
       if (bundled) {
         d.applyRuntimeProfile(bundled);
         this.#prof = bundled;
@@ -829,6 +868,7 @@ export class DeviceRegistry {
     if (bundled) {
       this.#prof = runtime; // keep /diag + reporting profile in sync for gen-3
       this.#appliedProfileKey = key;
+      this.#appliedSummary = profileSummaryOf(built, mid);
     }
   }
 

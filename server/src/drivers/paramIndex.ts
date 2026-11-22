@@ -218,7 +218,9 @@ function computeIndex(profile: DeviceProfile, family: string, force: ReadonlySet
 
   const suspect = facts?.suspectFamilies.includes(family) ?? false;
   const familyInProfile = !!facts && facts.ranges[family] !== undefined && !suspect;
-  const knowsFamily = familyInProfile && !!facts?.byteExact;
+  // byte-exact per family: a merged profile document can provide this family from a live walk only
+  const byteFamily = !!facts && facts.isByteExactFamily(family);
+  const knowsFamily = familyInProfile && byteFamily;
   const applied = facts?.appliedRows[family];
   const inProfile = (pid: number): boolean => applied?.has(pid) ?? false;
 
@@ -234,7 +236,7 @@ function computeIndex(profile: DeviceProfile, family: string, force: ReadonlySet
   // row into a selector. A live profile falls back to the catalog wherever the walk found no labels.
   const effLabels = (pid: number): readonly string[] | undefined => {
     if (!facts || !inProfile(pid)) return base.enumLabelsFor(family, pid);
-    if (!facts.byteExact) return profile.enumLabelsFor(family, pid);
+    if (!byteFamily) return profile.enumLabelsFor(family, pid);
     const own = facts.enumLabels[family]?.[String(pid)];
     if (own && own.length > 0) return own;
     const c = cat[pid];
@@ -245,7 +247,7 @@ function computeIndex(profile: DeviceProfile, family: string, force: ReadonlySet
   /** A live walk saw a row of the other kind than the catalog's: the merge kept the catalog row. A suspect
    *  family's profile section belongs to another family, so its rows say nothing about this one. */
   const liveKindConflict = (pid: number): boolean => {
-    if (!facts || facts.byteExact || suspect) return false;
+    if (!facts || byteFamily || suspect) return false;
     const walked = facts.ranges[family]?.[pid];
     const c = cat[pid];
     return !!walked && !!c && walked.displayMin !== walked.displayMax && walked.kind !== c.kind;
@@ -505,7 +507,7 @@ function computeIndex(profile: DeviceProfile, family: string, force: ReadonlySet
     hidden: Object.freeze([...hidden.entries()].sort((x, y) => x[0] - y[0]).map(([id, reason]) => Object.freeze({ id, reason }))),
     positional: stride === undefined ? null : maxPid < stride,
     suspect,
-    profile: !familyInProfile ? 'none' : facts!.byteExact ? 'byte-exact' : 'live',
+    profile: !familyInProfile ? 'none' : byteFamily ? 'byte-exact' : 'live',
     stride,
     maxPid,
     typePid,
