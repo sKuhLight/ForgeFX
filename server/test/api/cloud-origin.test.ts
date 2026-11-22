@@ -1,6 +1,7 @@
-// The /cloud/* and /remote/* routes refuse foreign origins (RELAXED guard: no Origin, a loopback origin, or the
-// server's own origin pass). Without it, CORS (which reflects every origin) let any web page sign this install
-// into an account of its choosing, sign it out, delete the account, switch Remote on, or read who is signed in.
+// The /cloud/* and /remote/* routes refuse foreign origins (the app-wide origin policy, FORGEFX-51: no Origin, a
+// loopback origin, or the server's own origin pass; api/http-policy sweeps every route). Without it, any web page
+// could sign this install into an account of its choosing, sign it out, delete the account, switch Remote on, or
+// read who is signed in.
 // Builds the app with AXIS_CLOUD=1 but NO Supabase URL/key, so the cloud client is configured off: nothing can
 // reach a network, and the allowed calls answer from the disabled client. Also the AXIS_CLOUD-off stubs.
 // Mocked FM3, NO hardware, NO network.

@@ -85,9 +85,11 @@ async function routes(): Promise<void> {
           t.app.inject({ method: 'PUT', url: `/store/${s}/${KEY}`, headers: { ...headers, 'content-type': 'application/json' }, payload: JSON.stringify({ data: '{"refresh_token":"planted"}' }) }),
           t.app.inject({ method: 'DELETE', url: `/store/${s}/${KEY}`, headers })
         ];
+        // a foreign origin is refused earlier, by the app-wide origin policy (FORGEFX-51); still 403, nothing touched
+        const want = origin === 'https://evil.example' ? 'forbidden-origin' : FORBIDDEN_COLLECTION;
         for (const res of await Promise.all(reqs)) {
           assertEqual(res.statusCode, 403, `[store-private] /store/${s} from ${String(origin)} → 403`);
-          assertEqual(res.payload, JSON.stringify({ error: FORBIDDEN_COLLECTION }), `[store-private] /store/${s}: body`);
+          assertEqual(res.payload, JSON.stringify({ error: want }), `[store-private] /store/${s}: body`);
         }
       }
       for (const [m, path, body] of [['GET', `/store/${s}`, undefined], ['GET', `/store/${s}/${KEY}`, undefined], ['PUT', `/store/${s}/${KEY}`, JSON.stringify({ data: 'planted' })], ['DELETE', `/store/${s}/${KEY}`, undefined]] as const) {

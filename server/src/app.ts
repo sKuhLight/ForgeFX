@@ -21,6 +21,7 @@
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
 import cors from '@fastify/cors';
 import { existsSync, statSync, createReadStream, readFileSync, mkdirSync, writeFileSync } from 'node:fs';
+import { hostname } from 'node:os';
 import { join, resolve, extname } from 'node:path';
 import type { DeviceRegistry } from './drivers/registry.js';
 import { parseHexBytes, sendErrorStatus } from './drivers/sendPolicy.js';
@@ -31,7 +32,9 @@ import * as deviceCache from './services/deviceCache.js';
 import * as editorCacheImport from './services/editorCacheImport.js';
 import * as editorCacheDiscovery from './services/editorCacheDiscovery.js';
 import type { DiscoverOpts } from './services/editorCacheDiscovery.js';
-import { FORBIDDEN_ORIGIN, isAllowedOrigin, loopbackOriginGuard, loopbackOrSameOriginGuard } from './services/originGuard.js';
+import { FORBIDDEN_ORIGIN, createRequestPolicy, isStrictAllowed, loopbackOriginGuard, splitList, type RequestPolicyOptions } from './services/originGuard.js';
+import { selectBindHost } from './services/bindHost.js';
+import { staticTarget } from './services/staticFiles.js';
 import * as cloudProfiles from './services/cloudProfiles.js';
 import * as diagnostics from './services/diagnosticCapture.js';
 import * as contribution from './services/cacheContribution.js';
@@ -61,7 +64,17 @@ export interface AppOptions {
   /** Editor-cache contribution seams: a cloud client (tests pass a fake; production binds the AXIS_CLOUD one),
    *  and the dry-run switches that otherwise come from FORGEFX_CONTRIBUTE_DRY_RUN / FORGEFX_CONTRIBUTE_DRY_RUN_DIR. */
   contribute?: { cloud?: contribution.ContributionCloud | null; dryRun?: boolean; dryRunDir?: string | null };
+  /** Origin/Host policy inputs (services/originGuard.ts). Each field omitted = production: the
+   *  FORGEFX_ALLOWED_ORIGINS / FORGEFX_ALLOWED_HOSTS env lists and `os.hostname()`. */
+  http?: RequestPolicyOptions;
+  /** Called for every route as it is registered (Fastify `onRoute`), before any route exists: lets the
+   *  tests enumerate the whole surface. */
+  onRoute?: (route: { method: string | string[]; url: string }) => void;
 }
+
+/** The 400 body for a JSON request body that does not parse (app-wide, see the parser in buildApp). */
+export const INVALID_JSON_BODY = { error: 'invalid-json' } as const;
+const INVALID_JSON_CODE = 'FORGEFX_INVALID_JSON';
 
 /** Dry-run copy for a manual check: `<dir>/<sha256>.cache` (the redacted bytes, exactly what an upload would
  *  send) and `<dir>/<sha256>.json` (the exact reserve body). Node-only; a failure is logged, never fatal. */
@@ -78,13 +91,46 @@ function writeContributionDryRun(dir: string, a: NonNullable<contribution.Contri
 
 export async function buildApp(registry: DeviceRegistry, opts: AppOptions = {}): Promise<FastifyInstance> {
   const app = Fastify({ logger: { level: process.env.LOG_LEVEL ?? 'info' } });
-  await app.register(cors, { origin: true });
+  if (opts.onRoute) { const onRoute = opts.onRoute; app.addHook('onRoute', (r) => onRoute({ method: r.method, url: r.url })); }
+
+  // ── origin + host policy (FORGEFX-51, services/originGuard.ts) ──
+  // ONE app-wide onRequest hook, added before anything else so it runs first on every route (CORS
+  // preflights and the static/404 handler included): a Host that is not a loopback name, an
+  // FORGEFX_ALLOWED_HOSTS entry or (non-loopback bind only) an IP literal / this machine's name → 403
+  // forbidden-host (DNS rebinding); then, except on the public requests (GET /healthz, unmatched GETs =
+  // static SPA), `Sec-Fetch-Site: cross-site` without a listed Origin, or an Origin that is not absent,
+  // loopback, same-origin or an FORGEFX_ALLOWED_ORIGINS entry → 403 forbidden-origin. Routes that read
+  // local files or reveal local paths add the STRICT loopbackOriginGuard (loopback peer) on top.
+  const policy = createRequestPolicy({
+    allowedOrigins: opts.http?.allowedOrigins ?? splitList(process.env.FORGEFX_ALLOWED_ORIGINS),
+    allowedHosts: opts.http?.allowedHosts ?? splitList(process.env.FORGEFX_ALLOWED_HOSTS),
+    machineHostnames: opts.http?.machineHostnames ?? [hostname()],
+    // index.ts passes the address it listens on; the same default otherwise (loopback inside Electron)
+    bindHost: opts.http?.bindHost ?? selectBindHost()
+  });
+  for (const e of policy.ignored) app.log.warn(`[forgefx] ignoring the unparseable allowlist entry ${e}`);
+  app.addHook('onRequest', policy.onRequest);
+  // CORS reflects loopback and operator-listed origins only (same-origin needs no CORS header; any other
+  // origin was already refused above, or is on a public route whose answer it then cannot read).
+  await app.register(cors, { origin: (origin, cb) => cb(null, policy.isCorsOrigin(origin)) });
+
   // tolerate an empty JSON body (no-body POSTs like /cloud/sync, /cloud/logout, /tempo/tap send
-  // content-type: application/json with no payload → Fastify would 400 by default).
-  app.addContentTypeParser('application/json', { parseAs: 'string' }, (_req, body, done) => {
+  // content-type: application/json with no payload → Fastify would 400 by default). A body that does not
+  // parse is the client's error: 400 { error: 'invalid-json' } on every route (the error handler below).
+  // Parsing is Fastify's own secure parser (secure-json-parse): a `__proto__` key or a
+  // `constructor.prototype` path is refused like malformed JSON instead of reaching a handler.
+  const secureJson = app.getDefaultJsonParser('error', 'error');
+  const invalidJson = () => Object.assign(new Error(INVALID_JSON_BODY.error), { statusCode: 400, code: INVALID_JSON_CODE });
+  app.addContentTypeParser('application/json', { parseAs: 'string' }, (req, body, done) => {
     const s = body as string;
     if (!s || !s.length) return done(null, {});
-    try { done(null, JSON.parse(s)); } catch (e) { done(e as Error); }
+    secureJson(req, s, (err, parsed) => (err ? done(invalidJson()) : done(null, parsed)));
+  });
+  // App-wide error handler: only the invalid-JSON shape is ours; every other error goes on to Fastify's
+  // default handler unchanged. A route-level errorHandler that re-sends an error lands here too.
+  app.setErrorHandler((err: { code?: string }, _req, reply) => {
+    if (err.code === INVALID_JSON_CODE) return reply.code(400).send(INVALID_JSON_BODY);
+    return reply.send(err);
   });
   // accept raw .syx bytes (preset files) on POST /preset/decode
   app.addContentTypeParser('application/octet-stream', { parseAs: 'buffer' }, (_req, body, done) => done(null, body));
@@ -170,9 +216,10 @@ export async function buildApp(registry: DeviceRegistry, opts: AppOptions = {}):
   // ── editor-cache import (SECOND cache source: an official-editor effectDefinitions_*.cache file;
   //    capability cacheImport). See services/editorCacheImport.ts + editorCacheDiscovery.ts. ──
   // Origin guards (FORGEFX-47, services/originGuard.ts): a foreign web page gets 403 before any fs
-  // access. Sources and the `{ path }` import read the disk or return local paths: STRICT (loopback or
-  // no Origin). The bytes import reads nothing local: RELAXED (also same-origin), so a LAN browser on a
-  // headless ForgeFX (Docker, Raspberry Pi) that serves the SPA can still drop a .cache file.
+  // access (the app-wide hook). Sources and the `{ path }` import read the disk or return local paths:
+  // STRICT on top (loopback or no Origin). The bytes import reads nothing local and keeps the app-wide
+  // rule, so a LAN browser on a headless ForgeFX (Docker, Raspberry Pi) that serves the SPA can still
+  // drop a .cache file.
   const discoverOpts = opts.editorCaches?.discover ?? {};
   const readCandidate = opts.editorCaches?.readFile ?? editorCacheDiscovery.readCandidateFile;
   // Sources: is a cache already persisted for the attached device + which on-disk editor caches exist.
@@ -182,17 +229,16 @@ export async function buildApp(registry: DeviceRegistry, opts: AppOptions = {}):
   });
   // Import: raw octet-stream of the .cache file + ?name=<filename> (& ?force=1), OR JSON { path } to
   // read a discovered candidate off disk. 501 no cacheImport, 409 model/firmware mismatch (force skips fw).
-  // The route-level hook is the relaxed guard; the `{ path }` branch re-checks the strict rule (403)
-  // before discovery runs. `{ path }` must then be one of a fresh discovery's candidates (400
-  // not-a-discovered-cache otherwise; the path is never opened or stat-ed); the read uses the
-  // candidate's own path.
-  app.post<{ Body: Buffer | { path?: string }; Querystring: { name?: string; force?: string } }>('/device/cache/import', { onRequest: loopbackOrSameOriginGuard }, async (req, reply) => {
+  // The app-wide hook applies; the `{ path }` branch re-checks the strict rule (403) before discovery
+  // runs. `{ path }` must then be one of a fresh discovery's candidates (400 not-a-discovered-cache
+  // otherwise; the path is never opened or stat-ed); the read uses the candidate's own path.
+  app.post<{ Body: Buffer | { path?: string }; Querystring: { name?: string; force?: string } }>('/device/cache/import', async (req, reply) => {
     const force = req.query.force === '1' || req.query.force === 'true';
     const b = req.body;
     let bytes: Uint8Array;
     let name: string;
     if (b && !Buffer.isBuffer(b) && typeof b.path === 'string' && b.path) {
-      if (!isAllowedOrigin(req.headers.origin)) { reply.code(403); return { error: FORBIDDEN_ORIGIN }; }
+      if (!isStrictAllowed(req.headers.origin, req.socket?.remoteAddress)) { reply.code(403); return { error: FORBIDDEN_ORIGIN }; }
       const candidate = editorCacheDiscovery.findDiscoveredCandidate(b.path, discoverOpts);
       if (!candidate) { reply.code(400); return { error: editorCacheImport.NOT_A_DISCOVERED_CACHE }; }
       try { const read = readCandidate(candidate.path); bytes = read.bytes; name = read.name; }
@@ -765,11 +811,14 @@ export async function buildApp(registry: DeviceRegistry, opts: AppOptions = {}):
   app.get('/events', (req, reply) => {
     reply.hijack();
     const raw = reply.raw;
+    // hijacked: the CORS plugin's headers are not sent, so apply the same rule here (never `*`)
+    const origin = req.headers.origin;
     raw.writeHead(200, {
       'content-type': 'text/event-stream',
       'cache-control': 'no-cache',
       connection: 'keep-alive',
-      'access-control-allow-origin': '*'
+      vary: 'Origin',
+      ...(origin && policy.isCorsOrigin(origin) ? { 'access-control-allow-origin': origin } : {})
     });
     raw.write(': connected\n\n');
     const unsub = registry.subscribe((e) => raw.write(`data: ${JSON.stringify(e)}\n\n`));
@@ -784,6 +833,10 @@ export async function buildApp(registry: DeviceRegistry, opts: AppOptions = {}):
   // When FORGEFX_STATIC points at a built SPA (Axis), serve it for any non-API GET, with SPA
   // fallback to index.html. Registered as the not-found handler so it never shadows API routes.
   // Used by the desktop app (loads http://localhost:PORT) and headless/Pi single-binary setups.
+  // Public (the app-wide hook skips the origin check for unmatched GET/HEAD): it serves build output only.
+  // Paths are contained by services/staticFiles.ts (escape or a Windows device name → 404, undecodable →
+  // 400; only regular files are opened), and the pages may not be framed by another site (a framed UI
+  // would make same-origin calls on a hostile page's behalf). HEAD answers the GET headers, no body.
   const STATIC = process.env.FORGEFX_STATIC;
   if (STATIC) {
     const root = resolve(STATIC);
@@ -793,13 +846,27 @@ export async function buildApp(registry: DeviceRegistry, opts: AppOptions = {}):
       '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.webp': 'image/webp', '.ico': 'image/x-icon',
       '.woff': 'font/woff', '.woff2': 'font/woff2', '.ttf': 'font/ttf', '.map': 'application/json', '.wasm': 'application/wasm'
     };
+    const index = join(root, 'index.html');
     app.setNotFoundHandler((req, reply) => {
-      if (req.method !== 'GET') return reply.code(404).send({ error: 'not found' });
-      const urlPath = decodeURIComponent(req.url.split('?')[0] ?? '/');
-      let file = join(root, urlPath === '/' ? 'index.html' : urlPath);
-      if (!resolve(file).startsWith(root) || !existsSync(file) || statSync(file).isDirectory()) file = join(root, 'index.html');
-      if (!existsSync(file)) return reply.code(404).send({ error: 'not found' });
-      return reply.type(MIME[extname(file).toLowerCase()] ?? 'application/octet-stream').send(createReadStream(file));
+      if (req.method !== 'GET' && req.method !== 'HEAD') return reply.code(404).send({ error: 'not found' });
+      const t = staticTarget(root, req.url);
+      if (t.kind === 'invalid-url') return reply.code(400).send({ error: 'invalid-url' });
+      if (t.kind === 'outside' || t.kind === 'reserved') return reply.code(404).send({ error: 'not found' });
+      let file = t.kind === 'file' ? t.path : index;
+      let size: number;
+      try {
+        let st = existsSync(file) ? statSync(file) : null;
+        if (!st || !st.isFile()) { file = index; st = existsSync(file) ? statSync(file) : null; }
+        if (!st || !st.isFile()) return reply.code(404).send({ error: 'not found' });
+        size = st.size;
+      } catch { return reply.code(404).send({ error: 'not found' }); }
+      reply
+        .header('x-frame-options', 'SAMEORIGIN')
+        .header('content-security-policy', "frame-ancestors 'self'")
+        .type(MIME[extname(file).toLowerCase()] ?? 'application/octet-stream');
+      // HEAD: the GET headers (length included) without opening the file
+      if (req.method === 'HEAD') return reply.header('content-length', String(size)).send();
+      return reply.send(createReadStream(file));
     });
   }
 
@@ -833,24 +900,23 @@ export async function buildApp(registry: DeviceRegistry, opts: AppOptions = {}):
   });
 
   // ── cloud sync (GATED: only when AXIS_CLOUD=1; release builds never load supabase-js) ──
-  // Every /cloud/* and /remote/* route is origin-guarded (RELAXED: no Origin, a loopback origin, or the server's
-  // own origin, so a LAN/Docker UI served by this server keeps working): CORS reflects every origin, so without
-  // it any web page could sign this install into an account of its choosing, sign it out, delete the account,
-  // switch Remote on, or read who is signed in. Non-browser callers (Electron main, the Remote relay) send no
-  // Origin and are unaffected.
-  const cloudGuard = { onRequest: loopbackOrSameOriginGuard };
+  // Every /cloud/* and /remote/* route sits behind the app-wide origin + host policy (no Origin, a loopback
+  // origin, the server's own origin or an operator-listed one), so a LAN/Docker UI served by this server keeps
+  // working while no other web page can sign this install into an account of its choosing, sign it out, delete
+  // the account, switch Remote on, or read who is signed in. Non-browser callers (Electron main, the Remote
+  // relay) send no Origin and are unaffected.
   if (process.env.AXIS_CLOUD === '1') {
     const { cloud } = await import('./cloud.js');
     diagCloud = cloud;
     contributionCloud = cloud;
     type Creds = { email: string; password: string };
-    app.get('/cloud/status', cloudGuard, async () => cloud.status());
-    app.post<{ Body: Creds }>('/cloud/register', cloudGuard, async (req, reply) => { try { return await cloud.register(req.body.email, req.body.password); } catch (e) { reply.code(400); return { error: (e as Error).message }; } });
-    app.post<{ Body: Creds }>('/cloud/login', cloudGuard, async (req, reply) => { try { return await cloud.login(req.body.email, req.body.password); } catch (e) { reply.code(401); return { error: (e as Error).message }; } });
-    app.post('/cloud/logout', cloudGuard, async () => cloud.logout());
-    app.post('/cloud/delete-account', cloudGuard, async (_req, reply) => { try { return await cloud.deleteAccount(); } catch (e) { reply.code(500); return { error: (e as Error).message }; } });
-    app.post<{ Body: { scopes?: { config?: boolean; presets?: boolean } } }>('/cloud/sync', cloudGuard, async (req, reply) => { try { return await cloud.sync(req.body?.scopes); } catch (e) { reply.code(503); return { error: (e as Error).message }; } });
-    app.get('/cloud/index', cloudGuard, async (_req, reply) => { try { return await cloud.cloudIndex(); } catch (e) { reply.code(503); return { error: (e as Error).message }; } });
+    app.get('/cloud/status', async () => cloud.status());
+    app.post<{ Body: Creds }>('/cloud/register', async (req, reply) => { try { return await cloud.register(req.body.email, req.body.password); } catch (e) { reply.code(400); return { error: (e as Error).message }; } });
+    app.post<{ Body: Creds }>('/cloud/login', async (req, reply) => { try { return await cloud.login(req.body.email, req.body.password); } catch (e) { reply.code(401); return { error: (e as Error).message }; } });
+    app.post('/cloud/logout', async () => cloud.logout());
+    app.post('/cloud/delete-account', async (_req, reply) => { try { return await cloud.deleteAccount(); } catch (e) { reply.code(500); return { error: (e as Error).message }; } });
+    app.post<{ Body: { scopes?: { config?: boolean; presets?: boolean } } }>('/cloud/sync', async (req, reply) => { try { return await cloud.sync(req.body?.scopes); } catch (e) { reply.code(503); return { error: (e as Error).message }; } });
+    app.get('/cloud/index', async (_req, reply) => { try { return await cloud.cloudIndex(); } catch (e) { reply.code(503); return { error: (e as Error).message }; } });
 
     // ── shared device-definition profiles (THIRD cache source; services/cloudProfiles.ts) ──
     app.get('/device/cache/cloud', async () => cloudProfiles.cloudCacheCheck(cloud, store.defaultStore, registry));
@@ -860,13 +926,13 @@ export async function buildApp(registry: DeviceRegistry, opts: AppOptions = {}):
     // ── Axis Cloud Remote — host agent (off by default; toggled by the Axis UI) ──
     const { RemoteHost } = await import('./remote.js');
     const remoteHost = new RemoteHost(app, () => cloud.remoteSession(), (fn) => registry.subscribe(fn));
-    app.get('/remote/status', cloudGuard, async () => remoteHost.status());
-    app.post<{ Body: { on?: boolean } }>('/remote/enable', cloudGuard, async (req, reply) => {
+    app.get('/remote/status', async () => remoteHost.status());
+    app.post<{ Body: { on?: boolean } }>('/remote/enable', async (req, reply) => {
       try { return await remoteHost.enable(!!req.body?.on); } catch (e) { reply.code(503); return { error: (e as Error).message }; }
     });
   } else {
-    app.get('/cloud/status', cloudGuard, async () => ({ enabled: false, user: null })); // so Axis can gate its UI without erroring
-    app.get('/remote/status', cloudGuard, async () => ({ enabled: false, connected: false, userId: null }));
+    app.get('/cloud/status', async () => ({ enabled: false, user: null })); // so Axis can gate its UI without erroring
+    app.get('/remote/status', async () => ({ enabled: false, connected: false, userId: null }));
     app.get('/device/cache/cloud', async () => ({ enabled: false, available: false })); // same non-erroring gate for the defs prompt
   }
 

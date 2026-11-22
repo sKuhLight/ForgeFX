@@ -6,6 +6,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { registry } from './drivers/registry.js';
 import { buildApp } from './app.js';
+import { selectBindHost } from './services/bindHost.js';
 
 // Load the server's .env (Supabase creds + AXIS_CLOUD/AXIS_TELEMETRY/AXIS_FARO_URL) — keeps secrets out
 // of source so the public repo never ships a hosted instance's keys. Resolve it RELATIVE TO THIS MODULE
@@ -26,16 +27,19 @@ if (typeof globalThis.WebSocket === 'undefined') {
 }
 
 const PORT = Number(process.env.PORT ?? 5056);
-const app = await buildApp(registry);
+// Listen address (services/bindHost.ts): loopback inside the Electron desktop app, all interfaces elsewhere
+// (Docker / headless / dev keep LAN access); FORGEFX_HOST overrides.
+const HOST = selectBindHost();
+const app = await buildApp(registry, { http: { bindHost: HOST } }); // the Host allowlist depends on the bind
 
 // Auto port allocation: try PORT; if it's taken, let the OS assign a free one (port 0).
 // The actual bound port is logged (and the desktop app picks a free port up front anyway).
 async function listen(port: number, fellBack = false): Promise<void> {
   try {
-    await app.listen({ port, host: '0.0.0.0' });
+    await app.listen({ port, host: HOST });
     const addr = app.server.address();
     const actual = addr && typeof addr === 'object' ? addr.port : port;
-    app.log.info(`ForgeFX (node) on http://localhost:${actual}`);
+    app.log.info(`ForgeFX (node) on http://localhost:${actual} (listening on ${HOST})`);
     // one-shot startup diagnostic — lands in the desktop debug log even if the /diag fetch never fires
     registry.diagnostics().then((d) => app.log.info({ diag: d }, 'forgefx startup diagnostics')).catch(() => {});
   } catch (e) {

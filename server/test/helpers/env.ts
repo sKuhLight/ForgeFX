@@ -30,4 +30,8 @@ delete process.env.FORGEFX_DEVICE;
 // Keep the app quiet + hermetic in tests: no cloud routes, no static SPA handler, terse logs.
 delete process.env.AXIS_CLOUD;
 delete process.env.FORGEFX_STATIC;
+// ...and no ambient origin/host allowlist or bind override (the http-policy suite sets them explicitly).
+delete process.env.FORGEFX_ALLOWED_ORIGINS;
+delete process.env.FORGEFX_ALLOWED_HOSTS;
+delete process.env.FORGEFX_HOST;
 process.env.LOG_LEVEL ??= 'silent';

@@ -180,8 +180,9 @@ the routes answers 404.
 | `POST /device/cache/contribute/decision` | `{ decision: "asked", days? }` (1..90, default 7) · `"declined"` · `"reset"` |
 | `POST /device/cache/contribute/withdraw` | delete this install's upload for the connected firmware |
 
-- **Origin:** every route is loopback-only (`loopbackOriginGuard`: no `Origin`, or an http(s) loopback
-  host); anything else is `403 { "error": "forbidden-origin" }` before any file is touched.
+- **Origin:** every route is loopback-only (`loopbackOriginGuard`, on top of the app-wide policy of
+  ADR 0004: no `Origin`, or an http(s) loopback host); anything else is `403 { "error": "forbidden-origin" }`
+  before any file is touched.
 - **Remote:** the status GET is readable over the relay; the three POSTs are not on its allowlist (consent
   must come from the person at the machine whose file is read).
 - **No new SSE event.** A coupled import emits the existing `cacheBuild` `done` event.
@@ -287,3 +288,98 @@ The upload request (also `wouldSend`) carries counts and version stamps only:
 | 503 | `no-device`, `firmware-unknown`, `cloud-disabled`, `paused`, `dry-run` |
 
 Messages never quote the file's content.
+
+---
+
+# ADR 0004 — Origin and Host policy for the HTTP API
+
+Status: accepted · 2026-11-22
+
+## Context
+The API drives the device and reads and writes local state (settings, preset versions, the local folder,
+port selection). Browsers let any web page send requests to `http://localhost:<port>` or to a LAN address,
+and a DNS-rebinding page can even make those requests look same-origin. The server used to reflect every
+origin in CORS and listened on all interfaces in every build, the desktop app included.
+
+## Decision
+One app-wide `onRequest` hook runs before body parsing and before any handler, on every route (CORS
+preflights and the static UI included):
+
+1. **Host allowlist** → `403 { "error": "forbidden-host" }`. Accepted `Host` values: none at all;
+   `localhost` and `*.localhost`; any hostname in `FORGEFX_ALLOWED_HOSTS`; and, by listen address:
+   - **loopback bind** (the desktop app): loopback addresses only (`127.0.0.0/8`, `[::1]`). The machine's
+     own names, LAN addresses and `0.0.0.0` are refused: a loopback-only server reached under such a name
+     is being reached through something that points it at `127.0.0.1`.
+   - **any other bind** (Docker, headless, dev): every IP literal (IPv4/IPv6), plus this machine's hostname,
+     its first label and `<first label>.local`.
+
+   Ports are not compared.
+2. **Public requests** skip the next two checks (never the Host check): `GET`/`HEAD /healthz` and
+   `GET`/`HEAD` requests that match no route (the static UI under `FORGEFX_STATIC`, or the 404 body).
+3. **Cross-site fetch metadata** → `403 { "error": "forbidden-origin" }`: a request with
+   `Sec-Fetch-Site: cross-site` is refused unless its `Origin` is in `FORGEFX_ALLOWED_ORIGINS`. This covers
+   what carries no `Origin` (an `<img>` or `<script>` load, a link from another site), which would otherwise
+   run side-effect GETs such as device detection or preset decodes. `same-origin`, `same-site`, `none` and no
+   header at all (Node clients, older browsers) pass. Browsers send the header only to potentially
+   trustworthy targets (`localhost`, `https`), so it protects the desktop app; a plain-`http` LAN address
+   relies on the Origin check and on the browser's own private-network restrictions.
+4. **Origin check** → `403 { "error": "forbidden-origin" }`. Accepted: no `Origin` header (curl, scripts,
+   the desktop app's main process, the Remote relay, a page's own same-origin GETs); an `http(s)` loopback
+   origin (`localhost`, `127.0.0.1`, `[::1]`, any port: the desktop app, the dev server); a same-origin
+   request (`Origin` host:port equals `Host`: a browser on the LAN using the UI a headless server serves);
+   any exact origin in `FORGEFX_ALLOWED_ORIGINS`. `Origin: null` is always refused.
+
+CORS reflects only loopback and listed origins (a same-origin page needs no CORS header), so a foreign page
+cannot read even a public answer. The static UI is sent with `X-Frame-Options: SAMEORIGIN` and
+`frame-ancestors 'self'`, so another site cannot frame it and borrow its origin.
+
+Routes that read files the server did not write, or return paths on the server machine (editor-cache
+sources, import by path, the contribution routes; ADR 0003), keep a stricter per-route rule on top: the
+TCP connection must come from a **loopback peer** (`127.0.0.0/8` or `::1`, IPv4-mapped included), with no
+`Origin` or a loopback origin. LAN clients (with or without an `Origin`), same-origin LAN pages and listed
+origins are refused there with `403 forbidden-origin`.
+
+**Listen address.** Inside the desktop app (`process.versions.electron` is set) the server listens on
+`127.0.0.1`; everywhere else (Docker, a headless box, `npm run dev`) on `0.0.0.0`. `FORGEFX_HOST` overrides
+both.
+
+| Variable | Format | Effect |
+|---|---|---|
+| `FORGEFX_HOST` | an address, e.g. `127.0.0.1`, `0.0.0.0`, `::` | listen address (default above); a loopback address also narrows the Host allowlist |
+| `FORGEFX_ALLOWED_HOSTS` | comma-separated hostnames | extra names accepted in `Host` (see the proxy notes below) |
+| `FORGEFX_ALLOWED_ORIGINS` | comma-separated exact origins (`scheme://host[:port]`) | extra origins that may call every route except the stricter ones (also cross-site), and that CORS reflects |
+
+Entries that do not parse are ignored with a warning in the log.
+
+Typical setups:
+- **Docker reached by name** (`http://raspberrypi.local:5056`): a container's hostname is not the host
+  machine's, so list the name in `FORGEFX_ALLOWED_HOSTS`. By IP address nothing is needed.
+- **Reverse proxy that keeps `Host`** (Traefik, Caddy by default): list the public name in
+  `FORGEFX_ALLOWED_HOSTS`; the page is then same-origin.
+- **Reverse proxy that rewrites `Host`** to its upstream (nginx's default for `proxy_pass`): the upstream
+  name, unless it is an IP, goes into `FORGEFX_ALLOWED_HOSTS`, and the public origin into
+  `FORGEFX_ALLOWED_ORIGINS` (the page's origin no longer matches `Host`).
+- **Testing the dev UI from another device** (`vite --host`, opened at `http://<lan-ip>:5173`): the dev
+  proxy forwards the page's origin, so put that exact origin into `FORGEFX_ALLOWED_ORIGINS` of the server
+  behind it.
+
+**Other request hygiene.** A JSON body that does not parse, or that tries prototype poisoning (a
+`__proto__` key, a `constructor.prototype` path; Fastify's secure parser), answers
+`400 { "error": "invalid-json" }` on every route (an empty body is still `{}`). The static UI handler serves
+`GET` and `HEAD`, resolves a path inside its root by a real containment check (an escape answers 404),
+refuses Windows device names (`CON`, `NUL`, `COM1`…) and `:` in a path segment on Windows before touching
+the disk (404), and answers `400 { "error": "invalid-url" }` to a path that does not decode.
+
+## Consequences
+- A browser on the LAN still works against a headless server by IP address or by that machine's own name;
+  Docker and proxy setups need the entries above.
+- **Non-browser clients on the LAN are not authenticated.** On a `0.0.0.0` bind anything on the network can
+  call the API without an `Origin` (curl, scripts), exactly like before; only the stricter routes above
+  require a loopback peer. Use `FORGEFX_HOST=127.0.0.1` (or a firewall) where the LAN is not trusted. A
+  reverse proxy on the same machine makes every client a loopback peer.
+- Residual risk: anyone who controls name resolution on the local network for a name the server accepts
+  (for example by answering mDNS for `<name>.local`) can rebind that name. Only a non-loopback server accepts
+  its own names, and such a party can reach it directly anyway; the desktop app listens on loopback and
+  accepts loopback names and addresses only (plus an operator's `FORGEFX_ALLOWED_HOSTS`). Other web pages
+  served from loopback (local dev servers, other local apps) count as loopback origins. Non-browser software
+  on the same machine is not a browser-borne threat and is out of scope.

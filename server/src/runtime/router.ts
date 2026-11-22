@@ -656,7 +656,7 @@ export function createRouter(deps: RuntimeDeps): {
         const s = typeof body === 'string' ? body : new TextDecoder().decode(body);
         if (s.length) {
           try { json = JSON.parse(s); }
-          catch { return respond(400, { statusCode: 400, error: 'Bad Request', message: 'Body is not valid JSON' }); }
+          catch { return respond(400, { error: 'invalid-json' }); } // same body as app.ts's JSON parser
         }
       }
 
