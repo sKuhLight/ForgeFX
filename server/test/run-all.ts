@@ -22,6 +22,7 @@ import { runChannelSliceTests, CHANNEL_SLICE_CASE_COUNT } from './drivers/channe
 import { runWalkReclassificationTests, WALK_RECLASSIFICATION_CASE_COUNT } from './drivers/walk-reclassification.test.js';
 import { runKnobUnitsTests, KNOB_UNITS_CASE_COUNT } from './drivers/knob-units.test.js';
 import { runFloatRowSelectorsTests, FLOAT_ROW_SELECTORS_CASE_COUNT } from './drivers/float-row-selectors.test.js';
+import { runBlockStateTests, BLOCK_STATE_CASE_COUNT } from './drivers/block-state.test.js';
 import { runTablesTests, TABLES_CASE_COUNT } from './drivers/tables.test.js';
 import { runLayoutsTests, LAYOUTS_CASE_COUNT } from './drivers/layouts.test.js';
 import { runTelemetryTests, TELEMETRY_CASE_COUNT } from './drivers/telemetry.test.js';
@@ -63,6 +64,7 @@ const tests: Array<{ name: string; run: () => void | Promise<void> }> = [
   { name: `drivers/walk-reclassification (${WALK_RECLASSIFICATION_CASE_COUNT} cases, non-byte-exact profiles never reclassify a catalog kind; editor-cache / cloud-from-cache override)`, run: runWalkReclassificationTests },
   { name: `drivers/knob-units (${KNOB_UNITS_CASE_COUNT} cases, knob selection: continuous units in, selectors and steppers out)`, run: runKnobUnitsTests },
   { name: `drivers/float-row-selectors (${FLOAT_ROW_SELECTORS_CASE_COUNT} cases, float-row selectors: the III global-mix toggles list as enums, nothing else changes category)`, run: runFloatRowSelectorsTests },
+  { name: `drivers/block-state (${BLOCK_STATE_CASE_COUNT} cases, Scene Ignore + Bypass Mode tagged per model: ids FM3 137 / FM9 6 / III 135, values per active channel, write frames, firmware gate, a failed read flagged, caps)`, run: runBlockStateTests },
   { name: `drivers/tables (${TABLES_CASE_COUNT} identity checks, paramId cross-contamination guard)`, run: runTablesTests },
   { name: `drivers/layouts (${LAYOUTS_CASE_COUNT} editor-layout v2 variant-selection + passthrough)`, run: runLayoutsTests },
   { name: `drivers/telemetry (${TELEMETRY_CASE_COUNT} cadence/traffic/echo-guard/yield cases)`, run: runTelemetryTests },

@@ -29,6 +29,7 @@ import {
   readBlockParamsForModel, modelsFromBlocks,
   effectRoster, blockRefForEid, slugForEffectId, blockInstances,
   retargetPresetDumpToEditBuffer,
+  blockStateParams, hasBlockStateParams, firmwareAtLeast, formatBlockStateFirmware, isMutingBypassMode,
   type DecodedBlock
 } from 'forgefx-midi/devices/gen3';
 import { isTransportTimeout, type Transport } from '../transport/types.js';
@@ -37,7 +38,7 @@ import { EmptyPresetError } from './types.js';
 import type {
   DeviceDriver, DriverCapabilities, DriverCtx, DiagnosticDump, SelectPresetOpts,
   PresetGridDTO, GridCellDTO, PresetBlockDTO, PresetSummary, NamedParam, EnumParam, MeterVal,
-  FcSwitchState, FcReadState, StoreReason
+  FcSwitchState, FcReadState, StoreReason, BlockStateDTO
 } from './types.js';
 import { validatedPresetDump } from './sendPolicy.js';
 
@@ -529,7 +530,9 @@ class Gen3Driver implements DeviceDriver {
       //    frames) → registry POLLS the open block instead (deviceEditWatch → readDeviceEditState below),
       //    the same poll-fallback shape as the AM4. Disable in the field via FORGEFX_FM3_EDITSYNC=0.
       deviceEditPush: profile.model !== 0x11,
-      deviceEditWatch: profile.model === 0x11 && process.env.FORGEFX_FM3_EDITSYNC !== '0'
+      deviceEditWatch: profile.model === 0x11 && process.env.FORGEFX_FM3_EDITSYNC !== '0',
+      // Scene Ignore + Bypass Mode tagged on the block-params response (codec blockStateParams: III/FM3/FM9).
+      blockState: hasBlockStateParams(profile.model)
     };
   }
 
@@ -1066,7 +1069,7 @@ class Gen3Driver implements DeviceDriver {
    * (knob position); `value`/`unit` are the device-true DISPLAY reading via this.#prof.ranges
    * (e.g. 1.2k Hz, -12 dB) where the cache has a range, else the 0..10 position.
    */
-  async blockParams(eid: number): Promise<{ block: string; slug: string; page: number; named: NamedParam[]; enums: EnumParam[]; type: { value: number; name: string } | null; layout?: DeviceLayout }> {
+  async blockParams(eid: number): Promise<{ block: string; slug: string; page: number; named: NamedParam[]; enums: EnumParam[]; type: { value: number; name: string } | null; layout?: DeviceLayout; blockState: BlockStateDTO }> {
     this.#watchedEid = eid; // this is the block the user has open → the target the FM3 device-edit poll re-reads
     const codecSlug = slugForEffectId(eid) ?? ''; // audio blocks resolve via the codec
     // virtual effects (GLOBAL=1, Controllers=2, Modifier=3, FC=199) resolve via the profile's effectId map
@@ -1080,7 +1083,8 @@ class Gen3Driver implements DeviceDriver {
     // type is read below we re-resolve to the type-matched (or firmware-pinned) variant.
     let layout = family ? this.#prof.layoutFor(family) : undefined;
     if (!family) {
-      return { block: blockName, slug, page, named: [], enums: [], type: null, layout }; // no device-true param family mapped
+      // no device-true param family mapped
+      return { block: blockName, slug, page, named: [], enums: [], type: null, layout, blockState: { sceneIgnore: null, bypassMode: null } };
     }
     const defs = this.#prof.params[family] ?? [];
     // knobs = every continuous param with a usable range: a float-kind range AND a continuous catalog
@@ -1096,6 +1100,7 @@ class Gen3Driver implements DeviceDriver {
     const named: NamedParam[] = [];
     const enums: EnumParam[] = [];
     let type: { value: number; name: string } | null = null;
+    let readOk = false; // the bulk read decoded (else the values above are a zeroed fallback)
     {
       const dev = await this.#conn();
       try {
@@ -1138,6 +1143,7 @@ class Gen3Driver implements DeviceDriver {
           const tv = raw > max ? Math.round((raw / 65534) * max) : raw;
           type = { value: tv, name: roster[tv]?.name ?? '' };
         }
+        readOk = true;
       } catch {
         named.length = 0; // a mid-loop throw left partial data — reset before the zeroed fallback
         for (const p of knobs) named.push({ id: p.paramId, name: paramLabel(p), value: 0, norm: 0 });
@@ -1164,7 +1170,40 @@ class Gen3Driver implements DeviceDriver {
     // so identical names get a 1/2/3 suffix the UI can tell apart.
     dedupeLabels(named);
     dedupeLabels(enums);
-    return { block: blockName, slug, page, named, enums, type, layout };
+    // a failed read is not "the block has none": flag it, so the client says the block could not be read
+    const blockState: BlockStateDTO = readOk ? this.#blockState(family, enums) : { sceneIgnore: null, bypassMode: null, readError: true };
+    return { block: blockName, slug, page, named, enums, type, layout, blockState };
+  }
+
+  /** Tag the block's Scene Ignore + Bypass Mode (additive `blockState`, capability `blockState`). WHICH param
+   *  each one is comes from the codec (`blockStateParams`: by name in THIS model's catalog, with the firmware
+   *  gate); the VALUE is the active-channel enum just read into `enums`, so the header and the board's own
+   *  control can never disagree. A member is null when the family has no such param (a failed read is flagged by the caller). */
+  #blockState(family: string, enums: readonly EnumParam[]): BlockStateDTO {
+    const facts = blockStateParams(this.#prof.model, family);
+    let sceneIgnore: BlockStateDTO['sceneIgnore'] = null;
+    const si = facts.sceneIgnore;
+    const siEnum = si ? enums.find((e) => e.id === si.paramId) : undefined;
+    if (si && siEnum) {
+      const supported = firmwareAtLeast(this.#ctx.getFirmware?.() ?? null, si.minFw);
+      sceneIgnore = {
+        paramId: si.paramId,
+        value: siEnum.value,
+        supported,
+        ...(supported || !si.minFw ? {} : { reason: `Needs firmware ≥ ${formatBlockStateFirmware(si.minFw)}` })
+      };
+    }
+    let bypassMode: BlockStateDTO['bypassMode'] = null;
+    const bm = facts.bypassMode;
+    const bmEnum = bm ? enums.find((e) => e.id === bm.paramId) : undefined;
+    if (bm && bmEnum) {
+      bypassMode = {
+        paramId: bm.paramId,
+        value: bmEnum.value,
+        options: bmEnum.options.map((o) => ({ value: o.value, label: o.label, muting: isMutingBypassMode(o.label) }))
+      };
+    }
+    return { sceneIgnore, bypassMode };
   }
 
   /** Read specific paramIds of an effect via per-pid fn 0x01 GET (sub 01 00) — the path FM3-Edit

@@ -31,6 +31,7 @@ type Caps = {
   versionStore: boolean;
   deviceParams: boolean;
   virtualEffects: { eid: number; slug: string; name: string }[];
+  blockState: boolean;
   telemetryControl: boolean;
   supportsSave: boolean;
 };
@@ -79,7 +80,18 @@ function checkGen3Common(caps: Caps, label: string, fullCapture = true): void {
   assertEqual(caps.deviceParams, false, `${label} deviceParams`);
   assertEqual(caps.virtualEffects.length, 4, `${label} virtualEffects (Setup/Controllers/Modifier/FC)`);
   assertEqual(caps.virtualEffects.map((v) => v.eid).join(','), '1,2,3,199', `${label} virtualEffects eids`);
+  assertEqual(caps.blockState, true, `${label} blockState (Scene Ignore + Bypass Mode on block params)`);
   assertEqual(caps.telemetryControl, true, `${label} telemetryControl (registry-level cadence-mode control)`);
+}
+
+/** The blockState flag is the LAST key of the extended matrix (additive-only ordering): it sits right after
+ *  virtualEffects and before the registry-level telemetryControl / supportsSave. */
+function checkBlockStateOrdering(caps: Caps, label: string): void {
+  const keys = Object.keys(caps);
+  const at = keys.indexOf('blockState');
+  assert(at > 0, `${label} blockState key present`);
+  assertEqual(keys[at - 1], 'virtualEffects', `${label} blockState follows virtualEffects`);
+  assertEqual(keys[at + 1], 'telemetryControl', `${label} blockState precedes telemetryControl`);
 }
 
 async function fm3(): Promise<void> {
@@ -87,6 +99,7 @@ async function fm3(): Promise<void> {
   try {
     assertEqual(device.apiVersion, 2, 'FM3 /device apiVersion');
     checkGen3Common(caps, 'FM3');
+    checkBlockStateOrdering(caps, 'FM3');
     assertEqual(caps.fc.liveState, true, 'FM3 fc.liveState (FM3 only)');
     assertEqual(caps.cabIrs, true, 'FM3 cabIrs (bundled IR names)');
 
@@ -169,6 +182,8 @@ async function am4(): Promise<void> {
     assertEqual(caps.versionStore, false, 'AM4 versionStore');
     assertEqual(caps.deviceParams, true, 'AM4 deviceParams');
     assert(Array.isArray(caps.virtualEffects) && caps.virtualEffects.length === 0, 'AM4 virtualEffects empty');
+    assertEqual(caps.blockState, false, 'AM4 blockState (no Scene Ignore / bypass-mode tagging)');
+    checkBlockStateOrdering(caps, 'AM4');
     assertEqual(caps.telemetryControl, true, 'AM4 telemetryControl');
     assertEqual(caps.supportsSave, true, 'AM4 supportsSave (curated key intact)');
     // 2026-07-08: HW-009 (amp/drive/reverb/delay only) was superseded — every AM4 block has an
@@ -216,6 +231,7 @@ async function gen1(): Promise<void> {
     assertEqual(caps.versionStore, false, 'gen1 versionStore');
     assertEqual(caps.deviceParams, false, 'gen1 deviceParams');
     assert(Array.isArray(caps.virtualEffects) && caps.virtualEffects.length === 0, 'gen1 virtualEffects empty');
+    assertEqual(caps.blockState, false, 'gen1 blockState');
     // telemetryControl is registry-level (route availability), so it's true even on the read-only gen-1.
     assertEqual(caps.telemetryControl, true, 'gen1 telemetryControl (registry-level)');
     assertEqual(caps.supportsSave, false, 'gen1 supportsSave');
@@ -284,11 +300,25 @@ async function fullCaptureFirmwareGate(): Promise<void> {
   assertEqual(fullCaptureAllowedOnFirmware(0x11, { major: 0, minor: 0 }), false, 'policy: major 0 refused');
 }
 
+// VP4 (0x14): its catalog names Scene Ignore on four families, but VP4 discrete writes are not decoded, so the
+// block-state tagging (and its capability) stays off.
+async function vp4(): Promise<void> {
+  const { device, caps, app } = await fetchCaps(0x14);
+  try {
+    assertEqual(device.modelId, 0x14, 'VP4 modelId');
+    assertEqual(caps.blockState, false, 'VP4 blockState (writes not decoded)');
+    checkBlockStateOrdering(caps, 'VP4');
+  } finally {
+    await app.close();
+  }
+}
+
 export async function runCapsTests(): Promise<void> {
   await fm3();
   await fm9();
   await axe3();
   await am4();
   await gen1();
+  await vp4();
   await fullCaptureFirmwareGate();
 }

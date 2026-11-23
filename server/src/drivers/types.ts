@@ -54,6 +54,19 @@ export interface PresetGridDTO { model: string; name: string; crcValid: boolean;
 export interface PresetBlockDTO { slug: string; name: string; effectId: number; row: number; col: number; fromRows: number[]; bypassed: boolean | null; channel: string | null; }
 export interface NamedParam { id: number; name: string; value: number; norm: number; unit?: string; min?: number; max?: number; log?: boolean; }
 export interface EnumParam { id: number; name: string; value: number; options: { value: number; label: string }[]; }
+/** The block's Scene Ignore toggle on its ACTIVE channel (the param is per channel). `paramId` is the
+ *  device catalog's `<FAMILY>_SCENEIGNORE` id (codec `blockStateParams`) — the same id the block's
+ *  `enums[]` entry carries, so a write goes through the ordinary enum write (PUT .../params/:paramId,
+ *  continuous:false). `supported:false` + `reason` when the device firmware is known and below the
+ *  param's gate. */
+export interface BlockSceneIgnoreDTO { paramId: number; value: number; supported: boolean; reason?: string }
+/** The block's Bypass Mode selector (what the block does WHILE bypassed) on its active channel. Options are
+ *  the device's own labels; `muting` marks the modes that silence the block (codec `isMutingBypassMode`). */
+export interface BlockBypassModeDTO { paramId: number; value: number; options: { value: number; label: string; muting: boolean }[] }
+/** Additive `blockState` on the block-params response (gen-3 III / FM3 / FM9; capability `blockState`).
+ *  A null member = the block family has no such param. `readError: true` = the block's read failed, so
+ *  nothing is known about either param (both members null). */
+export interface BlockStateDTO { sceneIgnore: BlockSceneIgnoreDTO | null; bypassMode: BlockBypassModeDTO | null; readError?: true }
 export interface MeterVal { norm: number; value: number; unit?: string; min?: number; max?: number; log?: boolean; }
 /** One side (tap/hold) of an FC switch as read by the sub-0x01 structured read. `present` = the
  *  device returned a record whose config/side echo matched the request; `raw` = the 78-byte response
@@ -205,6 +218,9 @@ export interface DriverCapabilities {
    *  burst, so the registry installs a persistent RX listener that reflects them as `param` events
    *  via the driver's `decodeEditBurst()` (gen-3 — the push mirror of deviceEditWatch). Absent = no listener. */
   deviceEditPush?: boolean;
+  /** The block-params response carries `blockState` (Scene Ignore + Bypass Mode of the open block, tagged
+   *  from the codec's per-model catalog lookup). Gen-3 Axe-Fx III / FM3 / FM9 only; absent = false. */
+  blockState?: boolean;
 }
 
 /** What the registry hands each driver: the ONE shared transport (a single exclusive MIDI/serial
@@ -293,7 +309,7 @@ export interface DeviceDriver {
   blockTypes?(slug: string): TypeModel[];
 
   // ── live block params ──
-  blockParams?(eid: number): Promise<{ block: string; slug: string; page: number; named: NamedParam[]; enums: EnumParam[]; type: { value: number; name: string } | null; layout?: DeviceLayout }>;
+  blockParams?(eid: number): Promise<{ block: string; slug: string; page: number; named: NamedParam[]; enums: EnumParam[]; type: { value: number; name: string } | null; layout?: DeviceLayout; blockState?: BlockStateDTO }>;
   readParams?(eid: number, pids: number[]): Promise<Record<number, number>>;
   readRange?(eid: number, pids: number[]): Promise<Record<number, number>>;
   rawBlock?(eid: number): Promise<{ eid: number; values: Record<number, number> }>;

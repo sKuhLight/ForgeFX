@@ -560,7 +560,11 @@ export class DeviceRegistry {
       restoreDump: !!d.restorePreset,
       versionStore: !!d.dumpRaw && !!d.loadPresetBytes,
       deviceParams: !!d.setParamByKey,
-      virtualEffects: grid ? GEN3_VIRTUAL_EFFECTS : []
+      virtualEffects: grid ? GEN3_VIRTUAL_EFFECTS : [],
+      // The block-params response carries `blockState` (Scene Ignore + Bypass Mode, tagged from the codec's
+      // per-model catalog lookup; written through the ordinary enum write). Gen-3 III / FM3 / FM9 only.
+      // Appended last (additive-only ordering).
+      blockState: !!c.blockState
     };
   }
 
