@@ -52,6 +52,7 @@ import type {
   DeviceEditorLayouts, EditorBlockLayout, EditorLayoutVariant, EditorLayoutPage,
   EditorLayoutRow, EditorFwRange,
 } from 'forgefx-midi/gen3/fm3';
+import { stampGraphKeys } from 'forgefx-midi/gen3/fm3'; // pure, device-agnostic (visuals.ts re-export)
 import { AM4_LAYOUTS } from 'forgefx-midi/am4';
 
 // Editor-authentic UI layout (v2 schema — see forgefx-midi src/editorLayouts.ts). The wire `layout`
@@ -206,12 +207,16 @@ export const resolveLayoutPages = (
 
 // Resolve a family's editor layout to the wire DeviceLayout for the block's CURRENT type value, with the
 // selected variant's pages filtered to the current selector/firmware state (see resolveLayoutPages).
-const layoutFrom = (layouts: DeviceEditorLayouts, preferredVariant: Record<string, string> = {}) =>
+// `graphKeys` (gen-3 grid units): stamp every graph slot with its normalised visual key (forgefx-midi
+// stampGraphKeys → `graphKey` on the control), so a client can anchor the served `visuals` at the slot
+// without knowing the raw widget tokens. Additive; slots without a visual stay unstamped.
+const layoutFrom = (layouts: DeviceEditorLayouts, preferredVariant: Record<string, string> = {}, opts: { graphKeys?: boolean } = {}) =>
   (family: string, typeValue?: number, selectors?: SelectorValues): DeviceLayout | undefined => {
     const block = layouts[family];
     if (!block) return undefined;
     const variant = selectVariant(block, typeValue, preferredVariant[family]);
     if (!variant) return undefined;
+    const pages = resolveLayoutPages(variant.pages, typeValue, selectors);
     return {
       editorName: block.editorName,
       family: block.family,
@@ -219,7 +224,7 @@ const layoutFrom = (layouts: DeviceEditorLayouts, preferredVariant: Record<strin
       variantValue: variant.value,
       ...(variant.fw ? { fw: variant.fw } : {}),
       ...(variant.pinned ? { pinned: true } : {}),
-      pages: resolveLayoutPages(variant.pages, typeValue, selectors),
+      pages: opts.graphKeys ? stampGraphKeys(block.family, pages) : pages,
     };
   };
 
@@ -551,7 +556,7 @@ export const PROFILES: Record<number, DeviceProfile> = {
     enumLabelsFor: axe3EnumLabels,
     cabIrs: () => AXE3_CAB_IRS as unknown as Record<string, string[]>, // factory banks bundled (III editor cache, fw 32.6 era); USER banks read live
     familyForEffectId: eidFamily(), // III ships no effectId table → shared gen-3 virtual eids only
-    layoutFor: layoutFrom(AXE3_LAYOUTS as unknown as DeviceEditorLayouts),
+    layoutFor: layoutFrom(AXE3_LAYOUTS as unknown as DeviceEditorLayouts, {}, { graphKeys: true }),
     fcModel: AXE3_FC_MODEL,
     modModel: AXE3_MOD_MODEL,
     monitorParams: AXE3_MONITOR_PARAMS
@@ -568,7 +573,7 @@ export const PROFILES: Record<number, DeviceProfile> = {
     enumLabelsFor: fm3EnumLabels,
     cabIrs: () => fm3CabIrs, // device-true IR names per bank (fractal-midi FM3_CAB_IRS)
     familyForEffectId: eidFamily(FM3_FAMILY_BY_EFFECT_ID as Record<number, string>),
-    layoutFor: layoutFrom(FM3_LAYOUTS as unknown as DeviceEditorLayouts),
+    layoutFor: layoutFrom(FM3_LAYOUTS as unknown as DeviceEditorLayouts, {}, { graphKeys: true }),
     fcModel: FM3_FC_MODEL,
     modModel: FM3_MOD_MODEL,
     monitorParams: FM3_MONITOR_PARAMS,
@@ -585,7 +590,7 @@ export const PROFILES: Record<number, DeviceProfile> = {
     enumLabelsFor: fm9EnumLabels,
     cabIrs: () => FM9_CAB_IRS as unknown as Record<string, string[]>, // factory banks bundled (FM9-Edit cache 76p0); USER banks read live
     familyForEffectId: eidFamily(FM9_FAMILY_BY_EFFECT_ID as Record<number, string>),
-    layoutFor: layoutFrom(FM9_LAYOUTS as unknown as DeviceEditorLayouts),
+    layoutFor: layoutFrom(FM9_LAYOUTS as unknown as DeviceEditorLayouts, {}, { graphKeys: true }),
     fcModel: FM9_FC_MODEL,
     modModel: FM9_MOD_MODEL,
     monitorParams: FM9_MONITOR_PARAMS

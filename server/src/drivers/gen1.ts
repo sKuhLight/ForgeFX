@@ -46,6 +46,7 @@ class Gen1Driver implements DeviceDriver {
     modBind: false,
     cabIrs: false,
     editorLayouts: false, // gen-1 (Axe-Fx Standard/Ultra) ships no editor layouts
+    blockVisuals: false, // block visuals are gen-3 grid units only
     supportsSave: false, // save/store is not part of the pinned gen-1 subset
     selfDescribe: false, // gen-1 predates the gen-3 self-describe protocol
     cacheImport: false, // no gen-3 editor .cache grammar for gen-1

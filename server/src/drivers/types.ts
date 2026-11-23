@@ -2,7 +2,7 @@
 // pre-driver Device/Am4Device modules — their JSON shapes are the HTTP contract Axis consumes and
 // must not drift. `DeviceDriver` is the per-device surface the routes call; methods a device lacks
 // are optional and mirrored by `DriverCapabilities` so routes can answer 501 instead of guessing.
-import type { DecodedBlock } from 'forgefx-midi/devices/gen3';
+import type { DecodedBlock, BlockVisual } from 'forgefx-midi/devices/gen3';
 import type { TypeModel, DeviceLayout, DeviceProfile } from '../devices.js';
 import type { Transport } from '../transport/types.js';
 import type { TelemetryMode, CadenceProfile } from './telemetryProfiles.js';
@@ -54,6 +54,14 @@ export interface PresetGridDTO { model: string; name: string; crcValid: boolean;
 export interface PresetBlockDTO { slug: string; name: string; effectId: number; row: number; col: number; fromRows: number[]; bypassed: boolean | null; channel: string | null; }
 export interface NamedParam { id: number; name: string; value: number; norm: number; unit?: string; min?: number; max?: number; log?: boolean; }
 export interface EnumParam { id: number; name: string; value: number; options: { value: number; label: string }[]; }
+/** ADDITIVE on the gen-3 block-params response: the read-only displays ("graphs") the block can show,
+ *  `{ key, kind, title, mode?, roles: { role: paramId } }` (forgefx-midi `BlockVisual`). Every role is a
+ *  paramId of THIS response (a served knob or selector, or a read-only monitor pid), already narrowed to
+ *  the block's current type/variant. Served only where `capabilities.blockVisuals` is true.
+ *  The served layout's graph slots carry the matching `graphKey`; a stamped key may have NO entry here
+ *  (the current variant lacks the visual's required params, or the key is 'eq') — clients treat such a
+ *  slot as a gap. Visuals without a stamped slot are offered but not anchored (e.g. DELAY, REVERB). */
+export type BlockVisualDTO = BlockVisual;
 export interface MeterVal { norm: number; value: number; unit?: string; min?: number; max?: number; log?: boolean; }
 /** One side (tap/hold) of an FC switch as read by the sub-0x01 structured read. `present` = the
  *  device returned a record whose config/side echo matched the request; `raw` = the 78-byte response
@@ -179,6 +187,11 @@ export interface DriverCapabilities {
   /** Editor-authentic block-editor UI layouts (v2 pages → rows → controls) served on the block-params
    *  `layout` field. True on the four devices that ship *_LAYOUTS (FM3 / FM9 / Axe-Fx III / AM4). */
   editorLayouts: boolean;
+  /** Read-only block visuals (`visuals` on the block-params response: role → paramId per display,
+   *  resolved against the device's own catalog and narrowed to the block's current type/variant), and
+   *  layout graph slots stamped with their normalised `graphKey`. Gen-3 grid units (FM3 / FM9 /
+   *  Axe-Fx III) only. */
+  blockVisuals: boolean;
   /** The server exposes GET/PUT /telemetry/config (cadence-mode control). Registry-level, not per-driver
    *  — advertised on every device so Axis can show the telemetry-mode control unconditionally. */
   telemetryControl?: boolean;
@@ -293,7 +306,7 @@ export interface DeviceDriver {
   blockTypes?(slug: string): TypeModel[];
 
   // ── live block params ──
-  blockParams?(eid: number): Promise<{ block: string; slug: string; page: number; named: NamedParam[]; enums: EnumParam[]; type: { value: number; name: string } | null; layout?: DeviceLayout }>;
+  blockParams?(eid: number): Promise<{ block: string; slug: string; page: number; named: NamedParam[]; enums: EnumParam[]; type: { value: number; name: string } | null; layout?: DeviceLayout; visuals?: BlockVisualDTO[] }>;
   readParams?(eid: number, pids: number[]): Promise<Record<number, number>>;
   readRange?(eid: number, pids: number[]): Promise<Record<number, number>>;
   rawBlock?(eid: number): Promise<{ eid: number; values: Record<number, number> }>;

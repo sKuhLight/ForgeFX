@@ -560,7 +560,11 @@ export class DeviceRegistry {
       restoreDump: !!d.restorePreset,
       versionStore: !!d.dumpRaw && !!d.loadPresetBytes,
       deviceParams: !!d.setParamByKey,
-      virtualEffects: grid ? GEN3_VIRTUAL_EFFECTS : []
+      virtualEffects: grid ? GEN3_VIRTUAL_EFFECTS : [],
+      // Read-only block visuals: `visuals` on GET /preset/blocks/:eid/params + `graphKey` on the served
+      // layout's graph slots. Derived from the driver cap AND the route method so the DTO can't drift.
+      // Appended last (additive-only ordering — see #capabilitiesDto).
+      blockVisuals: !!c.blockVisuals && !!d.blockParams
     };
   }
 

@@ -29,7 +29,9 @@ import {
   readBlockParamsForModel, modelsFromBlocks,
   effectRoster, blockRefForEid, slugForEffectId, blockInstances,
   retargetPresetDumpToEditBuffer,
-  type DecodedBlock
+  resolveBlockVisuals, layoutParamIds, hasBlockVisuals,
+  type DecodedBlock,
+  type BlockVisual
 } from 'forgefx-midi/devices/gen3';
 import { isTransportTimeout, type Transport } from '../transport/types.js';
 import { SLUG_FAMILY, PROFILES, type DeviceProfile, type TypeModel, type DeviceLayout, type SelectorValues } from '../devices.js';
@@ -463,6 +465,45 @@ export function enumParams(profile: DeviceProfile, family: string, typeId?: numb
   });
 }
 
+/** The read-only visuals served with a gen-3 block's params: the family's role tables (forgefx-midi
+ *  visuals) resolved against THIS profile's catalog, so every role is the device's own paramId, limited
+ *  to the ids this response serves (knobs + selectors) and — when the block has a layout — STRICTLY to
+ *  the resolved layout variant's own controls (a sustain-only compressor type shows SUSTAIN, not THRESH →
+ *  gain reduction only; a comb-filter type shows no FREQ and no LFO → neither visual). A block without a
+ *  layout (DELAY) keeps every served role. Monitor roles (gain reduction) are never narrowed.
+ *
+ *  One exception: a variant whose pages share no page name with the family's Default variant (the
+ *  value-less one) is a partial variant that only ADDS pages to the Default ones — the REVERB types whose
+ *  only page is 'Pitch Shift' still have the Default's Basic page with Time / Pre-Delay. A visual the
+ *  strict pass drops is then resolved once more against the Default's controls PLUS the selected
+ *  variant's. Visuals the strict pass already keeps stay as they are (so e.g. the TREMOLO panner variant,
+ *  which also shares no page name with the Default 'Tremolo' page, does not pick up its depth knob).
+ *  Families without a Default variant (FILTER) stay strict. Exported for the mocked tests. */
+export function blockVisualsFor(
+  profile: DeviceProfile,
+  family: string,
+  layout: DeviceLayout | undefined,
+  servedIds: Iterable<number>,
+): BlockVisual[] {
+  if (!hasBlockVisuals(profile.model)) return [];
+  const served = new Set(servedIds);
+  const params = profile.params[family];
+  if (!layout) return resolveBlockVisuals(params, family, served);
+  const selectedIds = layoutParamIds(layout.pages);
+  const strict = resolveBlockVisuals(params, family, served, { layoutParamIds: selectedIds });
+  if (layout.variantValue === null) return strict; // the selected variant IS a Default variant
+  const dflt = profile.layoutFor(family); // no type value → the value-less Default variant, if the family has one
+  if (!dflt || dflt.variantValue !== null) return strict;
+  const selectedNames = new Set(layout.pages.map((p) => p.name));
+  if (dflt.pages.some((p) => selectedNames.has(p.name))) return strict;
+  const union = new Set([...selectedIds, ...layoutParamIds(dflt.pages)]);
+  const relaxed = resolveBlockVisuals(params, family, served, { layoutParamIds: union });
+  const strictKeys = new Set(strict.map((v) => v.key));
+  // keep the family's visual order: a strict visual where it exists, else the relaxed one
+  return relaxed.flatMap((v) => (strictKeys.has(v.key) ? strict.filter((s) => s.key === v.key) : [v]))
+    .concat(strict.filter((s) => !relaxed.some((v) => v.key === s.key)));
+}
+
 /** Append 1/2/3… to labels that repeat within a list (e.g. the cab's four "Low Cut" mic params),
  * so the UI can tell otherwise-identical controls apart. Mutates the items' `name`. */
 function dedupeLabels(items: { name: string }[]): void {
@@ -514,6 +555,9 @@ class Gen3Driver implements DeviceDriver {
       modBind: !!profile.modModel,
       cabIrs: Object.keys(profile.cabIrs()).length > 0,
       editorLayouts: true, // FM3 / FM9 / Axe-Fx III all ship *_LAYOUTS (profile.layoutFor)
+      // Read-only block visuals (blockParams `visuals` + stamped layout graph slots): every model this
+      // driver serves has a catalog the codec's role tables resolve against.
+      blockVisuals: hasBlockVisuals(profile.model),
       supportsSave: true,
       // Live self-describe walk (fn 0x01 DEFINITION/ENUM-LABEL sweep) is HW-verified on the FM3 and
       // shares the gen-3 protocol on the FM9 / Axe-Fx III → the on-connect device-cache build is offered.
@@ -1066,7 +1110,7 @@ class Gen3Driver implements DeviceDriver {
    * (knob position); `value`/`unit` are the device-true DISPLAY reading via this.#prof.ranges
    * (e.g. 1.2k Hz, -12 dB) where the cache has a range, else the 0..10 position.
    */
-  async blockParams(eid: number): Promise<{ block: string; slug: string; page: number; named: NamedParam[]; enums: EnumParam[]; type: { value: number; name: string } | null; layout?: DeviceLayout }> {
+  async blockParams(eid: number): Promise<{ block: string; slug: string; page: number; named: NamedParam[]; enums: EnumParam[]; type: { value: number; name: string } | null; layout?: DeviceLayout; visuals: BlockVisual[] }> {
     this.#watchedEid = eid; // this is the block the user has open → the target the FM3 device-edit poll re-reads
     const codecSlug = slugForEffectId(eid) ?? ''; // audio blocks resolve via the codec
     // virtual effects (GLOBAL=1, Controllers=2, Modifier=3, FC=199) resolve via the profile's effectId map
@@ -1080,7 +1124,7 @@ class Gen3Driver implements DeviceDriver {
     // type is read below we re-resolve to the type-matched (or firmware-pinned) variant.
     let layout = family ? this.#prof.layoutFor(family) : undefined;
     if (!family) {
-      return { block: blockName, slug, page, named: [], enums: [], type: null, layout }; // no device-true param family mapped
+      return { block: blockName, slug, page, named: [], enums: [], type: null, layout, visuals: [] }; // no device-true param family mapped
     }
     const defs = this.#prof.params[family] ?? [];
     // knobs = every continuous param with a usable range: a float-kind range AND a continuous catalog
@@ -1091,11 +1135,17 @@ class Gen3Driver implements DeviceDriver {
     // enums = every discrete selector. The family TYPE selector is excluded (header retype palette),
     // plus the raw bypass flag; everything else (modes, slopes, mics, mic/cab pickers…) is shown, and so
     // are the float-row selectors (enumParams: the III's GLOBALMIX toggles).
-    const typeId = this.#paramId(family, 'type');
+    const typeSel = this.#typeSelector(family, slug);
+    const typeId = typeSel.id;
     const enumDefs = enumParams(this.#prof, family, typeId);
     const named: NamedParam[] = [];
     const enums: EnumParam[] = [];
     let type: { value: number; name: string } | null = null;
+    // Layout-variant key of a family whose '…TYPE' fallback was skipped (no roster — see #typeSelector).
+    // Where the family has a `<FAM>_BASETYPE` selector it IS the variant key (MULTITAP algorithm, PLEX
+    // base type — the variants are valued by it), so the variant follows its live value. Otherwise the
+    // pick the old fallback always made is kept: it decoded as ordinal 0 on every read (FORGEFX-56).
+    let legacyLayoutType: number | undefined;
     {
       const dev = await this.#conn();
       try {
@@ -1137,6 +1187,10 @@ class Gen3Driver implements DeviceDriver {
           const raw = bulk.values[base + typeId] ?? 0;
           const tv = raw > max ? Math.round((raw / 65534) * max) : raw;
           type = { value: tv, name: roster[tv]?.name ?? '' };
+        } else if (typeSel.skippedFallback) {
+          const baseTypeId = this.#paramId(family, `${family}_BASETYPE`);
+          const baseType = baseTypeId != null ? enums.find((e) => e.id === baseTypeId) : undefined;
+          legacyLayoutType = baseType ? baseType.value : 0;
         }
       } catch {
         named.length = 0; // a mid-loop throw left partial data — reset before the zeroed fallback
@@ -1159,12 +1213,15 @@ class Gen3Driver implements DeviceDriver {
     // Re-resolve the layout to the variant selected by the block's CURRENT type value (EQ band count,
     // amp firmware-pinned variant, etc.) and filter its pages to the current selector/firmware state;
     // falls back to the null/first variant when type is unknown.
-    layout = this.#prof.layoutFor(family, type?.value, selectors);
+    layout = this.#prof.layoutFor(family, type?.value ?? legacyLayoutType, selectors);
     // disambiguate repeated labels within a block (e.g. the cab's 4× "Low Cut", amp's two "Depth")
     // so identical names get a 1/2/3 suffix the UI can tell apart.
     dedupeLabels(named);
     dedupeLabels(enums);
-    return { block: blockName, slug, page, named, enums, type, layout };
+    // ADDITIVE: the read-only displays this block can show, narrowed to its current type/variant (see
+    // blockVisualsFor). Last key, so existing response consumers see the same leading shape.
+    const visuals = blockVisualsFor(this.#prof, family, layout, [...named.map((n) => n.id), ...enums.map((e) => e.id)]);
+    return { block: blockName, slug, page, named, enums, type, layout, visuals };
   }
 
   /** Read specific paramIds of an effect via per-pid fn 0x01 GET (sub 01 00) — the path FM3-Edit
@@ -1491,7 +1548,7 @@ class Gen3Driver implements DeviceDriver {
           const d = this.#display(family, id, bulk.values[base + id] ?? 0);
           vals[id] = { norm: d.norm, value: d.value, unit: d.unit, min: d.min, max: d.max, log: d.log };
         }
-        const typeId = this.#paramId(family, 'type');
+        const typeId = this.#typeSelector(family, slug).id;
         if (typeId != null) {
           const roster = this.#prof.rosterFor(slug);
           const tmax = Math.max(0, roster.length - 1);
@@ -1663,8 +1720,14 @@ class Gen3Driver implements DeviceDriver {
     return { value: Math.round(norm * 1000) / 100, norm }; // 0..10 fallback
   }
 
-  /** Resolve a param name (display label) → device-true paramId. 'Type' → the model-selector,
-   *  in strict preference order:
+  /** Resolve a param name (display label or catalog symbol) → device-true paramId. The family's
+   *  model/type selector is NOT resolved here: use #typeSelector(family, slug). */
+  #paramId(family: string, name: string): number | undefined {
+    const defs = this.#prof.params[family] ?? [];
+    return defs.find((p) => p.displayLabel === name || p.name === name)?.paramId;
+  }
+
+  /** The family's model/type selector, in strict preference order:
    *    1. `<FAM>_MODEL` — DELAY: its `DELAY_TYPE` is the 8-value MONO/STEREO routing enum, the
    *       real model list lives on `DELAY_MODEL` (cache-confirmed FM3/FM9/III 2026-07-06);
    *    2. the EXACT `<FAM>_TYPE` name regardless of unit — the FM3/FM9 device-true catalogs tag
@@ -1672,15 +1735,24 @@ class Gen3Driver implements DeviceDriver {
    *       DIFFERENT selector entirely (FUZZ → FUZZ_CLIPTYPE pid 10, PITCH → PITCH_XFADETYPE
    *       pid 46; III DYNDIST → DYNDIST_BQTYPE) — so the Drive block's "type" read AND wrote
    *       the clipping-diode param (the field-reported drive-type bug);
-   *    3. the enum-unit /TYPE$/ heuristic, as the last resort for families with neither. */
-  #paramId(family: string, name: string): number | undefined {
+   *    3. the enum-unit /TYPE$/ heuristic, as the last resort for families with neither — and only
+   *       when the family has a type roster (`slug` = the roster key, as blockParams uses it). Without
+   *       a roster the param cannot be decoded into a type anyway (every value clamps to ordinal 0,
+   *       name '') and it is usually an ordinary selector of the block — CONTROLLERS_LFO1TYPE,
+   *       GLOBAL_CC_BYPASS_TYPE, MULTITAP_BASETYPE, PLEX_FILTERTYPE / PLEX_BASETYPE … — which must stay
+   *       in the enum list. `skippedFallback` marks that case for blockParams' layout-variant pick.
+   *       (With CONTROLLERS_LFO1TYPE back in the enum list, the block's repeated "Type" labels number
+   *       one higher than before — LFO 2 "Type 2", ADSR 1 "Type 3", ADSR 2 "Type 4" — clients key
+   *       params by id, so nothing persisted changes.) The wider fallback problem (families whose real
+   *       selector is a differently named param, e.g. the FM3 CABINET) is FORGEFX-56. */
+  #typeSelector(family: string, slug: string): { id: number | undefined; skippedFallback: boolean } {
     const defs = this.#prof.params[family] ?? [];
-    if (name.toLowerCase() === 'type') {
-      return (defs.find((p) => p.name === `${family}_MODEL`)
-        ?? defs.find((p) => p.name === `${family}_TYPE`)
-        ?? defs.find((p) => p.unit === 'enum' && /TYPE$/i.test(p.name)))?.paramId;
-    }
-    return defs.find((p) => p.displayLabel === name || p.name === name)?.paramId;
+    const direct = defs.find((p) => p.name === `${family}_MODEL`) ?? defs.find((p) => p.name === `${family}_TYPE`);
+    if (direct) return { id: direct.paramId, skippedFallback: false };
+    const fallback = defs.find((p) => p.unit === 'enum' && /TYPE$/i.test(p.name));
+    if (!fallback) return { id: undefined, skippedFallback: false };
+    if (this.#prof.rosterFor(slug).length === 0) return { id: undefined, skippedFallback: true };
+    return { id: fallback.paramId, skippedFallback: false };
   }
 
   // ── device-edit push (capability deviceEditPush): reflect front-panel / editor edits the device
@@ -1752,8 +1824,9 @@ class Gen3Driver implements DeviceDriver {
   }
   /** Change a block's model/type (the family TYPE selector ordinal). */
   async setType(eid: number, value: number) {
-    const family = SLUG_FAMILY[(slugForEffectId(eid) ?? '').toLowerCase()];
-    const tid = family ? this.#paramId(family, 'type') : undefined;
+    const typeSlug = (slugForEffectId(eid) ?? '').toLowerCase();
+    const family = SLUG_FAMILY[typeSlug];
+    const tid = family ? this.#typeSelector(family, typeSlug).id : undefined;
     if (tid == null) return { ok: false };
     const r = await this.#write(this.#codec.buildSetParameter(eid, tid, value));
     this.#emit({ type: 'changed', scope: 'grid' });
