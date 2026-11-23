@@ -252,6 +252,7 @@ class Am4Driver implements DeviceDriver {
     modBind: false, // modifier model is data-only (see modifierModel); the wire binding is not captured
     cabIrs: false,
     editorLayouts: true, // AM4 ships AM4_LAYOUTS (served via am4LayoutFor in blockParams)
+    blockVisuals: false, // no AM4 role tables (its own codec/catalog); layouts stay unstamped
     supportsSave: true,
     selfDescribe: false, // the AM4 has its own (non-gen-3) codec; the gen-3 self-describe walk does not apply
     cacheImport: true, // byte-source import via AM4_CACHE_PARAMS/AM4_SEEDS (codec >= 0.3.20); no live walk

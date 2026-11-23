@@ -91,7 +91,8 @@ function checkBlockStateOrdering(caps: Caps, label: string): void {
   const at = keys.indexOf('blockState');
   assert(at > 0, `${label} blockState key present`);
   assertEqual(keys[at - 1], 'virtualEffects', `${label} blockState follows virtualEffects`);
-  assertEqual(keys[at + 1], 'telemetryControl', `${label} blockState precedes telemetryControl`);
+  assertEqual(keys[at + 1], 'blockVisuals', `${label} blockState precedes blockVisuals`);
+  assertEqual(keys[at + 2], 'telemetryControl', `${label} blockVisuals precedes telemetryControl`);
 }
 
 async function fm3(): Promise<void> {

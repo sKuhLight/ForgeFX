@@ -564,7 +564,11 @@ export class DeviceRegistry {
       // The block-params response carries `blockState` (Scene Ignore + Bypass Mode, tagged from the codec's
       // per-model catalog lookup; written through the ordinary enum write). Gen-3 III / FM3 / FM9 only.
       // Appended last (additive-only ordering).
-      blockState: !!c.blockState
+      blockState: !!c.blockState,
+      // Read-only block visuals: `visuals` on GET /preset/blocks/:eid/params + `graphKey` on the served
+      // layout's graph slots. Derived from the driver cap AND the route method so the DTO can't drift.
+      // Appended last (additive-only ordering — see #capabilitiesDto).
+      blockVisuals: !!c.blockVisuals && !!d.blockParams
     };
   }
 
