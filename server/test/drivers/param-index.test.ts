@@ -424,16 +424,21 @@ function catalogUnitKnobCatalogs(): void {
         return pid === undefined ? undefined : buildParamIndex(p, fam).byPid.get(pid);
       };
       const label = `${name} ${mode}`;
-      assertEqual(widgetOf(named('DELAY', 'DELAY_TIME')!), 'knob/catalog/named/norm/1', `${label}: DELAY_TIME (ms, 1..16000) is a knob`);
+      // DELAY_TIME is a knob from layout evidence since the editor layouts give the Delay its own family (its editor
+      // page used to be filed under MULTITAP, so the DELAY family had no layout evidence and the catalog rule decided)
+      assertEqual(widgetOf(named('DELAY', 'DELAY_TIME')!), 'knob/layout/named/norm/1', `${label}: DELAY_TIME (ms, 1..16000) is a knob (the Delay layout draws one)`);
       assertEqual(widgetOf(named('REVERB', 'REVERB_REVERBDELAY')!), 'knob/catalog/named/norm/1', `${label}: REVERB_REVERBDELAY (ms, 0..250) is a knob`);
-      // unit numeric: stays a stepper (a long time field is a number, not proof of a dial)
-      for (const n of ['DELAY_TIMER', 'DELAY_SPLICETIME']) assertEqual(widgetOf(named('DELAY', n)!).split('/')[0], 'stepper', `${label}: ${n} stays a stepper`);
+      // unit numeric: a long time field is a number, not proof of a dial; these two are knobs only because the Delay
+      // editor layout draws knobs for them (layout evidence first, D5)
+      for (const n of ['DELAY_TIMER', 'DELAY_SPLICETIME']) {
+        assertEqual(widgetOf(named('DELAY', n)!).split('/').slice(0, 2).join('/'), 'knob/layout', `${label}: ${n} is a knob from the Delay layout`);
+      }
       // the slot numbers stay steppers (a 0..1023 range is no knob)
       for (const n of ['CABINET_TYPE1', 'CABINET_TYPE2', 'CABINET_TYPE3', 'CABINET_TYPE4']) {
         const e = named('CABINET', n);
         if (e) assertEqual(`${e.widget}/${e.widgetSource}`, 'stepper/device', `${label}: ${n} stays a stepper`);
       }
-      // nothing else changed: the catalog knobs are exactly those two, all named, all on a continuous unit,
+      // nothing else changed: the catalog knobs are exactly the reverb delay (DELAY_TIME has layout evidence), named, on a continuous unit,
       // all over more than 64 whole steps and none with layout evidence
       const catalogKnobs: string[] = [];
       for (const fam of Object.keys(p.ranges)) {
@@ -447,7 +452,7 @@ function catalogUnitKnobCatalogs(): void {
           assertEqual(lw.get(e.pid), undefined, `${label} ${fam} ${e.pid}: no layout evidence`);
         }
       }
-      assertEqual(catalogKnobs.sort().join(','), 'DELAY_TIME,REVERB_REVERBDELAY', `${label}: the catalog knobs`);
+      assertEqual(catalogKnobs.sort().join(','), 'REVERB_REVERBDELAY', `${label}: the catalog knobs`);
     }
   }
 }

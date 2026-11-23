@@ -26,8 +26,10 @@ import {
 import { wireToDisplay } from 'forgefx-midi/shared';
 import {
   LIVE_WALK_LIMITS, blockBindableSection, enumOrdinalBounds, isInformativeRow, isPlaceholderRow, isSyntheticFamilyKey, matchBulkShape,
+  typecodeTaper, typecodeUnit,
   type BlockMapEntry, type DerivedSection, type RangeDef as CodecRangeDef
 } from 'forgefx-midi/cache';
+import { crossBlockEffectId, gen3RosterSpan, type CrossBlockRefKey } from 'forgefx-midi/gen3/fm3';
 import {
   parsePresetDump, decodeRawPatch, decodeGen3Body,
   readBlockParamsForModel, modelsFromBlocks,
@@ -38,7 +40,8 @@ import {
 import { isTransportTimeout, type Transport } from '../transport/types.js';
 import {
   SLUG_FAMILY, isEnumOnAnyDevice, paramLabel, typeSelectorPid, unlessHidden, variantSelectorPid,
-  type DeviceProfile, type ParamDef, type TypeModel, type DeviceLayout, type DeviceLayoutControl, type RangeDef, type SelectorValues
+  type DeviceProfile, type ParamDef, type TypeModel, type DeviceLayout, type DeviceLayoutControl, type LayoutFirmware, type RangeDef,
+  type SelectorValues
 } from '../devices.js';
 import { buildParamIndex, MAX_WIRE_PID, type BlockIndex, type ParamEntry } from './paramIndex.js';
 import { catalogFamilyOfBlock, deviceCacheKey, profileCatalogFor, staticFamilyForEffectId } from '../profileCatalog.js';
@@ -48,7 +51,8 @@ import type {
   DeviceDriver, DriverCapabilities, DriverCtx, DiagnosticDump, SelectPresetOpts,
   PresetGridDTO, GridCellDTO, PresetBlockDTO, PresetSummary, NamedParam, EnumParam, MeterVal,
   FcSwitchState, FcReadState, StoreReason,
-  BlockParamsDTO, BlockParamsV2DTO, BlockParamsOpts, NamedParamV2, EnumParamV2, ParamMeta, UnresolvedReason, BlockMapMeta
+  BlockParamsDTO, BlockParamsV2DTO, BlockParamsOpts, NamedParamV2, EnumParamV2, ParamMeta, UnresolvedReason, BlockMapMeta,
+  ValueSource
 } from './types.js';
 import { validatedPresetDump } from './sendPolicy.js';
 import { devHookValue, processEnv } from '../devHooks.js';
@@ -524,6 +528,18 @@ function decodeSelector(range: Pick<RangeDef, 'kind' | 'displayMin' | 'displayMa
   const value = raw > hi ? Math.round((raw / 65534) * (hi - lo)) + lo : raw;
   return { lo, hi, value, inRange: value >= lo && value <= hi };
 }
+
+/** One continuous param's reading for display (`#displayRow`). `unitSource` / `taperSource` are set for the generic
+ *  response only. */
+interface DisplayReading {
+  value: number; norm: number; unit?: string; min?: number; max?: number; log?: boolean;
+  unitSource?: ValueSource; taperSource?: ValueSource;
+}
+
+/** Where the row a generic reading is taken from comes from: the applied profile (`fromProfile`, the index entry's
+ *  `source`), and the bundled catalog's own row of the param (to tell a field the device supplied from the
+ *  catalog's). */
+interface RowProvenance { fromProfile: boolean; catalogRow: Readonly<RangeDef> | undefined }
 
 /** What one fn-0x1F read of a block gave, and how its body is laid out. */
 interface BlockRead {
@@ -1722,10 +1738,12 @@ class Gen3Driver implements DeviceDriver {
     // Re-resolve the layout to the variant selected by the block's CURRENT type value (EQ band count,
     // amp firmware-pinned variant, etc.) and filter its pages to the current selector/firmware state. A family
     // without a type selector is told apart by its variant selector instead (the cab's Legacy / DynaCab mode,
-    // the plex's base type); falls back to the null/first variant when the value is unknown.
+    // the plex's base type); a variant folded from another selector (the Delay's DELAY_TYPE) is keyed by that
+    // selector's value; falls back to the null/first variant when the value is unknown. Firmware gates are
+    // evaluated against the connected firmware (the newest when it is not known).
     const variantPid = variantSelectorPid(this.#prof, family);
     const variantValue = typeId != null ? type?.value : variantPid != null ? valueByPid.get(variantPid) : undefined;
-    const layout = this.#prof.layoutFor(family, variantValue, selectors);
+    const layout = this.#prof.layoutFor(family, variantValue, selectors, this.#layoutFirmware());
     // disambiguate repeated labels within a block (e.g. the cab's 4× "Low Cut", amp's two "Depth")
     // so identical names get a 1/2/3 suffix the UI can tell apart.
     dedupeLabels(named);
@@ -1739,19 +1757,23 @@ class Gen3Driver implements DeviceDriver {
     const named: NamedParamV2[] = [];
     const enums: EnumParamV2[] = [];
     const valueByPid = new Map<number, number>();
+    const catalogRows = (this.#prof.staticBase ?? this.#prof).ranges[family] ?? {};
     for (const e of index.entries) {
       const slot = readSlot(read, hasChannels, e.pid);
       const meta = paramMetaOf(e);
       if (e.list === 'named') {
         const why = typeof slot === 'string' ? slot : slot > 65534 ? 'out-of-range' : undefined;
-        const d = this.#displayRow(e.row, e.def?.unit, why ? 0 : (slot as number)); // no reading: the row's facts alone
+        // no reading: the row's facts alone
+        const d = this.#displayRow(e.row, e.def?.unit, why ? 0 : (slot as number), { fromProfile: e.source === 'profile', catalogRow: catalogRows[e.pid] });
         named.push({
           id: e.pid, name: e.name,
           value: why ? null : d.value, norm: why ? null : d.norm,
           ...(d.unit !== undefined ? { unit: d.unit } : {}),
+          ...(d.unitSource !== undefined ? { unitSource: d.unitSource } : {}),
           ...(d.min !== undefined ? { min: d.min } : {}),
           ...(d.max !== undefined ? { max: d.max } : {}),
           ...(d.log ? { log: true } : {}),
+          ...(d.taperSource !== undefined ? { taperSource: d.taperSource } : {}),
           ...meta,
           ...(why ? { unresolved: why } : {}),
         });
@@ -1793,7 +1815,7 @@ class Gen3Driver implements DeviceDriver {
       return valueByPid.get(pid);
     };
     const variantValue = typeId != null ? type?.value : index.variantPid != null ? valueByPid.get(index.variantPid) : undefined;
-    let layout = this.#prof.layoutFor(family, variantValue, selectors);
+    let layout = this.#prof.layoutFor(family, variantValue, selectors, this.#layoutFirmware());
     if (layout) layout = this.#servedLayout(layout, family, index);
     dedupeLabels(named);
     dedupeLabels(enums);
@@ -1813,34 +1835,66 @@ class Gen3Driver implements DeviceDriver {
     };
   }
 
+  /** The firmware the editor layouts' firmware gates are evaluated against: the one the registry read from the device
+   *  at detect time; null (the newest firmware) when it was not read. */
+  #layoutFirmware(): LayoutFirmware {
+    return this.#ctx.getFirmware?.() ?? null;
+  }
+
   /** The generic response's layout: the editor layout with its controls bound to the params the connected device
-   *  serves (the classic response keeps the editor layout as it is).
+   *  serves (the classic response keeps the editor layout as it is). A control names its param in the family that
+   *  owns it: its cross-block reference's family (`crossBlock.family`), else the layout's own family.
    *  - A button control (`<F>_BTN_<X><n>`, an editor pseudo id) gains `boundParamId`: the served param it presses.
-   *  - A control of this family whose catalog name now sits at another pid (the name followed its row) is pointed
-   *    there: `paramId` becomes that pid and `movedFrom` keeps the catalog pid.
+   *  - A control whose catalog name now sits at another pid of the owning family (the name followed its row) is
+   *    pointed there: `paramId` becomes that pid and `movedFrom` keeps the catalog pid; a cross-block reference's
+   *    `paramId` follows along. The owning family's own param index decides: the REFERENCED family's `namedAt` for a
+   *    control that addresses another block (FORGEFX-48).
    *  - A control whose catalog name the device does not serve any more although the catalog has a device-mined row
    *    for it (a byte-exact profile dropped it, or a shift left its name without a unique row) keeps its `paramId`
    *    and is marked `unbound`, so it is not written to whatever sits at that pid now. Display-only controls
    *    (meters, readouts, labels, graphs) and rows the catalog made up from inline bounds are never unbound.
-   *  A cross-block control that references this family is treated like the family's own (its reference follows
-   *  too). Controls that address another family, pseudo ids and names that did not move stay as they are. */
+   *  - Every cross-block reference gains `crossBlock.effectId`: the effect id of the block that owns the referenced
+   *    param on this device (#crossBlockOwners), or null where there is none to address (modifier slots, preset-level
+   *    data, a family without an effect id, an instance the device does not have). A write to that block keeps every
+   *    guard its own address has (GLOBAL's setup writes are persistent; #guardParamWrite).
+   *  A reference that did not resolve to a family, a reference into another family that does not name that family's
+   *  catalog param at its catalog pid, pseudo ids and names that did not move keep their binding. Every control that
+   *  changes is a copy; the profile's layout objects are never modified. */
   #servedLayout(layout: DeviceLayout, family: string, index: BlockIndex): DeviceLayout {
-    const defByName = new Map<string, ParamDef>();
-    for (const d of this.#prof.params[family] ?? []) if (!defByName.has(d.name)) defByName.set(d.name, d);
-    const catalogRows = (this.#prof.staticBase ?? this.#prof).ranges[family] ?? {};
-    return mapLayoutControls(layout, (c) => {
+    type Owner = { index: BlockIndex; defByName: ReadonlyMap<string, ParamDef>; catalogRows: Readonly<Record<number, RangeDef>> };
+    const owners = new Map<string, Owner | null>();
+    const ownerOf = (fam: string): Owner | null => {
+      let o = owners.get(fam);
+      if (o !== undefined) return o;
+      const defs = this.#prof.params[fam] ?? [];
+      if (fam !== family && defs.length === 0) o = null; // no catalog family of this device (PRESET)
+      else {
+        const defByName = new Map<string, ParamDef>();
+        for (const d of defs) if (!defByName.has(d.name)) defByName.set(d.name, d);
+        o = { index: fam === family ? index : buildParamIndex(this.#prof, fam), defByName, catalogRows: (this.#prof.staticBase ?? this.#prof).ranges[fam] ?? {} };
+      }
+      owners.set(fam, o);
+      return o;
+    };
+    let ownerEid: ((ref: CrossBlockRefKey) => number | null) | undefined;
+    const bound = (c: DeviceLayoutControl): DeviceLayoutControl => {
       if (!c.paramName) return c;
       const button = BUTTON_SYMBOL.exec(c.paramName);
       if (button) {
-        const catalogPid = defByName.get(`${button[1]}_${button[2]}`)?.paramId;
-        const bound = catalogPid === undefined ? undefined : index.namedAt.get(catalogPid);
-        return bound !== undefined && index.byPid.has(bound) ? { ...c, boundParamId: bound } : c;
+        const catalogPid = ownerOf(family)!.defByName.get(`${button[1]}_${button[2]}`)?.paramId;
+        const at = catalogPid === undefined ? undefined : index.namedAt.get(catalogPid);
+        return at !== undefined && index.byPid.has(at) ? { ...c, boundParamId: at } : c;
       }
-      if (c.crossBlock && c.crossBlock.family !== family) return c; // another family's param
+      const ownerFamily = c.crossBlock ? c.crossBlock.family : family;
+      if (ownerFamily === null) return c; // a reference that did not resolve names no param of ours
+      const owner = ownerOf(ownerFamily);
+      if (!owner) return c;
       if (c.paramId == null || c.paramId > MAX_WIRE_PID) return c;
-      const def = defByName.get(c.crossBlock?.paramName ?? c.paramName);
-      if (!def || def.paramId > MAX_WIRE_PID) return c; // not a symbol of this family
-      const at = index.namedAt.get(def.paramId);
+      const def = owner.defByName.get(c.crossBlock?.paramName ?? c.paramName);
+      if (!def || def.paramId > MAX_WIRE_PID) return c; // not a symbol of the owning family
+      // a reference into another family is followed only where it names that family's catalog param at its catalog pid
+      if (ownerFamily !== family && (c.crossBlock!.paramId ?? c.paramId) !== def.paramId) return c;
+      const at = owner.index.namedAt.get(def.paramId);
       if (at === def.paramId) return c;
       if (at !== undefined) {
         const crossBlock = c.crossBlock && c.crossBlock.paramId === def.paramId ? { crossBlock: { ...c.crossBlock, paramId: at } } : {};
@@ -1849,9 +1903,47 @@ class Gen3Driver implements DeviceDriver {
       // Only a row the catalog mined from the device proves the param existed: a row the III table made up from
       // inline bounds (synthetic) is not in any device cache, so its absence from the profile says nothing (the
       // gain-reduction meters). A control that only displays something writes nothing to protect.
-      const row = catalogRows[def.paramId];
+      const row = owner.catalogRows[def.paramId];
       return row && isInformativeRow(row) && !row.synthetic && !DISPLAY_ONLY_WIDGETS.has(c.widget) ? { ...c, unbound: true } : c;
+    };
+    return mapLayoutControls(layout, (c) => {
+      const out = bound(c);
+      if (!out.crossBlock) return out;
+      ownerEid ??= this.#crossBlockOwners();
+      return { ...out, crossBlock: { ...out.crossBlock, effectId: ownerEid(out.crossBlock) } };
     });
+  }
+
+  /** The owning effect id of a layout's cross-block reference on this device (codec `crossBlockEffectId`:
+   *  `firstId(family) + instance - 1` from the reference's `ID_<SYMBOL><n>` token), over a table of THIS device: the
+   *  model's own first effect ids (profileCatalogFor: FM3, FM9 and Axe-Fx III each their own table, the virtual blocks
+   *  GLOBAL 1 / CONTROLLERS 2 / FC 199 included, the development hook's hidden family left out), plus every catalog
+   *  family that table gives no effect id but the applied profile's block map binds `confirmed` (first id = its
+   *  lowest bound effect id, instances = the run of consecutive bound ids from there). The instance must exist on the
+   *  device: at most the model's instance count of the family (`instanceLimits`, 1 when unlisted) and never beyond
+   *  the effect-id span the gen-3 roster reserves for it (`gen3RosterSpan`). MOD (modifier slots) and PRESET
+   *  (preset-level data) references, a reference without a family, a family without an effect id and an instance
+   *  beyond the device's count resolve to null. Pure apart from reading the profile. */
+  #crossBlockOwners(): (ref: CrossBlockRefKey) => number | null {
+    const catalog = profileCatalogFor(this.#prof.model);
+    const first: Record<string, number | null> = { ...(catalog.familyFirstEid ?? {}) };
+    const counts: Record<string, number> = { ...(catalog.instanceLimits ?? {}) };
+    const mapped = new Map<string, number[]>();
+    for (const eid of this.#prof.profileFacts?.confirmedBlocks ?? []) {
+      const key = this.#prof.familyForEffectId(eid);
+      if (key === undefined || isSyntheticFamilyKey(key) || first[key] != null) continue; // the static table places it
+      let eids = mapped.get(key);
+      if (!eids) mapped.set(key, (eids = []));
+      eids.push(eid);
+    }
+    for (const [key, eids] of mapped) {
+      eids.sort((a, b) => a - b);
+      let n = 1;
+      while (eids.includes(eids[0]! + n)) n++;
+      first[key] = eids[0]!;
+      counts[key] = n;
+    }
+    return (ref) => crossBlockEffectId(ref, first, ref.family !== null ? counts[ref.family] ?? 1 : 1, gen3RosterSpan);
   }
 
   /** Read specific paramIds of an effect via per-pid fn 0x01 GET (sub 01 00) — the path FM3-Edit
@@ -2309,41 +2401,57 @@ class Gen3Driver implements DeviceDriver {
   /** Map a raw 0..65534 wire value to {value, norm, unit, min, max, log} via the device-true FM3 range.
    * Taper: a device-true explicit `range.taper` ('log'→log10; 'linear'|'flat'|'custom'→linear) wins;
    * absent it falls back to the typecode heuristic (middle nibble 4 = log10, e.g. freq cuts; every other nibble linear). */
-  #display(family: string | undefined, paramId: number, raw: number): { value: number; norm: number; unit?: string; min?: number; max?: number; log?: boolean } {
+  #display(family: string | undefined, paramId: number, raw: number): DisplayReading {
     const range = family ? this.#prof.ranges[family]?.[paramId] : undefined;
     const unitCode = family ? this.#prof.params[family]?.find((x) => x.paramId === paramId)?.unit : undefined;
     return this.#displayRow(range, unitCode, raw);
   }
 
-  /** `#display` for a row the caller already holds, with the catalog unit code of the param it belongs to. */
-  #displayRow(range: RangeDef | undefined, unitCode: string | undefined, raw: number): { value: number; norm: number; unit?: string; min?: number; max?: number; log?: boolean } {
+  /** `#display` for a row the caller already holds, with the catalog unit code of the param it belongs to. With
+   *  `sourced` (the generic response) the reading also says where its unit and taper came from (`unitSource` /
+   *  `taperSource`), and a row without a device or catalog unit takes the one its typecode implies (the codec's
+   *  typecode rules, read-time only). Without it (the classic response, meters) the reading is what it always was. */
+  #displayRow(range: RangeDef | undefined, unitCode: string | undefined, raw: number, sourced?: RowProvenance): DisplayReading {
     const norm = clamp01(raw / 65534);
     if (range && range.kind === 'float' && Number.isFinite(range.displayMin) && Number.isFinite(range.displayMax) && range.displayMin !== range.displayMax) {
       try {
         // Taper (log vs linear). A device-true explicit taper from the capture catalog WINS over the
-        // typecode-nibble heuristic: 'log' → log sweep; 'linear' | 'flat' | 'custom' → linear. A
+        // typecode rule: 'log' → log sweep; 'linear' | 'flat' | 'custom' → linear. A
         // 'custom' taper's `taperPoints` are NOT applied on the wire yet, so custom is served linear
         // for now (the Axis side documents the same). A log sweep still requires a positive range —
-        // wireToDisplay throws on log10 with displayMin<=0 — the same guard the nibble heuristic uses.
-        // When NO explicit taper is present, fall back to the typecode-nibble heuristic: only nibble 4
-        // marks a log taper, every other nibble is linear. Nibble 5 used to count as log too, but the
-        // explicit tapers in the FM9 and Axe-Fx III catalogs have it linear every time (7 and 17 params,
-        // none log), while nibble 4 is log for all but a few. The FM3 catalog carries no explicit tapers,
-        // so for the FM3 the rule is carried over from those two devices, not measured on it.
-        // `range.taper` reads device-true from a static-catalog row today, and reads the same field once
-        // walk-built RangeDefs carry it (parallel WP) — no rework needed here either way.
+        // wireToDisplay throws on log10 with displayMin<=0 — the same guard the typecode rule gets.
+        // When NO explicit taper is present, the codec's typecode rules decide (`typecodeTaper`): middle
+        // nibble 4 is a log taper, 3 and 5..9 linear, every other nibble predicts nothing (served linear).
+        // That is the nibble heuristic this code carried before, checked by the codec against the explicit
+        // tapers of the committed FM3 / FM9 / Axe-Fx III catalogs. `range.taper` reads device-true from a
+        // static-catalog row, and from a profile row that carries one.
+        const rowFromDevice = (field: 'taper' | 'unit') => !!sourced && (sourced.fromProfile || sourced.catalogRow?.[field] !== range[field]);
         let log: boolean;
+        let taperSource: ValueSource | undefined;
         if (range.taper) {
           log = range.taper === 'log' && range.displayMin > 0;
+          taperSource = rowFromDevice('taper') ? 'device' : 'catalog';
         } else {
-          const taperNib = (range.typecode >> 4) & 0xf;
-          log = taperNib === 4 && range.displayMin > 0;
+          const rule = typecodeTaper(range.typecode);
+          log = rule?.taper === 'log' && range.displayMin > 0;
+          if (rule) taperSource = 'typecode';
         }
         const v = wireToDisplay(raw, { displayMin: range.displayMin, displayMax: range.displayMax, displayScale: log ? 'log10' : 'linear' });
         // Prefer the DEVICE-TRUE unit captured by the live-walk (RangeDef.unit, view 0x00)
         // over the AM4-name-overlay catalog code; fall back to the overlay when absent
-        // (byte-source/.cache profiles carry no device-true unit).
-        return { value: round3(v), norm, unit: range.unit ?? ((unitCode && UNIT_LABEL[unitCode]) || undefined), min: range.displayMin, max: range.displayMax, log: log || undefined };
+        // (byte-source/.cache profiles carry no device-true unit). The generic response then falls back to the unit
+        // the row's typecode implies (`typecodeUnit`: a few exact typecodes, measured, never contradicting a
+        // catalog unit); the classic response does not.
+        const catalogUnit = (unitCode && UNIT_LABEL[unitCode]) || undefined;
+        const typecodeUnitCode = sourced && range.unit === undefined && catalogUnit === undefined ? typecodeUnit(range.typecode)?.unit : undefined;
+        const unit = range.unit ?? catalogUnit ?? (typecodeUnitCode !== undefined ? UNIT_LABEL[typecodeUnitCode] : undefined);
+        const unitSource: ValueSource | undefined = range.unit !== undefined ? (rowFromDevice('unit') ? 'device' : 'catalog')
+          : catalogUnit !== undefined ? 'catalog' : unit !== undefined ? 'typecode' : undefined;
+        return {
+          value: round3(v), norm, unit, min: range.displayMin, max: range.displayMax, log: log || undefined,
+          ...(sourced && unitSource ? { unitSource } : {}),
+          ...(sourced && taperSource ? { taperSource } : {}),
+        };
       } catch {
         /* fall through to 0..10 position */
       }

@@ -109,7 +109,18 @@ export interface ParamMeta {
   step?: number;
   unresolved?: UnresolvedReason;
 }
-export interface NamedParamV2 extends Omit<NamedParam, 'value' | 'norm' | 'unresolved'>, ParamMeta { value: number | null; norm: number | null; }
+/** Where a continuous param's display unit or taper came from: the applied device profile's row (`device`), the
+ *  bundled catalog (its row, or the catalog unit code: `catalog`), or the row's typecode (`typecode`: the codec's
+ *  typecode rules, used only where neither of the others says anything). */
+export type ValueSource = 'device' | 'catalog' | 'typecode';
+export interface NamedParamV2 extends Omit<NamedParam, 'value' | 'norm' | 'unresolved'>, ParamMeta {
+  value: number | null;
+  norm: number | null;
+  /** Where `unit` came from; absent when the param has no unit. */
+  unitSource?: ValueSource;
+  /** Where the taper (`log`, or linear when absent) came from; absent when nothing names one (served linear). */
+  taperSource?: ValueSource;
+}
 export interface EnumParamV2 extends Omit<EnumParam, 'value' | 'unresolved'>, ParamMeta {
   value: number | null;
   /** The option list was cut at the cap. */

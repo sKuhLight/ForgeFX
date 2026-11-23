@@ -167,20 +167,40 @@ const parseSelectorValues = (value: string | null | undefined): number[] =>
     ? []
     : value.split(',').map((s) => s.trim()).filter((s) => s !== '').map(Number).filter((n) => Number.isFinite(n));
 
-// Pick the block-type / firmware variant that matches the block's CURRENT type value:
-//   1. variants whose selector `value` list contains typeValue win (the normal per-type case);
-//   2. else the unconditional (value === null) variants — the firmware-only-versioned Amp block, whose
-//      variants all carry value:null but differ by `fw`;
-//   3. else every variant (degenerate: nothing declared).
-// Within the winning set, prefer the firmware-pinned variant (amp DISTORT ships every historical fw
-// layout with exactly one pinned:true), else the variant named `preferName` (a per-family hint, see
-// AM4_PREFERRED_VARIANT), else the first in editor order.
-const selectVariant = (block: EditorBlockLayout, typeValue?: number, preferName?: string): EditorLayoutVariant | undefined => {
-  const variants = block.variants;
-  if (!variants.length) return undefined;
-  let cands = typeValue == null ? [] : variants.filter((v) => parseSelectorValues(v.value).includes(typeValue));
+// Pick the block-type / firmware variant that matches the block's CURRENT state, on the firmware level `fw`
+// (see layoutFirmwareLevel; the newest firmware when the connected one is not known):
+//   0. only variants that exist on that firmware take part: the variant's own gate holds, and so does the gate of
+//      at least one of its pages. A variant whose pages are all gated away is a legacy one even when the variant
+//      itself carries no gate (TREMOLO types 0/2/4: their only page is `lt 8,00`, newer firmware draws them from the
+//      value-less default variant). When nothing is left on a known firmware, the newest firmware decides; when
+//      nothing is left at all, every variant takes part (degenerate data);
+//   1. the key: a variant the generator folded from a page-level selector names that selector
+//      (`selectorParamName`, e.g. DELAY_TYPE: the Delay's routing type, not its model selector DELAY_MODEL), so its
+//      `value` is that selector's CURRENT value (`selectors`); else the block's type value. A caller without a
+//      selector lookup keys by the type value;
+//   2. variants whose `value` list contains the key win (the normal per-type case);
+//   3. else the unconditional (value === null) variants — the firmware-only-versioned Amp block, whose
+//      variants all carry value:null but differ by `fw`, and a folded family's catch-all default;
+//   4. else every remaining variant.
+// Within the winning set, firmware siblings collapse to the one for the firmware (preferFw: a legacy and a current
+// variant of the same type, MULTITAP's `lt 9,02` / `gtet 9,02` pairs, keep the current one), then prefer the
+// firmware-pinned variant (amp DISTORT ships every historical fw layout with exactly one pinned:true), else the
+// variant named `preferName` (a per-family hint, see AM4_PREFERRED_VARIANT), else the first in editor order.
+const selectVariant = (
+  block: EditorBlockLayout, typeValue: number | undefined, selectors: SelectorValues | undefined, fw: number, preferName?: string,
+): EditorLayoutVariant | undefined => {
+  if (!block.variants.length) return undefined;
+  const existing = (at: number) => block.variants.filter((v) => fwGateHolds(v.fw, at) && v.pages.some((p) => fwGateHolds(p.fw, at)));
+  let at = fw;
+  let variants = existing(at);
+  if (!variants.length && at !== NEWEST_FW) variants = existing((at = NEWEST_FW));
+  if (!variants.length) variants = block.variants;
+  const selectorName = variants.find((v) => v.selectorParamName)?.selectorParamName;
+  const key = selectorName !== undefined && selectors ? selectors(selectorName) : typeValue;
+  let cands = key == null ? [] : variants.filter((v) => parseSelectorValues(v.value).includes(key));
   if (!cands.length) cands = variants.filter((v) => v.value == null);
   if (!cands.length) cands = variants;
+  cands = preferFw(cands, at);
   return cands.find((v) => v.pinned) ?? (preferName ? cands.find((v) => v.name === preferName) : undefined) ?? cands[0];
 };
 
@@ -197,12 +217,31 @@ const fwBound = (v?: string): number => {
   return maj * 1000 + min;
 };
 
+/** The connected device's firmware (`major.minor` as the device reports it, e.g. 13.0 → { major: 13, minor: 0 }),
+ *  which the editor layouts' firmware gates (`lt` / `gtet`) are evaluated against. Null or absent: not known — the
+ *  layout is resolved for the newest firmware. */
+export type LayoutFirmware = { major: number; minor: number } | null;
+
+/** The firmware level the newest firmware stands for: every `gtet` gate holds, no `lt` gate does. */
+const NEWEST_FW = Number.POSITIVE_INFINITY;
+
+/** A firmware on the scale of `fwBound` (13.0 → 13000, 9.02 → 9002); the newest firmware when it is not known. */
+export const layoutFirmwareLevel = (fw: LayoutFirmware | undefined): number =>
+  fw && Number.isInteger(fw.major) && Number.isInteger(fw.minor) && fw.major >= 0 && fw.minor >= 0 ? fw.major * 1000 + fw.minor : NEWEST_FW;
+
+/** Does an editor firmware gate hold on the firmware level `fw`? No gate always holds; `gtet` = at least that
+ *  firmware, `lt` = below it, both = the range in between. */
+const fwGateHolds = (gate: EditorFwRange | undefined, fw: number): boolean =>
+  !gate || ((gate.gtet == null || fw >= fwBound(gate.gtet)) && (gate.lt == null || fw < fwBound(gate.lt)));
+
 // Among same-named siblings (pages, or controls) that differ only by firmware gate, keep the one(s) that
 // apply to the NEWEST firmware — deterministic, no live firmware version needed:
 //   • a `gtet` (>=) sibling supersedes everything → keep the single highest `gtet`;
 //   • else null-gated (always-applicable) siblings supersede `lt`-only ones → keep the null-gated ones;
 //   • else (only `lt`-only siblings) the newest firmware reaches the highest `lt` bound → keep that one.
-// With no firmware gates in the set the siblings are genuinely distinct → all kept.
+// With no firmware gates in the set the siblings are genuinely distinct → all kept. (The layout resolution removes
+// every `lt`-gated sibling before it gets here — none applies to the newest firmware — so the last rule only
+// serves a caller that did not.)
 const preferNewestFw = <T extends { fw?: EditorFwRange }>(items: T[]): T[] => {
   if (items.length <= 1) return items;
   if (!items.some((i) => i.fw && (i.fw.gtet || i.fw.lt))) return items;
@@ -211,6 +250,19 @@ const preferNewestFw = <T extends { fw?: EditorFwRange }>(items: T[]): T[] => {
   const nullGated = items.filter((i) => !i.fw?.gtet && !i.fw?.lt);
   if (nullGated.length) return nullGated;
   return [items.reduce((a, b) => (fwBound(b.fw!.lt) > fwBound(a.fw!.lt) ? b : a))];
+};
+
+// Same-named firmware siblings whose gates all hold on the firmware level `fw`: the newest firmware → preferNewestFw;
+// a known firmware → the most specific gate wins, like a versioned editor page would be picked: the highest `gtet`
+// bound, then the lowest `lt` bound (a gated sibling beats an ungated one). One sibling is kept, the first on a tie
+// (the generator emits some pages twice); with no gate in the set every sibling is kept (genuinely distinct).
+const preferFw = <T extends { fw?: EditorFwRange }>(items: T[], fw: number): T[] => {
+  if (fw === NEWEST_FW) return preferNewestFw(items);
+  if (items.length <= 1) return items;
+  if (!items.some((i) => i.fw && (i.fw.gtet || i.fw.lt))) return items;
+  const low = (i: T) => (i.fw?.gtet ? fwBound(i.fw.gtet) : Number.NEGATIVE_INFINITY);
+  const high = (i: T) => (i.fw?.lt ? fwBound(i.fw.lt) : Number.POSITIVE_INFINITY);
+  return [items.reduce((a, b) => (low(b) > low(a) || (low(b) === low(a) && high(b) < high(a)) ? b : a))];
 };
 
 // Selector filter for one group of same-named pages: a page with no selector value is always kept; a
@@ -242,14 +294,14 @@ const filterPagesBySelector = (
   return [...ungated, ...(byType.length ? byType : fallback)];
 };
 
-// Drop controls that the newest firmware would hide: a control gated with an `lt` (only firmware < X)
-// bound never applies to the newest firmware (whether it also carries a `gtet` — a closed range — or not).
-// Controls with a `gtet`-only gate or no gate always apply and pass through untouched.
-const pruneControlsByFw = (page: EditorLayoutPage): EditorLayoutPage => {
+// Drop the controls the firmware level `fw` does not show: a control whose firmware gate does not hold. On the
+// newest firmware that is every control with an `lt` bound (whether it also carries a `gtet` — a closed range —
+// or not); controls with a `gtet`-only gate or no gate always apply there. Untouched pages and rows stay shared.
+const pruneControlsByFw = (page: EditorLayoutPage, fw: number): EditorLayoutPage => {
   let touched = false;
   const rows: EditorLayoutRow[] = page.rows.map((row) => {
     const controls = row.controls.filter((c) => {
-      const drop = c.fw?.lt != null;
+      const drop = !fwGateHolds(c.fw, fw);
       if (drop) touched = true;
       return !drop;
     });
@@ -258,37 +310,48 @@ const pruneControlsByFw = (page: EditorLayoutPage): EditorLayoutPage => {
   return touched ? { ...page, rows } : page;
 };
 
-// Filter a variant's pages down to what the editor actually shows for the block's current state: pages
-// group by display name (same-named pages are selector/firmware siblings), each group collapses to the
-// selector-matching page(s), firmware siblings collapse to the newest-firmware one, and per-control
-// firmware gates prune controls hidden on the newest firmware. Order preserved.
+// Filter a variant's pages down to what the editor actually shows for the block's current state on the connected
+// firmware (`firmware`; the newest firmware when it is not known): pages whose firmware gate does not hold are
+// dropped (on the newest firmware every `lt`-gated page, a lone one included), the rest group by display name
+// (same-named pages are selector/firmware siblings), each group collapses to the selector-matching page(s),
+// firmware siblings collapse to the one for the firmware (preferFw), and per-control firmware gates prune the
+// controls the firmware does not show. Order preserved.
 export const resolveLayoutPages = (
   pages: EditorLayoutPage[],
   typeValue?: number,
   selectors?: SelectorValues,
-): EditorLayoutPage[] => {
+  firmware?: LayoutFirmware,
+): EditorLayoutPage[] => resolvePagesAt(pages, typeValue, selectors, layoutFirmwareLevel(firmware));
+
+const resolvePagesAt = (pages: EditorLayoutPage[], typeValue: number | undefined, selectors: SelectorValues | undefined, fw: number): EditorLayoutPage[] => {
   const order: string[] = [];
   const groups = new Map<string, EditorLayoutPage[]>();
   for (const p of pages) {
+    if (!fwGateHolds(p.fw, fw)) continue;
     if (!groups.has(p.name)) { groups.set(p.name, []); order.push(p.name); }
     groups.get(p.name)!.push(p);
   }
   const out: EditorLayoutPage[] = [];
   for (const name of order) {
-    const kept = preferNewestFw(filterPagesBySelector(groups.get(name)!, typeValue, selectors));
-    for (const p of kept) out.push(pruneControlsByFw(p));
+    const kept = preferFw(filterPagesBySelector(groups.get(name)!, typeValue, selectors), fw);
+    for (const p of kept) out.push(pruneControlsByFw(p, fw));
   }
   return out;
 };
 
-// Resolve a family's editor layout to the wire DeviceLayout for the block's CURRENT type value, with the
-// selected variant's pages filtered to the current selector/firmware state (see resolveLayoutPages).
+// Resolve a family's editor layout to the wire DeviceLayout for the block's CURRENT state on the connected firmware
+// (`firmware`, the newest when not known): the variant per selectVariant, its pages filtered to the current
+// selector/firmware state (see resolveLayoutPages). A known firmware no variant exists on resolves as the newest.
 const layoutFrom = (layouts: DeviceEditorLayouts, preferredVariant: Record<string, string> = {}) =>
-  (family: string, typeValue?: number, selectors?: SelectorValues): DeviceLayout | undefined => {
+  (family: string, typeValue?: number, selectors?: SelectorValues, firmware?: LayoutFirmware): DeviceLayout | undefined => {
     const block = layouts[family];
     if (!block) return undefined;
-    const variant = selectVariant(block, typeValue, preferredVariant[family]);
+    let fw = layoutFirmwareLevel(firmware);
+    const variant = selectVariant(block, typeValue, selectors, fw, preferredVariant[family]);
     if (!variant) return undefined;
+    // the variant was picked on the newest firmware when none exists on the connected one: its pages are resolved
+    // on that level too, so the block is never served a variant without pages
+    if (fw !== NEWEST_FW && !(fwGateHolds(variant.fw, fw) && variant.pages.some((p) => fwGateHolds(p.fw, fw)))) fw = NEWEST_FW;
     return {
       editorName: block.editorName,
       family: block.family,
@@ -296,7 +359,7 @@ const layoutFrom = (layouts: DeviceEditorLayouts, preferredVariant: Record<strin
       variantValue: variant.value,
       ...(variant.fw ? { fw: variant.fw } : {}),
       ...(variant.pinned ? { pinned: true } : {}),
-      pages: resolveLayoutPages(variant.pages, typeValue, selectors),
+      pages: resolvePagesAt(variant.pages, typeValue, selectors, fw),
     };
   };
 
@@ -308,18 +371,20 @@ const AM4_FAMILY_BY_BLOCK: Record<string, string> = {
   chorus: 'CHORUS', flanger: 'FLANGER', rotary: 'ROTARY', phaser: 'PHASER', wah: 'WAH', volpan: 'VOLUME',
   tremolo: 'TREMOLO', filter: 'FILTER', drive: 'FUZZ', enhancer: 'ENHANCER', gate: 'GATE',
 };
-// The AM4 DISTORT layout holds two unconditional (value-less) variants: the device-global setup pages
-// ('Global': Audio / Footswitches / MIDI / Remote / Global — also the block's editorName) listed first, and
-// the actual 'Amp' editor. Plain first-wins selection served the global pages on the AM4 amp block, so name
-// the block editor. (The layout data itself should tag the global variant; that is a forgefx-midi matter.)
+// The AM4 DISTORT layout used to hold two unconditional (value-less) variants: the device-global setup pages
+// ('Global': Audio / Footswitches / MIDI / Remote / Global) listed first, and the actual 'Amp' editor, and plain
+// first-wins selection served the global pages on the AM4 amp block. The codec's layouts now file the global pages
+// under their own GLOBAL family (editorName 'Amp' on DISTORT); the hint stays so a regenerated layout that mixes
+// them again still serves the amp editor on the amp block.
 const AM4_PREFERRED_VARIANT: Record<string, string> = { DISTORT: 'Amp' };
 const am4LayoutOf = layoutFrom(AM4_LAYOUTS, AM4_PREFERRED_VARIANT);
 /** Editor-authentic layout for an AM4 block (by its lowercase block name, e.g. 'amp'/'drive'), for the
- *  block's current type value. Controls join to the AM4 catalog by cacheId in the codec; unresolved
- *  paramIds ride through as null (display-only). Undefined for a block with no AM4 layout. */
-export const am4LayoutFor = (block: string, typeValue?: number, selectors?: SelectorValues): DeviceLayout | undefined => {
+ *  block's current type value (and firmware, when known: see LayoutFirmware). Controls join to the AM4 catalog by
+ *  cacheId in the codec; unresolved paramIds ride through as null (display-only). Undefined for a block with no AM4
+ *  layout. */
+export const am4LayoutFor = (block: string, typeValue?: number, selectors?: SelectorValues, firmware?: LayoutFirmware): DeviceLayout | undefined => {
   const family = AM4_FAMILY_BY_BLOCK[block.toLowerCase()];
-  return family ? am4LayoutOf(family, typeValue, selectors) : undefined;
+  return family ? am4LayoutOf(family, typeValue, selectors, firmware) : undefined;
 };
 
 // FC + Modifier address models (FM3-decoded; other devices not decoded yet). Lets the client compute
@@ -540,9 +605,11 @@ export interface DeviceProfile {
    *  block is served per entry: drivers/blockMapState.ts. */
   blockMapFor?(eid: number): BlockMapEntry | undefined;
   /** Editor-authentic UI layout for a family, resolved to the block-type/firmware variant selected by
-   *  the block's CURRENT type value (`typeValue`); the variant's pages are further filtered to the
-   *  block's current selector/firmware state via `selectors` (see resolveLayoutPages). Undefined if none. */
-  layoutFor(family: string, typeValue?: number, selectors?: SelectorValues): DeviceLayout | undefined;
+   *  the block's CURRENT state: its type value (`typeValue`), or the value of the selector a folded variant names
+   *  (`selectors`); the variant's pages are further filtered to the block's current selector state via `selectors`
+   *  and everything to the connected firmware (`firmware`; the newest firmware when it is not known), see
+   *  selectVariant / resolveLayoutPages. Undefined if none. */
+  layoutFor(family: string, typeValue?: number, selectors?: SelectorValues, firmware?: LayoutFirmware): DeviceLayout | undefined;
   /** The raw editor layouts `layoutFor` resolves from (family → block → variants → pages → rows → controls).
    *  Kept so `layoutWidgetIndex` can read which widget the editor draws for a parameter id. */
   editorLayouts?: DeviceEditorLayouts;

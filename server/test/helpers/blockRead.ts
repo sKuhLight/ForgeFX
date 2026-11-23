@@ -49,9 +49,11 @@ export interface MockBlock {
 }
 
 /** A gen-3 driver on a mocked link that answers the status dump and each block's bulk read. `blocks` is read at
- *  every request, so a test may change a block's body between two reads; `emit` receives the driver's events. */
+ *  every request, so a test may change a block's body between two reads; `emit` receives the driver's events;
+ *  `firmware` is the running firmware the driver's context reports (absent: the context reports none). */
 export function mockBlockDevice(
-  profile: DeviceProfile, blocks: Record<number, MockBlock>, opts: { emit?: (e: DeviceEvent) => void } = {}
+  profile: DeviceProfile, blocks: Record<number, MockBlock>,
+  opts: { emit?: (e: DeviceEvent) => void; firmware?: { major: number; minor: number } | null } = {}
 ): { driver: Gen3Driver; mock: MockTransport } {
   const codec = createModernFractalCodec(profile.model);
   const statusHex = compactHex(codec.buildStatusDump());
@@ -74,6 +76,9 @@ export function mockBlockDevice(
     const b = blocks[eid]!;
     return b.silent ? [] : blockBulkFrames(profile.model, eid, b.values, b.advertised);
   };
-  const driver = createGen3Driver(profile, { transport: async () => mock, emit: opts.emit ?? (() => {}), getCadence: () => cadenceFor(null, 'balanced') });
+  const driver = createGen3Driver(profile, {
+    transport: async () => mock, emit: opts.emit ?? (() => {}), getCadence: () => cadenceFor(null, 'balanced'),
+    ...(opts.firmware !== undefined ? { getFirmware: () => opts.firmware ?? null } : {}),
+  });
   return { driver, mock };
 }

@@ -94,10 +94,20 @@ changes shape.
 | `nameSource`, `nameConfidence`, `movedFrom` | `catalog`, `catalog-moved` or `generic`; `high`/`medium`/`low` (absent when generic); the catalog id a moved name came from |
 | `fp` | fingerprint of the row and its labels (`1:xxxxxxxx`) |
 | `widget`, `widgetSource` | `knob`, `stepper`, `dropdown` or `toggle`; whether the row (`device`), the catalog or the editor layout settled it |
-| `write` | `norm`: `PUT { value: 0..1, continuous: true }`; `ordinal`: `PUT { value: <ordinal>, continuous: false }`; `null`: no verified write path (advice for a UI; the server does not refuse it); `readOnlyReason` says why |
+| `write` | `norm`: `PUT { value: 0..1, continuous: true }`; `ordinal`: `PUT { value: <ordinal>, continuous: false }`; `null`: no verified write path; `readOnlyReason` says why |
+| `readOnlyReason` | with `write: null`: `unverified-write-path` or `generic-typecode-f0` (advice for a UI; the server does not refuse the write), or, for every param of a read-only block-map block (`definitions.blockMap` below), `unconfirmed-block` or `live-only-block` (the server refuses the write: 409) |
 | `step` | display-unit step of a continuous parameter, when known |
+| `unit`, `min`, `max`, `log` | `named` only, as in the classic response (`log`: served with a log taper) |
+| `unitSource`, `taperSource` | `named` only: where `unit` and the taper came from (below); absent when there is no unit, or nothing names a taper (served linear) |
 | `unresolved` | why `value` is `null` (below) |
 | `optionsTruncated` | `enums` only: the option list was cut at 4096 |
+
+`unitSource` / `taperSource` (amended with ADR 0005): `device` = the applied device profile's own row supplied it;
+`catalog` = the bundled catalog did (its row, or the catalog's unit for the param); `typecode` = derived at read time from
+the row's typecode by the codec's typecode rules. A typecode unit is filled in only when neither the device row nor the
+catalog has a unit, and it is never persisted. The taper decision is unchanged: an explicit taper of the row wins (`log`,
+anything else linear), otherwise the typecode rule. The classic response is unchanged: no source fields, no typecode
+unit.
 
 `unresolved`: `read-failed` (the block read failed; `readError` is set on the response and every
 parameter is listed), `channel-unknown` (a channel block whose active channel the status read did not
@@ -110,8 +120,11 @@ report), `non-positional` (the block's body is indexed by record, not by paramet
                  "persistentWrites": false,
                  "hidden": [ { "id": 0, "reason": "type" }, { "id": 41, "reason": "bypass" } ] }
 ```
-- `family`: the catalog family (`null` for an effect id with no family: the response is then
-  `{ block: "Block <eid>", slug: "", page: -1, named: [], enums: [], type: null, unknownBlock: true }`).
+- `family`: the family the block is served under: the catalog family, or for a block only the block map binds
+  `section:<tag>` / `block:<eid>`; `null` when nothing describes the block (then `named` and `enums` are empty and
+  `profile` is `none`). A block the catalog has no family for is answered as
+  `{ block: "Block <eid>", slug: "", page: -1, type: null, unknownBlock: true, … }`, with its params when the block map
+  serves some, and with `blockMap`.
 - `profile`: `byte-exact`, `live` or `none` (no profile applied, the family is not in it, or it was
   flagged `suspect`, which the block then also says: `"suspect": true`).
 - `positional`: values are read by position (parameter id = index in the channel slice). `channel`: the
@@ -120,6 +133,27 @@ report), `non-positional` (the block's body is indexed by record, not by paramet
 - `hidden`: informative rows that are not listed, by `reason`: `bypass`, `type` (the type selector, shown
   in `type`), `by-design` (a write would retarget something, e.g. a modifier's target), `removed` (a
   byte-exact profile no longer has a row the catalog does).
+- `blockMap` (amended with ADR 0005; only for a block the catalog cannot place on its own, absent for every catalog
+  block): `{ state, key, sectionTag, evidence, candidates?, probe }`. `key` is the family the block is served under
+  (`null` without one), `sectionTag` the editor-cache section it is bound to, `evidence` what binds it
+  (`device-records`, `live-only`, `bulk-shape`, `roster`, `pack`), `candidates` the section tags that fit equally.
+
+  | `state` | Meaning | Params | `PUT` |
+  |---|---|---|---|
+  | `confirmed` | the block's definitions read from the unit equal an editor-cache section (`device-records`) | generic (named for a catalog family) | allowed, the guards below apply |
+  | `confirmed` | known from a read-only walk only (`live-only`) | generic from the block's own rows, `write: null`, `readOnlyReason: "live-only-block"` | 409 |
+  | `likely` | the block's bulk read fits exactly one editor-cache section (`bulk-shape`, never stored) | that section's params, `write: null`, `readOnlyReason: "unconfirmed-block"` | 409 |
+  | `likely` | Axe-Fx III: the effect-id table names the family from the block roster only (`roster`); not an `unknownBlock`, served under its catalog name | named, `write: null`, `readOnlyReason: "unconfirmed-block"` | 409 |
+  | `candidates` | several sections fit | none | not refused |
+  | `none` | nothing to go by | none | not refused |
+
+  `probe`: `{ available: true }` when `POST /device/definitions/blocks/<eid>/probe` would read the block now; else
+  `{ available: false, reason }` with `not-verified` (the probe, and above effect id 160 also definition reads there, is
+  not verified on the running firmware) or `not-placed` (the block is not in the edit-buffer grid as last read), and no
+  `reason` for a family the catalog knows (the roster-only family). A client treats any other `reason` as unavailable.
+  The channels of such a block come from its bulk read (one slice or four), else from its status entry; unknown makes
+  every value `channel-unknown`. The classic response lists nothing for a block only the block map binds (as before),
+  and serves a roster-only family like any family (its writes are refused all the same).
 - **Invariant for a byte-exact profile:** `named + enums + hidden (other than removed)` equals the number of
   informative rows of the family in the profile. `profile-check` verifies it.
 
@@ -135,6 +169,24 @@ Notes for clients (Axis):
   control whose parameter the device no longer serves (dropped, or its name could not follow a shifted row)
   keeps its `paramId` and carries `unbound: true`: disable it, the id may now hold another parameter. The
   classic response serves the editor layout unchanged.
+- **Controls that address another block** (amended with ADR 0005). A control with a `crossBlock` reference
+  (`{ effect, family, paramName, paramId }`, e.g. the global metronome on a block's tempo page) names a param of the
+  REFERENCED family, and follows that family's names on the connected device: moved →
+  `paramId` is the new pid and `movedFrom` the catalog pid (`crossBlock.paramId` follows), no longer served →
+  `unbound: true`. This applies only where the reference names that family's catalog param at its catalog pid; any other
+  reference keeps its binding. Every control with a `crossBlock` reference also carries `crossBlock.effectId`: the effect
+  id of the block that owns the param on the connected device, from that model's own effect-id table — the first effect
+  id of the referenced family plus the reference token's instance minus 1 (`ID_OUTPUT2`: the second Output block). The
+  instance must exist on the device: at most the model's instance count of that family, and within the effect-id span the
+  gen-3 roster reserves for it. A family the static table gives no effect id but the applied profile's block map binds
+  `confirmed` resolves to its bound effect ids. `effectId` is `null` when there is nothing to address: modifier slots
+  (`MOD`), preset-level data (`PRESET`), a reference whose family did not resolve, a family without an effect id, an
+  instance the device does not have. **Write such a control to `crossBlock.effectId`, not to the open block:** that
+  block's own write guards apply, and a write to GLOBAL (effect id 1) or FC (199) changes persistent settings, as
+  `definitions.persistentWrites` says of those blocks. `null` means display only. The classic response serves the layout
+  unchanged (no `effectId`).
+- **Which layout is served** (both responses): editor firmware gates are evaluated against the connected firmware, and a
+  variant folded from a page-level selector is keyed by that selector; see [LAYOUTS.md](LAYOUTS.md#how-a-layout-is-resolved).
 - Generic ids appear in `param` events like any other; a non-positional block emits none.
 
 ### Write guards (`PUT /preset/blocks/:eid/params/:paramId`)
@@ -150,11 +202,19 @@ usual error body on both surfaces and over Remote:
   parameter there. A catalog
   parameter with such a row (the modifier's min/max/param, the `*_GLOBALMIX` toggles) stays writable,
   and so does an id with no row at all (the FC block, a cross-block write).
+- **409** (amended with ADR 0005), a block the catalog cannot place on its own: its block-map binding is read-only (a
+  roster-only family, a `live-only` binding), or the last generic read of the block matched it by its bulk shape
+  (`likely`) and no confirmed, editor-cache-bridged binding serves it:
+  `block <eid> has no confirmed definitions on this device; write refused`. Also a pid of a `section:<tag>` /
+  `block:<eid>` family that has no informative row there: `param <pid> of block <eid> has no definition on this device;
+  write refused`. A block with `candidates` or `none` is not refused (nothing is known about it). The refusals hold for
+  every client, whichever response it read.
 
 ### Capabilities and tooling
-`capabilities.definitions` (`genericParams`, `catalogFirmware`, the applied `profile`, `drift`) and how
-rows are named are in [definitions.md](definitions.md). `server/scripts/profile-check.ts` (`npm run profile-check`)
-checks the response against a profile, offline or against a running server (GET only).
+`capabilities.definitions` (`genericParams`, `catalogFirmware`, the applied `profile` with its `format`, `sources` and
+`coverage`, `drift`, `contribute`, `walk`, `portable`) and how rows are named are in [definitions.md](definitions.md).
+`server/scripts/profile-check.ts` (`npm run profile-check`) checks the response against a profile, offline or against a
+running server (GET only), and has offline document tools (`--rederive`, `--diff`, `--merge`, `--blocks`).
 
 ---
 
@@ -334,7 +394,7 @@ cannot read even a public answer. The static UI is sent with `X-Frame-Options: S
 `frame-ancestors 'self'`, so another site cannot frame it and borrow its origin.
 
 Routes that read files the server did not write, or return paths on the server machine (editor-cache
-sources, import by path, the contribution routes; ADR 0003), keep a stricter per-route rule on top: the
+sources, import by path, the contribution routes; ADR 0003; the `.axisdefs` import, ADR 0005), keep a stricter per-route rule on top: the
 TCP connection must come from a **loopback peer** (`127.0.0.0/8` or `::1`, IPv4-mapped included), with no
 `Origin` or a loopback origin. LAN clients (with or without an `Origin`), same-origin LAN pages and listed
 origins are refused there with `403 forbidden-origin`.
@@ -383,3 +443,261 @@ the disk (404), and answers `400 { "error": "invalid-url" }` to a path that does
   accepts loopback names and addresses only (plus an operator's `FORGEFX_ALLOWED_HOSTS`). Other web pages
   served from loopback (local dev servers, other local apps) count as loopback origins. Non-browser software
   on the same machine is not a browser-borne threat and is out of scope.
+
+---
+
+# ADR 0005 — Device-definition profiles v2
+
+Status: accepted · 2026-11-23
+
+## Context
+A stored profile used to be the tables one source produced (an editor-cache import or a live walk), and each new source
+replaced it. Nothing raw was kept, so a newer build could not re-derive a profile without the device, an editor cache and a
+walk could not complement each other, a cloud pull could replace a better local profile, and a block type a newer firmware
+added had no definitions at all.
+
+## Decision
+A profile document keeps its raw definition sources and derives its tables from all of them; build, import and pull merge
+into it instead of replacing it. The model (formats, sources, merge precedence, drift, coverage, unknown blocks, `.axisdefs`)
+is described in [definitions.md](definitions.md); this ADR is the HTTP contract. Every route exists on the Fastify app and the
+browser runtime router with the same shapes and error codes (the differences are noted below). Gate on
+`capabilities.definitions` (`genericParams`, `portable`, `walk.blockProbe`).
+
+| Route | Purpose | Remote | Origin |
+|---|---|---|---|
+| `GET /device/definitions/diff` | the bundled catalog against the applied profile | allowed | app-wide (ADR 0004) |
+| `GET /device/definitions/export` | the stored profile as a `.axisdefs` file | allowed | app-wide |
+| `POST /device/definitions/import` | adopt a `.axisdefs` file | denied | loopback peer (ADR 0004's stricter rule) |
+| `POST /device/definitions/blocks/:eid/probe` | read one placed unknown block's definitions | denied | app-wide |
+
+Changed: `GET /device/cache`, `POST /device/cache/build`, `POST /device/cache/import`, `GET|POST /device/cache/cloud*`,
+`GET /preset/blocks/:eid/params?generic=1` and `PUT /preset/blocks/:eid/params/:paramId` (ADR 0002), `GET /device`
+(`capabilities.definitions`, definitions.md), and the event stream (below). Their Remote and origin rules are unchanged:
+the relay serves their GETs and the param `PUT`, never the build, the imports, the cloud pull or publish. Error bodies are
+`{ "error": "<code>", …fields, "message"? }`; the param write guard keeps ADR 0002's `{ statusCode, error, message }`.
+
+### Merges and refusals (every route that stores a source)
+Build, editor-cache import, cloud pull, `.axisdefs` import and probe add their source to the stored document of the key
+(definitions.md, *Merging*). Shared answers:
+- **409** `newer-profile`: a newer build wrote the stored document; it is not rewritten.
+- **409** `local-profile-better`: the stored document has no raw sources (format 1) and its source outranks every incoming
+  one, so the incoming sources would replace better data. Both 409 bodies carry `local: { source, format }`.
+- `replace` (`replace: true` in a JSON body, `?replace=1` on a query) replaces the stored document and is never refused.
+- **422** `derivation-failed`: the sources do not derive into a profile; `stored: true` (with `key`) when the new source was
+  kept next to the sources of a stale document that still does not derive.
+- SSE `definitions` after a build, editor-cache import or cloud pull that kept stored sources next to its own (`merged`),
+  after every `.axisdefs` import (`imported`) and every stored probe (`block-probe`).
+
+### `GET /device/cache` (changed)
+Additive fields (numbers illustrative):
+```json
+{ "key": "11_99p0", "exists": true, "building": false, "stale": false, "currentSchema": 1,
+  "meta": { "recordCount": 2400, "builtAt": "…", "firmware": "99.0", "unmappedSections": 2, "unmappedFamilies": 3, "source": "editor-cache", "schema": 1 },
+  "format": 2,
+  "sources": [ { "id": "editor-cache@2026-11-23T10:00:00.000Z#0", "kind": "editor-cache", "origin": "local",
+                 "capturedAt": "2026-11-23T10:00:00.000Z", "firmware": "99.0", "records": 2400 } ],
+  "coverage": { "complete": true, "gaps": [ { "kind": "no-tapers", "blocking": false, "fix": ["full-capture"] } ],
+                "units": 0, "tapers": 0, "highIds": { "expected": 10, "present": 10 },
+                "sections": { "total": 40, "assigned": 38, "system": 2, "new": 0, "unclassified": 0 }, "instances": [] } }
+```
+- `format` (a stored document): 1 or 2. `sources` (a stored document): one entry per raw source, empty for format 1; a
+  stale format-2 document lists its sources too. `coverage`: a usable document only (definitions.md, *Drift and coverage*).
+- `rederived: true`: this read derived the stored document again from its raw sources (no device traffic) and wrote it back
+  unless a newer build wrote it (then SSE `definitions`, reason `rederived`).
+- `staleReason` may be `derivation-failed`; `meta.source` may be `axisdefs`.
+
+### `POST /device/cache/build` (changed)
+Body `{ "force"?: boolean, "mode"?: "read-only" | "full", "scope"?: "standard" | "extended", "replace"?: boolean }`.
+`200 { ok: true, key, started: true }`, or `200 { ok: true, already: true }` (SSE `cacheBuild` `already-built`).
+- The walk is merged into the stored document (`replace`: replaces it).
+- **`already`** only when the stored document is format 2, holds a local live source of the requested kind (a full walk
+  also satisfies a read-only request), has no blocking gap a repeat walk could close (fix `read-from-device`) and, for an
+  extended build, a source whose scope already covers the extension; or when it is a format-1 document made from an editor
+  cache (byte-exact tables a walk cannot improve). `force` walks anyway and replaces the stored source of its kind; over a
+  format-1 editor-cache document it answers 409 `local-profile-better` (`replace` walks over it).
+- **`scope`**: absent = `extended` for a read-only build when `walk.extendedIds` or `walk.above160` of the running firmware
+  is open (judged after a fresh firmware read; a failed read keeps the standard scope), else `standard`; a full build stays
+  `standard` unless `extended` is asked for. An extended build stores and applies the standard walk first, then runs the
+  read-only extension walk; an extension that stops keeps the standard walk's result.
+- **409** `newer-profile` / `local-profile-better` (above), besides `building` and `busy`.
+- Terminal SSE `cacheBuild`: `done` of an extended build carries `extension: "done" | "skipped" | "aborted"` and, with
+  `aborted`, `abortReason`, one of `implausible-reply (block b, param p)`, `silent-run (block b)`, `query-budget (n
+  queries)`, `cancelled`, `empty-block (block b)`, `walk-failed`, `derivation-failed`. Over a stale document whose sources
+  still do not derive the build ends with `error` (`derivation-failed: …`; the walk is stored with the other sources).
+
+### `POST /device/cache/import`, `/device/cache/cloud/pull`, `/device/cache/cloud/publish` (changed)
+- **Import** (editor cache): merged into the stored document; `?replace=1` (or `replace: true` next to `path`) replaces it.
+  `200` adds `format: 2, sources, coverage, merged` (`merged`: stored sources were kept). New answers: the shared merge
+  refusals, `422 derivation-failed`, `409 firmware-differs` (a merge of another firmware's source), `500
+  contains-user-data` (a privacy guard hit: a bug).
+- **Pull**: body `{ "replace"?: boolean }`. A cloud row with raw sources this build reads: the sources are validated
+  strictly (`422 cloud profile malformed` with the offending path otherwise), stored with origin `cloud` and merged (a
+  local source of the same kind always outranks them); a source of another firmware is `409 firmware-differs`. A row with
+  derived tables only is adopted only when no usable profile and no raw sources are stored for the key, else `409
+  local-profile-better` (`replace: true` adopts it). `200` adds `format: 2, merged` for a merged row. `GET
+  /device/cache/cloud` adds `rederivable: true` for a row whose tables are not this build's but whose raw sources it can
+  derive (a pull re-derives it).
+- **Publish** uploads derived tables only: no raw sources, sections, block map, provenance or coverage, no format-2 meta,
+  and no `section:<tag>` / `block:<eid>` family in any table. A format-2 document publishes the tables derived from its
+  LOCAL sources alone (cloud and file sources never travel back); one without a local source is `409` (not publishable).
+  `409 profile-stale` for a stale document; `409 dev-hook-active` while the `FORGEFX_DEFS_HIDE_FAMILY` development hook
+  hides a family (or the stored tables were derived under it).
+
+### `GET /device/definitions/diff`
+The bundled catalog against the profile applied for the running firmware. Reads state the server already holds: it never
+triggers detection and never talks to the device.
+- Query: `family=<F>` (repeatable, also comma-separated; filters `families` only) and `include=` (comma-separated, also
+  repeatable) out of `params`, `rosters`, `enums`, `strides`, `sections`, `blocks`, `instances` (absent or empty: all).
+  Unknown `include` tokens are ignored; a part not included is omitted, not sent empty. `summary` always covers the whole
+  profile.
+- `200` whenever a gen-3 grid device is identified and its firmware is known (`state` says the rest); `503 no-device` (no
+  unit identified yet); `501 unsupported { capability: "genericParams" }`; `503 firmware-unknown`; `404 unknown-family {
+  family }` for a `family` the catalog and the profile do not have (a `section:` / `block:` key included).
+
+Example (numbers illustrative):
+```json
+{ "model": 17, "firmware": "99.0", "catalogFirmware": "12.0", "state": "none",
+  "profile": { "key": "11_99p0", "source": "editor-cache", "byteExact": true, "format": 2, "sources": [ … ] },
+  "summary": { "newParams": 1, "changed": { "compatible": 2, "incompatible": 0 }, "removed": 0, "movedNames": 0,
+               "rosterChanges": 1, "enumChanges": 0, "strideChanges": 1, "newSections": 0, "unknownBlocks": 0,
+               "suspects": [], "disagreements": [] },
+  "families": [
+    { "family": "FUZZ", "eid": 118, "status": "changed",
+      "params": { "added": [ { "id": 60, "name": "P60", "kind": "float", "generic": true, "min": 0, "max": 10 } ],
+                  "changed": [ … ], "removed": [], "moved": [] },
+      "roster": { "selectorId": 0, "before": 100, "after": 101, "appended": ["…"], "inserted": [], "renamed": [], "removed": [], "ordinalShift": false },
+      "enums": [], "stride": { "before": 60, "after": 61 } } ],
+  "sections": [], "blocks": [], "instances": [] }
+```
+- `state` equals `capabilities.definitions.drift` at the same moment; `profile` is null while the bundled catalog is live
+  (then no family is listed).
+- `families`: every family whose `status` is not `unchanged`: `changed`, `suspect` (its profile section looked
+  mis-assigned and was not used), `disagreement` (definitions.md, coverage) or `catalog-only` (the catalog has rows, the
+  profile has no such family). `eid` is the family's first effect id (null: none).
+- `params`: one entry per pid (`ParamDelta`: `id`, `name`, `kind`, `generic`, a float's `min`/`max`/device `unit`, an enum's
+  number of `options`, `change` `compatible`/`incompatible` and `fpBefore`/`fpAfter` on `changed`). Names are the catalog
+  names the generic response serves, or `P<pid>`. An `added` entry with `movedFrom` is a param whose name moved with its
+  row, not a new one. `removed` is null where nothing can be said (a family that is not byte-exact, a suspect family); it can
+  list more entries than `summary.removed` counts (a vanished name whose pid now holds another param).
+- `roster`: the model list against the catalog's (`appended`, `inserted`, `renamed`, `removed`; `ordinalShift`: a kept
+  label sits at another ordinal now, so stored selections change meaning). `enums`: other changed label lists (`change`:
+  `appended`, `renamed`, `inserted`, `removed` or `replaced`). `stride`: the family's table size changed.
+- `sections`: editor-cache sections no catalog family took that are new, unclassified or bound to a block
+  (`{ tag, key, role, stride, informative, mappedEids }`). `blocks`: block-map entries and placed blocks nothing describes
+  (`{ eid, placed, state, key, sectionTag, params }`; `placed` is from the edit-buffer grid as last read, false before any
+  grid read). `instances`: the coverage's instance-count mismatches.
+
+### `.axisdefs`: `GET /device/definitions/export`, `POST /device/definitions/import`
+The file is UTF-8 JSON (definitions.md, *Portable definitions files*):
+```json
+{ "kind": "axis-device-definitions", "version": 1, "model": 17, "firmware": "99.0", "key": "11_99p0",
+  "exportedAt": "2026-11-23T10:00:00.000Z", "app": { "engine": "…", "codec": "…" },
+  "profile": { "meta": { "schema": 1, "format": 2, "sources": [ { "id": "…", "kind": "editor-cache", "origin": "local", "capturedAt": "…", "firmware": "99.0", "records": 2400 } ] },
+               "raw": { "format": 1, "sources": [ … ] } },
+  "sha256": "<64 lowercase hex>" }
+```
+- `app.engine`: the exporting ForgeFX version; `app.codec`: the codec that derived the document. `profile.meta` is
+  informational (recomputed on import); `profile.raw` is the content.
+- `sha256`: hex SHA-256 of the UTF-8 bytes of the canonical JSON of `profile`: what `JSON.stringify` writes, without
+  whitespace, with the keys of every object sorted by UTF-16 code units, `undefined` properties left out.
+
+**Export.** `200`, the file as the body, with `Content-Disposition: attachment; filename="<model>-<firmware>.axisdefs"`
+(e.g. `fm3-13.0.axisdefs`). The browser runtime returns the same header with its response; the Remote relay does not pass
+headers on, so a client there names the file itself. No device traffic besides the detection every cache route runs on
+first use. `503 no-device`; `501 unsupported { capability: "portable" }`; `404 no-profile` (nothing stored for the
+firmware); `409 profile-legacy` (a format-1 document: nothing raw to export, read the definitions again first); `409
+profile-stale` (with the stale fields); `409 profile-unreadable` (raw sources of a newer format, or ones this build's own
+import would refuse); `500 contains-user-data` (a bug).
+
+**Import.** The file is the JSON body (at most 8 MiB, else `413 too-large { bytes?, limit }` before it is read). `force`
+and `replace` are query flags only (`?force=1`, `?replace=1`): nothing inside the file is read for them. After the gates
+(`503 no-device`, `501 unsupported { capability: "portable" }`), the file is checked in this order; the first failure
+answers:
+1. shape: `400 invalid-file` (a JSON object without prototype keys; `kind`; `version`; `model`; `firmware` in its canonical
+   spelling `13.0`; a `key` that is the model's and firmware's own; the profile envelope; every source and record — records
+   only in the sections an editor-cache source declares or the blocks a live source walked, a bounded record total, a
+   source's firmware, where it names one, the file's). A `version`, profile format or raw format newer than this build reads is `422
+   unsupported-format { what, got, supported }`;
+2. checksum over `profile` as received: `422 checksum-mismatch { declared, computed }`;
+3. user data: `422 contains-user-data`;
+4. model = the identified unit's: `409 model-mismatch { expected, got }`;
+5. firmware = the running firmware: `409 firmware-differs { expected, got, overridable: true }`. With `?force=1`, or on a
+   unit whose firmware is unknown, the sources are stored under the file's key and not applied;
+6. merge and derivation: the shared merge answers above (refusals, `422 derivation-failed`).
+
+Every imported source is stored with origin `file`. `200 { ok: true, imported: true, key, applied, sources, coverage }`
+(`applied`: the file is the running firmware's and now live; `sources` and `coverage` of the stored document), and SSE
+`definitions` (`imported`), also when the file was stored next to a stale document (`422 derivation-failed`, `stored: true`).
+On the server the route is loopback-peer guarded (`403 forbidden-origin`). The browser runtime takes the same body and
+query flags with the same 8 MiB limit and has no origin guard (an in-page call). A runtime without `crypto.subtle` (a
+browser page outside a secure context) answers both routes with `501 unsupported { capability: "sha256" }`.
+
+### `POST /device/definitions/blocks/:eid/probe`
+One read-only definition walk of a placed block the catalog does not know, so the block map can bind it. Preconditions,
+in this order, every refusal before any device traffic:
+
+| Status | `error` | When |
+|---|---|---|
+| 503 | `no-device` | no unit identified (detection is never triggered) |
+| 501 | `unsupported` `{ capability: "blockProbe" }` | not a gen-3 grid device |
+| 503 | `firmware-unknown` | the running firmware was not read |
+| 501 | `unsupported` `{ capability: "blockProbe", reason: "firmware", firmware }` | the probe is not verified on the running firmware (`walk.blockProbe` false) |
+| 400 | `invalid-eid` | the effect id is not an integer 0..16383 |
+| 501 | `unsupported` `{ …, reason: "firmware", scope: "above160" }` | an effect id above 160 while `walk.above160` is false |
+| 409 | `known-block` `{ family }` | the bundled tables place the effect id (a catalog family, a roster-only family, a virtual block) |
+| 404 | `block-not-placed` | the block is not in the edit-buffer grid as last read (read the grid first) |
+| 409 | `newer-profile`, `local-profile-better` | the probe could not be stored (merges, above) |
+| 409 | `building`, `busy` `{ what }` | another device job runs |
+
+The walk runs with the device claimed and telemetry paused: read-only, at most param id 127, bounded by the widest
+editor-cache section the block's bulk read fits, every query checked against that bound before it is sent. At most 60 s:
+`504 probe-timeout` (nothing stored). `500 walk-bound` (a query outside the planned scope: a bug, nothing stored), `503
+probe-failed`. The result is stored as a `live-probe` source (replacing an older probe of the same block), the document is
+derived again and applied, and SSE `definitions` (`block-probe`, with `eid`) is sent (numbers illustrative):
+```json
+{ "ok": true, "eid": 203,
+  "blockMap": { "eid": 203, "key": "section:60", "sectionTag": 60, "confidence": "confirmed", "evidence": ["device-records"],
+                "compared": { "rows": 40, "equal": 40, "probedTo": 72 }, "channels": true },
+  "records": 41, "walk": { "queries": 75, "pseudoReplies": { "endMarker": 3, "duplicateId": 0, "implausible": 0 }, "lostReplies": 0 } }
+```
+`blockMap` is the document's entry for the block, with the codec's `confidence` (`confirmed`, `likely`, `candidate`, …;
+ADR 0002's `state` is derived from it); a walk that binds nothing answers a `candidate` entry without candidates. `422
+derivation-failed` (`stored: true` when the probe was kept next to a stale document; the event is sent then too).
+
+### Events (`GET /events`, relayed over Remote)
+`{ "type": "definitions", "reason": "<reason>", "key": "11_99p0", "eid"?: 203 }`: re-read `capabilities.definitions`,
+`GET /device/cache` and the open block.
+
+| `reason` | When |
+|---|---|
+| `merged` | a build, an editor-cache import or a cloud pull kept stored sources next to its own (after its `cacheBuild` `done`) |
+| `imported` | a `.axisdefs` file was imported |
+| `block-probe` | a block probe stored its source (`eid`) |
+| `rederived` | a stored document was derived again from its raw sources and written back |
+| `unmapped-blocks` | gen-3 grid devices: the set of placed blocks nothing describes changed (after a grid read or a profile swap), which moves `coverage` and `drift`; `key` is the running firmware's, nothing stored changed |
+
+`cacheBuild` gains `extension` and `abortReason` on its terminal `done` (above); new outcomes ride on the existing terminal
+phases, never on new phases.
+
+### Errors
+| Status | `error` |
+|---|---|
+| 400 | `invalid-file`, `invalid-eid` |
+| 403 | `forbidden-origin` (import, server) |
+| 404 | `no-profile`, `unknown-family` `{family}`, `block-not-placed` |
+| 409 | `newer-profile` / `local-profile-better` `{local}`, `profile-legacy`, `profile-stale`, `profile-unreadable`, `model-mismatch` `{expected, got}`, `firmware-differs` `{expected, got, overridable?}`, `known-block` `{family}`, `building`, `busy` `{what}`, `cloud-profile-stale`, `dev-hook-active` |
+| 413 | `too-large` `{bytes?, limit}` |
+| 422 | `unsupported-format` `{what, got, supported}`, `checksum-mismatch` `{declared, computed}`, `contains-user-data`, `derivation-failed` `{stored?, key?}`, `cloud profile malformed` |
+| 500 | `contains-user-data` (export, persist: a bug), `walk-bound` (probe: a bug) |
+| 501 | `unsupported` `{capability: "genericParams" \| "portable" \| "blockProbe" \| "sha256", reason?, scope?, firmware?}` |
+| 503 | `no-device`, `firmware-unknown`, `probe-failed` |
+| 504 | `probe-timeout` |
+
+## Consequences
+- A profile survives a newer build (it is derived again, no new read needed) and gets better as sources are added: an
+  editor cache and a walk together give exact rows with device units.
+- A format-1 document from an older build stays usable (`no-raw`); the next build, import or pull writes format 2. Older
+  builds still read format-2 documents (the derived tables keep their shape).
+- A placed block a newer firmware added can be read (and, once bound to an editor-cache section, edited) without an app
+  update; until then its writes are refused.
+- A `.axisdefs` file proves integrity, not authorship: anyone can edit and re-seal one.

@@ -1,6 +1,9 @@
 // Editor-layout v2 serving — variant selection + wire passthrough shape, over the REAL device
 // profiles wired in src/devices.ts and the AM4 layout resolver. All data-only (no transport):
-//   • variant selection: type-value match, amp firmware-pin preference, null/first fallback;
+//   • variant selection: type-value match, a folded variant's own selector (DELAY_TYPE), amp firmware-pin preference,
+//     null/first fallback;
+//   • firmware gates (variants, pages, controls) on the connected firmware, else the newest (legacy `lt` pages and
+//     variants not served, TREMOLO's legacy-only variant yields to the default, MULTITAP keeps its current variant);
 //   • v2 passthrough: pages → rows → controls carry widget/rawWidget/placement/crossBlock verbatim;
 //   • AM4 gets a layout for the first time (family mapping via am4LayoutFor).
 import { PROFILES, am4LayoutFor, resolveLayoutPages, type DeviceLayout, type SelectorValues } from '../../src/devices.js';
@@ -100,8 +103,10 @@ const checks: Array<{ name: string; ok: () => boolean }> = [
     return !!analog && !!dyn && analog.variantName !== dyn.variantName && analog.pages.length >= 1 && dyn.pages.length >= 1; } },
 
   // ── AM4 layout presence (first-time) — block-name → family mapping ──
-  { name: "AM4 'amp' → DISTORT layout (editorName 'Global')", ok: () => {
-    const l = am4LayoutFor('amp'); return l?.family === 'DISTORT' && l.editorName === 'Global'; } },
+  // the codec files the AM4 device-global setup pages under their own GLOBAL family (WP-F7a generator fix), so the
+  // amp block's layout is the amp editor's own component
+  { name: "AM4 'amp' → DISTORT layout (editorName 'Amp')", ok: () => {
+    const l = am4LayoutFor('amp'); return l?.family === 'DISTORT' && l.editorName === 'Amp'; } },
   { name: "AM4 'reverb' → REVERB layout", ok: () => am4LayoutFor('reverb')?.family === 'REVERB' },
   { name: "AM4 'drive' → FUZZ layout", ok: () => am4LayoutFor('drive')?.family === 'FUZZ' },
   { name: "AM4 'volpan' → VOLUME layout", ok: () => am4LayoutFor('volpan')?.family === 'VOLUME' },
@@ -209,12 +214,23 @@ const checks: Array<{ name: string; ok: () => boolean }> = [
     ];
     const out = resolveLayoutPages(pages);
     return out.length === 1 && out[0]!.fw === undefined; } },
-  { name: 'fw rule: only lt-only siblings → newest reaches the highest lt bound', ok: () => {
+  { name: 'fw rule: lt-only siblings never apply to the newest firmware; a connected firmware gets the one whose gate holds', ok: () => {
+    // the newest firmware (no firmware known) is past every `lt` bound: neither sibling applies, the tab is not served
+    // (it used to serve the highest `lt` one, an editor page of an older firmware)
     const pages: EditorLayoutPage[] = [
       { name: 'X', rows: [], fw: { lt: '6,00' } }, { name: 'X', rows: [], fw: { lt: '12,00' } },
     ];
-    const out = resolveLayoutPages(pages);
-    return out.length === 1 && out[0]!.fw?.lt === '12,00'; } },
+    const at = (major: number, minor = 0) => resolveLayoutPages(pages, undefined, undefined, { major, minor }).map((p) => p.fw?.lt).join(',');
+    return resolveLayoutPages(pages).length === 0 && at(5) === '6,00' && at(8) === '12,00' && at(11, 99) === '12,00' && at(12) === ''; } },
+  { name: 'fw rule (connected firmware): a gtet page above it is hidden, the ungated sibling serves; at the bound the gtet page wins', ok: () => {
+    const pages: EditorLayoutPage[] = [{ name: 'X', rows: [], fw: { gtet: '10,00' } }, { name: 'X', rows: [] }];
+    const at = (major: number) => resolveLayoutPages(pages, undefined, undefined, { major, minor: 0 });
+    const old = at(9); const cur = at(10);
+    return old.length === 1 && old[0]!.fw === undefined && cur.length === 1 && cur[0]!.fw?.gtet === '10,00'; } },
+  { name: 'fw rule (connected firmware): a lone page whose gate does not hold is dropped, minors compare as written (9.02 = "9,02")', ok: () => {
+    const pages: EditorLayoutPage[] = [{ name: 'A', rows: [], fw: { lt: '9,02' } }, { name: 'B', rows: [], fw: { gtet: '9,02' } }];
+    const names = (minor: number) => resolveLayoutPages(pages, undefined, undefined, { major: 9, minor }).map((p) => p.name).join(',');
+    return names(1) === 'A' && names(2) === 'B' && resolveLayoutPages(pages).map((p) => p.name).join(',') === 'B'; } },
 
   // ── page filtering: per-control firmware pruning (lt-bounded controls hidden on newest firmware) ──
   { name: 'control fw pruning: lt-bounded controls are dropped, gtet/ungated kept', ok: () => {
@@ -226,7 +242,75 @@ const checks: Array<{ name: string; ok: () => boolean }> = [
     ] }] }];
     const out = resolveLayoutPages(pages);
     const labels = out[0]!.rows[0]!.controls.map((c) => c.label);
-    return labels.length === 2 && labels.join(',') === 'keep-plain,keep-gtet'; } },
+    // on a connected firmware every control whose gate holds is shown: 5.x hides the gtet ones, 8.x shows the range
+    const at = (major: number) => resolveLayoutPages(pages, undefined, undefined, { major, minor: 0 })[0]!.rows[0]!.controls.map((c) => c.label).join(',');
+    return labels.length === 2 && labels.join(',') === 'keep-plain,keep-gtet'
+      && at(5) === 'keep-plain,drop-lt' && at(8) === 'keep-plain,keep-gtet,drop-lt,drop-range' && at(10) === 'keep-plain,keep-gtet'; } },
+
+  // ── firmware gates on the real layouts (M3 P3): legacy pages / variants are not served on the newest firmware ──
+  { name: 'FM3 FLANGER: the legacy `lt 1,2` pages are not served on the newest firmware, a 1.0 unit gets them', ok: () => {
+    const newest = fm3.layoutFor('FLANGER')!.pages.map((p) => p.name).join(',');
+    const old = fm3.layoutFor('FLANGER', undefined, undefined, { major: 1, minor: 0 })!.pages.map((p) => p.name);
+    return newest === 'Basic,Expert 1,Expert 2' && old.includes('Flanger') && old.includes('Tone') && !old.includes('Basic'); } },
+  { name: 'TREMOLO types 0/2/4: their legacy variant (all pages `lt 8,00`) yields to the default variant on newer firmware', ok: () => {
+    const sel = (t: number): SelectorValues => (n) => (n === 'TREMOLO_TYPE' ? t : undefined);
+    for (const [p, bound] of [[fm3, 8], [fm9, 6], [axe3, 23]] as const) {
+      for (const t of [0, 2, 4]) {
+        const cur = p.layoutFor('TREMOLO', t, sel(t));
+        const old = p.layoutFor('TREMOLO', t, sel(t), { major: bound - 1, minor: 0 });
+        if (cur?.variantName !== 'Default' || cur.pages.length !== 1 || cur.pages[0]!.fw?.gtet === undefined) return false;
+        if (old?.variantName !== '0,2,4' || old.pages.length !== 1 || old.pages[0]!.fw?.lt === undefined) return false;
+      }
+      if (p.layoutFor('TREMOLO', 1, sel(1))?.variantName !== '1') return false; // the Panner keeps its own variant
+    }
+    return true; } },
+  { name: 'MULTITAP: the current-firmware variant of a type wins over its legacy twin (FM3 gtet 9,02, FM9 8,02, III 27,02); an older unit gets the legacy one', ok: () => {
+    for (const [p, maj, min] of [[fm3, 9, 2], [fm9, 8, 2], [axe3, 27, 2]] as const) {
+      for (let t = 0; t <= 5; t++) {
+        const cur = p.layoutFor('MULTITAP', t);
+        const old = p.layoutFor('MULTITAP', t, undefined, { major: maj, minor: min - 1 });
+        const atBound = p.layoutFor('MULTITAP', t, undefined, { major: maj, minor: min });
+        if (cur?.variantValue !== String(t) || cur.fw?.gtet === undefined || cur.pages[0]?.name !== 'Master') return false;
+        if (old?.variantValue !== String(t) || old.fw?.lt === undefined) return false;
+        if (atBound?.variantName !== cur.variantName) return false;
+      }
+    }
+    return true; } },
+  { name: 'DELAY: its variants are keyed by DELAY_TYPE (the routing type), not the model selector DELAY_MODEL', ok: () => {
+    // the Delay's model 20 with routing type 4 (whose variant has the Tone/Duck page) gets variant '4'; an unknown
+    // routing type gets the default variant; a caller without a selector lookup keys by the type value it passes
+    for (const p of [fm3, fm9, axe3]) {
+      const sel = (type: number | undefined): SelectorValues => (n) => (n === 'DELAY_TYPE' ? type : n === 'DELAY_MODEL' ? 20 : undefined);
+      const four = p.layoutFor('DELAY', 20, sel(4));
+      if (four?.family !== 'DELAY' || four.editorName !== 'Delay' || four.variantName !== '4') return false;
+      if (p === fm3 && !four.pages.some((pg) => pg.name === 'Tone/Duck')) return false;
+      if (p.layoutFor('DELAY', 2, sel(undefined))?.variantName !== 'Default') return false;
+      if (p.layoutFor('DELAY', 3)?.variantName !== '3') return false;
+    }
+    return true; } },
+  { name: 'every gen-3 family and type value: a non-empty layout whose pages and controls all apply to the firmware it was resolved for', ok: () => {
+    const holds = (g: { gtet?: string; lt?: string } | undefined, fw: number) => {
+      const b = (v?: string) => { const [a = 0, c = 0] = (v ?? '').split(',').map((x) => Number(x.trim()) || 0); return a * 1000 + c; };
+      return !g || ((g.gtet == null || fw >= b(g.gtet)) && (g.lt == null || fw < b(g.lt)));
+    };
+    for (const p of [fm3, fm9, axe3]) {
+      for (const fam of Object.keys(p.editorLayouts!)) {
+        for (const fw of [undefined, { major: 4, minor: 0 }, { major: 13, minor: 0 }]) {
+          const level = fw ? fw.major * 1000 + fw.minor : Number.POSITIVE_INFINITY;
+          for (let t = 0; t < 40; t++) {
+            const l = p.layoutFor(fam, t, (n) => (n.endsWith('_TYPE') || n.endsWith('_MODE') ? t % 4 : undefined), fw);
+            if (!l || l.pages.length === 0) return false;
+            // a variant picked on the newest firmware (nothing of the family exists on that firmware) is resolved there
+            const at = holds(l.fw, level) && l.pages.every((pg) => holds(pg.fw, level)) ? level : Number.POSITIVE_INFINITY;
+            for (const pg of l.pages) {
+              if (!holds(pg.fw, at)) return false;
+              for (const r of pg.rows) for (const c of r.controls) if (!holds(c.fw, at)) return false;
+            }
+          }
+        }
+      }
+    }
+    return true; } },
 ];
 
 // ── served variants: which layout variant a block answers with, from the values it reads ──
@@ -234,16 +318,16 @@ const checks: Array<{ name: string; ok: () => boolean }> = [
 // layout); one without picks it by its variant selector: the cab by CABINET_MODE (Legacy / DynaCab), the plex by
 // PLEX_BASETYPE. The cab used to follow its preamp type (CABINET_PRETYPE, a param that merely ends in TYPE), so
 // a cab on DynaCab could get the Legacy pages and the other way round.
-const SERVED_VARIANT_CASES = 4;
+const SERVED_VARIANT_CASES = 6;
 
 async function servedVariantChecks(): Promise<void> {
   for (const profile of [fm3, fm9, axe3]) {
-    const served = async (slug: string, set: Record<string, number>) => {
+    const served = async (slug: string, set: Record<string, number>, firmware?: { major: number; minor: number }) => {
       const family = SLUG_FAMILY[slug]!;
       const eid = eidOfSlug(slug);
       const values = new Array<number>(profile.rangeSections[family]!.stride * 4).fill(0);
       for (const [name, v] of Object.entries(set)) values[profile.params[family]!.find((p) => p.name === name)!.paramId] = v;
-      const { driver } = mockBlockDevice(profile, { [eid]: { values, channel: 0 } });
+      const { driver } = mockBlockDevice(profile, { [eid]: { values, channel: 0 } }, firmware ? { firmware } : {});
       return [await driver.blockParams(eid), (await driver.blockParams(eid, { generic: true })) as BlockParamsV2DTO] as const;
     };
     // 1. the cab follows CABINET_MODE, in both responses
@@ -270,8 +354,23 @@ async function servedVariantChecks(): Promise<void> {
     for (const r of await served('geq', { GEQ_TYPE: 2 })) {
       if (r.layout?.variantName !== '7 Band') throw new Error(`${profile.key}: GEQ variant for type 2 is ${r.layout?.variantName}`);
     }
+    // 5. the Delay follows its routing type DELAY_TYPE, not its model (DELAY_MODEL is the type selector)
+    for (const [routing, model] of [[4, 1], [1, 4], [7, 0]] as const) {
+      for (const r of await served('delay', { DELAY_TYPE: routing, DELAY_MODEL: model })) {
+        if (r.layout?.family !== 'DELAY' || r.layout.variantName !== String(routing)) throw new Error(`${profile.key}: Delay variant for DELAY_TYPE=${routing} (model ${model}) is ${r.layout?.variantName}`);
+      }
+    }
+    // 6. the driver evaluates the firmware gates against the firmware its context reports: a Tremolo of type 0 is
+    //    served the legacy variant by a unit older than the gate, the default variant by a current one and by a
+    //    driver that does not know the firmware
+    const bound = { fm3: 8, fm9: 6, axe3: 23 }[profile.key]!;
+    for (const [fw, want] of [[{ major: bound - 1, minor: 0 }, '0,2,4'], [{ major: bound, minor: 0 }, 'Default'], [undefined, 'Default']] as const) {
+      for (const r of await served('tremolo', { TREMOLO_TYPE: 0 }, fw)) {
+        if (r.layout?.variantName !== want) throw new Error(`${profile.key}: Tremolo type 0 on firmware ${fw ? `${fw.major}.${fw.minor}` : 'unknown'} is ${r.layout?.variantName}, expected ${want}`);
+      }
+    }
   }
-  console.log('  drivers/layouts: served variants — cab by CABINET_MODE (not the preamp type), plex by PLEX_BASETYPE, GEQ by its type; classic and generic, FM3/FM9/III');
+  console.log('  drivers/layouts: served variants — cab by CABINET_MODE (not the preamp type), plex by PLEX_BASETYPE, GEQ by its type, Delay by DELAY_TYPE (not its model), firmware gates on the firmware the driver reports; classic and generic, FM3/FM9/III');
 }
 
 export const LAYOUTS_CASE_COUNT = checks.length + SERVED_VARIANT_CASES;

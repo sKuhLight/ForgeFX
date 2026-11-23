@@ -18,19 +18,51 @@
  * family's editor page that addresses a different family), and flag the ones the write guard would
  * refuse; `--probe FAMILY:pid` shows one row and the guard's verdict for it.
  *
+ * DOCUMENT TOOLS (offline, need --profile; the bundled catalog and the given files only, no network, no device),
+ * each through the very server function the running server uses:
+ *   --rederive       re-derive the document from its raw sources (`rederiveProfileDoc`, the re-derivation of a stored
+ *                    profile) and compare the result with the stored derived tables, per family; a format-1 document
+ *                    has no raw sources (`no-raw`, not a finding)
+ *   --diff           the definitions diff of the document against the bundled catalog, built by the pure builder of
+ *                    `GET /device/definitions/diff` (`definitionsDiff`) as if the unit ran the document's firmware
+ *   --merge <file2>  merge the raw sources of a second document into this one the way an import / build / pull merges
+ *                    into a stored profile (`mergeSourcesIntoStored`), report the merged document and run the offline
+ *                    invariants on it
+ *   --blocks         the document's block map (state per `blockMapState`), its unassigned sections (`section:<tag>` /
+ *                    `block:<eid>`) and the effect ids it knows that map nowhere; on an Axe-Fx III also the
+ *                    roster-only ids of the static effect-id table
+ *   `--eid` names placed effect ids for --diff and --blocks offline.
+ *
  * Exit code: 0 all invariants hold; 1 an invariant failed (a block request the server answered with a status
  * other than 200 counts as one); 2 a usage or input error, a server that cannot be checked (GET /device or
- * /preset/blocks not answered with 200, no generic support), or any request that failed at the transport level
- * (connection refused, timeout, redirect).
+ * /preset/blocks not answered with 200, no generic support), any request that failed at the transport level
+ * (connection refused, timeout, redirect), or a --merge document the merge refuses.
  * Run with --help for the options.
+ *
+ * Tests call `runProfileCheck(argv)` (it never calls process.exit); `main()` only runs when this file is executed.
  */
-import { readFileSync } from 'node:fs';
-import { isInformativeRow, isPlaceholderRow, isSyntheticFamilyKey, paramFingerprint, rowsCompatible, type BuiltCache } from 'forgefx-midi/cache';
+import { readFileSync, realpathSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { format } from 'node:util';
+import {
+  ProfileDerivationError, ProfileUserDataError, isInformativeRow, isPlaceholderRow, isSyntheticFamilyKey, paramFingerprint, rowsCompatible,
+  sourceSummary, type BuiltCache, type ProfileCoverage, type ProfileDoc, type RawSource, type SourceSummary
+} from 'forgefx-midi/cache';
 import { slugForEffectId } from 'forgefx-midi/devices/gen3';
 import { PROFILES, SLUG_FAMILY, runtimeProfileFrom, type DeviceProfile, type RangeDef } from '../src/devices.js';
 import { buildParamIndex, MAX_WIRE_PID, type BlockIndex, type BlockProfileKind } from '../src/drivers/paramIndex.js';
-import { checkProfileSchema } from '../src/profileSchema.js';
+import {
+  checkProfileSchema, hasNewerRaw, profileFormatOf, profileSummaryOf, readableRaw, rederiveProfileDoc, rederiveReasonOf,
+  type ProfileFormat, type ProfileSchemaCheck, type RederiveReason
+} from '../src/profileSchema.js';
 import { compareRows, type RowComparison } from '../src/drivers/profileCompare.js';
+import { definitionsDiff, definitionsDrift } from '../src/drivers/definitionsDiff.js';
+import { blockMapAccess, blockMapState, type BlockMapState } from '../src/drivers/blockMapState.js';
+import type { DefinitionsDiffDTO } from '../src/drivers/types.js';
+import { deviceCacheKey, firmwareOfCacheKey, staticFamilyForEffectId } from '../src/profileCatalog.js';
+import { ProfileMergeRefused, mergeSourcesIntoStored } from '../src/services/profileMerge.js';
+import type { Doc } from '../src/runtime/storeBackend.js';
 
 // ── small utilities ───────────────────────────────────────────────────────────────────────────────
 
@@ -45,7 +77,13 @@ const warnings: Finding[] = [];
 const fail = (code: string, where: string, message: string): void => { failures.push({ code, where, message }); };
 /** Requests that failed at the transport level (the server was never heard): exit code 2, not a finding. */
 const transportErrors: Finding[] = [];
+/** Input the document tools cannot use (a --merge document the merge refuses): exit code 2, not a finding. */
+const inputErrors: Finding[] = [];
 const warn = (code: string, where: string, message: string): void => { warnings.push({ code, where, message }); };
+
+/** Where the report goes: stdout / stderr when executed, a buffer when a test calls `runProfileCheck`. */
+let out: (line: string) => void = (line) => console.log(line);
+let errOut: (...args: unknown[]) => void = (...args) => console.error(...args);
 
 function table(header: string[], rows: string[][], align: ('l' | 'r')[]): string {
   const widths = header.map((h, i) => Math.max(h.length, ...rows.map((r) => (r[i] ?? '').length)));
@@ -61,6 +99,8 @@ Usage
   tsx scripts/profile-check.ts --profile <file> [--model <m>] [--key <k>] [--allow-stale]   offline
   tsx scripts/profile-check.ts --url http://127.0.0.1:<port> [--eid <n,n>] [--profile <file>] online, read-only
   (both can be combined; the profile file is then the comparison profile for the server)
+  tsx scripts/profile-check.ts --profile <file> [--rederive] [--diff] [--merge <file2>] [--blocks] [--eid <n,n>]
+                     offline document tools (they add to the offline check; no network, no device)
 
 Options
   --profile <file>   a store file (deviceCaches.json: a map of cache key -> document), one stored document
@@ -70,9 +110,21 @@ Options
   --allow-stale      check a profile whose schema stamp the server would refuse to use (it would not be applied)
   --url <base>       a running ForgeFX server; only GET requests are sent (/device, /preset/blocks,
                      /preset/blocks/<eid>/params?generic=1, /store/deviceCaches/<key>)
-  --eid <n,n>        extra effect ids to read besides the placed blocks (repeatable), e.g. 1 for the setup block
+  --eid <n,n>        extra effect ids to read besides the placed blocks (repeatable), e.g. 1 for the setup block;
+                     offline: the placed blocks for --diff and --blocks
   --probe FAMILY:pid show the row at that param id and whether the write guard would refuse it (repeatable)
   --list FAMILY      list every param the index serves for that family (repeatable)
+  --rederive         re-derive the document from its raw sources the way the server re-derives a stored profile and
+                     compare the result with the stored derived tables (rows / labels / sections per family, and the
+                     other derived parts); a format-1 document has no raw sources: reported as no-raw
+  --diff             the definitions diff (GET /device/definitions/diff) of the document against the bundled
+                     catalog, from the same builder the route uses, as if the unit ran the document's firmware
+  --merge <file2>    merge the raw sources of a second document (same loader, same model) into this one the way an
+                     import / build / pull merges into a stored profile; report the merged sources, provenance,
+                     conflicts and coverage, and run the offline invariants on the merged document
+  --blocks           the block map (entry state, evidence, candidates), the sections no catalog family took
+                     (section:<tag> / block:<eid>), the effect ids the document knows (and --eid) that map nowhere,
+                     and on an Axe-Fx III the roster-only ids of the static effect-id table
   --json             print one JSON document instead of the tables (diagnostics go to stderr)
   --strict           treat warnings (layout controls that hit an unused slot) as failures
   --timeout <ms>     per-request timeout for --url (default 20000)
@@ -85,17 +137,28 @@ Invariants (a failure makes the exit code 1)
   - no value with unresolved 'channel-unknown' (or 'read-failed') in the served response
   - no family flagged as suspect by the section-assignment cross-check
   - the served response lists the same ids, hidden items and fingerprints as the profile predicts
+  - --rederive: the raw sources derive, and the re-derived tables equal the stored ones (a document the server
+    re-derives on load anyway, e.g. one of an older derivation revision, reports a difference as a warning)
+  - --merge: the merged sources derive, and the invariants above hold for the merged document
+  - --blocks: the block map is consistent (one entry per effect id, a confirmed entry's key has rows, a section it
+    names exists); --diff only reports
 Exit codes
   0  all invariants hold
   1  an invariant failed (a block request the server answered with a status other than 200 counts as one)
   2  usage or input error; the server cannot be checked (GET /device or /preset/blocks not answered with 200,
-     no generic support); or any request failed at the transport level (connection refused, timeout, redirect)`;
+     no generic support); or any request failed at the transport level (connection refused, timeout, redirect);
+     or the --merge document cannot be merged (another model, no raw sources, a source of another firmware, a
+     merge the server would refuse: newer-profile / local-profile-better)`;
 
 interface Args {
   profile?: string; key?: string; model?: number; allowStale: boolean;
   url?: string; eids: number[]; probes: { family: string; pid: number }[]; lists: string[];
   json: boolean; strict: boolean; timeoutMs: number; help: boolean;
+  rederive: boolean; diff: boolean; merge?: string; blocks: boolean;
 }
+
+/** Any of the document tools was asked for (they add sections to the report and the JSON document). */
+const docTools = (a: Args): boolean => a.rederive || a.diff || a.merge !== undefined || a.blocks;
 
 function parseModel(s: string): number {
   const named: Record<string, number> = { iii: 0x10, axe3: 0x10, fm3: 0x11, fm9: 0x12 };
@@ -105,7 +168,7 @@ function parseModel(s: string): number {
 }
 
 function parseArgs(argv: string[]): Args {
-  const a: Args = { allowStale: false, eids: [], probes: [], lists: [], json: false, strict: false, timeoutMs: 20000, help: false };
+  const a: Args = { allowStale: false, eids: [], probes: [], lists: [], json: false, strict: false, timeoutMs: 20000, help: false, rederive: false, diff: false, blocks: false };
   const take = (i: number, flag: string): string => {
     const v = argv[i + 1];
     if (v === undefined || v.startsWith('--')) throw new UsageError(`${flag} needs a value`);
@@ -122,6 +185,10 @@ function parseArgs(argv: string[]): Args {
       case '--key': a.key = take(i++, f); break;
       case '--model': a.model = parseModel(take(i++, f)); break;
       case '--url': a.url = take(i++, f); break;
+      case '--rederive': a.rederive = true; break;
+      case '--diff': a.diff = true; break;
+      case '--merge': a.merge = take(i++, f); break;
+      case '--blocks': a.blocks = true; break;
       case '--timeout': {
         const n = Number(take(i++, f));
         if (!Number.isFinite(n) || n <= 0) throw new UsageError('--timeout needs a positive number of milliseconds');
@@ -147,6 +214,7 @@ function parseArgs(argv: string[]): Args {
     }
   }
   if (!a.help && !a.profile && !a.url) throw new UsageError('give --profile <file> (offline) and/or --url <server> (online); --help lists the options');
+  if (!a.help && !a.profile && docTools(a)) throw new UsageError('--rederive, --diff, --merge and --blocks work on a document: give --profile <file>');
   return a;
 }
 
@@ -209,6 +277,14 @@ function reachableFamilies(p: DeviceProfile): Map<string, number[]> {
     if (fam) (out.get(fam) ?? out.set(fam, []).get(fam)!).push(eid);
   }
   return out;
+}
+
+/** A placed effect id no family describes, the way the gen-3 driver decides it (`unmappedPlacedEffectIds`): not a
+ *  block the applied document's block map confirms, and no family by the audio-block slug, the runtime profile's map
+ *  (block-map overlay included) or the model's static tables. */
+function mapsNowhere(p: DeviceProfile, model: number, eid: number): boolean {
+  if (p.profileFacts?.confirmedBlocks.has(eid)) return false;
+  return (familyOfEid(p, eid) ?? staticFamilyForEffectId(model, eid)) === undefined;
 }
 
 interface GuardVerdict { status: 200 | 400 | 409; reason: string }
@@ -298,7 +374,8 @@ function unservedProfileRows(profile: DeviceProfile, family: string, served: Rea
   return Object.keys(rows).map(Number).filter((pid) => pid <= MAX_WIRE_PID && isInformativeRow(rows[pid]!) && !served.has(pid)).sort((a, b) => a - b);
 }
 
-function analyseFamily(profile: DeviceProfile, family: string, reach: Map<string, number[]>): FamilyReport {
+/** `prefix` labels where a finding is (`''` for the checked document, `'merged '` for the --merge result). */
+function analyseFamily(profile: DeviceProfile, family: string, reach: Map<string, number[]>, prefix = ''): FamilyReport {
   const idx = buildParamIndex(profile, family);
   const hiddenByReason: Record<string, number> = {};
   for (const h of idx.hidden) hiddenByReason[h.reason] = (hiddenByReason[h.reason] ?? 0) + 1;
@@ -326,7 +403,7 @@ function analyseFamily(profile: DeviceProfile, family: string, reach: Map<string
     genericPids: idx.entries.filter((e) => e.generic && !e.isNew).map((e) => e.pid),
     enumInNamed: idx.entries.filter((e) => e.list === 'named' && e.kind === 'enum').map((e) => e.pid),
   };
-  const where = `${family}`;
+  const where = `${prefix}${family}`;
   const unserved = unservedProfileRows(profile, family, new Set([...idx.entries.map((e) => e.pid), ...idx.hidden.map((h) => h.id)]));
   if (unserved.length) fail('profile-row-not-served', where, `informative profile rows neither listed nor hidden: pid ${unserved.slice(0, 12).join(', ')}${unserved.length > 12 ? ' ...' : ''}`);
   if (rep.shown + rep.hidden !== rep.rows) fail('count-mismatch', where, `listed ${rep.shown} + hidden ${rep.hidden} = ${rep.shown + rep.hidden}, the profile has ${rep.rows} informative rows`);
@@ -410,8 +487,8 @@ function layoutReport(profile: DeviceProfile, reach: Map<string, number[]>, wher
 function printLayoutReport(rep: LayoutReport): void {
   const groups = new Map<string, LayoutRef[]>();
   for (const r of rep.cross) (groups.get(`${r.from} -> ${r.to}`) ?? groups.set(`${r.from} -> ${r.to}`, []).get(`${r.from} -> ${r.to}`)!).push(r);
-  console.log('\nLayout controls that write another block\'s param (cross-block):');
-  if (groups.size === 0) console.log('  none');
+  out('\nLayout controls that write another block\'s param (cross-block):');
+  if (groups.size === 0) out('  none');
   const rows: string[][] = [];
   for (const [k, list] of groups) {
     const hits = list.filter((r) => r.status === 409);
@@ -419,13 +496,13 @@ function printLayoutReport(rep: LayoutReport): void {
     const noRow = list.filter((r) => r.status === 200 && r.reason.startsWith('no row'));
     rows.push([k, String(list.length), String(list.reduce((n, r) => n + r.controls, 0)), list[0]!.eids.length ? list[0]!.eids.slice(0, 3).join(',') : 'none', String(hits.length), String(pseudo.length), String(noRow.length)]);
   }
-  if (rows.length) console.log(table(['LAYOUT -> TARGET', 'PIDS', 'CONTROLS', 'TARGET EID', 'GUARD 409', 'PSEUDO 400', 'NO ROW'], rows, ['l', 'r', 'r', 'l', 'r', 'r', 'r']));
+  if (rows.length) out(table(['LAYOUT -> TARGET', 'PIDS', 'CONTROLS', 'TARGET EID', 'GUARD 409', 'PSEUDO 400', 'NO ROW'], rows, ['l', 'r', 'r', 'l', 'r', 'r', 'r']));
   const hits = rep.cross.filter((r) => r.status === 409);
-  for (const r of hits) console.log(`  HIT  ${r.from} -> ${r.to} pid ${r.pid} ${r.paramName ?? ''}  [${r.effects.join(',') || '-'}]${r.eids.length ? '' : '  (no effect id)'}`);
-  console.log('  GUARD 409 = would be refused (an unused slot, no catalog param); PSEUDO 400 = id above 0x3FFF; NO ROW = the profile has no row at the id, so the guard lets it pass.');
+  for (const r of hits) out(`  HIT  ${r.from} -> ${r.to} pid ${r.pid} ${r.paramName ?? ''}  [${r.effects.join(',') || '-'}]${r.eids.length ? '' : '  (no effect id)'}`);
+  out('  GUARD 409 = would be refused (an unused slot, no catalog param); PSEUDO 400 = id above 0x3FFF; NO ROW = the profile has no row at the id, so the guard lets it pass.');
   if (rep.ownRefused.length) {
-    console.log('\nOwn-family layout controls the write guard would refuse:');
-    for (const r of rep.ownRefused) console.log(`  HIT  ${r.from} pid ${r.pid} ${r.paramName ?? ''}  (${r.controls} control${r.controls === 1 ? '' : 's'})`);
+    out('\nOwn-family layout controls the write guard would refuse:');
+    for (const r of rep.ownRefused) out(`  HIT  ${r.from} pid ${r.pid} ${r.paramName ?? ''}  (${r.controls} control${r.controls === 1 ? '' : 's'})`);
   }
 }
 
@@ -463,23 +540,23 @@ function probe(profile: DeviceProfile, family: string, pid: number): ProbeReport
 }
 
 function printProbe(p: ProbeReport): void {
-  console.log(`\nprobe ${p.family}:${p.pid}${p.catalogName ? `  (catalog name ${p.catalogName})` : '  (no catalog name)'}`);
-  console.log(`  catalog row    ${p.catalogRow}`);
-  console.log(`  effective row  ${p.effectiveRow}`);
-  if (p.profileRow !== null) console.log(`  profile row    ${p.profileRow}`);
-  console.log(`  served         ${p.served}`);
-  console.log(`  write guard    ${p.guard.status === 200 ? 'allows' : `refuses with ${p.guard.status}`}: ${p.guard.reason}`);
+  out(`\nprobe ${p.family}:${p.pid}${p.catalogName ? `  (catalog name ${p.catalogName})` : '  (no catalog name)'}`);
+  out(`  catalog row    ${p.catalogRow}`);
+  out(`  effective row  ${p.effectiveRow}`);
+  if (p.profileRow !== null) out(`  profile row    ${p.profileRow}`);
+  out(`  served         ${p.served}`);
+  out(`  write guard    ${p.guard.status === 200 ? 'allows' : `refuses with ${p.guard.status}`}: ${p.guard.reason}`);
 }
 
 function listFamily(profile: DeviceProfile, family: string): void {
   const idx = buildParamIndex(profile, family);
-  console.log(`\n${family}: ${idx.entries.length} listed, ${idx.hidden.length} hidden (profile ${idx.profile}${idx.suspect ? ', suspect' : ''})`);
-  console.log(table(
+  out(`\n${family}: ${idx.entries.length} listed, ${idx.hidden.length} hidden (profile ${idx.profile}${idx.suspect ? ', suspect' : ''})`);
+  out(table(
     ['PID', 'NAME', 'LIST', 'KIND', 'WIDGET', 'SRC', 'NAME-SRC', 'CONF', 'FLAGS'],
     idx.entries.map((e) => [String(e.pid), e.name, e.list, e.kind, e.widget, e.source, e.nameSource, e.nameConfidence ?? '-', [e.generic ? 'generic' : '', e.isNew ? 'new' : '', e.write === null ? 'read-only' : ''].filter(Boolean).join(',')]),
     ['r', 'l', 'l', 'l', 'l', 'l', 'l', 'l', 'l'],
   ));
-  if (idx.hidden.length) console.log(`hidden: ${idx.hidden.map((h) => `${h.id}(${h.reason})`).join(' ')}`);
+  if (idx.hidden.length) out(`hidden: ${idx.hidden.map((h) => `${h.id}(${h.reason})`).join(' ')}`);
 }
 
 // ── offline ───────────────────────────────────────────────────────────────────────────────────────
@@ -492,45 +569,55 @@ interface OfflineReport {
   layout: LayoutReport; probes: ProbeReport[];
 }
 
-function runOffline(args: Args): { report: OfflineReport; profile: DeviceProfile } {
+interface OfflineRun { report: OfflineReport; profile: DeviceProfile; loaded: LoadedProfile; model: number }
+
+function runOffline(args: Args): OfflineRun {
   const loaded = loadProfileFile(args.profile!, args.key, args.model);
   const model = modelOf(loaded, args.model);
-  const staticProfile = PROFILES[model]!;
   const check = checkProfileSchema(loaded.built);
   if (!check.usable && !args.allowStale) {
     throw new UsageError(`the profile's schema is stale (${check.reason}: stored ${check.schema ?? 'none'}, this build writes ${check.current}), so the server would not apply it. Re-run with --allow-stale to look at it anyway`);
   }
-  const profile = runtimeProfileFrom(loaded.built, staticProfile);
+  const { report, profile } = offlineReportOf(loaded.built, { file: args.profile!, key: loaded.key, shape: loaded.shape }, model, check, args.probes, '');
+  return { report, profile, loaded, model };
+}
+
+/** The offline check of one document (the --profile document, or the --merge result with `prefix` 'merged '). */
+function offlineReportOf(
+  built: BuiltCache, origin: { file: string; key: string | null; shape: string }, model: number, check: ProfileSchemaCheck,
+  probes: Args['probes'], prefix: string
+): { report: OfflineReport; profile: DeviceProfile } {
+  const staticProfile = PROFILES[model]!;
+  const profile = runtimeProfileFrom(built, staticProfile);
   const facts = profile.profileFacts!;
   const reach = reachableFamilies(profile);
 
   const families = familiesOf(profile)
-    .map((f) => analyseFamily(profile, f, reach))
+    .map((f) => analyseFamily(profile, f, reach, prefix))
     .filter((r) => r.rows > 0 || r.shown > 0 || r.hidden > 0);
   const reachable = families.filter((r) => r.reachable);
   const unreachable = families.filter((r) => !r.reachable);
   for (const f of facts.suspectFamilies) {
-    if (!families.some((r) => r.family === f && r.suspect)) fail('suspect-family', f, 'the section-assignment cross-check flagged this family');
+    if (!families.some((r) => r.family === f && r.suspect)) fail('suspect-family', `${prefix}${f}`, 'the section-assignment cross-check flagged this family');
   }
-  const layout = layoutReport(profile, reach, `model 0x${hex(model)}`);
+  const layout = layoutReport(profile, reach, `${prefix}model 0x${hex(model)}`);
   const report: OfflineReport = {
-    file: args.profile!, key: loaded.key, shape: loaded.shape, model: `0x${hex(model)} ${staticProfile.name}`,
+    file: origin.file, key: origin.key, shape: origin.shape, model: `0x${hex(model)} ${staticProfile.name}`,
     source: facts.source, byteExact: facts.byteExact, firmware: facts.firmware, catalogFirmware: staticProfile.catalogFirmware,
     schema: { stored: check.schema, current: check.current, usable: check.usable, ...(check.usable ? {} : { reason: check.reason }) },
-    recordCount: typeof loaded.built.meta?.recordCount === 'number' ? loaded.built.meta.recordCount : null,
+    recordCount: typeof built.meta?.recordCount === 'number' ? built.meta.recordCount : null,
     suspectFamilies: [...facts.suspectFamilies],
     families, totals: sumUp(reachable), unreachable: sumUp(unreachable),
-    rowComparison: compareRows(loaded.built, staticProfile, facts.suspectFamilies, facts.isByteExactFamily),
-    layout, probes: args.probes.map((p) => probe(profile, p.family, p.pid)),
+    rowComparison: compareRows(built, staticProfile, facts.suspectFamilies, facts.isByteExactFamily),
+    layout, probes: probes.map((p) => probe(profile, p.family, p.pid)),
   };
   return { report, profile };
 }
 
-function printOffline(r: OfflineReport, profile: DeviceProfile, args: Args): void {
-  console.log(`Offline check of ${r.file}${r.key ? `  [key ${r.key}]` : ''}`);
-  console.log(`  device ${r.model}; profile source ${r.source} (${r.byteExact ? 'byte-exact' : 'live walk'}); firmware ${r.firmware ?? 'not stated'}; bundled catalog firmware ${r.catalogFirmware ?? 'not settled'}`);
-  console.log(`  schema ${r.schema.stored ?? 'none'} (this build ${r.schema.current})${r.schema.usable ? '' : `  STALE (${r.schema.reason}): the server would not apply it; checked because of --allow-stale`}${r.recordCount !== null ? `; ${r.recordCount} records` : ''}`);
-  console.log(`  suspect families: ${r.suspectFamilies.length ? r.suspectFamilies.join(', ') : 'none'}\n`);
+/** The per-family table (reachable families + total, then the families no effect id reaches), every line after
+ *  `indent` (none for the checked document, so its report stays as it always was). */
+function printFamilyTable(r: OfflineReport, indent = ''): void {
+  const emit = (text: string): void => out(indent ? text.split('\n').map((l) => (l ? indent + l : l)).join('\n') : text);
   const flag = (f: FamilyReport) => [f.suspect ? 'SUSPECT' : '', f.reachable ? '' : 'no-eid', f.positional === false ? 'non-positional' : ''].filter(Boolean).join(' ');
   const row = (f: FamilyReport) => [
     f.family, f.eids[0] !== undefined ? String(f.eids[0]) : '-', f.profile, String(f.rows), String(f.shown), String(f.named), String(f.enums),
@@ -542,23 +629,591 @@ function printOffline(r: OfflineReport, profile: DeviceProfile, args: Args): voi
   const totalRow = (label: string, t: Totals) => [label, '', '', String(t.rows), String(t.shown), String(t.named), String(t.enums), String(t.hidden), String(t.removed), String(t.generic), String(t.isNew), String(t.high), String(t.medium), String(t.low), ''];
   const reachable = r.families.filter((f) => f.reachable);
   const unreachable = r.families.filter((f) => !f.reachable);
-  console.log(table(header, [...reachable.map(row), totalRow('TOTAL (blocks)', r.totals)], align));
+  emit(table(header, [...reachable.map(row), totalRow('TOTAL (blocks)', r.totals)], align));
   if (unreachable.length) {
-    console.log('\nFamilies no effect id reaches (the generic response cannot serve them; not in the total):');
-    console.log(table(header, [...unreachable.map(row), totalRow('subtotal', r.unreachable)], align));
+    emit('\nFamilies no effect id reaches (the generic response cannot serve them; not in the total):');
+    emit(table(header, [...unreachable.map(row), totalRow('subtotal', r.unreachable)], align));
   }
-  console.log('\nROWS = informative rows (pid <= 0x3FFF) of the family counted from the profile itself; SHOWN + HIDDEN must equal ROWS.');
-  console.log('HIDDEN = bypass / type / by-design rows; REMOVED = catalog rows a byte-exact profile no longer has (not rows of the profile).');
-  console.log('HIGH / MED / LOW = nameConfidence of every named row, the hidden type / bypass rows included (generic params carry none; --json has the listed-only counts).');
+}
+
+function printOffline(r: OfflineReport, profile: DeviceProfile, args: Args): void {
+  out(`Offline check of ${r.file}${r.key ? `  [key ${r.key}]` : ''}`);
+  out(`  device ${r.model}; profile source ${r.source} (${r.byteExact ? 'byte-exact' : 'live walk'}); firmware ${r.firmware ?? 'not stated'}; bundled catalog firmware ${r.catalogFirmware ?? 'not settled'}`);
+  out(`  schema ${r.schema.stored ?? 'none'} (this build ${r.schema.current})${r.schema.usable ? '' : `  STALE (${r.schema.reason}): the server would not apply it; checked because of --allow-stale`}${r.recordCount !== null ? `; ${r.recordCount} records` : ''}`);
+  out(`  suspect families: ${r.suspectFamilies.length ? r.suspectFamilies.join(', ') : 'none'}\n`);
+  printFamilyTable(r);
+  const reachable = r.families.filter((f) => f.reachable);
+  out('\nROWS = informative rows (pid <= 0x3FFF) of the family counted from the profile itself; SHOWN + HIDDEN must equal ROWS.');
+  out('HIDDEN = bypass / type / by-design rows; REMOVED = catalog rows a byte-exact profile no longer has (not rows of the profile).');
+  out('HIGH / MED / LOW = nameConfidence of every named row, the hidden type / bypass rows included (generic params carry none; --json has the listed-only counts).');
   const nw = reachable.filter((f) => f.newPids.length).map((f) => `${f.family} ${f.newPids.join(',')}`);
   const gn = reachable.filter((f) => f.genericPids.length).map((f) => `${f.family} x${f.genericPids.length}`);
-  console.log(`new params (no informative catalog row): ${nw.length ? nw.join('; ') : 'none'}`);
-  console.log(`generic params the catalog has rows for but no name: ${gn.length ? gn.join('; ') : 'none'}`);
+  out(`new params (no informative catalog row): ${nw.length ? nw.join('; ') : 'none'}`);
+  out(`generic params the catalog has rows for but no name: ${gn.length ? gn.join('; ') : 'none'}`);
   const c = r.rowComparison;
-  console.log(`\nRow-by-row against the bundled catalog (all families, hidden rows included, before any naming rule): ${c.exact} exact, ${c.compatible} compatible, ${c.incompatible} incompatible, ${c.newRows} new${c.removed !== null ? `, ${c.removed} removed` : ''}${c.skippedFamilies.length ? `; skipped suspect ${c.skippedFamilies.join(', ')}` : ''}`);
+  out(`\nRow-by-row against the bundled catalog (all families, hidden rows included, before any naming rule): ${c.exact} exact, ${c.compatible} compatible, ${c.incompatible} incompatible, ${c.newRows} new${c.removed !== null ? `, ${c.removed} removed` : ''}${c.skippedFamilies.length ? `; skipped suspect ${c.skippedFamilies.join(', ')}` : ''}`);
   printLayoutReport(r.layout);
   for (const p of r.probes) printProbe(p);
   for (const f of args.lists) listFamily(profile, f);
+}
+
+// ── document tools: shared ────────────────────────────────────────────────────────────────────────
+
+/** JSON text of `v` with every object's keys in sorted order: two values are equal as stored JSON exactly when these
+ *  texts are (an in-memory `undefined` property is dropped the way a JSON write drops it). */
+function canon(v: unknown): string {
+  const json = JSON.stringify(v);
+  if (json === undefined) return 'undefined';
+  const sortKeys = (x: unknown): unknown => {
+    if (Array.isArray(x)) return x.map(sortKeys);
+    if (isObj(x)) return Object.fromEntries(Object.keys(x).sort().map((k) => [k, sortKeys(x[k])]));
+    return x;
+  };
+  return JSON.stringify(sortKeys(JSON.parse(json)));
+}
+
+const byNum = (a: number, b: number) => a - b;
+const errMsg = (e: unknown): string => (e instanceof Error ? e.message : String(e));
+const list = (xs: readonly (string | number)[], max = 12): string => (xs.length === 0 ? 'none' : `${xs.slice(0, max).join(', ')}${xs.length > max ? ` ... (+${xs.length - max})` : ''}`);
+
+/** One summary line per raw source of a format-2 document (empty when the envelope is malformed). */
+function sourceSummariesOf(built: BuiltCache): SourceSummary[] {
+  const raw = (built as unknown as { raw?: { sources?: unknown } }).raw;
+  if (!isObj(raw) || !Array.isArray(raw.sources)) return [];
+  try { return (raw.sources as RawSource[]).map((s) => sourceSummary(s)); } catch { return []; }
+}
+
+const sourceTable = (sources: readonly SourceSummary[]): string =>
+  table(['ID', 'KIND', 'ORIGIN', 'CAPTURED', 'FIRMWARE', 'RECORDS'],
+    sources.map((s) => [s.id, s.kind, s.origin, s.capturedAt ?? '-', s.firmware ?? '-', String(s.records)]), ['l', 'l', 'l', 'l', 'l', 'r']);
+
+/** The document key the tools address the document by: the loaded key, else the model's key of the document's
+ *  firmware (`<model-hex>_<major>p<minor>`), else none. */
+function documentKey(loaded: LoadedProfile, model: number): string | null {
+  if (loaded.key) return loaded.key;
+  const fw = typeof loaded.built.firmware === 'string' ? /^(\d+)\.(\d+)$/.exec(loaded.built.firmware) : null;
+  return fw ? deviceCacheKey(model, Number(fw[1]), Number(fw[2])) : null;
+}
+
+// ── --rederive ────────────────────────────────────────────────────────────────────────────────────
+
+/** The difference of one family key (a catalog family or a synthetic `section:` / `block:` key) between the stored
+ *  and the re-derived tables. `added` = only in the re-derived tables, `removed` = only in the stored ones. */
+interface FamilyTableDiff {
+  family: string;
+  rows: { stored: number; rederived: number; added: number[]; removed: number[]; changed: number[] };
+  labels: { added: number[]; removed: number[]; changed: number[] };
+  section: { stored: unknown; rederived: unknown } | null;
+}
+
+interface RederiveReport {
+  /** equal / mismatch: re-derived and compared; no-raw: a format-1 document; unreadable-raw: a raw envelope this build
+   *  cannot read (a newer build's, or malformed); failed: the derivation threw (`message`). */
+  status: 'equal' | 'mismatch' | 'no-raw' | 'unreadable-raw' | 'failed';
+  format: ProfileFormat;
+  /** What loading the stored document would do (`rederiveReasonOf`): null = the server uses the stored tables as they
+   *  are; otherwise it re-derives them on load (and a difference is expected, reported as a warning). */
+  onLoad: RederiveReason | null;
+  message: string;
+  sources: SourceSummary[];
+  /** The derivation stamps of the stored and the re-derived document (not compared). */
+  stamps: Record<'schema' | 'derivedRevision' | 'derivedWith', { stored: unknown; rederived: unknown }> | null;
+  families: { compared: number; differing: number };
+  differences: FamilyTableDiff[];
+  /** The other derived parts of the document and whether they are equal (`keys`: the keys of a map that differ). */
+  parts: Array<{ part: string; equal: boolean; keys?: string[] }>;
+}
+
+/** Keys of two maps whose values differ: only in `after`, only in `before`, in both but not equal. */
+function keyedDiff(before: unknown, after: unknown): { added: string[]; removed: string[]; changed: string[] } {
+  const a = isObj(before) ? before : {};
+  const b = isObj(after) ? after : {};
+  const added: string[] = [];
+  const removed: string[] = [];
+  const changed: string[] = [];
+  for (const k of new Set([...Object.keys(a), ...Object.keys(b)])) {
+    if (a[k] === undefined) added.push(k);
+    else if (b[k] === undefined) removed.push(k);
+    else if (canon(a[k]) !== canon(b[k])) changed.push(k);
+  }
+  return { added, removed, changed };
+}
+const pids = (ks: string[]): number[] => ks.map(Number).sort(byNum);
+
+/** Document-level derived parts compared besides the per-family tables (top-level keys, then `meta` keys). */
+const DERIVED_PARTS = ['rosters', 'cabIrs', 'unmappedSections', 'unmappedFamilies', 'sections', 'blockMap', 'provenance', 'coverage', 'model', 'firmware'] as const;
+const DERIVED_META = ['recordCount', 'source', 'origin', 'walk', 'issues', 'sources'] as const;
+
+function runRederive(built: BuiltCache, model: number): RederiveReport {
+  const format = profileFormatOf(built);
+  const onLoad = rederiveReasonOf(built);
+  const base: RederiveReport = {
+    status: 'no-raw', format, onLoad, message: '', sources: sourceSummariesOf(built), stamps: null,
+    families: { compared: 0, differing: 0 }, differences: [], parts: []
+  };
+  if (format === 1) {
+    return { ...base, message: 'a format-1 document holds derived tables only, no raw sources to re-derive from (import the editor cache or read the definitions from the device to get a format-2 document)' };
+  }
+  if (!readableRaw(built)) {
+    const f = (built as unknown as { raw: { format?: unknown } }).raw.format;
+    return {
+      ...base, status: 'unreadable-raw',
+      message: hasNewerRaw(built)
+        ? `the raw envelope was written by a newer build (raw format ${String(f)}): this build cannot re-derive it`
+        : `the raw envelope is malformed (raw format ${String(f)}): no build can re-derive it`
+    };
+  }
+  const doc = built as unknown as ProfileDoc;
+  const derivedAt = typeof doc.meta?.derivedAt === 'string' ? doc.meta.derivedAt : new Date().toISOString();
+  let re: ProfileDoc;
+  try {
+    re = rederiveProfileDoc(doc, model, derivedAt);
+  } catch (e) {
+    fail('rederive-failed', 'rederive', `the raw sources do not derive: ${errMsg(e)}`);
+    return { ...base, status: 'failed', message: errMsg(e) };
+  }
+  const stored = doc as unknown as Record<string, unknown>;
+  const fresh = re as unknown as Record<string, unknown>;
+  const tableOf = (d: Record<string, unknown>, part: string): Record<string, unknown> => (isObj(d[part]) ? (d[part] as Record<string, unknown>) : {});
+  const keys = new Set<string>();
+  for (const d of [stored, fresh]) for (const part of ['ranges', 'enumOverrides', 'rangeSections']) for (const k of Object.keys(tableOf(d, part))) keys.add(k);
+  const differences: FamilyTableDiff[] = [];
+  for (const family of [...keys].sort()) {
+    const sRows = tableOf(stored, 'ranges')[family];
+    const fRows = tableOf(fresh, 'ranges')[family];
+    const rows = keyedDiff(sRows, fRows);
+    const labels = keyedDiff(tableOf(stored, 'enumOverrides')[family], tableOf(fresh, 'enumOverrides')[family]);
+    const sSec = tableOf(stored, 'rangeSections')[family];
+    const fSec = tableOf(fresh, 'rangeSections')[family];
+    const section = canon(sSec) === canon(fSec) ? null : { stored: sSec ?? null, rederived: fSec ?? null };
+    const rowsDiffer = rows.added.length + rows.removed.length + rows.changed.length > 0 || (sRows === undefined) !== (fRows === undefined);
+    const labelsDiffer = labels.added.length + labels.removed.length + labels.changed.length > 0;
+    if (!rowsDiffer && !labelsDiffer && !section) continue;
+    differences.push({
+      family,
+      rows: { stored: isObj(sRows) ? Object.keys(sRows).length : 0, rederived: isObj(fRows) ? Object.keys(fRows).length : 0, added: pids(rows.added), removed: pids(rows.removed), changed: pids(rows.changed) },
+      labels: { added: pids(labels.added), removed: pids(labels.removed), changed: pids(labels.changed) },
+      section
+    });
+  }
+  const parts: RederiveReport['parts'] = [];
+  for (const part of DERIVED_PARTS) {
+    const equal = canon(stored[part]) === canon(fresh[part]);
+    const entry: RederiveReport['parts'][number] = { part, equal };
+    if (!equal && (part === 'rosters' || part === 'cabIrs')) {
+      const d = keyedDiff(stored[part], fresh[part]);
+      entry.keys = [...d.added, ...d.removed, ...d.changed].sort();
+    }
+    parts.push(entry);
+  }
+  const sMeta = isObj(stored.meta) ? stored.meta : {};
+  const fMeta = isObj(fresh.meta) ? fresh.meta : {};
+  for (const k of DERIVED_META) parts.push({ part: `meta.${k}`, equal: canon(sMeta[k]) === canon(fMeta[k]) });
+  const stamps: RederiveReport['stamps'] = {
+    schema: { stored: sMeta.schema ?? null, rederived: fMeta.schema ?? null },
+    derivedRevision: { stored: sMeta.derivedRevision ?? null, rederived: fMeta.derivedRevision ?? null },
+    derivedWith: { stored: sMeta.derivedWith ?? null, rederived: fMeta.derivedWith ?? null },
+  };
+  const otherDiffs = parts.filter((p) => !p.equal);
+  const status = differences.length === 0 && otherDiffs.length === 0 ? 'equal' : 'mismatch';
+  // a document the server re-derives on load anyway (an older revision, another schema) is expected to differ
+  const note = onLoad ? ` (the server re-derives this document on load: ${onLoad})` : '';
+  const report = onLoad ? warn : fail;
+  for (const d of differences) {
+    const bits = [
+      d.rows.added.length + d.rows.removed.length + d.rows.changed.length > 0 ? `rows +${d.rows.added.length} -${d.rows.removed.length} ~${d.rows.changed.length} (pid ${list([...d.rows.added, ...d.rows.removed, ...d.rows.changed].sort(byNum), 8)})` : '',
+      d.labels.added.length + d.labels.removed.length + d.labels.changed.length > 0 ? `labels +${d.labels.added.length} -${d.labels.removed.length} ~${d.labels.changed.length}` : '',
+      d.section ? 'section meta differs' : '',
+    ].filter(Boolean).join('; ');
+    report('rederive-mismatch', `rederive ${d.family}`, `the re-derived tables differ from the stored ones: ${bits || 'the family is only on one side'}${note}`);
+  }
+  for (const p of otherDiffs) report('rederive-mismatch', 'rederive', `${p.part} differs from the stored document${p.keys?.length ? ` (${list(p.keys, 8)})` : ''}${note}`);
+  return {
+    ...base, status, stamps, differences, parts,
+    families: { compared: keys.size, differing: differences.length },
+    message: status === 'equal'
+      ? `the re-derived tables equal the stored ones (${keys.size} family keys, ${parts.length} other parts compared)`
+      : `${differences.length} of ${keys.size} family keys and ${otherDiffs.length} other part(s) differ`
+  };
+}
+
+function printRederive(r: RederiveReport): void {
+  out(`\nRe-derivation from the raw sources (--rederive): format ${r.format}${r.sources.length ? `, ${r.sources.length} raw source(s)` : ''}`);
+  if (r.format === 2) {
+    out(`  on load: ${r.onLoad ? `the server re-derives this document (${r.onLoad}); the stored tables are not what it applies` : 'the server uses the stored tables as they are'}`);
+  }
+  if (r.sources.length) out(sourceTable(r.sources).split('\n').map((l) => `  ${l}`).join('\n'));
+  const label: Record<RederiveReport['status'], string> = { equal: 'EQUAL', mismatch: 'MISMATCH', 'no-raw': 'NO-RAW', 'unreadable-raw': 'UNREADABLE RAW', failed: 'DERIVATION FAILED' };
+  out(`  result: ${label[r.status]}: ${r.message}`);
+  if (r.stamps) {
+    const s = r.stamps;
+    out(`  stamps (not compared): schema ${String(s.schema.stored)} -> ${String(s.schema.rederived)}, derivation revision ${String(s.derivedRevision.stored)} -> ${String(s.derivedRevision.rederived)}, codec ${String(s.derivedWith.stored)} -> ${String(s.derivedWith.rederived)}`);
+  }
+  if (r.differences.length) {
+    out(table(
+      ['FAMILY', 'ROWS', 'REDERIVED', 'ADDED', 'REMOVED', 'CHANGED', 'LABELS +/-/~', 'SECTION', 'PIDS'],
+      r.differences.map((d) => [
+        d.family, String(d.rows.stored), String(d.rows.rederived), String(d.rows.added.length), String(d.rows.removed.length), String(d.rows.changed.length),
+        `${d.labels.added.length}/${d.labels.removed.length}/${d.labels.changed.length}`, d.section ? 'differs' : '',
+        list([...d.rows.added, ...d.rows.removed, ...d.rows.changed, ...d.labels.added, ...d.labels.removed, ...d.labels.changed].filter((v, i, a) => a.indexOf(v) === i).sort(byNum), 8),
+      ]),
+      ['l', 'r', 'r', 'r', 'r', 'r', 'l', 'l', 'l'],
+    ).split('\n').map((l) => `  ${l}`).join('\n'));
+    out('  ROWS / REDERIVED = row count stored / re-derived; ADDED = only in the re-derived tables, REMOVED = only in the stored ones.');
+  }
+  const other = r.parts.filter((p) => !p.equal);
+  if (r.status === 'mismatch') out(`  other derived parts that differ: ${other.length ? other.map((p) => `${p.part}${p.keys?.length ? ` (${list(p.keys, 6)})` : ''}`).join('; ') : 'none'}`);
+}
+
+// ── --diff ────────────────────────────────────────────────────────────────────────────────────────
+
+interface DiffReport {
+  /** What the builder was given (the document as the applied profile of a unit running its firmware). */
+  input: { key: string; firmware: string | null; state: string; placedEids: number[] | null; unmappedEids: number[] };
+  diff: DefinitionsDiffDTO | null;
+  error?: string;
+}
+
+function runDiff(run: OfflineRun, placed: readonly number[]): DiffReport {
+  const { loaded, model, profile } = run;
+  const built = loaded.built;
+  const staticProfile = PROFILES[model]!;
+  const docFw = typeof built.firmware === 'string' ? built.firmware : null;
+  const key = documentKey(loaded, model) ?? `${hex(model)}_unknown`;
+  const firmware = docFw ?? firmwareOfCacheKey(key);
+  const placedEids = placed.length ? [...new Set(placed)].sort(byNum) : null;
+  const unmappedEids = (placedEids ?? []).filter((eid) => mapsNowhere(profile, model, eid));
+  const summary = profileSummaryOf(built, model);
+  // the same drift rule the registry's capabilities use, for a unit running the document's firmware
+  const state = definitionsDrift({
+    running: firmware, catalogFirmware: staticProfile.catalogFirmware, unmapped: unmappedEids.length > 0, storedStale: false,
+    applied: { firmware: docFw, blocking: !summary.coverage.complete }
+  });
+  const input = { key, firmware, state, placedEids, unmappedEids };
+  try {
+    const r = definitionsDiff({ model, firmware, state, staticProfile, applied: { key, doc: built, profile }, placedEids, unmappedEids });
+    if (!r.ok) throw new Error(`${r.error} ${r.family}`);
+    return { input, diff: r.diff };
+  } catch (e) {
+    fail('diff-failed', 'diff', `the definitions diff builder threw: ${errMsg(e)}`);
+    return { input, diff: null, error: errMsg(e) };
+  }
+}
+
+function printDiff(r: DiffReport): void {
+  out(`\nDefinitions diff against the bundled catalog (--diff; GET /device/definitions/diff with this document applied, the unit running firmware ${r.input.firmware ?? 'unknown'}):`);
+  const d = r.diff;
+  if (!d) { out(`  FAILED: ${r.error ?? 'no diff'}`); return; }
+  out(`  state ${d.state}; catalog firmware ${d.catalogFirmware ?? 'not settled'}; ${d.profile ? `profile ${d.profile.key}, source ${d.profile.source} (${d.profile.byteExact ? 'byte-exact' : 'live walk'}), format ${d.profile.format}, ${d.profile.sources.length} source(s)` : 'no applied profile'}`);
+  if (r.input.placedEids) out(`  placed (--eid): ${r.input.placedEids.join(', ')}; mapping nowhere: ${list(r.input.unmappedEids)}`);
+  const s = d.summary;
+  out(`  summary: ${s.newParams} new, ${s.changed.compatible} compatible + ${s.changed.incompatible} incompatible changed, ${s.removed ?? 'unknown'} removed, ${s.movedNames} moved name(s), ${s.rosterChanges} roster change(s), ${s.enumChanges} label-list change(s), ${s.strideChanges} stride change(s), ${s.newSections} new section(s), ${s.unknownBlocks} unknown block(s)`);
+  out(`  suspects: ${list(s.suspects)}; disagreements: ${list(s.disagreements)}`);
+  if (d.families.length) {
+    out(table(
+      ['FAMILY', 'EID', 'STATUS', 'ADDED', 'CHANGED', 'REMOVED', 'MOVED', 'ENUMS', 'ROSTER', 'STRIDE'],
+      d.families.map((f) => [
+        f.family, f.eid === null ? '-' : String(f.eid), f.status, String(f.params?.added.length ?? 0), String(f.params?.changed.length ?? 0),
+        f.params?.removed === null ? '?' : String(f.params?.removed.length ?? 0), String(f.params?.moved.length ?? 0), String(f.enums?.length ?? 0),
+        f.roster ? `${f.roster.before} -> ${f.roster.after}${f.roster.ordinalShift ? ' shift' : ''}` : '', f.stride ? `${f.stride.before} -> ${f.stride.after}` : '',
+      ]),
+      ['l', 'r', 'l', 'r', 'r', 'r', 'r', 'r', 'l', 'l'],
+    ).split('\n').map((l) => `  ${l}`).join('\n'));
+    out('  REMOVED ? = cannot be told (the family is not byte-exact, or suspect).');
+  } else {
+    out('  families: no family differs from the catalog');
+  }
+  if (d.sections?.length) {
+    out('  sections no catalog family took:');
+    out(table(['TAG', 'KEY', 'ROLE', 'STRIDE', 'INFORMATIVE', 'MAPPED EIDS'],
+      d.sections.map((x) => [String(x.tag), x.key, x.role, String(x.stride), String(x.informative), list(x.mappedEids)]), ['r', 'l', 'l', 'r', 'r', 'l'])
+      .split('\n').map((l) => `    ${l}`).join('\n'));
+  }
+  if (d.blocks?.length) {
+    out('  blocks no catalog family places:');
+    out(table(['EID', 'PLACED', 'STATE', 'KEY', 'SECTION', 'PARAMS'],
+      d.blocks.map((b) => [String(b.eid), b.placed ? 'yes' : 'no', b.state, b.key ?? '-', b.sectionTag === null ? '-' : String(b.sectionTag), String(b.params)]), ['r', 'l', 'l', 'l', 'r', 'r'])
+      .split('\n').map((l) => `    ${l}`).join('\n'));
+  }
+  if (d.instances?.length) out(`  instance-count mismatches: ${d.instances.map((i) => `${i.family} ${i.static} -> ${i.seen}`).join('; ')}`);
+}
+
+// ── --merge ───────────────────────────────────────────────────────────────────────────────────────
+
+interface ProvenanceSummary {
+  /** Per source id: the catalog families and the synthetic keys whose existence facts it provides. */
+  existence: Array<{ source: string; families: number; synthetic: number }>;
+  units: Record<string, number>;
+  tapers: Record<string, number>;
+  conflicts: { entries: number; pids: number; list: Array<{ key: string; count: number; pids: number[]; winner: string; loser: string }> };
+  suspects: Record<string, string[]>;
+}
+
+interface MergeReport {
+  /** The document merged into (`--profile`) and its key / model / firmware the merge ran for. */
+  file: string; key: string; model: string; firmware: string | null;
+  stored: { format: ProfileFormat; sources: SourceSummary[] };
+  incoming: { file: string; key: string | null; format: ProfileFormat; sources: SourceSummary[] };
+  /** merged: a derived document; refused: the input cannot be merged (exit 2); derivation-failed: the sources do not derive. */
+  status: 'merged' | 'refused' | 'derivation-failed';
+  error?: string; message?: string;
+  kept?: number; dropped?: number; replacedLegacy?: boolean;
+  result?: { sources: SourceSummary[]; provenance: ProvenanceSummary | null; coverage: ProfileCoverage | null; check: OfflineReport };
+}
+
+function provenanceSummary(doc: unknown): ProvenanceSummary | null {
+  const p = isObj(doc) ? doc.provenance : undefined;
+  if (!isObj(p)) return null;
+  const counts = new Map<string, { families: number; synthetic: number }>();
+  for (const [key, src] of Object.entries(isObj(p.existence) ? p.existence : {})) {
+    if (typeof src !== 'string') continue;
+    const c = counts.get(src) ?? { families: 0, synthetic: 0 };
+    if (isSyntheticFamilyKey(key)) c.synthetic++; else c.families++;
+    counts.set(src, c);
+  }
+  const conflicts = (Array.isArray(p.conflicts) ? p.conflicts : []).filter(isObj).map((c) => ({
+    key: String(c.key), count: Number(c.count) || 0, pids: Array.isArray(c.pids) ? (c.pids as unknown[]).filter((x): x is number => typeof x === 'number') : [],
+    winner: String(c.winner), loser: String(c.loser)
+  }));
+  const numbers = (o: unknown): Record<string, number> => Object.fromEntries(Object.entries(isObj(o) ? o : {}).filter(([, v]) => typeof v === 'number')) as Record<string, number>;
+  const suspects = Object.fromEntries(Object.entries(isObj(p.suspects) ? p.suspects : {}).filter(([, v]) => Array.isArray(v)).map(([k, v]) => [k, (v as unknown[]).map(String)]));
+  return {
+    existence: [...counts].map(([source, c]) => ({ source, ...c })).sort((a, b) => a.source.localeCompare(b.source)),
+    units: numbers(p.units), tapers: numbers(p.tapers),
+    conflicts: { entries: conflicts.length, pids: conflicts.reduce((n, c) => n + c.count, 0), list: conflicts },
+    suspects
+  };
+}
+
+function runMerge(run: OfflineRun, file2: string): MergeReport {
+  const { loaded, model } = run;
+  const loaded2 = loadProfileFile(file2, undefined, model);
+  let model2 = model;
+  try { model2 = modelOf(loaded2, undefined); } catch { /* the second document states no model: it is taken for the first one's */ }
+  const key = documentKey(loaded, model) ?? `${hex(model)}_unknown`;
+  const docFw = typeof loaded.built.firmware === 'string' ? loaded.built.firmware : null;
+  const firmware = docFw ?? firmwareOfCacheKey(key);
+  const rep: MergeReport = {
+    file: run.report.file, key, model: `0x${hex(model)} ${PROFILES[model]!.name}`, firmware,
+    stored: { format: profileFormatOf(loaded.built), sources: sourceSummariesOf(loaded.built) },
+    incoming: { file: file2, key: loaded2.key, format: profileFormatOf(loaded2.built), sources: sourceSummariesOf(loaded2.built) },
+    status: 'refused'
+  };
+  const refuse = (error: string, message: string): MergeReport => {
+    inputErrors.push({ code: error, where: 'merge', message });
+    return { ...rep, status: 'refused', error, message };
+  };
+  if (model2 !== model) return refuse('model-mismatch', `the --merge document is for model 0x${hex(model2)} (${PROFILES[model2]!.name}), the --profile document for 0x${hex(model)} (${PROFILES[model]!.name})`);
+  const raw2 = readableRaw(loaded2.built);
+  if (!raw2) {
+    if (profileFormatOf(loaded2.built) === 1) return refuse('no-raw', 'the --merge document is a format-1 profile: it holds derived tables only, no raw sources to merge');
+    return refuse('unreadable-raw', hasNewerRaw(loaded2.built) ? 'the --merge document\'s raw sources were written by a newer build: this build cannot read them' : 'the --merge document\'s raw envelope is malformed');
+  }
+  if (raw2.sources.length === 0) return refuse('no-sources', 'the --merge document lists no raw source');
+  // the --profile document stands in for the stored document of its key (the store is read, never written)
+  const storedDoc: Doc = { id: key, collection: 'deviceCaches', data: loaded.built, updatedAt: 0, rev: 1 };
+  const store = { getDoc: (collection: string, id: string): Doc | null => (collection === 'deviceCaches' && id === key ? storedDoc : null) };
+  const now = new Date().toISOString();
+  let merged: ReturnType<typeof mergeSourcesIntoStored>;
+  try {
+    merged = mergeSourcesIntoStored(store, { key, model, firmware, incoming: raw2.sources, now });
+  } catch (e) {
+    if (e instanceof ProfileMergeRefused) return refuse(e.refusal.error, e.refusal.message);
+    if (e instanceof ProfileUserDataError) return refuse('contains-user-data', e.message);
+    if (e instanceof ProfileDerivationError) return refuse(e.code === 'firmware-mismatch' ? 'firmware-differs' : e.code, e.message);
+    fail('merge-derivation-failed', 'merge', `the merged sources do not derive: ${errMsg(e)}`);
+    return { ...rep, status: 'derivation-failed', message: errMsg(e) };
+  }
+  const base = { ...rep, kept: merged.kept, dropped: merged.dropped, replacedLegacy: merged.replacedLegacy };
+  if (merged.derivationFailed !== undefined) {
+    fail('merge-derivation-failed', 'merge', `the stored document is stale and the merged sources still do not derive: ${merged.derivationFailed}`);
+    return { ...base, status: 'derivation-failed', message: merged.derivationFailed };
+  }
+  const doc = merged.doc;
+  const check = offlineReportOf(doc as unknown as BuiltCache, { file: `${run.report.file} + ${file2}`, key, shape: 'merged' }, model, checkProfileSchema(doc), [], 'merged ').report;
+  return {
+    ...base, status: 'merged',
+    result: {
+      sources: Array.isArray(doc.meta?.sources) ? doc.meta.sources : sourceSummariesOf(doc as unknown as BuiltCache),
+      provenance: provenanceSummary(doc),
+      coverage: isObj(doc.coverage) ? doc.coverage : null,
+      check
+    }
+  };
+}
+
+function printMerge(r: MergeReport): void {
+  out(`\nMerge (--merge ${r.incoming.file}) into the document of key ${r.key}: device ${r.model}, firmware ${r.firmware ?? 'unknown'}`);
+  out(`  stored: format ${r.stored.format}, ${r.stored.sources.length} source(s); incoming: format ${r.incoming.format}, ${r.incoming.sources.length} source(s) (origins as the file states them)`);
+  if (r.status === 'refused') { out(`  result: REFUSED [${r.error}]: ${r.message} (exit code 2)`); return; }
+  if (r.status === 'derivation-failed') { out(`  result: DERIVATION FAILED: ${r.message}`); return; }
+  out(`  result: merged; kept ${r.kept} stored source(s), dropped ${r.dropped}${r.replacedLegacy ? '; the stored document had no raw sources (format 1): the merged one holds the incoming sources only' : ''}`);
+  const res = r.result!;
+  out(sourceTable(res.sources).split('\n').map((l) => `  ${l}`).join('\n'));
+  const p = res.provenance;
+  if (p) {
+    out(`  provenance: existence facts per source: ${p.existence.map((e) => `${e.source} ${e.families} famil${e.families === 1 ? 'y' : 'ies'}${e.synthetic ? ` + ${e.synthetic} synthetic` : ''}`).join('; ') || 'none'}`);
+    out(`  conflicts: ${p.conflicts.entries} entr${p.conflicts.entries === 1 ? 'y' : 'ies'}, ${p.conflicts.pids} pid(s)`);
+    if (p.conflicts.entries) {
+      out(table(['KEY', 'WINNER', 'LOSER', 'COUNT', 'PIDS'], p.conflicts.list.slice(0, 20).map((c) => [c.key, c.winner, c.loser, String(c.count), list(c.pids, 8)]), ['l', 'l', 'l', 'r', 'l'])
+        .split('\n').map((l) => `    ${l}`).join('\n'));
+      if (p.conflicts.entries > 20) out(`    ... and ${p.conflicts.entries - 20} more (use --json for all)`);
+    }
+    const sus = Object.entries(p.suspects).filter(([, v]) => v.length);
+    out(`  suspects per source: ${sus.length ? sus.map(([k, v]) => `${k}: ${v.join(', ')}`).join('; ') : 'none'}`);
+  }
+  const c = res.coverage;
+  if (c) {
+    out(`  coverage: ${c.complete ? 'complete' : 'INCOMPLETE (a blocking gap)'}; gaps: ${c.gaps.length ? c.gaps.map((g) => `${g.kind}${g.blocking ? ' (blocking)' : ''}`).join(', ') : 'none'}`);
+    out(`  coverage counts: ${c.units} row(s) with a unit, ${c.tapers} with a taper; high ids ${c.highIds.present}/${c.highIds.expected}; sections ${c.sections.total} (assigned ${c.sections.assigned}, system ${c.sections.system}, new ${c.sections.new}, unclassified ${c.sections.unclassified})${c.instances.length ? `; instance mismatches ${c.instances.map((i) => `${i.family} ${i.static}->${i.seen}`).join(', ')}` : ''}`);
+  }
+  out('  invariants of the merged document (findings are marked \'merged\'):');
+  printFamilyTable(res.check, '  ');
+}
+
+// ── --blocks ──────────────────────────────────────────────────────────────────────────────────────
+
+interface BlockEntryReport {
+  eid: number; key: string | null; confidence: string; state: BlockMapState;
+  serves: boolean; writable: boolean; readOnlyReason?: string;
+  sectionTag: number | null; evidence: string[]; candidates?: number[]; compared?: unknown; channels: boolean | null;
+  /** Rows (and informative rows) the document holds under `key`. */
+  rows: number; informative: number;
+  /** The family the runtime profile resolves the effect id to (null: none). */
+  resolvesTo: string | null;
+}
+interface UnknownSectionReport { key: string; space: string | null; tags: number[]; role: string | null; stride: number | null; rows: number; informative: number; boundBy: number[] }
+interface BlocksReport {
+  format: ProfileFormat;
+  entries: BlockEntryReport[];
+  unknownSections: UnknownSectionReport[];
+  /** Effect ids the document knows (or --eid places) that map nowhere, with where each is known from. */
+  unmapped: Array<{ eid: number; known: string[] }>;
+  /** The static effect-id table's roster-only ids (Axe-Fx III; null for a model without them). */
+  roster: Array<{ eid: number; family: string | null; sectionTag: number | null; state: BlockMapState }> | null;
+}
+
+function runBlocks(run: OfflineRun, placed: readonly number[]): BlocksReport {
+  const { loaded, model, profile } = run;
+  const built = loaded.built as unknown as Record<string, unknown> & BuiltCache;
+  const staticProfile = PROFILES[model]!;
+  const ranges = (isObj(built.ranges) ? built.ranges : {}) as Record<string, Record<string, RangeDef>>;
+  const rowCounts = (key: string | null) => {
+    const rows = key !== null && isObj(ranges[key]) ? ranges[key]! : null;
+    return { rows: rows ? Object.keys(rows).length : 0, informative: rows ? Object.values(rows).filter((r) => isObj(r) && isInformativeRow(r as RangeDef)).length : 0 };
+  };
+  const sections = (Array.isArray(built.sections) ? built.sections : []).filter(isObj);
+  const hasSections = Array.isArray(built.sections);
+
+  // the persisted block map
+  const entries: BlockEntryReport[] = [];
+  const seen = new Set<number>();
+  const map = Array.isArray(built.blockMap) ? (built.blockMap as unknown[]) : [];
+  map.forEach((e, i) => {
+    if (!isObj(e) || !Number.isInteger(e.eid)) { fail('block-map-malformed', 'blocks', `block-map entry ${i} has no integer effect id`); return; }
+    const eid = e.eid as number;
+    const where = `blocks eid ${eid}`;
+    if (seen.has(eid)) { fail('block-map-duplicate', where, 'more than one block-map entry for this effect id (the server uses the first)'); return; }
+    seen.add(eid);
+    const key = typeof e.key === 'string' ? e.key : null;
+    const confidence = typeof e.confidence === 'string' ? e.confidence : String(e.confidence);
+    const evidence = Array.isArray(e.evidence) ? (e.evidence as unknown[]).map(String) : [];
+    const access = blockMapAccess({ confidence, evidence });
+    const counts = rowCounts(key);
+    const sectionTag = Number.isInteger(e.sectionTag) ? (e.sectionTag as number) : null;
+    const rep: BlockEntryReport = {
+      eid, key, confidence, state: access.state, serves: access.serves, writable: access.writable,
+      ...(access.readOnlyReason ? { readOnlyReason: access.readOnlyReason } : {}),
+      sectionTag, evidence,
+      ...(Array.isArray(e.candidates) ? { candidates: (e.candidates as unknown[]).filter((t): t is number => Number.isInteger(t)) } : {}),
+      ...(e.compared !== undefined ? { compared: e.compared } : {}),
+      channels: typeof e.channels === 'boolean' ? e.channels : null,
+      ...counts,
+      resolvesTo: familyOfEid(profile, eid) ?? null,
+    };
+    entries.push(rep);
+    if (confidence === 'confirmed') {
+      if (key === null) fail('block-map-no-rows', where, 'a confirmed entry without a key');
+      else if (counts.informative === 0) fail('block-map-no-rows', where, `a confirmed entry whose key ${key} has ${counts.rows === 0 ? 'no rows' : 'only placeholder rows'} in the document`);
+      if (evidence.includes('device-records') && sectionTag !== null && hasSections && !sections.some((s) => s.space === 'section' && s.tag === sectionTag)) {
+        fail('block-map-no-section', where, `a confirmed entry names editor-cache section ${sectionTag}, which the document does not describe`);
+      }
+      const fixed = staticProfile.familyForEffectId(eid) ?? SLUG_FAMILY[(slugForEffectId(eid) ?? '').toLowerCase()];
+      if (fixed !== undefined && fixed !== key) warn('block-map-shadowed', where, `the static tables place this effect id (${fixed}): the entry is never used`);
+    }
+  });
+
+  // sections no catalog family took: the synthetic keys of the tables and the sections
+  const synthetic = new Set<string>([...Object.keys(ranges), ...sections.map((s) => String(s.key))].filter((k) => isSyntheticFamilyKey(k)));
+  const rangeSections = (isObj(built.rangeSections) ? built.rangeSections : {}) as Record<string, { sectionTag?: number; stride?: number; instanceTags?: number[] }>;
+  const unknownSections: UnknownSectionReport[] = [...synthetic].sort((a, b) => {
+    const [sa, ta] = a.split(':');
+    const [sb, tb] = b.split(':');
+    return sa!.localeCompare(sb!) || Number(ta) - Number(tb);
+  }).map((key) => {
+    const own = sections.filter((s) => s.key === key);
+    const meta = rangeSections[key];
+    const tags = own.length ? own.map((s) => Number(s.tag)) : meta ? (meta.instanceTags ?? (meta.sectionTag !== undefined ? [meta.sectionTag] : [])) : [];
+    return {
+      key, space: own[0] ? String(own[0].space) : key.split(':')[0] ?? null, tags: [...new Set(tags)].sort(byNum),
+      role: own[0] && typeof own[0].role === 'string' ? own[0].role : null,
+      stride: typeof meta?.stride === 'number' ? meta.stride : own[0] && typeof own[0].stride === 'number' ? own[0].stride : null,
+      ...rowCounts(key),
+      boundBy: entries.filter((e) => e.confidence === 'confirmed' && e.key === key).map((e) => e.eid),
+    };
+  });
+
+  // effect ids the document knows (block map, live block sections, live-source records) and the placed ones
+  const known = new Map<number, Set<string>>();
+  const note = (eid: unknown, why: string) => {
+    if (!Number.isInteger(eid) || (eid as number) < 0 || (eid as number) > 255) return;
+    (known.get(eid as number) ?? known.set(eid as number, new Set()).get(eid as number)!).add(why);
+  };
+  for (const e of entries) note(e.eid, 'block-map');
+  for (const s of sections) if (s.space === 'block') note(s.tag, 'block-section');
+  const raw = readableRaw(built);
+  for (const s of raw?.sources ?? []) {
+    if ((s as { space?: unknown }).space !== 'block') continue;
+    for (const r of s.records) note((r as { section?: unknown }).section, 'live-source');
+  }
+  for (const eid of placed) note(eid, 'placed');
+  const unmapped = [...known].filter(([eid]) => mapsNowhere(profile, model, eid)).map(([eid, why]) => ({ eid, known: [...why].sort() })).sort((a, b) => a.eid - b.eid);
+
+  // the static effect-id table's roster-only ids (the Axe-Fx III's)
+  let roster: BlocksReport['roster'] = null;
+  if (staticProfile.blockMapFor) {
+    roster = [];
+    for (let eid = 0; eid <= 255; eid++) {
+      const e = staticProfile.blockMapFor(eid);
+      if (e) roster.push({ eid, family: e.key, sectionTag: e.sectionTag, state: blockMapState(e.confidence) });
+    }
+  }
+  return { format: profileFormatOf(built), entries, unknownSections, unmapped, roster };
+}
+
+function printBlocks(r: BlocksReport): void {
+  out(`\nBlock map (--blocks): ${r.entries.length} persisted entr${r.entries.length === 1 ? 'y' : 'ies'}${r.format === 1 ? ' (a format-1 document has none)' : ''}`);
+  if (r.entries.length) {
+    out(table(
+      ['EID', 'KEY', 'CONFIDENCE', 'STATE', 'ACCESS', 'SECTION', 'EVIDENCE', 'ROWS', 'CANDIDATES', 'RESOLVES TO'],
+      r.entries.map((e) => [
+        String(e.eid), e.key ?? '-', e.confidence, e.state,
+        !e.serves ? 'not served' : e.writable ? 'writable' : `read-only (${e.readOnlyReason ?? '?'})`,
+        e.sectionTag === null ? '-' : String(e.sectionTag), e.evidence.join(',') || '-', `${e.informative}/${e.rows}`,
+        e.candidates ? list(e.candidates, 6) : '-', e.resolvesTo ?? '-',
+      ]),
+      ['r', 'l', 'l', 'l', 'l', 'r', 'l', 'r', 'l', 'l'],
+    ).split('\n').map((l) => `  ${l}`).join('\n'));
+    out('  ROWS = informative / all rows the document holds under the key; RESOLVES TO = the family the runtime profile gives the effect id.');
+  }
+  out(`\nSections no catalog family took (section:<tag> / block:<eid>): ${r.unknownSections.length || 'none'}`);
+  if (r.unknownSections.length) {
+    out(table(['KEY', 'SPACE', 'TAGS', 'ROLE', 'STRIDE', 'ROWS', 'INFORMATIVE', 'BOUND BY'],
+      r.unknownSections.map((s) => [s.key, s.space ?? '-', list(s.tags, 6), s.role ?? '-', s.stride === null ? '-' : String(s.stride), String(s.rows), String(s.informative), list(s.boundBy, 6)]),
+      ['l', 'l', 'l', 'l', 'r', 'r', 'r', 'l']).split('\n').map((l) => `  ${l}`).join('\n'));
+  }
+  out(`\nEffect ids the document knows (or --eid places) that map nowhere: ${r.unmapped.length ? r.unmapped.map((u) => `${u.eid} (${u.known.join(', ')})`).join('; ') : 'none'}`);
+  if (r.roster) out(`Roster-only effect ids of the static effect-id table (served read-only, never written): ${r.roster.length ? r.roster.map((x) => `${x.eid} ${x.family ?? '?'}`).join('; ') : 'none'}`);
 }
 
 // ── online (read-only) ────────────────────────────────────────────────────────────────────────────
@@ -740,20 +1395,20 @@ async function runOnline(args: Args, fileProfile: DeviceProfile | null): Promise
 }
 
 function printOnline(r: OnlineReport, profile: DeviceProfile | null, args: Args): void {
-  console.log(`Online check of ${r.url}  (GET only)`);
-  console.log(`  device ${r.device.model ?? '?'}, firmware ${r.device.firmware ?? '?'}`);
-  console.log(`  capabilities.definitions: ${JSON.stringify(r.definitions)}`);
-  console.log(`  compared against: ${r.comparison.source}${r.comparison.key ? ` (key ${r.comparison.key})` : ''}${r.comparison.note ? `; ${r.comparison.note}` : ''}\n`);
+  out(`Online check of ${r.url}  (GET only)`);
+  out(`  device ${r.device.model ?? '?'}, firmware ${r.device.firmware ?? '?'}`);
+  out(`  capabilities.definitions: ${JSON.stringify(r.definitions)}`);
+  out(`  compared against: ${r.comparison.source}${r.comparison.key ? ` (key ${r.comparison.key})` : ''}${r.comparison.note ? `; ${r.comparison.note}` : ''}\n`);
   const rows = r.blocks.map((b) => [
     String(b.eid), b.block, b.family ?? '-', String(b.listed), String(b.named), String(b.enums), String(b.hidden), String(b.removed),
     b.rows === null ? '-' : String(b.rows), String(b.generic), String(b.isNew),
     Object.entries(b.unresolved).map(([k, n]) => `${k}:${n}`).join(' ') || '-',
     b.status === 'ok' ? 'OK' : b.status === 'unknown-block' ? 'unknown block' : 'FAIL',
   ]);
-  console.log(table(['EID', 'BLOCK', 'FAMILY', 'LISTED', 'NAMED', 'ENUMS', 'HIDDEN', 'REMOVED', 'ROWS', 'GENERIC', 'NEW', 'UNRESOLVED', 'STATUS'], rows,
+  out(table(['EID', 'BLOCK', 'FAMILY', 'LISTED', 'NAMED', 'ENUMS', 'HIDDEN', 'REMOVED', 'ROWS', 'GENERIC', 'NEW', 'UNRESOLVED', 'STATUS'], rows,
     ['r', 'l', 'l', 'r', 'r', 'r', 'r', 'r', 'r', 'r', 'r', 'l', 'l']));
-  for (const b of r.blocks) for (const p of b.problems) console.log(`  eid ${b.eid} ${b.block}: ${p}`);
-  console.log('\nLISTED = named + enums; HIDDEN excludes the reason \'removed\'; LISTED + HIDDEN must equal ROWS (the informative rows of the compared profile).');
+  for (const b of r.blocks) for (const p of b.problems) out(`  eid ${b.eid} ${b.block}: ${p}`);
+  out('\nLISTED = named + enums; HIDDEN excludes the reason \'removed\'; LISTED + HIDDEN must equal ROWS (the informative rows of the compared profile).');
   if (r.layout) printLayoutReport(r.layout);
   for (const p of r.probes) printProbe(p);
   if (profile) for (const f of args.lists) listFamily(profile, f);
@@ -761,47 +1416,124 @@ function printOnline(r: OnlineReport, profile: DeviceProfile | null, args: Args)
 
 // ── main ──────────────────────────────────────────────────────────────────────────────────────────
 
-async function main(): Promise<void> {
-  const args = parseArgs(process.argv.slice(2));
-  if (args.help) { console.log(HELP); return; }
+/** The JSON document `--json` prints (the document tools' sections and `inputErrors` only when a tool was asked for). */
+type ProfileCheckJson = Record<string, unknown>;
 
-  let offline: { report: OfflineReport; profile: DeviceProfile } | null = null;
+/** Run the check for `argv` (the options after the script name) and set the exit code; output goes through `out`. */
+async function main(argv: string[]): Promise<{ exitCode: number; json: ProfileCheckJson | null }> {
+  const args = parseArgs(argv);
+  if (args.help) { out(HELP); return { exitCode: 0, json: null }; }
+
+  let offline: OfflineRun | null = null;
   let online: { report: OnlineReport; profile: DeviceProfile | null } | null = null;
   if (args.profile) offline = runOffline(args);
+  const rederive = offline && args.rederive ? runRederive(offline.loaded.built, offline.model) : null;
+  const diff = offline && args.diff ? runDiff(offline, args.eids) : null;
+  const merge = offline && args.merge !== undefined ? runMerge(offline, args.merge) : null;
+  const blocks = offline && args.blocks ? runBlocks(offline, args.eids) : null;
   if (args.url) online = await runOnline(args, offline?.profile ?? null);
 
   if (args.strict) {
     for (const w of warnings) failures.push({ ...w, code: `${w.code} (strict)` });
   }
+  const tools = docTools(args);
+  let json: ProfileCheckJson | null = null;
   if (args.json) {
-    console.log(JSON.stringify({
-      ok: failures.length === 0 && transportErrors.length === 0,
+    json = {
+      ok: failures.length === 0 && transportErrors.length === 0 && inputErrors.length === 0,
       failures, warnings, transportErrors,
+      ...(tools ? { inputErrors } : {}),
       offline: offline?.report ?? null,
       online: online?.report ?? null,
-    }, null, 2));
+      ...(args.rederive ? { rederive } : {}),
+      ...(args.diff ? { diff } : {}),
+      ...(args.merge !== undefined ? { merge } : {}),
+      ...(args.blocks ? { blocks } : {}),
+    };
+    out(JSON.stringify(json, null, 2));
   } else {
     if (offline) printOffline(offline.report, offline.profile, args);
-    if (offline && online) console.log('\n' + '='.repeat(72) + '\n');
+    if (rederive) printRederive(rederive);
+    if (diff) printDiff(diff);
+    if (merge) printMerge(merge);
+    if (blocks) printBlocks(blocks);
+    if (offline && online) out('\n' + '='.repeat(72) + '\n');
     if (online) printOnline(online.report, online.profile, args);
     if (!args.strict && warnings.length) {
-      console.log(`\nWarnings (${warnings.length}, they do not change the exit code; --strict does):`);
-      for (const w of warnings.slice(0, 40)) console.log(`  [${w.code}] ${w.where}: ${w.message}`);
-      if (warnings.length > 40) console.log(`  ... and ${warnings.length - 40} more (use --json for all)`);
+      out(`\nWarnings (${warnings.length}, they do not change the exit code; --strict does):`);
+      for (const w of warnings.slice(0, 40)) out(`  [${w.code}] ${w.where}: ${w.message}`);
+      if (warnings.length > 40) out(`  ... and ${warnings.length - 40} more (use --json for all)`);
     }
-    console.log(failures.length === 0 ? '\nRESULT: all invariants hold' : `\nRESULT: ${failures.length} invariant failure(s)`);
-    for (const f of failures.slice(0, 60)) console.log(`  FAIL [${f.code}] ${f.where}: ${f.message}`);
-    if (failures.length > 60) console.log(`  ... and ${failures.length - 60} more (use --json for all)`);
+    out(failures.length === 0 ? '\nRESULT: all invariants hold' : `\nRESULT: ${failures.length} invariant failure(s)`);
+    for (const f of failures.slice(0, 60)) out(`  FAIL [${f.code}] ${f.where}: ${f.message}`);
+    if (failures.length > 60) out(`  ... and ${failures.length - 60} more (use --json for all)`);
     if (transportErrors.length) {
-      console.log(`\nTRANSPORT: ${transportErrors.length} request(s) failed before the server answered (exit code 2)`);
-      for (const t of transportErrors) console.log(`  ${t.where}: ${t.message}`);
+      out(`\nTRANSPORT: ${transportErrors.length} request(s) failed before the server answered (exit code 2)`);
+      for (const t of transportErrors) out(`  ${t.where}: ${t.message}`);
+    }
+    if (inputErrors.length) {
+      out(`\nINPUT: ${inputErrors.length} document(s) the tools could not use (exit code 2)`);
+      for (const t of inputErrors) out(`  [${t.code}] ${t.where}: ${t.message}`);
     }
   }
-  process.exitCode = transportErrors.length > 0 ? 2 : failures.length === 0 ? 0 : 1;
+  return { exitCode: transportErrors.length > 0 || inputErrors.length > 0 ? 2 : failures.length === 0 ? 0 : 1, json };
 }
 
-main().catch((e: unknown) => {
-  if (e instanceof UsageError) console.error(`profile-check: ${e.message}`);
-  else console.error('profile-check: unexpected error:', e);
-  process.exitCode = 2;
-});
+export interface ProfileCheckResult {
+  /** 0 / 1 / 2 as the script exits (see --help). */
+  exitCode: number;
+  /** Everything printed to stdout (the tables, or the JSON text with --json), one entry per line written. */
+  stdout: string;
+  /** Diagnostics (usage errors). */
+  stderr: string;
+  /** The JSON document with --json (null otherwise, or after a usage error). */
+  json: ProfileCheckJson | null;
+}
+
+/**
+ * Run profile-check with `argv` (the options after the script name) and hand back what it printed and its exit code,
+ * without exiting the process. `io` receives the output as it is written (default: buffered only). One run at a time:
+ * the findings are module state, reset at the start of every run.
+ */
+export async function runProfileCheck(argv: string[], io: { out?: (line: string) => void; err?: (...args: unknown[]) => void } = {}): Promise<ProfileCheckResult> {
+  const stdout: string[] = [];
+  const stderr: string[] = [];
+  const prevOut = out;
+  const prevErr = errOut;
+  failures.length = 0;
+  warnings.length = 0;
+  transportErrors.length = 0;
+  inputErrors.length = 0;
+  out = (line) => { stdout.push(line); io.out?.(line); };
+  errOut = (...args) => { stderr.push(format(...args)); io.err?.(...args); };
+  try {
+    const r = await main(argv);
+    return { exitCode: r.exitCode, stdout: stdout.join('\n'), stderr: stderr.join('\n'), json: r.json };
+  } catch (e: unknown) {
+    if (e instanceof UsageError) errOut(`profile-check: ${e.message}`);
+    else errOut('profile-check: unexpected error:', e);
+    return { exitCode: 2, stdout: stdout.join('\n'), stderr: stderr.join('\n'), json: null };
+  } finally {
+    out = prevOut;
+    errOut = prevErr;
+  }
+}
+
+/** True when this file is the process entry (`tsx scripts/profile-check.ts`, `npm run profile-check`), not imported.
+ *  Compares resolved real paths without the extension; case-insensitively on Windows (drive letters, `C:` vs `c:`). */
+function invokedDirectly(): boolean {
+  const entry = process.argv[1];
+  if (!entry) return false;
+  const norm = (p: string): string => {
+    let r = resolve(p);
+    try { r = realpathSync(r); } catch { /* not on disk under that name: compare as given */ }
+    r = r.replace(/\.[cm]?[jt]s$/i, '');
+    return process.platform === 'win32' ? r.toLowerCase() : r;
+  };
+  try { return norm(fileURLToPath(import.meta.url)) === norm(entry); } catch { return false; }
+}
+
+if (invokedDirectly()) {
+  const r = await runProfileCheck(process.argv.slice(2), { out: (line) => console.log(line), err: (...args) => console.error(...args) });
+  process.exitCode = r.exitCode;
+}
