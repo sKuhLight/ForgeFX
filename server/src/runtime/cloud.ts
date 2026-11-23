@@ -242,8 +242,16 @@ export class Cloud {
   /** The session an editor-cache (or, with `slot`, a shared-definitions) call runs under: the signed-in account when
    *  there is one; otherwise this install's anonymous session of that slot, signed in on first use when `create` (an
    *  upload / a share) — never for a delete, which must run as whoever uploaded. `prefer` pins the session kind (a
-   *  delete of an anonymous upload). */
+   *  delete of an anonymous upload).
+   *  An auth OUTAGE (the auth service could not be asked: network failure, 5xx, 429 — `isAuthOutage`) answers 503
+   *  `auth-unavailable`, never 401: a stored session that could not be refreshed right now is still this install's
+   *  session, so the caller must not treat the user as signed out, and an anonymous slot whose stored session could not
+   *  be refreshed is never replaced by a freshly minted identity (its earlier shares would become unremovable). When
+   *  the cloud has anonymous sign-ins switched off, the sign-in mints nothing and answers 403 `account-required`. */
   async #uploaderSession(create: boolean, prefer?: UploaderSession, slot: AnonymousSlot = ANONYMOUS_UPLOADER_STORAGE_KEY): Promise<UploaderWho | EditorCacheCloudOutcome> {
+    const outage = (reason: string, via: UploaderSession, e: { message?: string } | null | undefined): EditorCacheCloudOutcome => ({
+      code: 503, body: { error: 'auth-unavailable', reason, message: e?.message ?? 'the sign-in service could not be reached' }, via
+    });
     if (prefer !== 'anonymous') {
       // read BEFORE getSession(): a refresh the server refuses (revoked session) makes supabase-js delete the stored
       // session inside getSession(), and a check after it would then let the upload slip to the anonymous session
@@ -255,15 +263,23 @@ export class Cloud {
       // a stored account session that cannot be loaded (refresh failed, offline): say so, never fall back to an
       // anonymous upload behind the signed-in user's back
       if (storedAccount) {
+        if (error && isAuthOutage(error)) return outage('account-session-unavailable', 'account', error);
         return { code: 401, body: { error: 'not signed in', reason: 'account-session-unavailable', message: error?.message ?? 'the account session could not be loaded' }, via: 'account' };
       }
       if (prefer === 'account') return { code: 401, body: { error: 'not signed in', reason: 'account-signed-out' }, via: 'account' };
     }
     const a = this.#anon(slot);
-    const { data: as } = await a.auth.getSession();
+    const { data: as, error: loadError } = await a.auth.getSession();
     if (as.session?.access_token) return { client: a, token: as.session.access_token, via: 'anonymous', uploaderId: as.session.user?.id ?? null };
+    // the stored anonymous session could not be refreshed right now: it is kept (supabase-js drops a session only on a
+    // verdict), and it is never replaced by a new identity during an outage
+    if (loadError && isAuthOutage(loadError)) return outage('anonymous-session-unavailable', 'anonymous', loadError);
     if (!create) return { code: 401, body: { error: 'not signed in', reason: 'anonymous-session-missing' }, via: 'anonymous' };
     const { data, error } = await a.auth.signInAnonymously();
+    if (error && isAuthOutage(error)) return outage('anonymous-sign-in-failed', 'anonymous', error);
+    if (error && isAnonymousSignInDisabled(error)) {
+      return { code: 403, body: { error: 'account-required', reason: 'anonymous-sign-in-disabled', message: 'the cloud does not accept anonymous sessions; sign in' }, via: 'anonymous' };
+    }
     if (error || !data.session?.access_token) {
       return { code: 401, body: { error: 'not signed in', reason: 'anonymous-sign-in-failed', message: error?.message ?? 'no session' }, via: 'anonymous' };
     }
@@ -857,6 +873,10 @@ export interface DefinitionSourceList {
   firmware: string;
   sources: DefinitionSourceSummary[];
   alternatives: Record<SharedSourceKind, number>;
+  /** Whether the store takes shares from anonymous sessions, when the cloud says so (a newer deployment). Absent =
+   *  unknown (an older cloud): never read as `false`. `true` does not promise an anonymous sign-in works (the auth
+   *  service has its own switch). */
+  allowAnonymous?: boolean;
 }
 
 /** `GET definition-sources/source/<id>`: one row with its sanitized raw source (still to be validated). */
@@ -967,7 +987,10 @@ export function parseDefinitionSourceList(body: unknown, asked: { model: number;
   }
   const alt = isPlainObject(body.alternatives) ? body.alternatives : {};
   const alternatives = Object.fromEntries(SHARED_SOURCE_KINDS.map((k) => [k, isCount(alt[k]) ? alt[k] : 0])) as Record<SharedSourceKind, number>;
-  return { model: asked.model, firmware: asked.firmware, sources, alternatives };
+  return {
+    model: asked.model, firmware: asked.firmware, sources, alternatives,
+    ...(typeof body.allowAnonymous === 'boolean' ? { allowAnonymous: body.allowAnonymous } : {})
+  };
 }
 
 /** The `/source/<id>` answer for `id`, or null when it is not one (another id, a kind never shared, a tier never
@@ -984,6 +1007,26 @@ export function parseDefinitionSourceBody(body: unknown, id: string): Definition
     id, model: b.model, firmware: b.firmware, kind: b.kind, rawFormat: b.rawFormat, factHash: b.factHash, tier: b.tier,
     quality: b.quality, summary: cleanSummary(b.summary), source: b.source
   };
+}
+
+/**
+ * Is an error of the auth client an OUTAGE (ask again later) rather than a verdict on the session? A network failure
+ * (`AuthRetryableFetchError`, status 0), a 5xx, a 429, or an error without an HTTP status (an unparsable gateway page)
+ * is an outage; a 4xx (a bad, expired or revoked token, a deleted user, a switched-off provider) is a verdict. The
+ * same rule as the cloud's own check (axis-cloud `definition-sources` `isAuthOutage`). Pure, exported for the tests.
+ */
+export function isAuthOutage(e: { name?: unknown; status?: unknown } | null | undefined): boolean {
+  if (!e) return false;
+  if (e.name === 'AuthRetryableFetchError') return true;
+  const status = e.status;
+  if (typeof status !== 'number' || status === 0) return true;
+  return status === 429 || status >= 500;
+}
+
+/** Did the auth service refuse an anonymous sign-in because anonymous sign-ins are switched off for the project? */
+function isAnonymousSignInDisabled(e: { code?: unknown; status?: unknown; message?: unknown }): boolean {
+  if (e.code === 'anonymous_provider_disabled') return true;
+  return e.status === 422 && typeof e.message === 'string' && /anonymous sign-?ins are disabled/i.test(e.message);
 }
 
 /** supabase-js's default auth storage key for a project URL (`sb-<first host label>-auth-token`). */

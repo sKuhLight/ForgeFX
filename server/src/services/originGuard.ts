@@ -43,6 +43,11 @@ import type { FastifyReply, FastifyRequest } from 'fastify';
 
 /** The 403 error code a refused origin gets. */
 export const FORBIDDEN_ORIGIN = 'forbidden-origin';
+
+/** Header the Remote relay (remote.ts) sets on every request it injects, so a route can tell a relayed request from a
+ *  local one where that matters (the share status skips its cloud round trips for a relayed `?refresh=1`). Not a
+ *  security boundary: a local caller can send it too, which only makes its own answer more conservative. */
+export const REMOTE_RELAY_HEADER = 'x-forgefx-remote-relay';
 /** The 403 error code a refused `Host` header gets (DNS rebinding). */
 export const FORBIDDEN_HOST = 'forbidden-host';
 

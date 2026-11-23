@@ -601,6 +601,14 @@ function cloudError(r: EditorCacheCloudOutcome, extra: { bytes?: number } = {}):
     return fail(429, { error: rb.error === 'quota-exceeded' ? 'quota-exceeded' : 'rate-limited', retryAfterSeconds, ...(typeof rb.scope === 'string' ? { scope: rb.scope } : {}) });
   }
   if (r.code === 503 && rb.error === 'paused') return fail(503, { error: 'paused' });
+  // the sign-in service could not be asked (a network failure or its outage, here or in the cloud): retry later; never
+  // 401, the session is still this install's
+  if (r.code === 503 && rb.error === 'auth-unavailable') {
+    const fromBody = typeof rb.retryAfterSeconds === 'number' ? rb.retryAfterSeconds : NaN;
+    const fromHeader = Number(r.retryAfter ?? NaN);
+    const retryAfterSeconds = Number.isFinite(fromBody) ? fromBody : Number.isFinite(fromHeader) ? fromHeader : null;
+    return fail(503, { error: 'auth-unavailable', retryAfterSeconds, ...(typeof rb.reason === 'string' ? { reason: rb.reason } : {}) });
+  }
   const message = typeof rb.message === 'string' ? rb.message : typeof rb.error === 'string' ? rb.error : r.code === 0 ? 'cloud unreachable' : `cloud answered ${r.code}`;
   return fail(502, { error: 'cloud', status: r.code, message });
 }
@@ -839,6 +847,7 @@ export async function withdrawContribution(
       if (typeof rb.reason === 'string') item.reason = rb.reason;
     } else {
       item.result = 'failed';
+      if (r.code === 503 && rb.error === 'auth-unavailable') item.reason = 'auth-unavailable';
       firstFailure ??= r;
     }
   }

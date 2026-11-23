@@ -32,10 +32,11 @@ import * as deviceCache from './services/deviceCache.js';
 import * as editorCacheImport from './services/editorCacheImport.js';
 import * as editorCacheDiscovery from './services/editorCacheDiscovery.js';
 import type { DiscoverOpts } from './services/editorCacheDiscovery.js';
-import { FORBIDDEN_ORIGIN, createRequestPolicy, isStrictAllowed, loopbackOriginGuard, splitList, type RequestPolicyOptions } from './services/originGuard.js';
+import { FORBIDDEN_ORIGIN, REMOTE_RELAY_HEADER, createRequestPolicy, isStrictAllowed, loopbackOriginGuard, splitList, type RequestPolicyOptions } from './services/originGuard.js';
 import { selectBindHost } from './services/bindHost.js';
 import { staticTarget } from './services/staticFiles.js';
 import * as cloudProfiles from './services/cloudProfiles.js';
+import * as cloudShare from './services/cloudShare.js';
 import * as diagnostics from './services/diagnosticCapture.js';
 import * as contribution from './services/cacheContribution.js';
 import * as definitionsFile from './services/definitionsFile.js';
@@ -66,9 +67,10 @@ export interface AppOptions {
   /** Editor-cache contribution seams: a cloud client (tests pass a fake; production binds the AXIS_CLOUD one),
    *  and the dry-run switches that otherwise come from FORGEFX_CONTRIBUTE_DRY_RUN / FORGEFX_CONTRIBUTE_DRY_RUN_DIR. */
   contribute?: { cloud?: contribution.ContributionCloud | null; dryRun?: boolean; dryRunDir?: string | null };
-  /** Shared device-definition seam: the cloud client `GET /device/cache/cloud` reads (tests pass a fake, also without
-   *  AXIS_CLOUD; null = no cloud). Production passes nothing: the AXIS_CLOUD client, or the disabled answer. */
-  cloudProfiles?: { cloud?: cloudProfiles.CloudProfilesCloud | null };
+  /** Shared device-definition seam: the cloud client `GET /device/cache/cloud`, the pull and the share routes use (tests
+   *  pass a fake, also without AXIS_CLOUD; null = no cloud). Production passes nothing: the AXIS_CLOUD client, or the
+   *  disabled answer. */
+  cloudProfiles?: { cloud?: cloudShare.ShareCloud | null };
   /** Origin/Host policy inputs (services/originGuard.ts). Each field omitted = production: the
    *  FORGEFX_ALLOWED_ORIGINS / FORGEFX_ALLOWED_HOSTS env lists and `os.hostname()`. */
   http?: RequestPolicyOptions;
@@ -390,6 +392,32 @@ export async function buildApp(registry: DeviceRegistry, opts: AppOptions = {}):
   });
   app.post('/device/cache/contribute/withdraw', { onRequest: loopbackOriginGuard }, async (_req, reply) => {
     const r = await contribution.withdrawContribution(store.defaultStore, registry, contributionCloudOf(), { serverDryRun: contributeServerDryRun() });
+    reply.code(r.code);
+    return r.body;
+  });
+
+  // ── sharing device definitions (cloud v2; services/cloudShare.ts) ── a consented, deliberate step: the status says what
+  // could be shared and what was; a share sends this install's own sanitized sources (consent gate first, `dryRun` answers
+  // the exact envelopes and sends nothing); withdraw removes one share or all. Served with or without AXIS_CLOUD (the
+  // cloud client is late-bound like the contribution's; without one the status says cloud.enabled:false and a send
+  // answers 503 cloud-disabled). Behind the app-wide origin policy (ADR 0004); not on the Remote allowlist (remote.ts):
+  // the status GET is readable there, the POSTs are refused.
+  let shareCloud: cloudShare.ShareCloud | null = null;
+  const shareCloudOf = (): cloudShare.ShareCloud | null =>
+    opts.cloudProfiles?.cloud !== undefined ? opts.cloudProfiles.cloud : shareCloud;
+  // over the Remote relay: `?refresh=1` is ignored (the remote does not make this install ask the cloud under its
+  // sessions) and the anonymous shares are left out (which rows this install shared anonymously stays on this machine)
+  app.get<{ Querystring: { refresh?: string } }>('/device/cache/cloud/share', async (req) => cloudShare.cloudShareStatus(
+    shareCloudOf(), store.defaultStore, registry,
+    { refresh: req.query.refresh === '1' || req.query.refresh === 'true', relayed: req.headers[REMOTE_RELAY_HEADER] !== undefined }
+  ));
+  app.post<{ Body: unknown }>('/device/cache/cloud/share', async (req, reply) => {
+    const r = await cloudShare.cloudShare(shareCloudOf(), store.defaultStore, registry, req.body, { versions: { forgefx: FORGEFX_VERSION } });
+    reply.code(r.code);
+    return r.body;
+  });
+  app.post<{ Body: unknown }>('/device/cache/cloud/share/withdraw', async (req, reply) => {
+    const r = await cloudShare.cloudShareWithdraw(shareCloudOf(), store.defaultStore, registry, req.body);
     reply.code(r.code);
     return r.body;
   });
@@ -969,6 +997,7 @@ export async function buildApp(registry: DeviceRegistry, opts: AppOptions = {}):
     const { cloud } = await import('./cloud.js');
     diagCloud = cloud;
     contributionCloud = cloud;
+    shareCloud = cloud;
     type Creds = { email: string; password: string };
     app.get('/cloud/status', async () => cloud.status());
     app.post<{ Body: Creds }>('/cloud/register', async (req, reply) => { try { return await cloud.register(req.body.email, req.body.password); } catch (e) { reply.code(400); return { error: (e as Error).message }; } });

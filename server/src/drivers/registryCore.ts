@@ -690,7 +690,12 @@ export class DeviceRegistry {
     // the walk-scope gates of the running firmware: only a gen-3 grid driver walks definitions at all
     const walk: WalkScopeGates = gen3Grid ? this.#walkGatesFor(mid) : { extendedIds: false, above160: false, blockProbe: false, farIds: false };
     // `.axisdefs` export/import: the same gen-3 grid trio (stored sources to write, a catalog to derive against)
-    return { caps: { genericParams: gen3Grid, catalogFirmware, profile, drift, contribute, walk, portable: gen3Grid }, applied };
+    // the spot check of shared definitions (a cloud pull checks them against the unit first): the gen-3 grid trio with a
+    // bundled catalog of its model and a firmware read. Computed here, not imported from services/spotCheck.ts (the
+    // registry stays below the services); the pull applies the same conditions (`spotCheckSupported` + firmware).
+    // Appended after `portable` (additive-only key order).
+    const spotCheck = gen3Grid && running !== null && PROFILES[mid] !== undefined;
+    return { caps: { genericParams: gen3Grid, catalogFirmware, profile, drift, contribute, walk, portable: gen3Grid, spotCheck }, applied };
   }
 
   /** What `GET /device/definitions/diff` reads, all of it state the registry and the driver already hold (no

@@ -217,6 +217,12 @@ export interface DefinitionsCaps {
    *  `/device/definitions/import`): a gen-3 grid driver (the generic-params trio). Whether a profile is stored to
    *  export is the route's answer (404 `no-profile`), not this flag's. */
   portable: boolean;
+  /** Shared definitions pulled from the cloud can be checked against this unit before they are used (the spot check of
+   *  `POST /device/cache/cloud/pull`: read-only definition queries): a gen-3 grid driver with a bundled catalog of its
+   *  model whose firmware was read. Without it a pull that needs the check is refused (501 `unsupported` with
+   *  `capability: 'spotCheck'`, or 503 `firmware-unknown` while the firmware is not read). Whether a cloud is
+   *  configured is in the cloud status routes, not here. */
+  spotCheck: boolean;
 }
 
 /** The kind of a SHARED definition source (cloud v2, `definition-sources`): a raw source of one read. Single-block

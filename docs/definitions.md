@@ -223,7 +223,8 @@ Served by `GET /device` and `GET /device/detect` on every device:
   "profile": { "key": "11_99p0", "source": "editor-cache", "byteExact": true, "firmware": "99.0", "suspectFamilies": [],
                "format": 2, "sources": ["editor-cache", "live-readonly"], "coverage": { "complete": true, "gaps": ["no-tapers"] } },
   "drift": "none", "contribute": true,
-  "walk": { "extendedIds": false, "above160": false, "blockProbe": false, "farIds": false }, "portable": true }
+  "walk": { "extendedIds": false, "above160": false, "blockProbe": false, "farIds": false }, "portable": true,
+  "spotCheck": true }
 ```
 The keys come in this order; new keys are appended, never inserted (also inside `profile`).
 - `genericParams`: the device serves `?generic=1` (gen-3 grid devices with self-describe: Axe-Fx III, FM3,
@@ -249,6 +250,8 @@ The keys come in this order; new keys are appended, never inserted (also inside 
   an aborted extension keeps the standard walk's result).
 - `portable`: the stored profile can be exported to and imported from a `.axisdefs` file (a gen-3 grid device). Whether
   a profile is stored to export is the export route's answer (404 `no-profile`), not this flag's.
+- `spotCheck`: shared definitions pulled from the cloud can be checked against this unit before they are used
+  (see "Shared definitions" below): a `genericParams` device with a bundled catalog whose firmware was read.
 
 ## Portable definitions files (`.axisdefs`)
 `GET /device/definitions/export` writes the stored profile of the running firmware into a file; `POST
@@ -355,3 +358,46 @@ the maintainer can read it (API: [api-design.md](api-design.md#adr-0003--editor-
   would send (`wouldSend`). Server-wide: `FORGEFX_CONTRIBUTE_DRY_RUN=1`, or
   `FORGEFX_CONTRIBUTE_DRY_RUN_DIR=<dir>`, which also writes `<dir>/<sha256>.cache` (the redacted copy) and
   `<dir>/<sha256>.json` (the request body) so the redaction can be checked by hand. Node server only.
+
+## Shared definitions (cloud)
+Users can share the definitions Axis read for their unit, so the same model and firmware is supported for
+everyone without an app update (API: [api-design.md](api-design.md#adr-0006--shared-device-definitions-cloud-v2)).
+
+- **The shared store keeps sources.** Each row is one sanitized raw source — an editor-cache import, a full or a
+  read-only read of the device — for one model and firmware, identified by a **fact hash** over its content
+  (not over who read it, when, or how the read went). Identical shares from different users land on the same
+  row and confirm it. Rows of different kinds never compete; within a kind, the tier, then the quality, the
+  coverage and the number of confirmations rank them, and among equals the oldest wins — never the newest upload.
+- **Tiers.** `official` (confirmed by the maintainer), `verified` (identical facts from at least two contributors
+  on two networks, and a complete read), `candidate` (everything else). A tier orders what is offered; it never
+  exempts a row from the device check.
+- **Pulling checks first.** Before shared rows decide which parameters exist, a sample of them (at most 24) is
+  read back from the connected unit with read-only definition queries — no value reads, no label reads, no
+  writes — within the same per-block bounds as the read-only definition walk, which come from the bundled
+  catalog or a local editor cache, never from cloud data. Rows the catalog lacks or that differ from it are
+  checked first. Any difference refuses the pull and nothing is stored; the verdict is remembered per row (the
+  `cloudVerdicts` collection) and a failed row is not offered again unless checked again on request. A pull
+  that would only add units or display curves to rows the stored definitions already decide needs no check.
+  `capabilities.definitions.spotCheck` says whether the unit can be checked. Shared rows from the earlier
+  store are checked the same way.
+- **Sharing is a deliberate step.** Nothing is shared without the user's consent to the current explanation
+  (`consentVersion`). Only this install's own sources are shared (never one that came from the cloud or a
+  definitions file, never a single-block probe, never an editor file read with damaged parts). Before sending,
+  the codec's sanitizer removes everything that could identify the installation or the moment: no ids, no file
+  fingerprint, no user name tables (preset names, user cab names), no free-text notes, the capture time cut to
+  the day; the result is validated again in its strict shared form, and exactly that copy is sent. A dry run
+  returns the exact requests without sending them.
+- **Who shares.** A signed-in account, or an anonymous session of this install that the first share creates —
+  its own, separate from the one of the editor-cache contribution, and unrelated to the telemetry id. What this
+  install shared is recorded locally in the private `definitionShares` collection (not readable over `/store` or the
+  Remote relay; kind, row id, fact hash, session kind
+  and a one-way tag of the session, time, consent version; no user ids, paths or names) and can be removed again
+  by the session that made it, one share or all — "all" under a signed-in account also removes the shares that
+  account made on other computers. A share made under another account, or under an anonymous session this
+  install no longer has, stays listed but cannot be removed from here. If the cloud refuses anonymous sharing,
+  ForgeFX asks for a sign-in instead of creating an anonymous session. If the definitions changed between the
+  preview and the share, nothing is sent. After 180 days the cloud unlinks a share from its sharer; it then stays
+  published but can no longer be removed individually.
+- **Older clients.** A share that includes a local editor-cache source made under an account also publishes
+  that source's derived tables — derived from it alone, without this install's bookkeeping times — to the earlier
+  shared store, which older versions read. The preview shows that request too.

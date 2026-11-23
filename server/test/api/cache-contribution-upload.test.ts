@@ -261,7 +261,10 @@ async function errorMapping(): Promise<void> {
     { label: 'cloud switched off meanwhile', out: { code: 503, body: { error: 'cloud-disabled' }, disabled: true }, code: 503, body: { error: 'cloud-disabled' } },
     { label: 'signed in, but the account session cannot be loaded (no silent anonymous upload)', out: { code: 401, body: { error: 'not signed in', reason: 'account-session-unavailable', message: 'offline' }, via: 'account' }, code: 401, body: { error: 'not-signed-in', reason: 'account-session-unavailable', via: 'account' } },
     { label: 'rate limited, with the session kind', out: { code: 429, body: { error: 'rate-limited', scope: 'uploader', retryAfterSeconds: 9 }, via: 'anonymous' }, code: 429, body: { error: 'rate-limited', retryAfterSeconds: 9, scope: 'uploader', via: 'anonymous' } },
-    { label: 'a 2xx that did not complete', out: { code: 200, body: { uploadId: UUID, status: 'pending' } }, code: 502, body: { error: 'cloud', status: 200, message: 'the upload did not complete' } }
+    { label: 'a 2xx that did not complete', out: { code: 200, body: { uploadId: UUID, status: 'pending' } }, code: 502, body: { error: 'cloud', status: 200, message: 'the upload did not complete' } },
+    // the sign-in service could not be asked (client side or in the cloud): 503, never 401 and never 502
+    { label: 'auth outage on this side', out: { code: 503, body: { error: 'auth-unavailable', reason: 'anonymous-sign-in-failed', message: 'fetch failed' }, via: 'anonymous' }, code: 503, body: { error: 'auth-unavailable', retryAfterSeconds: null, reason: 'anonymous-sign-in-failed', via: 'anonymous' } },
+    { label: 'auth outage in the cloud', out: { code: 503, body: { error: 'auth-unavailable', retryAfterSeconds: 30 }, retryAfter: '30' }, code: 503, body: { error: 'auth-unavailable', retryAfterSeconds: 30 } }
   ];
   try {
     for (const c of cases) {
@@ -384,6 +387,12 @@ async function withdraw(): Promise<void> {
     x = await w();
     assertEqual(`${x.code} ${x.b.error}`, '502 cloud', '[withdraw] network → 502');
     assertEqual((await statusOf(r.app)).withdrawable, true, '[withdraw] still withdrawable after a failure');
+    // the sign-in service could not be asked: 503 auth-unavailable (never 401 or 502), the item says why, still listed
+    f.script.del = () => ({ code: 503, body: { error: 'auth-unavailable', reason: 'anonymous-session-unavailable' }, via: 'anonymous' });
+    x = await w();
+    assertEqual(`${x.code} ${x.b.error} ${x.b.reason} ${JSON.stringify(x.b.uploads?.map((u) => [u.result, (u as { reason?: string }).reason]))}`,
+      `503 auth-unavailable anonymous-session-unavailable ${JSON.stringify([['failed', 'auth-unavailable']])}`, '[withdraw] auth outage → 503');
+    assertEqual((await statusOf(r.app)).withdrawable, true, '[withdraw] still withdrawable after an outage');
     // ok
     f.script.del = (uploadId) => ({ code: 200, body: { uploadId, deleted: true } });
     x = await w();

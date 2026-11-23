@@ -20,6 +20,7 @@ import * as backups from '../services/backups.js';
 import * as deviceCache from '../services/deviceCache.js';
 import * as editorCacheImport from '../services/editorCacheImport.js';
 import * as cloudProfiles from '../services/cloudProfiles.js';
+import * as cloudShare from '../services/cloudShare.js';
 import * as diagnostics from '../services/diagnosticCapture.js';
 import * as contribution from '../services/cacheContribution.js';
 import * as definitionsFile from '../services/definitionsFile.js';
@@ -256,6 +257,21 @@ export function createRouter(deps: RuntimeDeps): {
   });
   on('POST', '/device/cache/cloud/publish', async (c) => {
     const r = await cloudProfiles.cloudCachePublish(deps.cloud ?? null, store, registry);
+    c.reply.code(r.code);
+    return r.body;
+  });
+  // sharing device definitions (cloud v2; services/cloudShare.ts): status, share (consent gate first, `dryRun` sends
+  // nothing), withdraw. No cloud dep → cloud.enabled:false in the status, 503 cloud-disabled on a send.
+  on('GET', '/device/cache/cloud/share', (c) => cloudShare.cloudShareStatus(deps.cloud ?? null, store, registry, {
+    refresh: c.query.get('refresh') === '1' || c.query.get('refresh') === 'true'
+  }));
+  on('POST', '/device/cache/cloud/share', async (c) => {
+    const r = await cloudShare.cloudShare(deps.cloud ?? null, store, registry, c.body, deps.versions ? { versions: { forgefx: deps.versions.forgefx, axis: deps.versions.axis } } : {});
+    c.reply.code(r.code);
+    return r.body;
+  });
+  on('POST', '/device/cache/cloud/share/withdraw', async (c) => {
+    const r = await cloudShare.cloudShareWithdraw(deps.cloud ?? null, store, registry, c.body);
     c.reply.code(r.code);
     return r.body;
   });

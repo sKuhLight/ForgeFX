@@ -291,7 +291,10 @@ decision `uploaded` is stored (also for a duplicate). The status of an error is 
 bodies after the validation carry the `import` sub-result, and `via` once a session was chosen. Size: 1 …
 4 MiB (`413 too-large { bytes, limit }` otherwise — an empty file too, a discovered file by its size before it
 is read, and a body over the route's limit in the same shape). Signed in but the account session cannot be
-loaded: `401 not-signed-in` `reason: account-session-unavailable` — never a silent anonymous upload.
+loaded: `401 not-signed-in` `reason: account-session-unavailable` — never a silent anonymous upload. When the
+sign-in service cannot be reached (a network failure, its outage), the answer is `503 auth-unavailable`
+`{ retryAfterSeconds, reason? }` instead — never 401, the session is still this install's (also for a withdraw);
+when the cloud does not take anonymous sessions, `401 not-signed-in` `reason: account-required`.
 
 ```json
 { "ok": true, "dryRun": false,
@@ -354,7 +357,7 @@ The upload request (also `wouldSend`) carries counts and version stamps only:
 | 500 | `import-failed` |
 | 501 | `unsupported` `{capability: "contribute"}` |
 | 502 | `cloud` `{status, message}` |
-| 503 | `no-device`, `firmware-unknown`, `cloud-disabled`, `paused`, `dry-run` |
+| 503 | `no-device`, `firmware-unknown`, `cloud-disabled`, `paused`, `dry-run`, `auth-unavailable` `{retryAfterSeconds, reason?}` (the sign-in service could not be reached) |
 
 Messages never quote the file's content.
 
@@ -762,3 +765,219 @@ phases, never on new phases.
 - A placed block a newer firmware added can be read (and, once bound to an editor-cache section, edited) without an app
   update; until then its writes are refused.
 - A `.axisdefs` file proves integrity, not authorship: anyone can edit and re-seal one.
+
+---
+
+# ADR 0006 — Shared device definitions (cloud v2)
+
+Status: accepted · 2026-11-23
+
+## Context
+Device definitions (parameter ranges, type lists, factory cab names) are the same for every unit of a model on
+a firmware, so one user's read can support everyone on that firmware. The first shared store kept one
+document per firmware, and the newest upload won: an incomplete read could replace a complete one. Shared data
+also comes from strangers, so a client must not trust it blindly, and sharing must be the user's informed
+decision.
+
+## Decision
+The cloud keeps **sources**, not documents: one sanitized raw source per row (an editor-cache import, a full
+or a read-only read of the device), filed by model, firmware, kind and a **fact hash** (sha256 of the source's
+canonical content, without who read it, when, or the read's statistics). Identical shares from different
+users land on the same row and confirm it. Rows of different kinds never compete; within a kind they are
+ranked by tier, then quality, coverage, confirmations, and the oldest first — never by upload date.
+
+**Tiers** (`CloudSourceTier`): `official` (confirmed by the maintainer), `verified` (identical facts shared by
+at least two contributors from two networks, and a complete read), `candidate` (everything else). A tier only
+orders the offer; every pulled row is still checked against the device.
+
+**Quality** (0–3, computed by the cloud): 3 = a self-consistent editor cache of this firmware, or a device read
+without unresolved replies, missing slots, bound hits or an aborted extension; lower values mark a partial read.
+
+The routes exist on the Fastify app and the browser runtime router (same shapes) and sit behind the app-wide
+origin policy (ADR 0004). Over the Remote relay the two GETs are readable; the POSTs are refused.
+
+| Route | Purpose |
+|---|---|
+| `GET /device/cache/cloud[?refresh=1]` | what the cloud offers for the attached unit and firmware |
+| `POST /device/cache/cloud/pull` | adopt shared rows after a device spot check, or preview them |
+| `GET /device/cache/cloud/share[?refresh=1]` | what this install could share, and what it shared |
+| `POST /device/cache/cloud/share` | share this install's own definitions (consent required) |
+| `POST /device/cache/cloud/share/withdraw` | remove one share, or all |
+| `POST /device/cache/cloud/publish` | **deprecated**: the earlier derived-tables upload, kept for older clients |
+
+### The offer: `GET /device/cache/cloud`
+Answered for the Axe-Fx III, FM3 and FM9 with a firmware read; the listing is reused for 10 minutes per unit
+and firmware (`?refresh=1` asks again). When the shared store is not deployed, does not answer, or offers
+nothing, the earlier store answers as before (`version: 1`). Additive fields:
+```json
+{ "enabled": true, "available": true, "version": 2,
+  "sources": [ { "id": "<uuid>", "kind": "editor-cache", "tier": "verified", "quality": 3, "complete": true,
+                 "contributors": 3, "deviceChecks": { "passed": 5, "failed": 0 }, "firstSeen": "2026-11-20",
+                 "records": 2500, "sections": 45, "verdict": null, "identical": false } ],
+  "rejected": [], "improves": "yes" }
+```
+- `sources`: the best row per kind, minus rows this install's device check failed (those are listed under
+  `rejected`). Device reads carry `blocks`, `extended`, `above160` instead of `sections`.
+- `verdict`: this install's last check of the row; `identical`: the row's facts equal a source already stored.
+- `improves`: `yes` (pulling would change what decides the definitions), `no` (nothing offered, or a stored
+  source of this firmware outranks or equals every offered row), `unknown` (undecidable; always for `version: 1`).
+
+### Pulling: `POST /device/cache/cloud/pull`
+Body `{ "replace"?: boolean, "dryRun"?: boolean, "sourceIds"?: ["<uuid>"], "recheck"?: boolean }` (each flag
+counts only when `true`; unknown keys are ignored):
+- `replace`: drop every stored source (the whole stored document is replaced), skipping the merge refusals;
+- `dryRun`: a preview — no device traffic, no store write;
+- `sourceIds`: the offered rows to pull (at most 3, one per kind; default: every offered row);
+- `recheck`: rows this install's device check failed before are pulled (and checked) again.
+
+Each fetched row is bound to its listing (model, firmware, kind, raw format, a recomputed fact hash) and
+validated strictly before anything is derived from it; pulled sources are tagged `origin: "cloud"` and merged
+with the stored ones (a local source outranks a cloud source of the same kind).
+
+**The spot check.** When a pulled row would decide which parameters exist for any block, ForgeFX first reads a
+sample of those rows back from the unit — at most 24, read-only **definition queries only** (no value reads, no
+label reads, no writes), within the same per-block bounds as the read-only definition walk, taken from the
+bundled catalog or a local editor cache, never from cloud data. Rows the catalog lacks or that differ from it
+are checked first. The check `passed` when nothing differs and at least 90 % answered; one difference is
+`failed`; anything else is `inconclusive`. Fewer than 12 checkable rows refuse the pull. Nothing is stored
+unless the check passed or was not needed (no pulled row decides a block's existence). A passed or failed
+verdict is remembered per row and facts in the store collection `cloudVerdicts` (read-only over `/store`); a
+failed row is offered no more (`rejected`) until a pull with `recheck`. When a session already exists, the
+verdict (counts only) is reported to the cloud; a report never creates a session. Rows from the earlier store
+are checked the same way (no verdict is kept for them). A unit without the check keeps the earlier behaviour
+for those rows and marks the answer `"spotCheck": { "verdict": "unavailable" }`.
+
+While the check runs it holds the unit as the device job `cloud-verify` (other device jobs answer 409 `busy`
+with `what: "cloud-verify"`) and pauses telemetry. Progress arrives as the SSE `cacheBuild` event with
+`phase: "verifying"` (`done`/`total` = rows read back / to read), then the terminal `done` (and
+`definitions { reason: "merged" }` when stored sources were kept), or the terminal `phase: "error"` with a
+`reason`: `spot-check-failed`, `spot-check-inconclusive`, `spot-check-error` (the check could not run to its
+end), `definitions-changed` (the stored definitions changed meanwhile), `unit-changed` (another unit was
+attached), `contains-user-data` (the privacy guard refused the result). Clients treat unknown phases as progress.
+
+```json
+{ "ok": true, "pulled": true, "key": "11_13p0", "model": 17, "firmware": "13.0", "source": "cloud", "format": 2,
+  "merged": true, "adopted": [ { "id": "<uuid>", "kind": "editor-cache", "tier": "verified" } ],
+  "spotCheck": { "verdict": "passed", "checked": 24, "answered": 24, "mismatches": 0, "durationMs": 1800, "unverifiable": 0 },
+  "coverage": { "complete": true, "gaps": [] } }
+```
+`spotCheck.verdict` is `passed` or `not-needed`; `unverifiable` counts pulled rows that decide a block but lie
+outside the read-only envelope. A dry run answers `{ "ok": true, "dryRun": true, "sources", "coverage", "diff"
+(the definitions diff summary the result would have), "wins": { "families", "rows", "units", "tapers" },
+"spotCheck": { "needed", "status", "eligible", "planned", "unverifiable" } }` (plus `version: 1` and `meta` for
+a row of the earlier store).
+
+| Status | `error` |
+|---|---|
+| 400 | `invalid-request` (body) |
+| 404 | `not-found` `{sourceId}` (not offered for this unit and firmware); also when the earlier store has no row |
+| 409 | `spot-check-failed` `{spotCheck: {verdict, checked, answered, mismatches, failures: [{family, pid}], durationMs}}` (nothing stored, verdict kept) · `spot-check-inconclusive` `{spotCheck}` (try again) · `spot-check-insufficient` `{eligible, needed}` · `spot-check-rejected-before` `{sourceId}` (use `recheck`) · `building` · `busy` `{what}` · `firmware-differs` · `local-profile-better` · `newer-profile` · `cloud-profile-stale` |
+| 422 | `invalid-source` `{kind, path, message}` · `contains-user-data` · `derivation-failed` `{stored}` |
+| 500 | `walk-bound` (a query outside the bounds was refused before it was sent), `spot-check-error` |
+| 501 | `unsupported` `{capability: "spotCheck" or "cacheImport"}` |
+| 502 | `cloud` `{status, message}` (a row could not be fetched or does not match its listing: check again) |
+| 503 | `firmware-unknown`, `no-device`, `no device detected`, `cloud disabled` |
+
+`busy` normally names the **device job** holding the unit (`cache-build` answers `building`; otherwise
+`capture`, `block-probe` or `cloud-verify`). One case differs: `409 busy` with `what: "definitions"` means the
+stored definitions changed while the check ran (a build or an import finished meanwhile); nothing was stored —
+pull again.
+
+`capabilities.definitions.spotCheck` (after `portable`) says whether the attached unit can be checked: a gen-3
+grid unit with a bundled catalog and a firmware read.
+
+### Sharing: `GET /device/cache/cloud/share`
+```json
+{ "supported": true, "device": { "model": 17, "firmware": "13.0", "key": "11_13p0" },
+  "cloud": { "enabled": true, "signedIn": false, "anonymousAllowed": null }, "consentVersion": 1,
+  "shareable": [ { "kind": "editor-cache", "records": 2500, "capturedAt": "2026-11-22T00:00:00.000Z", "state": "not-shared" },
+                 { "kind": "live-full", "records": 3000, "capturedAt": "2026-11-21T00:00:00.000Z", "state": "not-shareable", "reason": "cloud-origin" } ],
+  "shares": [ { "kind": "live-readonly", "sourceId": "<uuid>", "tier": "candidate", "contributors": 1,
+                "at": "2026-11-23T10:00:00.000Z", "via": "anonymous", "model": 17, "firmware": "13.0", "removable": true } ],
+  "reason": null }
+```
+- `shareable`: every stored source of the attached unit's firmware. `state`: `not-shared`, `shared` (this
+  install shared these facts; `sourceId`), `identical-in-cloud` (someone shared the same facts, sharing confirms
+  them; `sourceId`), or `not-shareable` with a `reason`: `cloud-origin`, `file-origin`, `probe` (single-block
+  probes are not shared), `tolerant-source` (an editor file read with damaged parts), `contains-user-data`,
+  `duplicates`, `invalid-source`, `firmware-differs`, `too-large`. `capturedAt` is the capture **day**.
+- `shares`: the shares recorded in the local store collection `definitionShares` (private: `/store` refuses it on
+  every method, `403 forbidden-collection`, like the auth sessions; no user ids, paths or names; a share's session
+  is kept as a one-way tag only), every unit and firmware, the attached one
+  first. `removable`: the session that made it is the current one of its kind (`false` for a share made under
+  another account, or under an anonymous session this install no longer has). `?refresh=1` also asks the cloud
+  for the current sessions' shares and records them: **for a signed-in account that includes shares the account
+  made on other computers**; a share of the current session that the cloud no longer lists (withdrawn elsewhere,
+  unlinked after 180 days) is dropped. Records of another session are never dropped by a refresh. Over the Remote
+  relay `?refresh=1` is ignored and the anonymous shares are left out (`shares` and the `shared` states): which
+  rows this install shared anonymously stays on this machine.
+- `cloud.signedIn` is a local check. `anonymousAllowed`: `false` after the cloud refused an anonymous share (for
+  10 minutes) or when the cloud's listing says it takes no anonymous shares; `true` after an anonymous share went
+  through or when the listing says it takes them (that does not promise an anonymous sign-in works: the sign-in
+  service has its own switch); `null` when unknown (an older cloud's listing does not say).
+- `reason` (first match): `no-device`, `unsupported`, `firmware-unknown`, `cloud-disabled`, `dev-hook-active`,
+  `profile-stale`, `no-local-source`.
+
+### Sharing: `POST /device/cache/cloud/share`
+Body `{ "consent": true, "consentVersion": 1, "kinds"?: [ … ], "dryRun"?: boolean, "compat"?: boolean,
+"expect"?: [{ "kind", "factHash" }], "axisVersion"?: "…" }`.
+Order: consent gate (without `dryRun`, nothing is read or sent unless `consent: true` with the current
+`consentVersion`) → the unit → the stored definitions → per stored source: only **local** sources of the
+running firmware, sanitized (no ids or origins, no file fingerprint, no user name tables, no tolerant parse, no
+free-text walk note, the capture time cut to the day, unknown fields dropped) and validated again in the strict
+shared form → `expect` → a dry run answers here → one request per kind.
+```json
+{ "ok": true, "dryRun": false,
+  "shared": [ { "kind": "editor-cache", "sourceId": "<uuid>", "factHash": "<64 hex>", "deduped": true, "confirmed": true,
+                "tier": "verified", "contributors": 2 } ],
+  "skipped": [ { "kind": "live-probe", "reason": "probe" } ], "via": "anonymous",
+  "compat": { "published": false, "reason": "anonymous" } }
+```
+- A dry run answers `"wouldSend": [ … ]` — the exact request bodies (`{ model, firmware, kind, rawFormat,
+  source, app, consentAt, consentVersion }`; `app` holds version stamps only) — and `"expect": [{ kind, factHash }]`,
+  the facts of those bodies, and sends nothing. Passing that `expect` with the real share makes it send exactly
+  what was previewed: if the stored definitions changed in between, the answer is `409 share-content-changed`
+  `{ expected, actual }` and nothing is sent.
+- Sessions: the signed-in account, else an anonymous session of this install that the first share creates (its
+  own, separate from the editor-cache contribution's; never the telemetry id). If the cloud does not accept
+  anonymous shares (its listing says so, it refused one a moment ago, or anonymous sign-ins are off), the answer
+  while signed out is `401 not-signed-in` with `reason: "account-required"`, without creating an anonymous
+  session. An older cloud's listing does not say: then the first share creates the session and is refused, and
+  later ones are answered without asking. A sign-in service that cannot be reached answers `503 auth-unavailable`,
+  never 401.
+- `compat` (default on): after the editor cache was shared under an **account**, that editor cache's derived
+  tables — derived from it alone — are also published to the earlier store, for older clients (its `meta` is an
+  allow list: `schema`, `recordCount`, `source`, the `walk` counters and the damaged sections of `issues` without
+  their reason text or positions; the deprecated publish route uses the same list): `{ published, status?, reason? }`, `reason` one of `anonymous`, `no-editor-cache`,
+  `not-shared`, `not-requested`, `failed`; `null` with `compat: false`. A failing compat publish never fails the
+  share. In a dry run: `{ "wouldPublish": true, "wouldSend": { …the exact earlier-store request… } }`, or
+  `{ "wouldPublish": false, "reason" }` (`cloud-disabled` without a cloud).
+- A refusal of one source by the cloud (413, 422, 409 `rejected`) is listed in `skipped` and the other kinds
+  are still shared; if none was shared, that refusal is the answer. Any other failure stops and is answered
+  with what was shared before it.
+
+### Withdrawing: `POST /device/cache/cloud/share/withdraw`
+`{ "sourceId": "<uuid>" }` removes that share under each session that recorded it. `{ "all": true, "model"?,
+"firmware"? }` removes **every share of the signed-in account, including those it made on other computers**, and
+— when this install recorded anonymous shares — every share of its anonymous sharing session. Works without a
+unit attached. Only the session that made a share can remove it: a share recorded under another account, or
+under an anonymous session this install no longer has, is not sent, stays listed, and is answered
+`409 session-mismatch` (sign in with that account to remove it). `200 { "ok": true, "withdrawn": n,
+"deletedSources": m, "sessions": [{ "via", "result" }] }`; a row nobody else shared is deleted from the cloud.
+After 180 days the cloud unlinks a share from its sharer; it can then no longer be removed individually.
+
+### Errors (share and withdraw)
+| Status | `error` |
+|---|---|
+| 400 | `invalid-request`, `not-consented` (no consent; `reason: "consent-refused"` when the cloud refused the consent time), `unsupported-consent-version` `{consentVersion, supported}` (as for the editor-cache contribution) |
+| 401 | `not-signed-in` (`reason`: `account-required`, `account-session-unavailable`, `account-signed-out`, `anonymous-sign-in-failed`, `anonymous-session-missing`) |
+| 403 | `forbidden-origin` |
+| 404 | `nothing-to-share` `{skipped}`, `nothing-to-withdraw` |
+| 409 | `profile-stale` `{staleReason}`, `unsupported-model`, `dev-hook-active`, `rejected`, `share-content-changed` `{expected, actual}`, `session-mismatch`, `unverified` (the cloud has no such share for the current session and the record does not say which session made it) |
+| 413 | `too-large` `{bytes, limit}` (2 MiB per source) |
+| 422 | `invalid-source` `{path, detail?}`, `contains-user-data`, `tolerant-source`, `firmware-inconsistent`, `version-mismatch`, `implausible`, `unsupported-raw-format` |
+| 429 | `rate-limited`, `quota-exceeded` `{retryAfterSeconds, scope}` |
+| 502 | `cloud` `{status, message}` |
+| 503 | `no-device`, `firmware-unknown`, `cloud-disabled`, `paused`, `auth-unavailable` `{retryAfterSeconds}` |
+
+Messages never quote source content.

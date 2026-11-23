@@ -29,12 +29,14 @@ const SPELLINGS = ['cloud', 'CLOUD', 'Cloud', '%63loud', 'cl%6Fud'];
 
 const COLLECTIONS: Array<[string, boolean]> = [
   ['cloud', true], ['CLOUD', true], ['Cloud', true], ['cloud ', false], ['config', false], ['deviceCaches', false],
-  ['cloudy', false], ['xcloud', false], ['local', false], ['cacheContributions', false], ['', false]
+  ['cloudy', false], ['xcloud', false], ['local', false], ['cacheContributions', false], ['', false],
+  // this install's records of its shared definitions (anonymous row ids, session tags): private too
+  ['definitionShares', true], ['DEFINITIONSHARES', true]
 ];
 const PATHS: Array<[string, boolean]> = [
   ['/store/cloud', true], ['/store/cloud/', true], ['/store/cloud/x', true], ['/store/CLOUD/x', true], ['/store/%63loud', true],
   ['/store/cl%6Fud/sb-x-auth-token?y=1', true], ['/store/%E0%A4%A', true], ['/store/config', false], ['/store/config/cloud', false],
-  ['/cloudstore/cloud', false], ['/store', false]
+  ['/cloudstore/cloud', false], ['/store', false], ['/store/definitionShares/11_13p0', true], ['/store/definitionShares', true]
 ];
 
 // [path, allowed for a GET over the relay]: spellings that resolve to a refused area once normalised

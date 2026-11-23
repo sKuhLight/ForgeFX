@@ -21,7 +21,7 @@ import { buildTestApp, firmwareVersionReply } from '../helpers/api.js';
 import { catalogBuilt } from '../helpers/catalogProfile.js';
 import { MockTransport, handshakeReply, isIdentifyBroadcast, assert, assertEqual } from '../helpers/mock.js';
 
-export const CAPS_CASE_COUNT = 15;
+export const CAPS_CASE_COUNT = 16;
 
 type Caps = {
   slotModel: string;
@@ -567,7 +567,8 @@ async function definitionsKeyOrder(): Promise<void> {
       assertEqual(keys.filter((k) => k !== 'definitions').join(','), previous.join(','), `${name}: every previous key keeps its place, none is added or dropped`);
       assertEqual(keys[keys.indexOf('virtualEffects') + 1], 'definitions', `${name}: definitions follows virtualEffects`);
       assertEqual(keys[keys.indexOf('definitions') + 1], 'telemetryControl', `${name}: definitions comes before telemetryControl`);
-      assertEqual(Object.keys(caps.definitions as object).join(','), 'genericParams,catalogFirmware,profile,drift,contribute,walk,portable', `${name}: definitions key order`);
+      // spotCheck (M4) is appended after portable: additive-only
+      assertEqual(Object.keys(caps.definitions as object).join(','), 'genericParams,catalogFirmware,profile,drift,contribute,walk,portable,spotCheck', `${name}: definitions key order`);
       const profile = (caps.definitions as { profile: Record<string, unknown> | null }).profile;
       if (profile) {
         // the profile v2 fields are appended after the M2 ones (contract §7), coverage as { complete, gaps }
@@ -744,6 +745,21 @@ async function definitionsPortable(): Promise<void> {
   }
 }
 
+// the spot check of shared definitions (M4): the gen-3 grid trio with a firmware read (a pull can check the rows it would
+// adopt against the unit); false without a firmware read and on every other device (AM4, Axe-Fx II, VP4, gen-1)
+async function definitionsSpotCheck(): Promise<void> {
+  for (const [modelId, name, fw] of [[0x10, 'Axe-Fx III', [32, 6]], [0x11, 'FM3', [13, 0]], [0x12, 'FM9', [12, 0]]] as const) {
+    let r = await defsRig(modelId, [fw[0], fw[1]]);
+    try { assertEqual((await definitionsOf(r)).spotCheck, true, `${name} with firmware ${fw.join('.')}: spotCheck`); } finally { await r.app.close(); }
+    r = await defsRig(modelId, null);
+    try { assertEqual((await definitionsOf(r)).spotCheck, false, `${name} without a firmware read: no spotCheck`); } finally { await r.app.close(); }
+  }
+  for (const [modelId, name] of [[0x15, 'AM4'], [0x07, 'Axe-Fx II'], [0x14, 'VP4'], [0x01, 'gen-1']] as const) {
+    const r = await defsRig(modelId, [13, 0]);
+    try { assertEqual((await definitionsOf(r)).spotCheck, false, `${name}: no spotCheck`); } finally { await r.app.close(); }
+  }
+}
+
 export async function runCapsTests(): Promise<void> {
   await fm3();
   await fm9();
@@ -759,5 +775,6 @@ export async function runCapsTests(): Promise<void> {
   await definitionsKeyOrder();
   await definitionsContribute();
   await definitionsPortable();
+  await definitionsSpotCheck();
   await definitionsDriftV2();
 }

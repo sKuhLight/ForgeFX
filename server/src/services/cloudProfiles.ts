@@ -458,8 +458,41 @@ async function v1CloudCacheCheck(cloud: DeviceProfileCloud, registry: DeviceRegi
 /** Fields of a format-2 document that never go to the shared cloud store before M4: the raw sources and
  *  everything derived only for this install's coverage view. */
 const PUBLISH_STRIPPED_KEYS: readonly string[] = ['raw', 'sections', 'blockMap', 'provenance', 'coverage'];
-/** Format-2 `meta` fields stripped with them (the uploaded copy is a plain derived-tables document). */
-const PUBLISH_STRIPPED_META: readonly string[] = ['format', 'sources', 'derivedWith', 'derivedRevision', 'derivedAt', 'derivedHidden'];
+/** The only `meta` fields a published (or a pulled derived-tables-only) copy keeps — an ALLOW list, so a bookkeeping
+ *  field added later (when this install built, imported or pulled, which row it pulled, the format-2 fields) never
+ *  travels: `schema` (the v1 store filters on it), `recordCount` and `source` (the v1 store requires them), `walk` (the
+ *  reply-loss counts a client's coverage reads for a document without raw sources; numbers only) and `issues` (a
+ *  tolerant parse's damaged stretches, coarsened: section and counts, no free-text reason, no positions). */
+const PUBLISH_META_KEYS: readonly string[] = ['schema', 'recordCount', 'source', 'walk', 'issues'];
+/** The counters of `meta.walk` (`BuiltCacheWalkStats`) a published copy keeps. */
+const PUBLISH_WALK_COUNTS: readonly string[] = ['queries', 'lostReplies', 'recoveredReplies', 'unresolvedReplies', 'placeholderSlots', 'missingSlots', 'silentAddresses'];
+const PUBLISH_PSEUDO_COUNTS: readonly string[] = ['endMarker', 'duplicateId', 'implausible'];
+
+const countsOf = (v: unknown, keys: readonly string[]): Record<string, number> => {
+  const o = isPlainObject(v) ? v : {};
+  return Object.fromEntries(keys.filter((k) => typeof o[k] === 'number' && Number.isFinite(o[k])).map((k) => [k, o[k] as number]));
+};
+
+/** `meta` reduced to `PUBLISH_META_KEYS`: `walk` to its counters, each `issues` entry to its section and counts (the
+ *  reason text and the byte positions are dropped; the entry still says the section was damaged). */
+function publishableMeta(meta: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const k of PUBLISH_META_KEYS) {
+    if (!(k in meta)) continue;
+    const v = meta[k];
+    if (k === 'walk') {
+      if (!isPlainObject(v)) continue;
+      out.walk = { ...countsOf(v, PUBLISH_WALK_COUNTS), ...(isPlainObject(v.pseudoReplies) ? { pseudoReplies: countsOf(v.pseudoReplies, PUBLISH_PSEUDO_COUNTS) } : {}) };
+    } else if (k === 'issues') {
+      if (!Array.isArray(v)) continue;
+      out.issues = v.filter(isPlainObject).map((i) => ({
+        section: typeof i.section === 'number' ? i.section : null, record: null, offset: 0, reason: 'damaged',
+        droppedRecords: typeof i.droppedRecords === 'number' ? i.droppedRecords : 0, skippedBytes: 0, resumedAt: null
+      }));
+    } else out[k] = v;
+  }
+  return out;
+}
 
 /** The 409 body of a refused share while the development hook hides a catalog family (devices.ts `hiddenFamily`), or
  *  while the stored document still carries tables derived under it (`meta.derivedHidden`): what would be shared was
@@ -475,9 +508,9 @@ export function devHookActiveBody(): Record<string, unknown> {
 const isPlainObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
 
 /** The derived-tables-only copy of a profile document — what `publish` uploads and what a pull of a row without
- *  readable raw sources stores: no raw sources, sections, block map, provenance or coverage, no format-2 meta, and
- *  no synthetic family (`section:<tag>` / `block:<eid>`, an unassigned section of this install's document) in any
- *  derived table. A format-1 doc without synthetic keys passes unchanged. Exported for the tests. */
+ *  readable raw sources stores: no raw sources, sections, block map, provenance or coverage, `meta` reduced to the
+ *  allow list (`publishableMeta`), and no synthetic family (`section:<tag>` / `block:<eid>`, an unassigned section of
+ *  this install's document) in any derived table. Exported for the tests. */
 export function publishableProfile(data: Record<string, unknown>): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(data)) {
@@ -487,7 +520,7 @@ export function publishableProfile(data: Record<string, unknown>): Record<string
       : v;
   }
   const meta = data.meta as Record<string, unknown> | undefined;
-  if (meta) out.meta = Object.fromEntries(Object.entries(meta).filter(([k]) => !PUBLISH_STRIPPED_META.includes(k)));
+  if (meta) out.meta = publishableMeta(meta);
   return out;
 }
 
@@ -1070,53 +1103,73 @@ async function pullV1(cloud: DeviceProfileCloud, store: Store, registry: DeviceR
  *  too. Either way the upload is derived tables only (`publishableProfile`: no raw sources before M4, no synthetic
  *  families), after the privacy guard. The store validator expects the codec's meta.source vocabulary
  *  ('live'|'bytes'), so the uploaded copy is normalized back to it. */
-export async function cloudCachePublish(cloud: DeviceProfileCloud | null, store: Store, registry: DeviceRegistry): Promise<ImportResult> {
+export async function cloudCachePublish(
+  cloud: DeviceProfileCloud | null, store: Store, registry: DeviceRegistry, opts: { sources?: readonly RawSourceKind[] } = {}
+): Promise<ImportResult> {
   if (!cloud) return { code: 503, body: { error: 'cloud disabled' } };
+  const prepared = await v1PublishBody(store, registry, opts);
+  if (!prepared.ok) return prepared.result;
+  const r = await cloud.deviceProfilePublish(prepared.body);
+  return { code: r.code, body: r.body };
+}
+
+/** The v1 publish request body (`cloudCachePublish`). */
+export interface V1PublishBody { model: number; firmware: string; source: 'live-walk' | 'editor-cache'; profile: Record<string, unknown> }
+
+/** The exact v1 publish request `cloudCachePublish` sends (no cloud call), or the refusal it answers. `sources`: derive
+ *  only from the LOCAL raw sources of these kinds (the compat publish of a share passes `['editor-cache']`, so nothing
+ *  the user did not share reaches the v1 store); a document without raw sources is then refused (409). The body is a
+ *  pure function of the stored document (no clock), so a preview equals what is sent. */
+export async function v1PublishBody(
+  store: Store, registry: DeviceRegistry, opts: { sources?: readonly RawSourceKind[] } = {}
+): Promise<{ ok: true; body: V1PublishBody } | { ok: false; result: ImportResult }> {
+  const no = (result: ImportResult) => ({ ok: false as const, result });
   // the development hook's hidden catalog never reaches the shared store
-  if (hiddenFamily() !== null) return { code: 409, body: devHookActiveBody() };
+  if (hiddenFamily() !== null) return no({ code: 409, body: devHookActiveBody() });
   const id = await deviceIdentity(store, registry);
-  if (!id) return { code: 503, body: { error: 'no device detected' } };
+  if (!id) return no({ code: 503, body: { error: 'no device detected' } });
   const doc = store.getDoc('deviceCaches', id.key);
   const storedData = doc && !doc.deleted ? (doc.data as { meta?: { source?: string; derivedHidden?: unknown }; firmware?: unknown }) : null;
-  if (!storedData?.meta) return { code: 404, body: { error: 'no locally persisted profile to publish' } };
-  if (storedData.meta.derivedHidden !== undefined) return { code: 409, body: devHookActiveBody() };
+  if (!storedData?.meta) return no({ code: 404, body: { error: 'no locally persisted profile to publish' } });
+  if (storedData.meta.derivedHidden !== undefined) return no({ code: 409, body: devHookActiveBody() });
 
   const kind = storedData.meta.source;
-  const notPublishable = (why: string): ImportResult => ({ code: 409, body: { error: `profile source '${kind}' is not publishable (${why})` } });
+  const notPublishable = (why: string) => no({ code: 409, body: { error: `profile source '${kind}' is not publishable (${why})` } });
   let apiSource: 'live-walk' | 'editor-cache' | null;
   let tables: Record<string, unknown>;
   if (profileFormatOf(storedData) === 2) {
     const raw = readableRaw(storedData);
     if (!raw) return notPublishable('raw sources this build cannot read');
-    const local = raw.sources.filter((s) => s.origin === 'local');
+    const local = raw.sources.filter((s) => s.origin === 'local' && (!opts.sources || opts.sources.includes(s.kind)));
     if (local.length === 0) return notPublishable('no source read on this install: already from the cloud or a file?');
     const stored = loadStoredProfile(store, id.key);
-    if (stored.state === 'stale') return { code: 409, body: { error: 'profile-stale', ...staleFields(stored.check) } };
-    if (stored.state !== 'usable') return { code: 404, body: { error: 'no locally persisted profile to publish' } };
+    if (stored.state === 'stale') return no({ code: 409, body: { error: 'profile-stale', ...staleFields(stored.check) } });
+    if (stored.state !== 'usable') return no({ code: 404, body: { error: 'no locally persisted profile to publish' } });
     apiSource = local.some((s) => s.kind === 'editor-cache') ? 'editor-cache' : 'live-walk';
     let own: ProfileDoc;
     try {
       const fw = typeof storedData.firmware === 'string' ? storedData.firmware : id.firmware;
       own = deriveProfileDoc({ format: 1, sources: local }, id.model, fw, new Date().toISOString(), metaExtrasOf(storedData.meta));
     } catch (e) {
-      return { code: 422, body: { error: 'derivation-failed', message: (e as Error).message } };
+      return no({ code: 422, body: { error: 'derivation-failed', message: (e as Error).message } });
     }
     tables = publishableProfile(own as unknown as Record<string, unknown>);
   } else {
+    // a legacy document has no raw sources to choose from: a publish restricted to some kinds cannot use it
+    if (opts.sources) return notPublishable('no raw sources to publish from');
     apiSource = kind === 'live' ? 'live-walk' : kind === 'editor-cache' ? 'editor-cache' : null;
     if (!apiSource) return notPublishable('already from the cloud?');
     const stored = loadStoredProfile(store, id.key);
-    if (stored.state === 'stale') return { code: 409, body: { error: 'profile-stale', ...staleFields(stored.check) } };
-    if (stored.state !== 'usable') return { code: 404, body: { error: 'no locally persisted profile to publish' } };
+    if (stored.state === 'stale') return no({ code: 409, body: { error: 'profile-stale', ...staleFields(stored.check) } });
+    if (stored.state !== 'usable') return no({ code: 404, body: { error: 'no locally persisted profile to publish' } });
     tables = publishableProfile(stored.profile as unknown as Record<string, unknown>);
   }
   const data = tables;
   try {
     assertNoUserTables(data as Parameters<typeof assertNoUserTables>[0]);
   } catch (e) {
-    return { code: 500, body: { error: 'contains-user-data', message: (e as Error).message } };
+    return no({ code: 500, body: { error: 'contains-user-data', message: (e as Error).message } });
   }
   const upload = { ...data, meta: { ...(data.meta as Record<string, unknown>), source: apiSource === 'live-walk' ? 'live' : 'bytes' } };
-  const r = await cloud.deviceProfilePublish({ model: id.model, firmware: id.firmware, source: apiSource, profile: upload });
-  return { code: r.code, body: r.body };
+  return { ok: true, body: { model: id.model, firmware: id.firmware, source: apiSource, profile: upload } };
 }

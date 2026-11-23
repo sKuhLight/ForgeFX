@@ -41,6 +41,8 @@ const ALLOWED: [string, string][] = [
   ['GET', '/device/definitions/diff'], // the definitions diff: a read, relayed like the caps it explains
   ['GET', '/device/definitions/diff?family=DISTORT&include=params,rosters'],
   ['GET', '/device/definitions/export'], // the .axisdefs export: raw definitions, no user data — a read like the diff
+  ['GET', '/device/cache/cloud/share'], // the share status: what could be shared and what this install shared — a read
+  ['GET', '/device/cache/cloud/share?refresh=1'],
   ['PUT', '/telemetry/config'],  // benign cadence-mode control (no device data moves)
   // deprecated aliases stay relayable during the window
   ['PUT', '/am4/param'],
@@ -88,6 +90,11 @@ const REJECTED: [string, string][] = [
   // cloud pull: a device check of the unit and a write of the stored definitions — never relayed, preview or not
   ['POST', '/device/cache/cloud/pull'],
   ['POST', '/device/cache/cloud/pull?dryRun=1'],
+  // sharing definitions: consent comes from the person at the machine — share and withdraw never relayed, dry run or not
+  ['POST', '/device/cache/cloud/share'],
+  ['POST', '/device/cache/cloud/share?dryRun=1'],
+  ['POST', '/device/cache/cloud/share/withdraw'],
+  ['POST', '/device/cache/cloud/publish'],
 ];
 
 // Requests relayed end to end, with the status the remote must receive.

@@ -19,8 +19,11 @@
 //
 // Pure, browser-safe: no imports.
 
-/** Collections the generic store routes refuse. */
-export const PRIVATE_STORE_COLLECTIONS: readonly string[] = ['cloud'];
+/** Collections the generic store routes refuse. `cloud`: the auth sessions (above). `definitionShares`: this install's
+ *  records of its shared definitions (services/cloudShare.ts) — the row ids it shared anonymously and one-way tags of the
+ *  sessions that shared them, which together could tie an anonymous sharer to an account; a page that could write them
+ *  could also hide a share from "remove my shared definitions". The share status route is their only reader. */
+export const PRIVATE_STORE_COLLECTIONS: readonly string[] = ['cloud', 'definitionShares'];
 
 /** Collections the generic store routes may READ but never write or delete: state a dedicated API owns.
  *  `cacheContributions` holds the handles to this install's editor-cache uploads (services/cacheContribution.ts);

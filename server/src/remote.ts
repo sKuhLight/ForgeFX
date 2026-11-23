@@ -8,6 +8,7 @@ import type { FastifyInstance, InjectOptions } from 'fastify';
 import type { SupabaseClient, RealtimeChannel } from '@supabase/supabase-js';
 import type { DeviceEvent } from './drivers/types.js';
 import { isPrivateStorePath } from './runtime/storeAccess.js';
+import { REMOTE_RELAY_HEADER } from './services/originGuard.js';
 
 type Session = { client: SupabaseClient; userId: string };
 type Subscribe = (fn: (e: DeviceEvent) => void) => () => void;
@@ -168,7 +169,7 @@ export class RemoteHost {
       res = { id: rq?.id ?? '?', status: 403, contentType: 'application/json', body: JSON.stringify({ error: 'not allowed remotely' }), encoding: 'utf8' };
     } else {
       try {
-        const inj: InjectOptions = { method: rq.method as InjectOptions['method'], url: rq.path, headers: { 'content-type': 'application/json' } };
+        const inj: InjectOptions = { method: rq.method as InjectOptions['method'], url: rq.path, headers: { 'content-type': 'application/json', [REMOTE_RELAY_HEADER]: '1' } };
         if (rq.body != null) inj.payload = rq.body;
         const r = await this.#app.inject(inj);
         const ct = (r.headers['content-type']?.toString()) ?? 'application/json';
