@@ -10,6 +10,8 @@ import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 import type { Store } from './store.js';
 import { createStoreSessionStorage, type SessionStorageAdapter } from './sessionStorage.js';
 import { planVersionSync, type FreeLimits, type PlanVersion } from '../syncPlan.js';
+import type { ShareableSource } from 'forgefx-midi/cache';
+import type { CloudSourceTier, SharedSourceKind } from '../drivers/types.js';
 
 /** Cloud endpoint + gate. Publishable key only; never a secret. `enabled` is the operator gate the
  *  server reads from AXIS_CLOUD (checked per call, so a flag flip needs no new instance). */
@@ -49,7 +51,8 @@ export class Cloud {
     this.#store = store;
     this.#storage = createStoreSessionStorage(store);
   }
-  #anonClient: SupabaseClient | null = null;
+  /** The anonymous clients per storage slot (editor-cache uploads, definition shares: separate identities). */
+  #anonClients = new Map<string, SupabaseClient>();
   #enabled(): boolean {
     return (this.#cfg.enabled?.() ?? true) && !!this.#cfg.url && !!this.#cfg.anonKey;
   }
@@ -83,11 +86,14 @@ export class Cloud {
     if (!this.#client) this.#client = this.#createClient(defaultAuthStorageKey(this.#cfg.url), true);
     return this.#client;
   }
-  /** The client of this install's ANONYMOUS upload session (editor-cache contributions while signed out). Its
-   *  own storage key, so it never replaces or masks the account session; tokens refresh on demand (no timer). */
-  #anon(): SupabaseClient {
-    if (!this.#anonClient) this.#anonClient = this.#createClient(ANONYMOUS_UPLOADER_STORAGE_KEY, false);
-    return this.#anonClient;
+  /** The client of one of this install's ANONYMOUS sessions: `ANONYMOUS_UPLOADER_STORAGE_KEY` for editor-cache
+   *  contributions, `DEFINITION_SHARER_STORAGE_KEY` for shared definitions (a separate anonymous identity, so the two
+   *  stores' rows can never be linked by user id). Each has its own storage key, so it never replaces or masks the
+   *  account session; tokens refresh on demand (no timer). */
+  #anon(slot: AnonymousSlot): SupabaseClient {
+    let c = this.#anonClients.get(slot);
+    if (!c) this.#anonClients.set(slot, (c = this.#createClient(slot, false)));
+    return c;
   }
   /** Is a (non-anonymous) account session stored? A local read of the persisted session — no network call, so
    *  an expired access token with a refresh token still counts as signed in. False when the cloud is off. */
@@ -233,10 +239,11 @@ export class Cloud {
     } catch { return null; }
   }
 
-  /** The session an editor-cache call runs under: the signed-in account when there is one; otherwise this
-   *  install's anonymous session, signed in on first use when `create` (an upload) — never for a delete, which
-   *  must run as whoever uploaded. `prefer` pins the session kind (a delete of an anonymous upload). */
-  async #uploaderSession(create: boolean, prefer?: UploaderSession): Promise<UploaderWho | EditorCacheCloudOutcome> {
+  /** The session an editor-cache (or, with `slot`, a shared-definitions) call runs under: the signed-in account when
+   *  there is one; otherwise this install's anonymous session of that slot, signed in on first use when `create` (an
+   *  upload / a share) — never for a delete, which must run as whoever uploaded. `prefer` pins the session kind (a
+   *  delete of an anonymous upload). */
+  async #uploaderSession(create: boolean, prefer?: UploaderSession, slot: AnonymousSlot = ANONYMOUS_UPLOADER_STORAGE_KEY): Promise<UploaderWho | EditorCacheCloudOutcome> {
     if (prefer !== 'anonymous') {
       // read BEFORE getSession(): a refresh the server refuses (revoked session) makes supabase-js delete the stored
       // session inside getSession(), and a check after it would then let the upload slip to the anonymous session
@@ -252,7 +259,7 @@ export class Cloud {
       }
       if (prefer === 'account') return { code: 401, body: { error: 'not signed in', reason: 'account-signed-out' }, via: 'account' };
     }
-    const a = this.#anon();
+    const a = this.#anon(slot);
     const { data: as } = await a.auth.getSession();
     if (as.session?.access_token) return { client: a, token: as.session.access_token, via: 'anonymous', uploaderId: as.session.user?.id ?? null };
     if (!create) return { code: 401, body: { error: 'not signed in', reason: 'anonymous-session-missing' }, via: 'anonymous' };
@@ -308,8 +315,17 @@ export class Cloud {
   /** The user id of the STORED session of that kind (local read, no network), null when there is none: the
    *  account slot for 'account', this install's anonymous slot for 'anonymous'. */
   editorCacheUploader(via: UploaderSession): string | null {
+    return this.#storedUploader(via, ANONYMOUS_UPLOADER_STORAGE_KEY);
+  }
+
+  /** Like `editorCacheUploader`, for shared definitions: the account slot, or this install's anonymous SHARER slot. */
+  definitionSharer(via: UploaderSession): string | null {
+    return this.#storedUploader(via, DEFINITION_SHARER_STORAGE_KEY);
+  }
+
+  #storedUploader(via: UploaderSession, slot: AnonymousSlot): string | null {
     if (!this.#enabled()) return null;
-    const key = via === 'account' ? defaultAuthStorageKey(this.#cfg.url) : ANONYMOUS_UPLOADER_STORAGE_KEY;
+    const key = via === 'account' ? defaultAuthStorageKey(this.#cfg.url) : slot;
     const s = parseStoredSession(this.#storage.getItem(key)) as { refresh_token?: unknown; user?: { id?: unknown; is_anonymous?: unknown } | null } | null;
     if (!s || typeof s.refresh_token !== 'string' || !s.refresh_token) return null;
     if (via === 'account' && s.user?.is_anonymous === true) return null;
@@ -325,6 +341,102 @@ export class Cloud {
       const who = await this.#uploaderSession(false, via);
       if (!('token' in who)) return who;
       return { ...(await this.#postFn(`${EDITOR_CACHE_FN}/delete`, who.token, { uploadId })), via: who.via };
+    } catch (e) {
+      return { code: 0, body: { error: (e as Error).message } };
+    }
+  }
+
+  // ── shared device definitions, cloud v2 (axis-cloud `definition-sources`) ──
+  // Public rows of sanitized raw definition sources, the best one per kind for (model, firmware). The reads are
+  // anonymous; sharing, withdrawing, listing one's own shares and reporting a device check run under the same session
+  // choice as the editor-cache uploads (#uploaderSession): the signed-in account, else an anonymous session - but in a
+  // slot of its own (`DEFINITION_SHARER_STORAGE_KEY`), never the editor-cache one: a separate anonymous identity, so a
+  // public shared row and a private editor-cache upload can never be linked by user id (D-M4-6, maintainer D2).
+
+  /** The best shared source per kind for (model, firmware) whose raw format this build reads (`rawFormat` = the
+   *  newest it reads). Null when the cloud is off, the function is missing (404) or answers anything but a
+   *  well-formed 200 (the caller then falls back to the v1 store). An empty `sources` = nothing shared yet. */
+  async definitionSourcesList(model: number, firmware: string, rawFormat: number): Promise<DefinitionSourceList | null> {
+    if (!this.#enabled()) return null;
+    try {
+      const u = `${this.#cfg.url}/functions/v1/${DEFINITION_SOURCES_FN}?model=${encodeURIComponent(String(model))}&firmware=${encodeURIComponent(firmware)}&rawFormat=${encodeURIComponent(String(rawFormat))}`;
+      // `no-cache`: a browser runtime (Browser Direct) must revalidate, never answer a refresh from its HTTP cache
+      // (the listing is served with max-age=300); this client caches the listing itself (services/cloudProfiles.ts)
+      // (Node's RequestInit typing omits `cache`; Node's fetch accepts and ignores it, browsers honour it)
+      const init: RequestInit & { cache?: 'no-cache' } = { headers: { apikey: this.#cfg.anonKey }, cache: 'no-cache', signal: AbortSignal.timeout(15000) };
+      const res = await fetch(u, init);
+      if (!res.ok) return null;
+      return parseDefinitionSourceList(await res.json(), { model, firmware, rawFormat });
+    } catch { return null; }
+  }
+
+  /** One shared source with its content (`GET definition-sources/source/<id>`). Null when the cloud is off, the id
+   *  is not a row id, the row is gone (404: withdrawn, rejected, quarantined) or the answer is malformed. The
+   *  `source` is NOT validated here: the caller runs the shared-source check (services/rawValidation.ts). */
+  async definitionSourceGet(rawId: string): Promise<DefinitionSourceBody | null> {
+    const id = typeof rawId === 'string' ? rawId.toLowerCase() : rawId;
+    if (!this.#enabled() || !isRowId(id)) return null;
+    try {
+      const u = `${this.#cfg.url}/functions/v1/${DEFINITION_SOURCES_FN}/source/${encodeURIComponent(id)}`;
+      const res = await fetch(u, { headers: { apikey: this.#cfg.anonKey }, signal: AbortSignal.timeout(15000) });
+      if (!res.ok) return null;
+      return parseDefinitionSourceBody(await res.json(), id);
+    } catch { return null; }
+  }
+
+  /** Share one sanitized source (`POST definition-sources`): the account session, else this install's anonymous
+   *  slot, signed in on first use. The function's HTTP outcome verbatim (201 created / 200 deduped, 4xx/5xx with
+   *  their bodies, `retryAfter` on a 429), `via` = the session it ran under. */
+  async definitionSourceContribute(body: DefinitionSourceContribution): Promise<DefinitionSourceOutcome> {
+    if (!this.#enabled()) return { code: 503, body: { error: 'cloud-disabled' }, disabled: true };
+    try {
+      const who = await this.#uploaderSession(true, undefined, DEFINITION_SHARER_STORAGE_KEY);
+      if (!('token' in who)) return who;
+      return { ...(await this.#postFn(DEFINITION_SOURCES_FN, who.token, body)), via: who.via, uploaderId: who.uploaderId };
+    } catch (e) {
+      return { code: 0, body: { error: (e as Error).message } };
+    }
+  }
+
+  /** Withdraw this install's shares (`POST definition-sources/withdraw`): one row, or all (optionally of one model
+   *  and firmware). Runs under the session that shared (`via`; unknown → the account, else the anonymous one) and
+   *  never signs in anonymously: a fresh anonymous user has nothing to withdraw. */
+  async definitionSourceWithdraw(sel: DefinitionSourceWithdrawal, via?: UploaderSession): Promise<DefinitionSourceOutcome> {
+    if (!this.#enabled()) return { code: 503, body: { error: 'cloud-disabled' }, disabled: true };
+    try {
+      const who = await this.#uploaderSession(false, via, DEFINITION_SHARER_STORAGE_KEY);
+      if (!('token' in who)) return who;
+      return { ...(await this.#postFn(`${DEFINITION_SOURCES_FN}/withdraw`, who.token, sel)), via: who.via };
+    } catch (e) {
+      return { code: 0, body: { error: (e as Error).message } };
+    }
+  }
+
+  /** The caller's linked shares (`GET definition-sources/mine`, at most 100) under the session `via` (unknown → the
+   *  account, else the anonymous one). Never signs in anonymously. */
+  async definitionSourcesMine(via?: UploaderSession): Promise<DefinitionSourceOutcome> {
+    if (!this.#enabled()) return { code: 503, body: { error: 'cloud-disabled' }, disabled: true };
+    try {
+      const who = await this.#uploaderSession(false, via, DEFINITION_SHARER_STORAGE_KEY);
+      if (!('token' in who)) return who;
+      const res = await fetch(`${this.#cfg.url}/functions/v1/${DEFINITION_SOURCES_FN}/mine`, {
+        headers: { Authorization: `Bearer ${who.token}`, apikey: this.#cfg.anonKey },
+        signal: AbortSignal.timeout(15000)
+      });
+      return { code: res.status, body: (await res.json().catch(() => ({}))) as Record<string, unknown>, retryAfter: res.headers.get('retry-after'), via: who.via };
+    } catch (e) {
+      return { code: 0, body: { error: (e as Error).message } };
+    }
+  }
+
+  /** Report this install's device check of a row (`POST definition-sources/report`) — ONLY under a session that
+   *  already exists (the account, else this install's anonymous slot): a report never creates one. 401 without. */
+  async definitionSourceReport(body: DefinitionSourceReport): Promise<DefinitionSourceOutcome> {
+    if (!this.#enabled()) return { code: 503, body: { error: 'cloud-disabled' }, disabled: true };
+    try {
+      const who = await this.#uploaderSession(false, undefined, DEFINITION_SHARER_STORAGE_KEY);
+      if (!('token' in who)) return who;
+      return { ...(await this.#postFn(`${DEFINITION_SOURCES_FN}/report`, who.token, body)), via: who.via };
     } catch (e) {
       return { code: 0, body: { error: (e as Error).message } };
     }
@@ -692,6 +804,187 @@ export interface EditorCacheCloudOutcome {
  *  Separate from the account session so a signed-out user never appears signed in, and so the anonymous user —
  *  minted by Supabase Auth, unrelated to the telemetry instance id — is only ever used for these uploads. */
 export const ANONYMOUS_UPLOADER_STORAGE_KEY = 'axis-editor-cache-anonymous-session';
+
+/** Store key (same `cloud` collection) of this install's anonymous session for SHARED DEFINITIONS (cloud v2 shares,
+ *  withdrawals, `/mine`, device-check reports while signed out). Deliberately not the editor-cache slot: a separate
+ *  anonymous identity, so the public definition store and the private editor-cache uploads never share a user id. */
+export const DEFINITION_SHARER_STORAGE_KEY = 'axis-definition-sources-anonymous-session';
+
+/** The anonymous session slots of this install. */
+type AnonymousSlot = typeof ANONYMOUS_UPLOADER_STORAGE_KEY | typeof DEFINITION_SHARER_STORAGE_KEY;
+
+// ── shared device definitions, cloud v2 (axis-cloud `definition-sources`): wire types and answer parsers ──
+// Everything the function answers is checked here before anyone reads it: a row that does not have the documented
+// shape is dropped (a malformed listing as a whole reads as "no answer", so the caller falls back to v1). Only counts,
+// enumerated values and short stamps pass; a summary keeps scalar fields only. Pure, exported for the tests.
+
+const DEFINITION_SOURCES_FN = 'definition-sources';
+const SHARED_SOURCE_KINDS: readonly SharedSourceKind[] = ['editor-cache', 'live-full', 'live-readonly'];
+const SERVED_TIERS: readonly CloudSourceTier[] = ['official', 'verified', 'candidate'];
+const ROW_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const FACT_HASH_RE = /^[0-9a-f]{64}$/;
+const CANONICAL_FIRMWARE_RE = /^(0|[1-9]\d{0,3})\.(0|[1-9]\d{0,3})$/;
+/** A UTC day (`2026-11-23`), or a full ISO stamp (an older deployment); nothing else. */
+const CLOUD_DATE_RE = /^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}(:\d{2}(\.\d{1,9})?)?(Z|[+-]\d{2}:\d{2}))?$/;
+/** At most this many rows of a listing are looked at (the function serves one per kind, three at most). */
+const LIST_ROWS_MAX = 16;
+const SUMMARY_KEYS_MAX = 32;
+
+/** A shared source as the cloud lists it (axis-cloud `SourceSummary`). */
+export interface DefinitionSourceSummary {
+  id: string;
+  kind: SharedSourceKind;
+  rawFormat: number;
+  /** sha256 (hex) of the source's facts: equal to the codec's `sourceFactHash` of the same source. */
+  factHash: string;
+  tier: CloudSourceTier;
+  quality: number;
+  contributors: number;
+  networks: number;
+  /** Distinct networks that reported a passed / failed device check. */
+  spotChecks: { passed: number; failed: number };
+  firstSeen: string;
+  lastConfirmedAt: string | null;
+  bytes: number;
+  /** The cloud's counts (scalar fields only, `walk` one level deep). */
+  summary: Record<string, unknown>;
+}
+
+/** `GET definition-sources?model&firmware&rawFormat`: the best row per kind (none = nothing shared yet) and how
+ *  many servable rows each kind has (the listed one included). */
+export interface DefinitionSourceList {
+  model: number;
+  firmware: string;
+  sources: DefinitionSourceSummary[];
+  alternatives: Record<SharedSourceKind, number>;
+}
+
+/** `GET definition-sources/source/<id>`: one row with its sanitized raw source (still to be validated). */
+export interface DefinitionSourceBody {
+  id: string;
+  model: number;
+  firmware: string;
+  kind: SharedSourceKind;
+  rawFormat: number;
+  factHash: string;
+  tier: CloudSourceTier;
+  quality: number;
+  summary: Record<string, unknown>;
+  source: Record<string, unknown>;
+}
+
+/** The share envelope (`POST definition-sources`). `source` is the codec's `shareableSource` output; `consentAt`
+ *  is when the user ticked the consent (ISO, within a day of the cloud's clock), `consentVersion` the text shown. */
+export interface DefinitionSourceContribution {
+  model: number;
+  firmware: string;
+  kind: SharedSourceKind;
+  rawFormat: number;
+  source: ShareableSource;
+  app: { forgefx?: string; codec?: string; axis?: string };
+  consentAt: string;
+  consentVersion: number;
+}
+
+/** What `POST definition-sources/withdraw` removes: one share, or all (optionally of one model and firmware). */
+export type DefinitionSourceWithdrawal = { sourceId: string } | { all: true; model?: number; firmware?: string };
+
+/** A device-check report (`POST definition-sources/report`): counts only, never a value. */
+export interface DefinitionSourceReport {
+  sourceId: string;
+  verdict: 'passed' | 'failed';
+  checked: number;
+  answered: number;
+  mismatches: number;
+  app?: { forgefx?: string; codec?: string; axis?: string };
+}
+
+/** Outcome of a `definition-sources` write or `/mine`: the function's status and body (0 = network failure),
+ *  `disabled` when the cloud is off, `via` = the session it ran under. */
+export type DefinitionSourceOutcome = EditorCacheCloudOutcome;
+
+const isPlainObject = (v: unknown): v is Record<string, unknown> =>
+  typeof v === 'object' && v !== null && !Array.isArray(v) && (Object.getPrototypeOf(v) === Object.prototype || Object.getPrototypeOf(v) === null);
+const isCount = (v: unknown): v is number => typeof v === 'number' && Number.isSafeInteger(v) && v >= 0;
+const isIntIn = (v: unknown, min: number, max: number): v is number => typeof v === 'number' && Number.isInteger(v) && v >= min && v <= max;
+const isCloudDate = (v: unknown): v is string => typeof v === 'string' && v.length <= 40 && CLOUD_DATE_RE.test(v);
+const isSharedKind = (v: unknown): v is SharedSourceKind => typeof v === 'string' && (SHARED_SOURCE_KINDS as readonly string[]).includes(v);
+const isServedTier = (v: unknown): v is CloudSourceTier => typeof v === 'string' && (SERVED_TIERS as readonly string[]).includes(v);
+
+/** A cloud row id (a lower-case UUID, as Postgres prints it). */
+export const isRowId = (v: unknown): v is string => typeof v === 'string' && ROW_ID_RE.test(v);
+/** A fact hash (sha256, lower-case hex). */
+export const isFactHash = (v: unknown): v is string => typeof v === 'string' && FACT_HASH_RE.test(v);
+
+/** A summary value worth passing on: null, a boolean, a finite number or a short printable stamp. */
+const isSummaryScalar = (v: unknown): boolean =>
+  v === null || typeof v === 'boolean' || (typeof v === 'number' && Number.isFinite(v)) ||
+  (typeof v === 'string' && v.length <= 32 && /^[\x20-\x7e]*$/.test(v));
+
+function cleanSummary(v: unknown, nested = true): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  if (!isPlainObject(v)) return out;
+  for (const k of Object.keys(v).slice(0, SUMMARY_KEYS_MAX)) {
+    if (!/^[A-Za-z][A-Za-z0-9]{0,31}$/.test(k)) continue;
+    const x = v[k];
+    if (isSummaryScalar(x)) out[k] = x;
+    else if (nested && k === 'walk' && isPlainObject(x)) out[k] = cleanSummary(x, false);
+  }
+  return out;
+}
+
+function listedRow(r: unknown, rawFormatMax: number): DefinitionSourceSummary | null {
+  if (!isPlainObject(r)) return null;
+  const sc = r.spotChecks;
+  if (
+    !isRowId(r.id) || !isSharedKind(r.kind) || !isIntIn(r.rawFormat, 1, rawFormatMax) || !isFactHash(r.factHash) ||
+    !isServedTier(r.tier) || !isIntIn(r.quality, 0, 3) || !isCount(r.contributors) || !isCount(r.networks) ||
+    !isPlainObject(sc) || !isCount(sc.passed) || !isCount(sc.failed) || !isCloudDate(r.firstSeen) ||
+    !(r.lastConfirmedAt === null || isCloudDate(r.lastConfirmedAt)) || !isCount(r.bytes)
+  ) return null;
+  return {
+    id: r.id, kind: r.kind, rawFormat: r.rawFormat, factHash: r.factHash, tier: r.tier, quality: r.quality,
+    contributors: r.contributors, networks: r.networks, spotChecks: { passed: sc.passed, failed: sc.failed },
+    firstSeen: r.firstSeen, lastConfirmedAt: r.lastConfirmedAt as string | null, bytes: r.bytes, summary: cleanSummary(r.summary)
+  };
+}
+
+/**
+ * The listing answer for (model, firmware, rawFormat), or null when it is not one: no `sources` array, or another
+ * model / firmware than asked for. Rows without the documented shape, of a raw format above `rawFormat`, of a kind
+ * that is never shared or of a tier that is never served are dropped; of several rows of one kind the first stays.
+ */
+export function parseDefinitionSourceList(body: unknown, asked: { model: number; firmware: string; rawFormat: number }): DefinitionSourceList | null {
+  if (!isPlainObject(body) || !Array.isArray(body.sources)) return null;
+  if (body.model !== asked.model || body.firmware !== asked.firmware) return null;
+  const sources: DefinitionSourceSummary[] = [];
+  const kinds = new Set<SharedSourceKind>();
+  for (const r of body.sources.slice(0, LIST_ROWS_MAX)) {
+    const row = listedRow(r, asked.rawFormat);
+    if (!row || kinds.has(row.kind)) continue;
+    kinds.add(row.kind);
+    sources.push(row);
+  }
+  const alt = isPlainObject(body.alternatives) ? body.alternatives : {};
+  const alternatives = Object.fromEntries(SHARED_SOURCE_KINDS.map((k) => [k, isCount(alt[k]) ? alt[k] : 0])) as Record<SharedSourceKind, number>;
+  return { model: asked.model, firmware: asked.firmware, sources, alternatives };
+}
+
+/** The `/source/<id>` answer for `id`, or null when it is not one (another id, a kind never shared, a tier never
+ *  served, a non-canonical firmware, no source object). The source itself is checked by the caller. */
+export function parseDefinitionSourceBody(body: unknown, id: string): DefinitionSourceBody | null {
+  if (!isPlainObject(body)) return null;
+  const b = body;
+  if (
+    b.id !== id || !isIntIn(b.model, 0, 255) || typeof b.firmware !== 'string' || !CANONICAL_FIRMWARE_RE.test(b.firmware) ||
+    !isSharedKind(b.kind) || !isIntIn(b.rawFormat, 1, 100) || !isFactHash(b.factHash) || !isServedTier(b.tier) ||
+    !isIntIn(b.quality, 0, 3) || !isPlainObject(b.source)
+  ) return null;
+  return {
+    id, model: b.model, firmware: b.firmware, kind: b.kind, rawFormat: b.rawFormat, factHash: b.factHash, tier: b.tier,
+    quality: b.quality, summary: cleanSummary(b.summary), source: b.source
+  };
+}
 
 /** supabase-js's default auth storage key for a project URL (`sb-<first host label>-auth-token`). */
 function defaultAuthStorageKey(url: string): string {

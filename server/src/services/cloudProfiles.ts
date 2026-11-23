@@ -18,10 +18,22 @@
 // PUBLISH refuses to upload a stale local profile (409) so the shared store only ever receives profiles
 // other builds can use. Nothing is deleted, locally or in the cloud.
 //
+// Cloud v2 (M4, shared definition sources — axis-cloud `definition-sources`): the CHECK reads the v2 store first for
+// the gen-3 grid units (Axe-Fx III, FM3, FM9) whose firmware was read: the best shared source per kind, as summaries,
+// minus the rows this install's device check failed (listed under `rejected`), with `identical` (the facts equal a
+// source already stored, by the codec's fact hash) and `improves` (would a pull change what decides the definitions?).
+// When the v2 store does not answer (function not deployed: 404/5xx, cloud client without v2) or offers nothing,
+// the v1 path below runs unchanged. The v2 listing is cached per registry and device key for 10 minutes
+// (`refresh` bypasses it); verdicts and local fact hashes are read fresh on every check.
+//
 // Browser-safe: registry/store/cloud are type-only or structural imports; the fetch work lives in
 // runtime/cloud.ts (itself browser-safe). check-browser-safe.ts enforces it.
-import { assertNoUserTables, isSyntheticFamilyKey, ProfileDerivationError, ProfileUserDataError, type ProfileDoc } from 'forgefx-midi/cache';
+import {
+  assertNoUserTables, isSyntheticFamilyKey, ProfileDerivationError, ProfileUserDataError, RAW_FORMAT, sourceFactHash, sourceRank,
+  type ProfileDoc, type RawSource, type RawSourceKind, type SourceOrigin
+} from 'forgefx-midi/cache';
 import { deviceCacheKey, type DeviceRegistry } from '../drivers/registryCore.js';
+import type { CloudSourceSummary, SharedSourceKind } from '../drivers/types.js';
 import { resolveCacheKey } from './deviceCache.js';
 import {
   CURRENT_CACHE_SCHEMA, checkProfileSchema, deriveProfileDoc, loadStoredProfile, metaExtrasOf, persistProfile, profileFormatOf,
@@ -31,6 +43,10 @@ import { ProfileMergeRefused, foreignSources, mergeRefusal, mergeSourcesIntoStor
 import { checkRawSources } from './rawValidation.js';
 import { HIDE_FAMILY_ENV, hiddenFamily } from '../devices.js';
 import type { Store } from '../runtime/store.js';
+import type {
+  DefinitionSourceBody, DefinitionSourceContribution, DefinitionSourceList, DefinitionSourceOutcome, DefinitionSourceReport,
+  DefinitionSourceSummary, DefinitionSourceWithdrawal, UploaderSession
+} from '../runtime/cloud.js';
 import type { ImportResult } from './editorCacheImport.js';
 
 /** The slice of the Cloud service these functions need — structural so tests fake it in two lines
@@ -40,6 +56,290 @@ export interface DeviceProfileCloud {
    *  row of that schema, so builds on different schemas do not hide each other's shared profiles. */
   deviceProfileGet(model: number, firmware: string, schema?: number): Promise<{ profile: unknown; contentHash: string; source: string; recordCount: number | null; createdAt: string } | null>;
   deviceProfilePublish(body: { model: number; firmware: string; source: 'live-walk' | 'editor-cache'; profile: unknown }): Promise<{ code: number; body: unknown }>;
+}
+
+/** The slice of the Cloud client the shared definition store (cloud v2, axis-cloud `definition-sources`) needs —
+ *  structural, so tests and Browser Direct pass their own (runtime/cloud.ts `Cloud` implements it). The reads are
+ *  anonymous and answer null on any failure (the caller then uses the v1 store); the writes run under the account
+ *  session, else this install's anonymous one (created by a share only; a report never creates one). */
+export interface DefinitionSourceCloud {
+  definitionSourcesList(model: number, firmware: string, rawFormat: number): Promise<DefinitionSourceList | null>;
+  definitionSourceGet(id: string): Promise<DefinitionSourceBody | null>;
+  definitionSourceContribute(body: DefinitionSourceContribution): Promise<DefinitionSourceOutcome>;
+  definitionSourceWithdraw(sel: DefinitionSourceWithdrawal, via?: UploaderSession): Promise<DefinitionSourceOutcome>;
+  definitionSourcesMine(via?: UploaderSession): Promise<DefinitionSourceOutcome>;
+  definitionSourceReport(body: DefinitionSourceReport): Promise<DefinitionSourceOutcome>;
+}
+
+/** What the cloud-profile routes take: the v1 store always, the v2 store when the client has it (a client without
+ *  the v2 methods keeps the v1 path, unchanged). */
+export type CloudProfilesCloud = DeviceProfileCloud & Partial<DefinitionSourceCloud>;
+
+/** Models the v2 store serves (the gen-3 grid units with a definition walk): Axe-Fx III, FM3, FM9. */
+export const DEFINITION_SOURCE_MODELS: readonly number[] = [0x10, 0x11, 0x12];
+/** How long the v2 listing is reused per registry and device key; `?refresh=1` bypasses it. */
+export const CLOUD_CHECK_CACHE_MS = 10 * 60 * 1000;
+/** Local store collection of this install's device-check verdicts on shared rows (one doc per device-cache key). */
+export const CLOUD_VERDICTS_COLLECTION = 'cloudVerdicts';
+/** Verdicts kept per device key (the newest). */
+export const CLOUD_VERDICTS_MAX = 64;
+
+/** This install's device check of one shared row (stored by the pull, keyed by the cloud row id). */
+export interface CloudVerdict {
+  /** The fact hash the verdict was reached on: a verdict only counts for a row with these facts. */
+  factHash: string;
+  /** The kind of the checked row. Optional for older entries: the fact hash covers the kind anyway (the codec's fact
+   *  document names it), so (kind, factHash) never matches another kind's row. */
+  kind?: SharedSourceKind;
+  verdict: 'passed' | 'failed';
+  /** ISO time of the check. */
+  at: string;
+  checked: number;
+  answered: number;
+  mismatches: number;
+}
+
+const ROW_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const FACT_HASH_RE = /^[0-9a-f]{64}$/;
+const SHARED_KINDS: readonly SharedSourceKind[] = ['editor-cache', 'live-full', 'live-readonly'];
+const isCount = (v: unknown): v is number => typeof v === 'number' && Number.isSafeInteger(v) && v >= 0;
+
+/** A cloud row id from a request body or the store, lower-cased (Postgres prints UUIDs lower-case), or null when it
+ *  is not a UUID. Every id a client sends (`sourceIds`, `recheck`, withdraw) goes through this before it is used. */
+export function normalizeRowId(v: unknown): string | null {
+  if (typeof v !== 'string' || v.length !== 36) return null;
+  const id = v.toLowerCase();
+  return ROW_ID_RE.test(id) ? id : null;
+}
+
+function verdictOf(v: unknown): CloudVerdict | null {
+  if (typeof v !== 'object' || v === null || Array.isArray(v)) return null;
+  const o = v as Record<string, unknown>;
+  if (typeof o.factHash !== 'string' || !FACT_HASH_RE.test(o.factHash)) return null;
+  if (o.verdict !== 'passed' && o.verdict !== 'failed') return null;
+  if (typeof o.at !== 'string' || o.at.length > 40 || !isCount(o.checked) || !isCount(o.answered) || !isCount(o.mismatches)) return null;
+  if (o.kind !== undefined && !(SHARED_KINDS as readonly unknown[]).includes(o.kind)) return null;
+  return {
+    factHash: o.factHash, ...(o.kind !== undefined ? { kind: o.kind as SharedSourceKind } : {}), verdict: o.verdict, at: o.at,
+    checked: o.checked, answered: o.answered, mismatches: o.mismatches
+  };
+}
+
+/** The verdicts stored for a device key, by cloud row id. Malformed entries are ignored (never trusted). */
+export function readCloudVerdicts(store: Pick<Store, 'getDoc'>, key: string): Map<string, CloudVerdict> {
+  const out = new Map<string, CloudVerdict>();
+  const doc = store.getDoc(CLOUD_VERDICTS_COLLECTION, key);
+  const verdicts = doc && !doc.deleted ? (doc.data as { verdicts?: unknown } | null)?.verdicts : undefined;
+  if (typeof verdicts !== 'object' || verdicts === null || Array.isArray(verdicts)) return out;
+  for (const [rawId, v] of Object.entries(verdicts as Record<string, unknown>)) {
+    const id = normalizeRowId(rawId);
+    const verdict = id ? verdictOf(v) : null;
+    if (id && verdict) out.set(id, verdict);
+  }
+  return out;
+}
+
+/**
+ * This install's verdict on a listed row: the newest stored verdict reached on the row's facts — under the row's id,
+ * or under another id with the same (kind, factHash). A row the cloud re-created under a new id with identical facts
+ * (an orphan reset: withdrawn, then shared again) keeps its verdict; a row with other facts never inherits one.
+ */
+export function verdictFor(row: Pick<DefinitionSourceSummary, 'id' | 'kind' | 'factHash'>, verdicts: ReadonlyMap<string, CloudVerdict>): CloudVerdict | null {
+  let best: CloudVerdict | null = null;
+  for (const [id, v] of verdicts) {
+    if (v.factHash !== row.factHash) continue;
+    if (id !== row.id && v.kind !== undefined && v.kind !== row.kind) continue;
+    if (!best || v.at > best.at) best = v;
+  }
+  return best;
+}
+
+/** Store this install's verdict on a shared row (replacing an earlier one), keeping the newest `CLOUD_VERDICTS_MAX`. */
+export function recordCloudVerdict(store: Pick<Store, 'getDoc' | 'putDoc'>, key: string, rawSourceId: string, verdict: CloudVerdict): void {
+  const sourceId = normalizeRowId(rawSourceId);
+  const v = verdictOf(verdict);
+  if (!sourceId || !v) throw new TypeError('recordCloudVerdict: not a row id or not a verdict');
+  const all = readCloudVerdicts(store, key);
+  all.delete(sourceId);
+  all.set(sourceId, v);
+  const kept = [...all.entries()].sort((a, b) => (a[1].at < b[1].at ? 1 : a[1].at > b[1].at ? -1 : 0)).slice(0, CLOUD_VERDICTS_MAX);
+  store.putDoc(CLOUD_VERDICTS_COLLECTION, key, { verdicts: Object.fromEntries(kept) });
+}
+
+/** The v2 listing cache: per registry, valid for one cloud client and device key. */
+const V2_LIST = new WeakMap<DeviceRegistry, { cloud: object; key: string; at: number; list: DefinitionSourceList }>();
+
+/** Forget the cached v2 listing (after this install shared or withdrew, the next check asks again). */
+export function forgetDefinitionSources(registry: DeviceRegistry): void {
+  V2_LIST.delete(registry);
+}
+
+/** The identity the v2 store is asked for, or null when it does not apply: a model it serves, a gen-3 unit with a
+ *  definition walk, and a firmware READ from the unit (never one derived from a stored document's key). */
+function definitionSourceIdentity(registry: DeviceRegistry, id: { model: number; firmware: string; key: string }): { model: number; firmware: string; key: string } | null {
+  if (!DEFINITION_SOURCE_MODELS.includes(id.model)) return null;
+  if (registry.activeCapabilities()?.selfDescribe !== true) return null;
+  const fw = registry.firmwareInfo();
+  if (!fw || `${fw.major}.${fw.minor}` !== id.firmware) return null;
+  return id;
+}
+
+/** The v2 listing for the attached device (the cached one unless `refresh`), or null: no v2 client, the store does
+ *  not apply to this device, or the store did not answer. For the check and the pull. */
+export async function definitionSourcesFor(
+  cloud: CloudProfilesCloud, registry: DeviceRegistry, id: { model: number; firmware: string; key: string },
+  opts: { refresh?: boolean; now?: number } = {}
+): Promise<DefinitionSourceList | null> {
+  if (typeof cloud.definitionSourcesList !== 'function' || !definitionSourceIdentity(registry, id)) return null;
+  const now = opts.now ?? Date.now();
+  const hit = V2_LIST.get(registry);
+  if (hit && !opts.refresh && hit.cloud === cloud && hit.key === id.key && now - hit.at >= 0 && now - hit.at < CLOUD_CHECK_CACHE_MS) return hit.list;
+  let list: DefinitionSourceList | null;
+  try { list = await cloud.definitionSourcesList(id.model, id.firmware, RAW_FORMAT); } catch { list = null; }
+  if (list) V2_LIST.set(registry, { cloud, key: id.key, at: now, list });
+  else V2_LIST.delete(registry);
+  return list;
+}
+
+/** A source stored for the device key, as the improves / identical judgement needs it. `hash` null = its fact hash
+ *  could not be computed (a malformed stored source); `blocks` = the blocks its records sit in (live sources). */
+interface StoredFact { kind: RawSourceKind; origin: SourceOrigin; hash: string | null; blocks: ReadonlySet<number> }
+
+/** Fact hashes of stored docs, per store and key, valid while the doc's revision is unchanged. */
+const STORED_FACTS = new WeakMap<object, Map<string, { rev: number; updatedAt: number; model: number; facts: StoredFact[] | null }>>();
+
+/** The raw sources stored for `id.key` that a pull would keep next to cloud sources (those of the device firmware),
+ *  with their fact hashes; null when no doc with readable raw sources is stored. */
+async function storedSourceFacts(store: Pick<Store, 'getDoc'>, id: { model: number; firmware: string; key: string }): Promise<StoredFact[] | null> {
+  const doc = store.getDoc('deviceCaches', id.key);
+  if (!doc || doc.deleted) return null;
+  let memo = STORED_FACTS.get(store);
+  if (!memo) STORED_FACTS.set(store, (memo = new Map()));
+  const hit = memo.get(id.key);
+  if (hit && hit.rev === doc.rev && hit.updatedAt === doc.updatedAt && hit.model === id.model) return hit.facts;
+  const raw = readableRaw(doc.data);
+  let facts: StoredFact[] | null = null;
+  if (raw) {
+    facts = [];
+    for (const s of raw.sources as RawSource[]) {
+      if (s.kind === 'live-probe') continue; // a single-block probe has no fact hash and is never shared
+      if (s.firmware !== null && s.firmware !== id.firmware) continue; // the merge drops a source of another firmware
+      let hash: string | null;
+      try { hash = await sourceFactHash(s, { model: id.model, firmware: id.firmware }); } catch { hash = null; }
+      const blocks = new Set<number>(s.kind === 'editor-cache' ? [] : s.records.map((r) => r.section));
+      facts.push({ kind: s.kind, origin: s.origin, hash, blocks });
+    }
+  }
+  memo.set(id.key, { rev: doc.rev, updatedAt: doc.updatedAt, model: id.model, facts });
+  return facts;
+}
+
+/**
+ * Would pulling the offered sources change what decides the definitions? The codec's merge takes a family's existence
+ * from the best-ranked source THAT HAS the family (`sourceRank`), so a better-ranked source only covers an offer where
+ * it covers the same blocks. Per offered row:
+ *   - covered by a stored source of the same kind with identical facts (fact hash);
+ *   - covered by a stored EDITOR-CACHE source that outranks it (local or cloud origin: an editor cache has every
+ *     family, byte-exact);
+ *   - against better-ranked stored LIVE sources (a local read of the same kind, a better live kind): their
+ *     record-carrying blocks together are compared with the offer's `summary.blocks` — the offer has more → `yes`
+ *     (blocks the local reads lack), as many or fewer → covered; an offer without a block count → undecidable.
+ * `no` when nothing is offered, when a pull would be refused (a doc a newer build wrote; a stored doc without raw
+ * sources that outranks every offered source: `mergeRefusal`), or when every offered row is covered. `yes` when an
+ * offered row is not covered. `unknown` when a row could be covered but that cannot be decided (a stored source of
+ * its kind without a computable hash, an offer without a block count).
+ */
+function improvesOf(offered: readonly DefinitionSourceSummary[], facts: StoredFact[] | null, refused: boolean): 'yes' | 'no' | 'unknown' {
+  if (offered.length === 0 || refused) return 'no';
+  if (facts === null) return 'yes';
+  let undetermined = false;
+  for (const row of offered) {
+    const rank = sourceRank(row.kind, 'cloud');
+    let covered = false;
+    let maybe = false;
+    let betterLive = false;
+    const liveBlocks = new Set<number>();
+    for (const s of facts) {
+      if (s.kind === row.kind && s.hash === row.factHash) { covered = true; break; }
+      if (sourceRank(s.kind, s.origin) < rank) {
+        if (s.kind === 'editor-cache') { covered = true; break; }
+        betterLive = true;
+        for (const b of s.blocks) liveBlocks.add(b);
+      }
+      if (s.kind === row.kind && s.hash === null) maybe = true;
+    }
+    if (!covered && betterLive) {
+      const offerBlocks = row.kind === 'editor-cache' ? undefined : summaryCount(row.summary, 'blocks');
+      if (offerBlocks === undefined) maybe = true;
+      else if (offerBlocks > liveBlocks.size) return 'yes'; // the offer has blocks the better-ranked local reads lack
+      else covered = true;
+    }
+    if (covered) continue;
+    if (!maybe) return 'yes';
+    undetermined = true;
+  }
+  return undetermined ? 'unknown' : 'no';
+}
+
+const summaryCount = (s: Record<string, unknown>, k: string): number | undefined => (isCount(s[k]) ? s[k] : undefined);
+
+/** The client summary of a listed row (counts from the cloud's summary; no content). */
+function cloudSourceSummary(row: DefinitionSourceSummary, verdict: CloudVerdict | null, identical: boolean): CloudSourceSummary {
+  const s = row.summary;
+  const live = row.kind !== 'editor-cache';
+  const sections = live ? undefined : summaryCount(s, 'sections');
+  const blocks = live ? summaryCount(s, 'blocks') : undefined;
+  return {
+    id: row.id, kind: row.kind, tier: row.tier, quality: row.quality, complete: row.quality === 3,
+    contributors: row.contributors, deviceChecks: { passed: row.spotChecks.passed, failed: row.spotChecks.failed },
+    firstSeen: row.firstSeen, records: summaryCount(s, 'records') ?? 0,
+    ...(sections !== undefined ? { sections } : {}),
+    ...(blocks !== undefined ? { blocks } : {}),
+    ...(live && typeof s.extended === 'boolean' ? { extended: s.extended } : {}),
+    ...(live && typeof s.above160 === 'boolean' ? { above160: s.above160 } : {}),
+    verdict: verdict?.verdict ?? null,
+    identical
+  };
+}
+
+/** One listed row with its client summary (and, when rejected, the verdict that rejected it). */
+export interface OfferedSource { row: DefinitionSourceSummary; summary: CloudSourceSummary }
+export interface RejectedSource extends OfferedSource { verdict: CloudVerdict }
+
+/** The v2 offer for the attached device, as the check answers it and the pull starts from it. */
+export interface DefinitionSourcesOffer {
+  /** The listing the split was made from (cached per registry and key, see `definitionSourcesFor`). */
+  list: DefinitionSourceList;
+  /** Best row per kind, minus the rows this install's device check failed (`verdictFor`). */
+  offered: OfferedSource[];
+  /** The rows this install's device check failed (on the same facts): not offered unless re-checked. */
+  rejected: RejectedSource[];
+  /** Would pulling the offered rows change what decides the definitions (`improvesOf`)? */
+  improves: 'yes' | 'no' | 'unknown';
+}
+
+/** The v2 offer: the listing split into offered and locally rejected rows, with their summaries and `improves`. Null
+ *  when the v2 store does not apply to this device or did not answer. Shared by the check and the pull (WP-F2). */
+export async function definitionSourcesOffer(
+  cloud: CloudProfilesCloud, store: Store, registry: DeviceRegistry, id: { model: number; firmware: string; key: string },
+  opts: { refresh?: boolean; now?: number } = {}
+): Promise<DefinitionSourcesOffer | null> {
+  const list = await definitionSourcesFor(cloud, registry, id, opts);
+  if (!list) return null;
+  const verdicts = readCloudVerdicts(store, id.key);
+  const facts = await storedSourceFacts(store, id);
+  const offered: OfferedSource[] = [];
+  const rejected: RejectedSource[] = [];
+  for (const row of list.sources) {
+    const mine = verdictFor(row, verdicts); // a verdict counts only for the facts it was reached on
+    const identical = !!facts?.some((f) => f.kind === row.kind && f.hash === row.factHash);
+    const summary = cloudSourceSummary(row, mine, identical);
+    if (mine?.verdict === 'failed') rejected.push({ row, summary, verdict: mine });
+    else offered.push({ row, summary });
+  }
+  const rows = offered.map((o) => o.row);
+  const refused = rows.length > 0 && mergeRefusal(store, id.key, rows.map((r) => ({ kind: r.kind, origin: 'cloud' as const }))) !== null;
+  return { list, offered, rejected, improves: improvesOf(rows, facts, refused) };
 }
 
 /** check's GET result caches here so an immediately following pull doesn't refetch the (possibly
@@ -77,14 +377,46 @@ export interface CloudCacheCheck {
   staleReason?: StaleReason;
   schema?: number | null;
   currentSchema?: number;
+  /** Which store answered: 2 = the shared definition sources, 1 = the v1 profile store (fallback). Absent when no
+   *  store had anything. */
+  version?: 1 | 2;
+  /** v2: the best shared source per kind, minus the rows this install's device check failed. */
+  sources?: CloudSourceSummary[];
+  /** v2: the rows this install's device check failed (not offered; a pull with `recheck` checks them again). Also on
+   *  a v1 fallback answer when every v2 row was rejected. */
+  rejected?: CloudSourceSummary[];
+  /** Would a pull change what decides the definitions? `no` when nothing is offered or a stored source of this
+   *  firmware outranks (or equals) every offered one; `unknown` for a v1 row (and an undecidable stored source). */
+  improves?: 'yes' | 'no' | 'unknown';
 }
 
-/** GET /device/cache/cloud — is a USABLE shared profile available for the attached device+firmware?
- *  Fetches (and caches) the row so a following pull is instant. `enabled:false` when cloud is off entirely. */
-export async function cloudCacheCheck(cloud: DeviceProfileCloud | null, store: Store, registry: DeviceRegistry): Promise<CloudCacheCheck> {
+/** GET /device/cache/cloud — what the cloud offers for the attached device+firmware. The v2 store first (gen-3 grid
+ *  units with a read firmware; listing cached for 10 minutes, `refresh` asks again): `version: 2` with the offered
+ *  `sources`, the locally `rejected` rows and `improves`. Without a v2 offer (store missing or unreachable, nothing
+ *  shared, every row rejected here) the v1 profile store answers as before, with `version: 1` when it had a row; the
+ *  v1 row is fetched (and cached) so a following pull is instant. `enabled:false` when cloud is off entirely. */
+export async function cloudCacheCheck(
+  cloud: CloudProfilesCloud | null, store: Store, registry: DeviceRegistry, opts: { refresh?: boolean; now?: number } = {}
+): Promise<CloudCacheCheck> {
   if (!cloud) return { enabled: false, available: false };
   const id = await deviceIdentity(store, registry);
   if (!id) return { enabled: true, available: false };
+  const v2 = await definitionSourcesOffer(cloud, store, registry, id, opts);
+  const rejected = v2 ? v2.rejected.map((r) => r.summary) : [];
+  if (v2 && v2.offered.length > 0) {
+    // the v2 store answers: a v1 row cached by an earlier check must not be what a following pull adopts
+    LAST_CHECK.delete(registry);
+    return { enabled: true, available: true, version: 2, sources: v2.offered.map((o) => o.summary), rejected, improves: v2.improves };
+  }
+  const v1 = await v1CloudCacheCheck(cloud, registry, id);
+  if (v1.version === 1) return rejected.length > 0 ? { ...v1, rejected } : v1;
+  // the v2 store answered and offers nothing (nothing shared, or every row failed here); the v1 store has no row
+  if (v2) return { enabled: true, available: false, version: 2, sources: [], rejected, improves: 'no' };
+  return v1;
+}
+
+/** The v1 half of the check (the profile store, M3 behaviour). `version: 1` when the store had a row. */
+async function v1CloudCacheCheck(cloud: DeviceProfileCloud, registry: DeviceRegistry, id: { model: number; firmware: string; key: string }): Promise<CloudCacheCheck> {
   const row = await cloud.deviceProfileGet(id.model, id.firmware, CURRENT_CACHE_SCHEMA);
   if (!row) return { enabled: true, available: false };
   // Backstop for a cloud endpoint that ignores the schema filter (older deployment): still judge the row. A format-2
@@ -93,12 +425,13 @@ export async function cloudCacheCheck(cloud: DeviceProfileCloud | null, store: S
   const rederivable = rederiveReasonOf(row.profile) !== null;
   if (!verdict.usable && !rederivable) {
     LAST_CHECK.delete(registry); // never let a pull reuse a row that was just judged unusable
-    return { enabled: true, available: false, ...staleFields(verdict) };
+    return { enabled: true, available: false, ...staleFields(verdict), version: 1 };
   }
   LAST_CHECK.set(registry, { key: id.key, row });
   return {
     enabled: true, available: true, meta: { source: row.source, recordCount: row.recordCount, createdAt: row.createdAt, contentHash: row.contentHash },
-    ...(rederivable ? { rederivable: true as const } : {})
+    ...(rederivable ? { rederivable: true as const } : {}),
+    version: 1, improves: 'unknown'
   };
 }
 

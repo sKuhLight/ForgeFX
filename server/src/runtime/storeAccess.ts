@@ -24,8 +24,10 @@ export const PRIVATE_STORE_COLLECTIONS: readonly string[] = ['cloud'];
 
 /** Collections the generic store routes may READ but never write or delete: state a dedicated API owns.
  *  `cacheContributions` holds the handles to this install's editor-cache uploads (services/cacheContribution.ts);
- *  a page that could delete or plant them could make an upload undeletable or point a withdraw elsewhere. */
-export const WRITE_PROTECTED_STORE_COLLECTIONS: readonly string[] = ['cacheContributions'];
+ *  a page that could delete or plant them could make an upload undeletable or point a withdraw elsewhere.
+ *  `cloudVerdicts` holds this install's device checks of shared definition rows (services/cloudProfiles.ts); a page
+ *  that could plant a `failed` verdict could hide an honest row from the offer. */
+export const WRITE_PROTECTED_STORE_COLLECTIONS: readonly string[] = ['cacheContributions', 'cloudVerdicts'];
 
 /** The error code a refused collection gets (HTTP 403). */
 export const FORBIDDEN_COLLECTION = 'forbidden-collection';

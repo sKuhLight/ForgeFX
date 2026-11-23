@@ -219,6 +219,47 @@ export interface DefinitionsCaps {
   portable: boolean;
 }
 
+/** The kind of a SHARED definition source (cloud v2, `definition-sources`): a raw source of one read. Single-block
+ *  probes (`live-probe`) are never shared. */
+export type SharedSourceKind = Exclude<RawSourceKind, 'live-probe'>;
+
+/** How far a shared source is confirmed: `official` by the maintainer, `verified` by at least two contributors on
+ *  two networks with identical facts, `candidate` otherwise. A tier orders the offer; it never exempts a source
+ *  from the device check before use. */
+export type CloudSourceTier = 'official' | 'verified' | 'candidate';
+
+/** One shared definition source the cloud offers for the attached device and firmware (`GET /device/cache/cloud`,
+ *  v2): the best row of its kind, as a summary (counts only, no content). */
+export interface CloudSourceSummary {
+  /** The cloud row id (a UUID). */
+  id: string;
+  kind: SharedSourceKind;
+  tier: CloudSourceTier;
+  /** 0..3, computed by the cloud without the catalogs: 3 = a self-consistent editor cache of this firmware, or a
+   *  device read without unresolved replies, missing slots, bound hits or an aborted extension. */
+  quality: number;
+  /** `quality === 3`. */
+  complete: boolean;
+  /** Uploaders whose shares carried these exact facts. */
+  contributors: number;
+  /** Device checks other installs reported for this row (distinct networks per outcome). */
+  deviceChecks: { passed: number; failed: number };
+  /** When the cloud first saw these facts (a UTC day, `YYYY-MM-DD`). */
+  firstSeen: string;
+  /** Distinct definition records. */
+  records: number;
+  /** Editor-cache sources: declared sections. */
+  sections?: number;
+  /** Device reads: blocks that carry records, and whether the read went beyond the standard scope. */
+  blocks?: number;
+  extended?: boolean;
+  above160?: boolean;
+  /** This install's last device check of this row (`passed` / `failed`), null when it was never checked here. */
+  verdict: 'passed' | 'failed' | null;
+  /** The facts equal a source already stored for this firmware (same kind, same fact hash): nothing to gain. */
+  identical: boolean;
+}
+
 /** The parts of `GET /device/definitions/diff` a client can ask for (`include=`; default: all of them). */
 export type DefinitionsDiffPart = 'params' | 'rosters' | 'enums' | 'strides' | 'sections' | 'blocks' | 'instances';
 

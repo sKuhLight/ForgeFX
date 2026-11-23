@@ -59,7 +59,7 @@ export { blockHelpBySlug, helpIndex, type BlockHelpDTO } from '../help.js';
 // ── cloud sync (optional router dep; supabase-js is isomorphic) ──
 export { createCloud, Cloud, type CloudConfig, type CloudService } from './cloud.js';
 export {
-  runSignedUpload, ANONYMOUS_UPLOADER_STORAGE_KEY,
+  runSignedUpload, ANONYMOUS_UPLOADER_STORAGE_KEY, DEFINITION_SHARER_STORAGE_KEY,
   type SignedUploadTransport, type SignedUploadSpec, type SignedUploadOutcome,
   type EditorCacheReserveBody, type EditorCacheCloudOutcome, type UploaderSession
 } from './cloud.js';

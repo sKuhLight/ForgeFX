@@ -66,6 +66,9 @@ export interface AppOptions {
   /** Editor-cache contribution seams: a cloud client (tests pass a fake; production binds the AXIS_CLOUD one),
    *  and the dry-run switches that otherwise come from FORGEFX_CONTRIBUTE_DRY_RUN / FORGEFX_CONTRIBUTE_DRY_RUN_DIR. */
   contribute?: { cloud?: contribution.ContributionCloud | null; dryRun?: boolean; dryRunDir?: string | null };
+  /** Shared device-definition seam: the cloud client `GET /device/cache/cloud` reads (tests pass a fake, also without
+   *  AXIS_CLOUD; null = no cloud). Production passes nothing: the AXIS_CLOUD client, or the disabled answer. */
+  cloudProfiles?: { cloud?: cloudProfiles.CloudProfilesCloud | null };
   /** Origin/Host policy inputs (services/originGuard.ts). Each field omitted = production: the
    *  FORGEFX_ALLOWED_ORIGINS / FORGEFX_ALLOWED_HOSTS env lists and `os.hostname()`. */
   http?: RequestPolicyOptions;
@@ -976,7 +979,10 @@ export async function buildApp(registry: DeviceRegistry, opts: AppOptions = {}):
     app.get('/cloud/index', async (_req, reply) => { try { return await cloud.cloudIndex(); } catch (e) { reply.code(503); return { error: (e as Error).message }; } });
 
     // ── shared device-definition profiles (THIRD cache source; services/cloudProfiles.ts) ──
-    app.get('/device/cache/cloud', async () => cloudProfiles.cloudCacheCheck(cloud, store.defaultStore, registry));
+    app.get<{ Querystring: { refresh?: string } }>('/device/cache/cloud', async (req) => cloudProfiles.cloudCacheCheck(
+      opts.cloudProfiles?.cloud !== undefined ? opts.cloudProfiles.cloud : cloud, store.defaultStore, registry,
+      { refresh: req.query.refresh === '1' || req.query.refresh === 'true' }
+    ));
     app.post<{ Body: { replace?: boolean } | undefined }>('/device/cache/cloud/pull', async (req, reply) => {
       const r = await cloudProfiles.cloudCachePull(cloud, store.defaultStore, registry, { replace: req.body?.replace === true });
       reply.code(r.code);
@@ -994,7 +1000,10 @@ export async function buildApp(registry: DeviceRegistry, opts: AppOptions = {}):
   } else {
     app.get('/cloud/status', async () => ({ enabled: false, user: null })); // so Axis can gate its UI without erroring
     app.get('/remote/status', async () => ({ enabled: false, connected: false, userId: null }));
-    app.get('/device/cache/cloud', async () => ({ enabled: false, available: false })); // same non-erroring gate for the defs prompt
+    // same non-erroring gate for the defs prompt ({ enabled: false, available: false }); a test seam may supply a cloud
+    app.get<{ Querystring: { refresh?: string } }>('/device/cache/cloud', async (req) => cloudProfiles.cloudCacheCheck(
+      opts.cloudProfiles?.cloud ?? null, store.defaultStore, registry, { refresh: req.query.refresh === '1' || req.query.refresh === 'true' }
+    ));
   }
 
   // ── telemetry / diagnostics ── status is always served (so Axis gates its UI without erroring). The

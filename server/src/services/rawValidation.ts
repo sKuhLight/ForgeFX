@@ -25,10 +25,24 @@
 // ~2.5 k records, a live source ~3 k; the largest label list ~340 entries), not tight protocol facts: a bound that real
 // data could exceed would refuse the document this build exported itself.
 //
-// Browser-safe: pure, only codec types.
+// Two modes (M4):
+//   - `local` (default): a source as a profile document stores it — `id` and `origin` required, any `capturedAt` stamp,
+//     `contentSha256` and `issues` as the codec writes them. `.axisdefs` files and v1 cloud profiles.
+//   - `shared` (`checkSharedSources` / `checkSharedSource`): a source as it is SHARED through the cloud's definition
+//     store — the codec's `shareableSource` output, and what the cloud serves back. `id` and `origin` absent (a receiver
+//     assigns its own), `capturedAt` a UTC day (`YYYY-MM-DDT00:00:00.000Z`) or null, `contentSha256` null, no `issues`
+//     (a tolerant parse is never shared), no `walk.abortReason` (free text), no `live-probe` source, no record of a
+//     user name table, and the closed patterns of the codec's sanitizer / the cloud validator: canonical `fileVersion`,
+//     a semantic-version `codecVersion`, unit tokens, labels without control characters (≤ 255 UTF-8 bytes), no
+//     `(section, id)` repeated with different content, no block listed twice. Used for share output (our own must pass
+//     before it is sent) and pull input (before anything is derived from it); the pull then assigns ids and the origin
+//     `cloud` itself.
+//
+// Browser-safe: pure, only codec types and two pure codec helpers.
+import { canonicalJson, isUserNameTable } from 'forgefx-midi/cache';
 import type {
   CacheWalkIssue, EditorCacheRawSource, FloatTaper, LiveRawSource, LiveSourceScope, ProfileRaw, RawRecord, RawSource,
-  SourceOrigin, WalkBoundHit
+  ShareableEditorCacheSource, ShareableLiveSource, ShareableSource, SourceOrigin, WalkBoundHit
 } from 'forgefx-midi/cache';
 
 /** Why a value was refused: where (`raw.sources[0].records[3].id`) and what is wrong. */
@@ -36,6 +50,11 @@ export interface RawIssue { path: string; message: string }
 
 export type RawCheck = { ok: true; raw: ProfileRaw } | ({ ok: false } & RawIssue);
 export type RawSourcesCheck = { ok: true; sources: RawSource[] } | ({ ok: false } & RawIssue);
+export type SharedSourceCheck = { ok: true; source: ShareableSource } | ({ ok: false } & RawIssue);
+export type SharedSourcesCheck = { ok: true; sources: ShareableSource[] } | ({ ok: false } & RawIssue);
+
+/** `local`: a stored source (with `id` and `origin`); `shared`: a source as shared through the cloud (module comment). */
+type Mode = 'local' | 'shared';
 
 /** The size limits of the validation (exported for the tests; never lowered below real data). */
 export const RAW_LIMITS = Object.freeze({
@@ -173,9 +192,77 @@ const firmwareString = (v: unknown, path: string): string =>
   isCanonicalFirmware(v) ? v : bad(path, 'expected "<major>.<minor>" without leading zeros');
 
 const SOURCE_KINDS = ['editor-cache', 'live-readonly', 'live-full', 'live-probe'] as const;
+/** The kinds a shared source can have: never a single-block probe. */
+const SHARED_KINDS = ['editor-cache', 'live-readonly', 'live-full'] as const;
 const ORIGINS: readonly SourceOrigin[] = ['local', 'cloud', 'file'];
+
+const DAY_STAMP = /^\d{4}-\d{2}-\d{2}T00:00:00\.000Z$/;
+/** A UTC day as the codec's `coarsenCapturedAt` writes it (`2026-11-22T00:00:00.000Z`), and a real date. */
+export const isDayStamp = (v: unknown): v is string => {
+  if (typeof v !== 'string' || !DAY_STAMP.test(v)) return false;
+  const t = Date.parse(v);
+  return Number.isFinite(t) && new Date(t).toISOString() === v;
+};
+const dayStamp = (v: unknown, path: string): string => (isDayStamp(v) ? v : bad(path, 'expected a UTC day (YYYY-MM-DDT00:00:00.000Z)'));
+/** A key a shared source never carries (present at all = refused, whatever it holds). */
+const absent = (o: Record<string, unknown>, key: string, path: string): void => {
+  if (o[key] !== undefined) bad(`${path}.${key}`, 'not part of a shared source');
+};
 const TAPER_SHAPES = ['linear', 'log', 'flat', 'custom', 'unknown'] as const;
 const EXTENSIONS = ['done', 'skipped', 'aborted'] as const;
+
+// ── the shared mode's closed patterns (the codec's `shareableSource` and the cloud validator apply the same) ──
+
+/** A device unit token as the live walker reads it (the codec's `UNIT_RE`). */
+const SHARED_UNIT = /^[A-Za-z%°µΩ/]{1,8}$/;
+/** The codec's version stamp: a semantic version (`0.12.0`, `0.12.0-beta.1`, `1.0.0+build.5`), at most 64 characters. */
+const CODEC_VERSION_STAMP = /^(0|[1-9]\d{0,5})\.(0|[1-9]\d{0,5})\.(0|[1-9]\d{0,5})(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
+/** UTF-8 bytes of one shared label (the editor file's name limit). */
+const SHARED_LABEL_BYTES = 255;
+
+/** A shared label: at most 255 UTF-8 bytes, no C0 control character or DEL, no lone surrogate. */
+export function isSharedLabel(s: string): boolean {
+  let bytes = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c < 0x20 || c === 0x7f) return false;
+    if (c < 0x80) bytes += 1;
+    else if (c < 0x800) bytes += 2;
+    else if (c >= 0xd800 && c <= 0xdbff) {
+      const d = s.charCodeAt(i + 1);
+      if (!(d >= 0xdc00 && d <= 0xdfff)) return false;
+      bytes += 4;
+      i++;
+    } else if (c >= 0xdc00 && c <= 0xdfff) return false;
+    else bytes += 3;
+    if (bytes > SHARED_LABEL_BYTES) return false;
+  }
+  return true;
+}
+
+/** What two records of one `(section, id)` must agree on (the codec's duplicate rule, = what the fact hash sees): the
+ *  whole record of an editor cache, the kind-free projection of a live record (unit, taper, kind, counts left out). */
+function duplicateContent(live: boolean, r: RawRecord): string {
+  if (!live) return canonicalJson(r);
+  const values = r.kind === 'enum' ? r.values : [];
+  return canonicalJson({
+    section: r.section, id: r.id, tc: r.tc, min: r.min, max: r.max, def: r.def, step: r.step,
+    ...(values.length > 0 ? { values } : {}), ...(r.kind === 'float' && r.placeholder === true ? { placeholder: true } : {})
+  });
+}
+
+/** A shared source never repeats a `(section, id)` with different content (identical repeats are one position). */
+function refuseConflictingDuplicates(records: readonly RawRecord[], live: boolean, path: string): void {
+  const seen = new Map<string, string>();
+  for (let i = 0; i < records.length; i++) {
+    const r = records[i]!;
+    const pos = `${r.section}:${r.id}`;
+    const content = duplicateContent(live, r);
+    const first = seen.get(pos);
+    if (first === undefined) seen.set(pos, content);
+    else if (first !== content) bad(`${path}.records[${i}]`, 'repeats a (section, id) with different content');
+  }
+}
 
 function taper(v: unknown, path: string): FloatTaper {
   const o = obj(v, path);
@@ -192,9 +279,11 @@ function taper(v: unknown, path: string): FloatTaper {
   };
 }
 
-/** One walker record without its byte position (a `RawRecord`), fields in the codec's order. */
-function record(v: unknown, path: string): RawRecord {
+/** One walker record without its byte position (a `RawRecord`), fields in the codec's order. In the shared mode a
+ *  `unit` is a unit token and every label a shared label (no control characters, ≤ 255 UTF-8 bytes). */
+function record(v: unknown, path: string, mode: Mode = 'local'): RawRecord {
   const o = obj(v, path);
+  const shared = mode === 'shared';
   const kind = oneOf(o.kind, `${path}.kind`, ['float', 'enum'] as const);
   const section = int(o.section, `${path}.section`, 0, U16);
   const id = int(o.id, `${path}.id`, 0, U16);
@@ -203,7 +292,10 @@ function record(v: unknown, path: string): RawRecord {
   const max = flt(o.max, `${path}.max`);
   const def = flt(o.def, `${path}.def`);
   const step = flt(o.step, `${path}.step`);
-  const unit = optional(o.unit, `${path}.unit`, (x, p) => str(x, p, RAW_LIMITS.unit));
+  const unit = optional(o.unit, `${path}.unit`, (x, p) => {
+    const u = str(x, p, RAW_LIMITS.unit);
+    return !shared || SHARED_UNIT.test(u) ? u : bad(p, 'expected a unit token');
+  });
   if (kind === 'float') {
     const t1 = int(o.t1, `${path}.t1`, 0, U32);
     const t2 = int(o.t2, `${path}.t2`, 0, U32);
@@ -215,7 +307,10 @@ function record(v: unknown, path: string): RawRecord {
     };
   }
   const count = int(o.count, `${path}.count`, 0, U32);
-  const values = arr(o.values, `${path}.values`, RAW_LIMITS.enumValues).map((x, i) => str(x, `${path}.values[${i}]`, RAW_LIMITS.label));
+  const values = arr(o.values, `${path}.values`, RAW_LIMITS.enumValues).map((x, i) => {
+    const label = str(x, `${path}.values[${i}]`, RAW_LIMITS.label);
+    return !shared || isSharedLabel(label) ? label : bad(`${path}.values[${i}]`, `expected a label of at most ${SHARED_LABEL_BYTES} bytes without control characters`);
+  });
   const x = int(o.x, `${path}.x`, 0, U32);
   const wireIds = optional(o.wireIds, `${path}.wireIds`, (w, p) => arr(w, p, RAW_LIMITS.wireIds).map((n, i) => int(n, `${p}[${i}]`, 0, U32)));
   return { kind: 'enum', section, id, tc, min, max, def, step, ...(unit !== undefined ? { unit } : {}), count, values, x, ...(wireIds !== undefined ? { wireIds } : {}) };
@@ -260,8 +355,9 @@ function scope(v: unknown, path: string): LiveSourceScope {
   };
 }
 
-function liveWalk(v: unknown, path: string): LiveRawSource['walk'] {
+function liveWalk(v: unknown, path: string, mode: Mode = 'local'): LiveRawSource['walk'] {
   const o = obj(v, path);
+  if (mode === 'shared') absent(o, 'abortReason', path);
   const n = (key: string): number => int(o[key], `${path}.${key}`, 0, U32);
   const pseudo = optional(o.pseudoReplies, `${path}.pseudoReplies`, (x, p) => {
     const q = obj(x, p);
@@ -287,25 +383,39 @@ function liveWalk(v: unknown, path: string): LiveRawSource['walk'] {
   };
 }
 
-/** `records` of one source, each checked and (through `accept`) required to sit in a section / block the source declares. */
-function sourceRecords(recs: unknown[], path: string, accept: (section: number) => boolean, what: string): RawRecord[] {
+/** `records` of one source, each checked and (through `accept`) required to sit in a section / block the source declares.
+ *  A shared source never holds a record of a user name table (preset names, user cab names: `isUserNameTable`). */
+function sourceRecords(recs: unknown[], path: string, accept: (section: number) => boolean, what: string, mode: Mode = 'local'): RawRecord[] {
   const records: RawRecord[] = new Array<RawRecord>(recs.length);
   for (let i = 0; i < recs.length; i++) {
-    const r = record(recs[i], `${path}.records[${i}]`);
+    const r = record(recs[i], `${path}.records[${i}]`, mode);
     if (!accept(r.section)) bad(`${path}.records[${i}].section`, what);
+    if (mode === 'shared' && isUserNameTable(r.id)) bad(`${path}.records[${i}].id`, 'a user name table is never part of a shared source');
     records[i] = r;
   }
   return records;
 }
 
-function source(v: unknown, path: string): RawSource {
+function source(v: unknown, path: string): RawSource;
+function source(v: unknown, path: string, mode: 'shared'): ShareableSource;
+function source(v: unknown, path: string, mode: Mode = 'local'): RawSource | ShareableSource {
   const o = obj(v, path);
-  const kind = oneOf(o.kind, `${path}.kind`, SOURCE_KINDS);
-  const id = ident(o.id, `${path}.id`, 160, 1);
-  const origin = oneOf(o.origin, `${path}.origin`, ORIGINS);
-  const capturedAt = nullable(o.capturedAt, `${path}.capturedAt`, (x, p) => ident(x, p, 64));
+  const shared = mode === 'shared';
+  const kind = shared ? oneOf(o.kind, `${path}.kind`, SHARED_KINDS) : oneOf(o.kind, `${path}.kind`, SOURCE_KINDS);
+  let id = '';
+  let origin: SourceOrigin = 'local';
+  if (shared) {
+    // a receiver assigns its own id and origin: a shared source carries neither
+    absent(o, 'id', path);
+    absent(o, 'origin', path);
+  } else {
+    id = ident(o.id, `${path}.id`, 160, 1);
+    origin = oneOf(o.origin, `${path}.origin`, ORIGINS);
+  }
+  const capturedAt = nullable(o.capturedAt, `${path}.capturedAt`, shared ? dayStamp : (x, p) => ident(x, p, 64));
   const firmware = nullable(o.firmware, `${path}.firmware`, firmwareString);
   const codecVersion = ident(o.codecVersion, `${path}.codecVersion`, 64);
+  if (shared && !CODEC_VERSION_STAMP.test(codecVersion)) bad(`${path}.codecVersion`, 'expected a version stamp (0.12.0-beta.1)');
   const recs = arr(o.records, `${path}.records`, RAW_LIMITS.totalRecords);
   if (kind === 'editor-cache') {
     oneOf(o.space, `${path}.space`, ['section'] as const);
@@ -317,14 +427,25 @@ function source(v: unknown, path: string): RawSource {
       declared.add(tag);
       return { tag, count: int(q.count, `${path}.sections[${i}].count`, 0, U32) };
     });
-    const records = sourceRecords(recs, path, (t) => declared.has(t), 'not a section this source declares');
+    const records = sourceRecords(recs, path, (t) => declared.has(t), 'not a section this source declares', mode);
     const om = obj(o.omitted, `${path}.omitted`);
     const omitted = { tables: int(om.tables, `${path}.omitted.tables`, 0, U32), records: int(om.records, `${path}.omitted.records`, 0, U32) };
     const header = nullable(o.header, `${path}.header`, (x, p) => {
       const h = obj(x, p);
       return { major: int(h.major, `${p}.major`, 0, U32), minor: int(h.minor, `${p}.minor`, 0, U32), sectionCount: int(h.sectionCount, `${p}.sectionCount`, 0, U32) };
     });
-    const fileVersion = nullable(o.fileVersion, `${path}.fileVersion`, (x, p) => ident(x, p, 32));
+    const fileVersion = nullable(o.fileVersion, `${path}.fileVersion`, shared ? firmwareString : (x, p) => ident(x, p, 32));
+    if (shared) {
+      refuseConflictingDuplicates(records, false, path);
+      // the redacted file's content hash is a per-install fingerprint (always null once shared); a tolerant parse
+      // (damaged stretches skipped) is never shared
+      if (o.contentSha256 !== null) bad(`${path}.contentSha256`, 'expected null in a shared source');
+      absent(o, 'issues', path);
+      const out: ShareableEditorCacheSource = {
+        kind: 'editor-cache', space: 'section', capturedAt, firmware, codecVersion, sections, omitted, header, fileVersion, contentSha256: null, records
+      };
+      return out;
+    }
     const contentSha256 = nullable(o.contentSha256, `${path}.contentSha256`, (x, p) =>
       typeof x === 'string' && /^[0-9a-f]{64}$/.test(x) ? x : bad(p, 'expected 64 lowercase hex characters'));
     const issues = optional(o.issues, `${path}.issues`, (x, p) => arr(x, p, RAW_LIMITS.issues).map((q, i) => walkIssue(q, `${p}[${i}]`)));
@@ -337,8 +458,14 @@ function source(v: unknown, path: string): RawSource {
   oneOf(o.space, `${path}.space`, ['block'] as const);
   const sc = scope(o.scope, `${path}.scope`);
   const blocks = new Set<number>(sc.blocks);
-  const walk = liveWalk(o.walk, `${path}.walk`);
-  const records = sourceRecords(recs, path, (b) => blocks.has(b), 'not a block this source walked (scope.blocks)');
+  const walk = liveWalk(o.walk, `${path}.walk`, mode);
+  const records = sourceRecords(recs, path, (b) => blocks.has(b), 'not a block this source walked (scope.blocks)', mode);
+  if (shared) {
+    if (blocks.size !== sc.blocks.length) bad(`${path}.scope.blocks`, 'lists a block twice');
+    refuseConflictingDuplicates(records, true, path);
+    const out: ShareableLiveSource = { kind: kind as ShareableLiveSource['kind'], space: 'block', capturedAt, firmware, codecVersion, scope: sc, walk, records };
+    return out;
+  }
   const out: LiveRawSource = { id, kind, origin, capturedAt, firmware, codecVersion, space: 'block', scope: sc, walk, records };
   return out;
 }
@@ -365,6 +492,32 @@ export function checkRawSources(value: unknown, path = 'sources', opts: { scanne
     const list = arr(value, path, RAW_LIMITS.sources);
     totalRecords(list, path);
     return { ok: true, sources: list.map((s, i) => source(s, `${path}[${i}]`)) };
+  } catch (e) {
+    return { ok: false, ...issueOf(e) };
+  }
+}
+
+/** Stage 1 + 2 in the SHARED mode (module comment) over one source as it is shared through the cloud: the codec's
+ *  `shareableSource` output before it is sent, a cloud row's `source` before anything is derived from it. The
+ *  sanitized copy (known keys only, no `id` / `origin`), or the first problem. */
+export function checkSharedSource(value: unknown, path = 'source', opts: { scanned?: boolean } = {}): SharedSourceCheck {
+  const unsafe = opts.scanned ? null : findUnsafeValue(value, path);
+  if (unsafe) return { ok: false, ...unsafe };
+  try {
+    return { ok: true, source: source(value, path, 'shared') };
+  } catch (e) {
+    return { ok: false, ...issueOf(e) };
+  }
+}
+
+/** `checkSharedSource` over a list of shared sources (all of them together within `RAW_LIMITS.totalRecords`). */
+export function checkSharedSources(value: unknown, path = 'sources', opts: { scanned?: boolean } = {}): SharedSourcesCheck {
+  const unsafe = opts.scanned ? null : findUnsafeValue(value, path);
+  if (unsafe) return { ok: false, ...unsafe };
+  try {
+    const list = arr(value, path, RAW_LIMITS.sources);
+    totalRecords(list, path);
+    return { ok: true, sources: list.map((s, i) => source(s, `${path}[${i}]`, 'shared')) };
   } catch (e) {
     return { ok: false, ...issueOf(e) };
   }

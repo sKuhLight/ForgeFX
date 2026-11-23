@@ -245,7 +245,9 @@ export function createRouter(deps: RuntimeDeps): {
   });
   // ── shared device-definition profiles (THIRD cache source; services/cloudProfiles.ts). deps.cloud is
   //    optional — absent (no cloud in this runtime) degrades to the same non-erroring disabled shape. ──
-  on('GET', '/device/cache/cloud', () => cloudProfiles.cloudCacheCheck(deps.cloud ?? null, store, registry));
+  on('GET', '/device/cache/cloud', (c) => cloudProfiles.cloudCacheCheck(deps.cloud ?? null, store, registry, {
+    refresh: c.query.get('refresh') === '1' || c.query.get('refresh') === 'true'
+  }));
   on('POST', '/device/cache/cloud/pull', async (c) => {
     const r = await cloudProfiles.cloudCachePull(deps.cloud ?? null, store, registry, { replace: (c.body as { replace?: unknown } | null)?.replace === true });
     c.reply.code(r.code);
