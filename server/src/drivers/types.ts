@@ -422,8 +422,16 @@ export type DeviceEvent =
    *  selfDescribe). `phase` walks the job: 'walking' (per-block sweep) → 'building' (deriving tables)
    *  → 'done' (persisted) | 'cancelled' | 'error'; 'already-built' is emitted when a build was asked
    *  for but a cache already existed. `done`/`total` are the block-sweep counters; `key`/`model`/
-   *  `firmware` identify the cache; `error` carries the failure message on 'error'. */
-  | { type: 'cacheBuild'; phase: 'walking' | 'building' | 'done' | 'error' | 'cancelled' | 'already-built'; done: number; total: number; key?: string; model?: number; firmware?: string; error?: string;
+   *  `firmware` identify the cache; `error` carries the failure message on 'error'. A cloud pull that checks shared
+   *  definitions against the device first reports 'verifying' (`done`/`total` = definitions read back so far / to
+   *  read), then the terminal 'done' — or 'error' with `reason` when the check did not pass (nothing was stored). */
+  | { type: 'cacheBuild'; phase: 'walking' | 'building' | 'verifying' | 'done' | 'error' | 'cancelled' | 'already-built'; done: number; total: number; key?: string; model?: number; firmware?: string; error?: string;
+      /** Terminal 'error' of a cloud pull after 'verifying': the shared definitions did not match the device
+       *  (`spot-check-failed`), the device did not answer enough of the check (`spot-check-inconclusive`), the check could
+       *  not run to its end (`spot-check-error`), or the checked definitions were not stored: the stored ones changed
+       *  meanwhile (`definitions-changed`), the unit was swapped (`unit-changed`), the privacy guard refused them
+       *  (`contains-user-data`). */
+      reason?: 'spot-check-failed' | 'spot-check-inconclusive' | 'spot-check-error' | 'definitions-changed' | 'unit-changed' | 'contains-user-data';
       /** Terminal `done` of a build with the extended scope: the extension walk (phase B) completed (`done`), had
        *  nothing to walk under the running firmware's gates (`skipped`), or stopped (`aborted`: the standard walk's
        *  result is kept, `abortReason` says why). */

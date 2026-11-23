@@ -20,6 +20,7 @@ import { createRouter } from '../../src/runtime/router.js';
 import * as store from '../../src/store.js';
 import * as deviceCache from '../../src/services/deviceCache.js';
 import { cloudCachePull, type DeviceProfileCloud } from '../../src/services/cloudProfiles.js';
+import { __setSpotCheckForTest } from '../../src/services/spotCheck.js';
 import { loadStoredProfile } from '../../src/profileSchema.js';
 import { PROFILES, runtimeProfileFrom } from '../../src/devices.js';
 import { buildParamIndex } from '../../src/drivers/paramIndex.js';
@@ -47,6 +48,9 @@ async function makeApp(fw: [number, number] = [12, 0]) {
   };
   const registry = __createRegistryForTest({ resolveConn: async () => ({ transport: 'serial', id: mock.label }), openConn: () => mock });
   await registry.detect();
+  // the subject here is the merge of a pull, not its device check (cloud-v2-pull.test.ts): the mocked unit answers no
+  // definition query
+  __setSpotCheckForTest(registry, { skip: true });
   const app = await buildApp(registry);
   const events: DeviceEvent[] = [];
   const unsub = registry.subscribe((e) => events.push(e));
@@ -567,12 +571,17 @@ async function rawSourcesNeverDropped(): Promise<void> {
     assertEqual(imp.body.error, 'derivation-failed', 'derivation-failed');
     assertEqual(imp.body.stored, true, 'stored: true');
     assertEqual(kindsOf(storedData()), 'live-readonly/cloud,live-readonly/local,editor-cache/local', 'all three sources stored');
-    // a pull of a format-2 cloud doc: the same (its source replaces the stored cloud walk of its slot, which derives)
-    // — here a cloud editor cache, so the stored cloud WALK stays and the doc still fails
+    // a pull of a format-2 cloud doc (a cloud editor cache: the stored cloud WALK stays and the doc still fails): on a
+    // unit that can be spot-checked (M4) a candidate that does not derive cannot be checked, so nothing is stored —
+    // the stored sources stay as they are (never dropped)
+    const revBefore = stored()!.rev;
     let res = await cloudCachePull(cloudOf(profileDoc([await editorCacheSource()])), store.defaultStore, r.registry);
     assertEqual(res.code, 422, 'pull over a still-failing doc: 422');
-    assertEqual((res.body as { stored?: boolean }).stored, true, 'pull: stored: true');
-    assertEqual(kindsOf(storedData()), 'live-readonly/cloud,live-readonly/local,editor-cache/local,editor-cache/cloud', 'all four sources stored');
+    assertEqual((res.body as { error?: string }).error, 'derivation-failed', 'pull: derivation-failed');
+    assertEqual((res.body as { stored?: boolean }).stored, false, 'pull: stored: false (an unverifiable candidate)');
+    assert(String((res.body as { message?: string }).message).includes('replace: true'), 'pull: the message hints at replace: true');
+    assertEqual(kindsOf(storedData()), 'live-readonly/cloud,live-readonly/local,editor-cache/local', 'the three stored sources kept, the cloud one not added');
+    assertEqual(stored()!.rev, revBefore, 'pull: the stored doc untouched');
     // a derived-only cloud row would drop the raw sources: 409, untouched
     const rev = stored()!.rev;
     res = await cloudCachePull(cloudOf({ ...fakeCacheDoc(), meta: { ...fakeCacheDoc().meta, source: 'bytes' } }), store.defaultStore, r.registry);

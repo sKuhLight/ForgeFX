@@ -1127,8 +1127,10 @@ async function importGuards(): Promise<void> {
 
 async function cloudPullValidation(): Promise<void> {
   const { cloudCachePull } = await import('../../src/services/cloudProfiles.js');
+  const { __setSpotCheckForTest } = await import('../../src/services/spotCheck.js');
   clearDocs();
   const r = await makeRig();
+  __setSpotCheckForTest(r.registry, { skip: true }); // the subject is the shape check, not the device check (cloud-v2-pull.test.ts)
   try {
     const row = (doc: unknown) => ({
       deviceProfileGet: async () => ({ profile: doc, contentHash: 'h', source: 'editor-cache', recordCount: 1, createdAt: STAMP }),

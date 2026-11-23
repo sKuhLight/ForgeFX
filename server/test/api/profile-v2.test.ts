@@ -20,6 +20,7 @@ import * as runtimeBarrel from '../../src/runtime/index.js';
 import * as store from '../../src/store.js';
 import * as deviceCache from '../../src/services/deviceCache.js';
 import { cloudCacheCheck, cloudCachePublish, cloudCachePull, type DeviceProfileCloud } from '../../src/services/cloudProfiles.js';
+import { __setSpotCheckForTest } from '../../src/services/spotCheck.js';
 import {
   classifyProfile, lastProfileVerdict, loadStoredProfile, loadUsableProfile, profileSummaryOf, upgradeStoredProfile
 } from '../../src/profileSchema.js';
@@ -47,6 +48,7 @@ async function makeApp() {
   // no loadDeviceCache override: the real Node hook (loadUsableProfile over the default store)
   const registry = __createRegistryForTest({ resolveConn: async () => ({ transport: 'serial', id: mock.label }), openConn: () => mock });
   await registry.detect();
+  __setSpotCheckForTest(registry, { skip: true }); // the subject is the profile store, not the pull's device check
   const app = await buildApp(registry);
   const events: DeviceEvent[] = [];
   const unsub = registry.subscribe((e) => events.push(e));

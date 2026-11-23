@@ -979,12 +979,13 @@ export async function buildApp(registry: DeviceRegistry, opts: AppOptions = {}):
     app.get('/cloud/index', async (_req, reply) => { try { return await cloud.cloudIndex(); } catch (e) { reply.code(503); return { error: (e as Error).message }; } });
 
     // ── shared device-definition profiles (THIRD cache source; services/cloudProfiles.ts) ──
+    const profilesCloud = opts.cloudProfiles?.cloud !== undefined ? opts.cloudProfiles.cloud : cloud;
     app.get<{ Querystring: { refresh?: string } }>('/device/cache/cloud', async (req) => cloudProfiles.cloudCacheCheck(
-      opts.cloudProfiles?.cloud !== undefined ? opts.cloudProfiles.cloud : cloud, store.defaultStore, registry,
-      { refresh: req.query.refresh === '1' || req.query.refresh === 'true' }
+      profilesCloud, store.defaultStore, registry, { refresh: req.query.refresh === '1' || req.query.refresh === 'true' }
     ));
-    app.post<{ Body: { replace?: boolean } | undefined }>('/device/cache/cloud/pull', async (req, reply) => {
-      const r = await cloudProfiles.cloudCachePull(cloud, store.defaultStore, registry, { replace: req.body?.replace === true });
+    // the pull (v2 + v1, preview, device check; never relayed by Remote)
+    app.post<{ Body: unknown }>('/device/cache/cloud/pull', async (req, reply) => {
+      const r = await cloudProfiles.cloudPullRoute(profilesCloud, store.defaultStore, registry, req.body, { app: { forgefx: FORGEFX_VERSION } });
       reply.code(r.code);
       return r.body;
     });
@@ -1004,6 +1005,15 @@ export async function buildApp(registry: DeviceRegistry, opts: AppOptions = {}):
     app.get<{ Querystring: { refresh?: string } }>('/device/cache/cloud', async (req) => cloudProfiles.cloudCacheCheck(
       opts.cloudProfiles?.cloud ?? null, store.defaultStore, registry, { refresh: req.query.refresh === '1' || req.query.refresh === 'true' }
     ));
+    // the pull only when the test seam supplies a cloud (production without AXIS_CLOUD keeps no pull route)
+    const seamCloud = opts.cloudProfiles?.cloud ?? null;
+    if (seamCloud) {
+      app.post<{ Body: unknown }>('/device/cache/cloud/pull', async (req, reply) => {
+        const r = await cloudProfiles.cloudPullRoute(seamCloud, store.defaultStore, registry, req.body, { app: { forgefx: FORGEFX_VERSION } });
+        reply.code(r.code);
+        return r.body;
+      });
+    }
   }
 
   // ── telemetry / diagnostics ── status is always served (so Axis gates its UI without erroring). The

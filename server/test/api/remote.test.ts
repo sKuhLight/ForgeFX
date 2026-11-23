@@ -85,6 +85,9 @@ const REJECTED: [string, string][] = [
   // block probe: a definition walk of the unit that also rewrites the stored definitions — never relayed
   ['POST', '/device/definitions/blocks/203/probe'],
   ['POST', '/device/definitions/blocks/162/probe'],
+  // cloud pull: a device check of the unit and a write of the stored definitions — never relayed, preview or not
+  ['POST', '/device/cache/cloud/pull'],
+  ['POST', '/device/cache/cloud/pull?dryRun=1'],
 ];
 
 // Requests relayed end to end, with the status the remote must receive.

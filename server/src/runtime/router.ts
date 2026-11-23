@@ -248,8 +248,9 @@ export function createRouter(deps: RuntimeDeps): {
   on('GET', '/device/cache/cloud', (c) => cloudProfiles.cloudCacheCheck(deps.cloud ?? null, store, registry, {
     refresh: c.query.get('refresh') === '1' || c.query.get('refresh') === 'true'
   }));
+  // the pull (v2 + v1, preview, device check over this runtime's link; services/cloudProfiles.ts)
   on('POST', '/device/cache/cloud/pull', async (c) => {
-    const r = await cloudProfiles.cloudCachePull(deps.cloud ?? null, store, registry, { replace: (c.body as { replace?: unknown } | null)?.replace === true });
+    const r = await cloudProfiles.cloudPullRoute(deps.cloud ?? null, store, registry, c.body, deps.versions ? { app: { ...deps.versions } } : {});
     c.reply.code(r.code);
     return r.body;
   });

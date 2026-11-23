@@ -26,22 +26,34 @@
 // the v1 path below runs unchanged. The v2 listing is cached per registry and device key for 10 minutes
 // (`refresh` bypasses it); verdicts and local fact hashes are read fresh on every check.
 //
+// Pull v2 (M4): the offered rows of the check (`definitionSourcesOffer`, the same split) are fetched, each body bound to
+// its listed row (model, firmware, kind, raw format, the strict shared-mode shape check, the recomputed fact hash),
+// re-tagged `origin: 'cloud'` and merged IN MEMORY; a dry run answers a preview from that candidate without device
+// traffic or a store write. Before the candidate is stored, every pull that lets a cloud source decide which parameters
+// exist — v2 rows and v1 rows alike — is spot-checked against the unit (services/spotCheck.ts, read-only definition
+// queries); a failed check stores nothing but this install's verdict on the row (`cloudVerdicts`, by row id and fact
+// hash), which hides the row from the offer until a pull with `recheck` checks it again. A passed or failed verdict is
+// reported to the cloud when a session already exists (never creating one).
+//
 // Browser-safe: registry/store/cloud are type-only or structural imports; the fetch work lives in
 // runtime/cloud.ts (itself browser-safe). check-browser-safe.ts enforces it.
 import {
-  assertNoUserTables, isSyntheticFamilyKey, ProfileDerivationError, ProfileUserDataError, RAW_FORMAT, sourceFactHash, sourceRank,
-  type ProfileDoc, type RawSource, type RawSourceKind, type SourceOrigin
+  assertNoUserTables, isSyntheticFamilyKey, ProfileDerivationError, ProfileUserDataError, RAW_FORMAT, SPOT_CHECK_LIMITS, rawSourceId,
+  sourceFactHash, sourceRank,
+  type BuiltCache, type ProfileDoc, type RawSource, type RawSourceKind, type SourceOrigin, type SpotCheckGates, type SpotCheckResult
 } from 'forgefx-midi/cache';
 import { deviceCacheKey, type DeviceRegistry } from '../drivers/registryCore.js';
-import type { CloudSourceSummary, SharedSourceKind } from '../drivers/types.js';
+import type { CloudSourceSummary, DefinitionsDiffDTO, SharedSourceKind } from '../drivers/types.js';
+import { definitionsDiff } from '../drivers/definitionsDiff.js';
 import { resolveCacheKey } from './deviceCache.js';
 import {
   CURRENT_CACHE_SCHEMA, checkProfileSchema, deriveProfileDoc, loadStoredProfile, metaExtrasOf, persistProfile, profileFormatOf,
-  readableRaw, rederiveReasonOf, staleFields, type StaleReason
+  profileSummaryOf, readableRaw, rederiveReasonOf, staleFields, type StaleReason
 } from '../profileSchema.js';
-import { ProfileMergeRefused, foreignSources, mergeRefusal, mergeSourcesIntoStored, refusalBody } from './profileMerge.js';
-import { checkRawSources } from './rawValidation.js';
-import { HIDE_FAMILY_ENV, hiddenFamily } from '../devices.js';
+import { ProfileMergeRefused, foreignSources, mergeRefusal, mergeSourcesIntoStored, refusalBody, type MergedProfile } from './profileMerge.js';
+import { checkRawSources, checkSharedSource } from './rawValidation.js';
+import { HIDE_FAMILY_ENV, hiddenFamily, runtimeProfileFrom } from '../devices.js';
+import { planSpotCheck, runDeviceSpotCheck, spotCheckRngFor, spotCheckSupported, spotCheckTestOptions, type HostSpotCheckPlan } from './spotCheck.js';
 import type { Store } from '../runtime/store.js';
 import type {
   DefinitionSourceBody, DefinitionSourceContribution, DefinitionSourceList, DefinitionSourceOutcome, DefinitionSourceReport,
@@ -330,7 +342,15 @@ export async function definitionSourcesOffer(
   const facts = await storedSourceFacts(store, id);
   const offered: OfferedSource[] = [];
   const rejected: RejectedSource[] = [];
+  // The store serves the best row per kind. Whatever a (structural) client hands over, only the FIRST row of a kind with a
+  // canonical, not yet seen id is considered: a pull maps its sources to rows by kind, so a second row of a kind could
+  // otherwise be blamed for (and reported with) another row's verdict.
+  const kinds = new Set<string>();
+  const ids = new Set<string>();
   for (const row of list.sources) {
+    if (kinds.has(row.kind) || ids.has(row.id) || normalizeRowId(row.id) !== row.id) continue;
+    kinds.add(row.kind);
+    ids.add(row.id);
     const mine = verdictFor(row, verdicts); // a verdict counts only for the facts it was reached on
     const identical = !!facts?.some((f) => f.kind === row.kind && f.hash === row.factHash);
     const summary = cloudSourceSummary(row, mine, identical);
@@ -471,43 +491,482 @@ export function publishableProfile(data: Record<string, unknown>): Record<string
   return out;
 }
 
-/** POST /device/cache/cloud/pull — adopt the shared profile for the attached device. Model/firmware match is
- *  inherent — the row was fetched BY the attached identity. Gated on the same capability as import (only
- *  cache-capable devices apply profiles). Nothing from the wire is trusted for provenance: every source a row
- *  brings in is re-tagged `origin: 'cloud'` (`foreignSources`), whatever origin it claims, and a row without
- *  readable raw sources is stored as derived tables only (`publishableProfile`).
- *   - A format-2 cloud doc (raw sources this build can read) contributes its raw sources to the stored doc,
- *     merged by the codec's precedence: a local source of the same kind always outranks it, so a pull never
- *     replaces a better local source. The row's raw sources must pass the strict shape check (rawValidation.ts, 422
- *     `cloud profile malformed` with the offending path otherwise); they are stored as the sanitized copies it returns.
- *     A source of another firmware is refused (409 `firmware-differs`). Refused
- *     merges (profileMerge.ts `mergeRefusal`, unless `replace`): a stored doc without raw sources that outranks
- *     every cloud source (e.g. a legacy local editor-cache import) → 409 `local-profile-better`; a doc a newer
- *     build wrote → 409 `newer-profile`. Over a stale doc whose sources do not derive, the cloud sources are
- *     stored next to them; if they still do not derive the answer is 422 `derivation-failed` with `stored: true`.
- *   - A row with derived tables only (format 1, or a raw envelope this build cannot read — its raw is dropped)
- *     is adopted only when the key holds no usable profile and no raw sources (stale or not: raw sources are never
- *     dropped implicitly); otherwise 409 `local-profile-better` (or `newer-profile`), nothing stored.
- *     `replace: true` adopts it anyway (old behaviour). A row whose schema this build cannot use is refused with
- *     409 `cloud-profile-stale` (+ reason, stored and current schema) and NOT stored. It is persisted with source
- *     'cloud' (original kind in `origin`). */
-export async function cloudCachePull(cloud: DeviceProfileCloud | null, store: Store, registry: DeviceRegistry, opts: { replace?: boolean } = {}): Promise<ImportResult> {
+/** Options of `POST /device/cache/cloud/pull` (the request body, see `parsePullBody`). */
+export interface CloudPullOptions {
+  /** Drop every stored source (the whole doc is replaced) and skip the merge refusals. */
+  replace?: boolean;
+  /** Preview only: what the pull would store and whether a device check is needed. No device traffic, no store write. */
+  dryRun?: boolean;
+  /** v2: the listed rows to pull, by id (default: every offered row). */
+  sourceIds?: readonly string[];
+  /** v2: rows this install's device check failed before are pulled (and checked) again. */
+  recheck?: boolean;
+  /** Version stamps a report to the cloud carries (where the host knows them). */
+  app?: DefinitionSourceReport['app'];
+}
+
+/** Most row ids a pull names (the v2 store lists one row per kind). */
+export const PULL_MAX_SOURCE_IDS = 3;
+
+/** The pull body `{ replace?, dryRun?, sourceIds?, recheck? }` as options — each flag counts only when it is `true`,
+ *  unknown keys are ignored — or 400 `invalid-request`: a body that is not a JSON object, `sourceIds` that is not an
+ *  array of at most `PULL_MAX_SOURCE_IDS` row ids (lower-cased, duplicates dropped). */
+export function parsePullBody(body: unknown): { ok: true; opts: CloudPullOptions } | { ok: false; result: ImportResult } {
+  const bad = (message: string) => ({ ok: false as const, result: { code: 400, body: { error: 'invalid-request', message } } });
+  if (body !== undefined && body !== null && !isPlainObject(body)) return bad('the body must be a JSON object');
+  const b = (body ?? {}) as Record<string, unknown>;
+  let sourceIds: string[] | undefined;
+  if (b.sourceIds !== undefined) {
+    if (!Array.isArray(b.sourceIds) || b.sourceIds.length > PULL_MAX_SOURCE_IDS) return bad(`sourceIds must be an array of at most ${PULL_MAX_SOURCE_IDS} row ids`);
+    sourceIds = [];
+    for (const v of b.sourceIds) {
+      const sid = normalizeRowId(v);
+      if (!sid) return bad('sourceIds must hold row ids');
+      if (!sourceIds.includes(sid)) sourceIds.push(sid);
+    }
+  }
+  return { ok: true, opts: { replace: b.replace === true, dryRun: b.dryRun === true, recheck: b.recheck === true, ...(sourceIds ? { sourceIds } : {}) } };
+}
+
+/** `POST /device/cache/cloud/pull` as both twins serve it: 503 without a cloud, the body parsed (`parsePullBody`), then
+ *  `cloudCachePull`. `app` = the version stamps a device-check report carries. */
+export async function cloudPullRoute(
+  cloud: CloudProfilesCloud | null, store: Store, registry: DeviceRegistry, body: unknown, extra: { app?: DefinitionSourceReport['app'] } = {}
+): Promise<ImportResult> {
+  if (!cloud) return { code: 503, body: { error: 'cloud disabled' } };
+  const parsed = parsePullBody(body);
+  if (!parsed.ok) return parsed.result;
+  return cloudCachePull(cloud, store, registry, { ...parsed.opts, ...(extra.app ? { app: extra.app } : {}) });
+}
+
+/** A cloud client that can pull from the v2 store (the listing and the bodies). */
+type V2Cloud = CloudProfilesCloud & Pick<DefinitionSourceCloud, 'definitionSourcesList' | 'definitionSourceGet'>;
+const hasV2Reads = (cloud: CloudProfilesCloud): cloud is V2Cloud =>
+  typeof cloud.definitionSourcesList === 'function' && typeof cloud.definitionSourceGet === 'function';
+
+/** 409 `spot-check-rejected-before`: this install's device check failed the row before. */
+const rejectedBeforeResult = (sourceId: string): ImportResult => ({
+  code: 409,
+  body: {
+    error: 'spot-check-rejected-before', sourceId,
+    message: 'these shared definitions did not match this device in an earlier check; pull with recheck: true to check them again'
+  }
+});
+
+/** 404 `not-found`: a named row is not listed for this device and firmware (any more). */
+const notOfferedResult = (sourceId: string): ImportResult => ({
+  code: 404, body: { error: 'not-found', sourceId, message: 'no shared source with this id is listed for this device and firmware; check again' }
+});
+
+/** The rows a v2 pull takes from the check's offer: the named ones (a row this install's check failed only with
+ *  `recheck`, else 409 `spot-check-rejected-before`; an unlisted id 404 `not-found`), or every offered row (with
+ *  `recheck` the rejected rows too). */
+function chooseRows(offer: DefinitionSourcesOffer, opts: CloudPullOptions): { rows: OfferedSource[] } | { result: ImportResult } {
+  if (opts.sourceIds && opts.sourceIds.length > 0) {
+    const rows: OfferedSource[] = [];
+    for (const raw of opts.sourceIds) {
+      const sid = normalizeRowId(raw);
+      if (!sid) return { result: notOfferedResult(String(raw).slice(0, 64)) };
+      if (rows.some((o) => o.row.id === sid)) continue;
+      const offered = offer.offered.find((o) => o.row.id === sid);
+      const rejected = offered ? undefined : offer.rejected.find((r) => r.row.id === sid);
+      if (!offered && !rejected) return { result: notOfferedResult(sid) };
+      if (rejected && !opts.recheck) return { result: rejectedBeforeResult(sid) };
+      const row = (offered ?? rejected)!;
+      if (!rows.some((o) => o.row.kind === row.row.kind)) rows.push(row); // one row per kind (the offer guarantees it)
+    }
+    return { rows };
+  }
+  return { rows: [...offer.offered, ...(opts.recheck ? offer.rejected : [])] };
+}
+
+/**
+ * POST /device/cache/cloud/pull — adopt shared definitions for the attached device (body: `parsePullBody`). Model and
+ * firmware match is inherent (rows are fetched BY the attached identity) and re-checked on every body. Gated on the
+ * same capability as import (only cache-capable devices apply profiles). Nothing from the wire is trusted for
+ * provenance: every source a pull brings in is re-tagged `origin: 'cloud'` (`foreignSources`).
+ *
+ * v2 (the shared definition store answers and offers rows; `pullV2`): the check's offer (`definitionSourcesOffer`, the
+ * cached listing split into offered and locally rejected rows) → the chosen rows (`chooseRows`) → each body fetched and
+ * bound to its listed row (`fetchBoundSource`) → merged in memory (`mergeSourcesIntoStored`: M3 refusals apply) →
+ * `dryRun`: a preview (`pullPreview`), else the spot check when a cloud source decides any family
+ * (`verifyCandidate`) → stored and applied only after it passed (or was not needed). Verdicts: `passed` / `failed` on
+ * the rows that decide a checked / mismatching family, stored by row id and fact hash and reported when a session
+ * exists; `inconclusive` stores nothing. 200 `{ ok, pulled, key, model, firmware, source: 'cloud', format: 2, merged,
+ * adopted: [{ id, kind, tier }], spotCheck: { verdict: 'passed' | 'not-needed', checked, answered, mismatches,
+ * durationMs }, coverage: { complete, gaps } }`.
+ *
+ * v1 (no v2 client, the v2 store does not answer or offers nothing — also when this install rejected every v2 row;
+ * `pullV1`): today's M3 path — a format-2 row merges its raw sources (strict shape check, 422 `cloud profile malformed`),
+ * a derived-tables-only row is adopted only without a usable local profile (409 `local-profile-better` unless
+ * `replace`; 409 `cloud-profile-stale` for a schema this build cannot use) — plus the same spot check against the rows
+ * the cloud profile would decide, on a unit that can be checked (`spotCheckSupported`); a unit that cannot keeps
+ * today's path unchanged. A v1 row has no row id: a failed check stores no verdict.
+ *
+ * Errors of the check (nothing stored in any of them): 501 `unsupported` (`capability: 'spotCheck'`), 503
+ * `firmware-unknown`, 409 `spot-check-insufficient` `{ eligible, needed }`, 409 `building` / `busy`, 409
+ * `spot-check-failed` / `spot-check-inconclusive` `{ spotCheck }`, 409 `busy` (`what: 'definitions'`: the stored
+ * definitions changed while the check ran). A candidate that does not derive is not stored either on a unit that can
+ * be checked (422 `derivation-failed`, `stored: false`): it could not be checked.
+ */
+export async function cloudCachePull(cloud: CloudProfilesCloud | null, store: Store, registry: DeviceRegistry, opts: CloudPullOptions = {}): Promise<ImportResult> {
   if (!cloud) return { code: 503, body: { error: 'cloud disabled' } };
   const caps = registry.activeCapabilities();
   if (!caps?.cacheImport) return { code: 501, body: { error: 'unsupported', capability: 'cacheImport' } };
   const id = await deviceIdentity(store, registry);
   if (!id) return { code: 503, body: { error: 'no device detected' } };
+  let rejectedBefore: string | null = null;
+  if (hasV2Reads(cloud)) {
+    const offer = await definitionSourcesOffer(cloud, store, registry, id);
+    if (offer) {
+      const chosen = chooseRows(offer, opts);
+      if ('result' in chosen) return chosen.result;
+      if (chosen.rows.length > 0) return pullV2(cloud, store, registry, id, chosen.rows, opts);
+      rejectedBefore = offer.rejected[0]?.row.id ?? null;
+    }
+  }
+  if (opts.sourceIds && opts.sourceIds.length > 0) return notOfferedResult(opts.sourceIds[0]!);
+  return pullV1(cloud, store, registry, id, opts, rejectedBefore);
+}
 
+type Identity = { model: number; firmware: string; key: string };
+
+/** 422 `invalid-source` of a fetched v2 body (the path names the offending field; never a value). */
+const invalidSource = (kind: SharedSourceKind, path: string, message: string): ImportResult => ({ code: 422, body: { error: 'invalid-source', kind, path, message } });
+
+/**
+ * Fetch one listed row's body and bind it to the row before anything is derived from it: the body names the row's
+ * id, model, kind, raw format (≤ this build's `RAW_FORMAT`) and fact hash (else 502 `cloud`) and the device firmware
+ * (else 409 `firmware-differs`); its source passes the strict shared-mode shape check (`checkSharedSource`: 422
+ * `invalid-source` with the path), is of the listed kind, of the device firmware (409 `firmware-differs`), and its fact
+ * hash, recomputed here with the codec's `sourceFactHash`, equals the listed one (else 422 `invalid-source`): a verdict
+ * stored under that hash is about these very facts. The source comes back with a fresh id (`rawSourceId`) and
+ * `origin: 'cloud'`.
+ * A row whose body cannot be fetched (withdrawn after the listing was cached, a 404, the cloud not answering) or does
+ * not match its listing answers 502 `cloud` and drops the cached listing — never a silent substitute (another row the
+ * user did not choose or preview) and never the v1 store: the next check lists afresh.
+ */
+async function fetchBoundSource(cloud: V2Cloud, registry: DeviceRegistry, id: Identity, row: DefinitionSourceSummary): Promise<{ source: RawSource } | { result: ImportResult }> {
+  const unavailable = (message: string): { result: ImportResult } => {
+    forgetDefinitionSources(registry);
+    return { result: { code: 502, body: { error: 'cloud', status: null, message } } };
+  };
+  let body: DefinitionSourceBody | null;
+  try { body = await cloud.definitionSourceGet(row.id); } catch { body = null; }
+  if (!body) return unavailable('the shared definitions could not be fetched (withdrawn, or the cloud did not answer); check again');
+  if (body.id !== row.id || body.model !== id.model || body.kind !== row.kind || body.factHash !== row.factHash
+    || body.rawFormat !== row.rawFormat || body.rawFormat > RAW_FORMAT) {
+    return unavailable('the shared source does not match its listing; check again');
+  }
+  if (body.firmware !== id.firmware) return { result: { code: 409, body: { error: 'firmware-differs', kind: row.kind, expected: id.firmware, got: body.firmware } } };
+  const checked = checkSharedSource(body.source, 'source');
+  if (!checked.ok) return { result: invalidSource(row.kind, checked.path, checked.message) };
+  const s = checked.source;
+  if (s.kind !== row.kind) return { result: invalidSource(row.kind, 'source.kind', 'not the kind of the listed row') };
+  if (s.firmware !== id.firmware) return { result: { code: 409, body: { error: 'firmware-differs', kind: row.kind, expected: id.firmware, got: s.firmware } } };
+  let hash: string | null;
+  try { hash = await sourceFactHash(s as unknown as RawSource, { model: id.model, firmware: id.firmware }); } catch { hash = null; }
+  if (hash !== row.factHash) return { result: invalidSource(row.kind, 'source', 'its facts do not match the listed fact hash') };
+  return { source: { ...s, id: rawSourceId(s.kind, s.capturedAt, 0), origin: 'cloud' } as unknown as RawSource };
+}
+
+/** The answer of a merge that threw (refusals, user data, a source of another firmware, a derivation failure). */
+function mergeFailure(e: unknown): ImportResult {
+  if (e instanceof ProfileMergeRefused) return { code: 409, body: refusalBody(e.refusal) };
+  if (e instanceof ProfileUserDataError) return { code: 422, body: { error: 'contains-user-data', message: e.message } };
+  if (e instanceof ProfileDerivationError && e.code === 'firmware-mismatch') return { code: 409, body: { error: 'firmware-differs', message: e.message } };
+  return { code: 422, body: { error: 'derivation-failed', message: (e as Error).message } };
+}
+
+/** 422 of a candidate that does not derive on a unit that can be checked: nothing stored (it could not be checked). */
+const notDerivable = (id: Identity, message: string): ImportResult => ({
+  code: 422,
+  body: {
+    error: 'derivation-failed', stored: false, key: id.key,
+    message: `${message} — nothing was stored (definitions that do not derive cannot be checked against the device); pull with replace: true to replace the stored definitions instead`
+  }
+});
+
+/** Is the attached unit still the one `id` names: the same model, and the same firmware when one is read? A unit swapped
+ *  while the rows were fetched or checked never gets the old model's queries, nor its definitions under the old key. */
+function sameUnit(registry: DeviceRegistry, id: Identity): boolean {
+  if (registry.detectedModelId !== id.model) return false;
+  const fw = registry.firmwareInfo();
+  return !fw || `${fw.major}.${fw.minor}` === id.firmware;
+}
+const unitChanged = (): ImportResult => ({
+  code: 503, body: { error: 'no-device', message: 'the attached unit changed while the shared definitions were fetched or checked; nothing was stored — check again' }
+});
+
+/** The walk-scope gates of the running firmware, as the spot check takes them. */
+function gatesOf(registry: DeviceRegistry): SpotCheckGates {
+  const g = registry.walkScopeGates();
+  return { above160: g.above160 === true, extendedIds: g.extendedIds === true };
+}
+
+/** The plan a check of `doc` would run (no device traffic); a suite whose subject is the merge may skip it (test seam). */
+function planFor(registry: DeviceRegistry, store: Store, id: Identity, doc: BuiltCache, cloudSourceIds: readonly string[] | undefined, gates: SpotCheckGates): HostSpotCheckPlan {
+  if (spotCheckTestOptions(registry).skip) {
+    return { status: 'not-needed', eligible: 0, needed: SPOT_CHECK_LIMITS.minTargets, pools: { new: 0, changed: 0, other: 0, unverifiable: 0 }, targets: [], winners: [] };
+  }
+  return planSpotCheck({
+    model: id.model, firmware: id.firmware, doc, ...(cloudSourceIds !== undefined ? { cloudSourceIds } : {}),
+    store, key: id.key, gates, rng: spotCheckRngFor(registry)
+  });
+}
+
+/** The revision of the stored doc of `key` (a pull stores its candidate only when it is unchanged after the check). */
+function docRevision(store: Pick<Store, 'getDoc'>, key: string): string {
+  const d = store.getDoc('deviceCaches', key);
+  return d ? `${d.deleted ? 'deleted' : 'doc'}:${d.rev}:${d.updatedAt}` : 'none';
+}
+
+type Verification = { state: 'not-needed' } | { state: 'ran'; result: SpotCheckResult } | { state: 'refused'; result: ImportResult };
+
+/** The spot check of a candidate (§4.3), in the contract's order: not needed (no cloud-decided family) → 503 `no-device`
+ *  (the unit was swapped since the rows were fetched for it) → 501 no spot check on this unit → 503 `firmware-unknown` →
+ *  409 `spot-check-insufficient` (no traffic) → the claimed run (409 `building` / `busy`, 500 `walk-bound` /
+ *  `spot-check-error`, 503 `no-device`; the last three after a terminal SSE error). */
+async function verifyCandidate(registry: DeviceRegistry, id: Identity, plan: HostSpotCheckPlan, gates: SpotCheckGates): Promise<Verification> {
+  if (plan.status === 'not-needed') return { state: 'not-needed' };
+  if (registry.detectedModelId !== id.model) return { state: 'refused', result: unitChanged() };
+  if (!spotCheckSupported(registry)) return { state: 'refused', result: { code: 501, body: { error: 'unsupported', capability: 'spotCheck' } } };
+  const fw = registry.firmwareInfo();
+  if (!fw || `${fw.major}.${fw.minor}` !== id.firmware) return { state: 'refused', result: { code: 503, body: { error: 'firmware-unknown' } } };
+  if (plan.status === 'insufficient') {
+    return {
+      state: 'refused',
+      result: {
+        code: 409,
+        body: { error: 'spot-check-insufficient', eligible: plan.eligible, needed: plan.needed, message: 'too few of these definitions can be checked against this device; nothing was stored' }
+      }
+    };
+  }
+  const run = await runDeviceSpotCheck(registry, plan, { key: id.key, model: id.model, firmware: id.firmware }, gates);
+  if (!run.ok) {
+    if (run.code !== 409) {
+      registry.emitEvent({
+        type: 'cacheBuild', phase: 'error', done: 0, total: plan.targets.length, key: id.key, model: id.model, firmware: id.firmware,
+        reason: 'spot-check-error', error: String(run.body.error)
+      });
+    }
+    return { state: 'refused', result: { code: run.code, body: run.body } };
+  }
+  return { state: 'ran', result: run.result };
+}
+
+/** The `spotCheck` field of a refused pull: counts and the mismatching (family, pid) addresses only, never a value. */
+function spotCheckBody(r: SpotCheckResult): Record<string, unknown> {
+  return {
+    verdict: r.verdict, checked: r.checked, answered: r.answered, mismatches: r.mismatches, failures: r.failures.map((f) => ({ family: f.family, pid: f.pid })),
+    durationMs: r.durationMs, ...(r.stopped !== undefined ? { stopped: r.stopped } : {})
+  };
+}
+
+/** A check that did not pass: the terminal SSE `cacheBuild` error (`reason`) and 409 `spot-check-failed` (a mismatch) or
+ *  `spot-check-inconclusive` (too few answers, the budget, the device stopped answering). Nothing is stored here. */
+function checkNotPassed(registry: DeviceRegistry, id: Identity, r: SpotCheckResult): ImportResult {
+  const reason = r.verdict === 'failed' ? 'spot-check-failed' as const : 'spot-check-inconclusive' as const;
+  registry.emitEvent({
+    type: 'cacheBuild', phase: 'error', done: r.checked, total: r.planned, key: id.key, model: id.model, firmware: id.firmware, reason,
+    error: r.verdict === 'failed' ? 'the shared definitions did not match the device; nothing was stored' : 'the device did not answer enough of the check; nothing was stored'
+  });
+  if (r.verdict === 'insufficient') {
+    return { code: 409, body: { error: 'spot-check-insufficient', eligible: r.planned, needed: SPOT_CHECK_LIMITS.minTargets } };
+  }
+  return { code: 409, body: { error: reason, spotCheck: spotCheckBody(r) } };
+}
+
+/** Store and apply a candidate that passed (or needed no check): refused (409 `busy`, `what: 'definitions'`) when the
+ *  stored doc changed since the candidate was merged; 503 `no-device` when the attached unit changed (`sameUnit`); 422
+ *  `contains-user-data` from the privacy guard. After a check that ran (`checked`: the client saw `verifying`), a refusal
+ *  also emits the terminal `cacheBuild error` with its `reason`. On success emits the terminal `cacheBuild done` and, with
+ *  stored sources kept, `definitions { reason: 'merged' }`. Null = stored. */
+async function adoptCandidate(
+  store: Store, registry: DeviceRegistry, id: Identity, doc: unknown, rev: string, kept: number, checked: boolean
+): Promise<ImportResult | null> {
+  const refuse = (result: ImportResult, reason: 'definitions-changed' | 'unit-changed' | 'contains-user-data'): ImportResult => {
+    if (checked) {
+      const message = (result.body as { message?: unknown }).message;
+      registry.emitEvent({
+        type: 'cacheBuild', phase: 'error', done: 0, total: 0, key: id.key, model: id.model, firmware: id.firmware, reason,
+        error: typeof message === 'string' ? message : reason
+      });
+    }
+    return result;
+  };
+  if (docRevision(store, id.key) !== rev) {
+    return refuse({ code: 409, body: { error: 'busy', what: 'definitions', message: 'the stored definitions changed while the shared ones were checked; nothing was stored — pull again' } }, 'definitions-changed');
+  }
+  if (!sameUnit(registry, id)) return refuse(unitChanged(), 'unit-changed');
+  try {
+    persistProfile(store, id.key, doc);
+  } catch (e) {
+    return refuse({ code: 422, body: { error: 'contains-user-data', message: (e as Error).message } }, 'contains-user-data');
+  }
+  await registry.applyRuntimeCache();
+  registry.emitEvent({ type: 'cacheBuild', phase: 'done', done: 0, total: 0, key: id.key, model: id.model, firmware: id.firmware });
+  if (kept > 0) registry.emitEvent({ type: 'definitions', reason: 'merged', key: id.key });
+  return null;
+}
+
+/** The pulled rows whose sources decide any of `families` in the candidate (`provenance.existence`). */
+function rowsDeciding(doc: ProfileDoc, rowBySource: ReadonlyMap<string, OfferedSource>, families: Iterable<string>): OfferedSource[] {
+  const existence = doc.provenance?.existence ?? {};
+  const out = new Set<OfferedSource>();
+  for (const f of families) {
+    const src = Object.prototype.hasOwnProperty.call(existence, f) ? existence[f] : undefined;
+    const row = typeof src === 'string' ? rowBySource.get(src) : undefined;
+    if (row) out.add(row);
+  }
+  return [...out];
+}
+
+/** Store this install's verdict on each row (by row id and listed fact hash) and report it to the cloud when a
+ *  session already exists (the client never creates one for a report). The report is a bonus signal: not awaited,
+ *  its failure ignored. */
+function settleVerdicts(cloud: CloudProfilesCloud, store: Store, key: string, rows: readonly OfferedSource[], verdict: 'passed' | 'failed', r: SpotCheckResult, app: CloudPullOptions['app']): void {
+  const at = new Date().toISOString();
+  for (const { row } of rows) {
+    recordCloudVerdict(store, key, row.id, { factHash: row.factHash, kind: row.kind, verdict, at, checked: r.checked, answered: r.answered, mismatches: r.mismatches });
+    if (typeof cloud.definitionSourceReport !== 'function') continue;
+    const report: DefinitionSourceReport = { sourceId: row.id, verdict, checked: r.checked, answered: r.answered, mismatches: r.mismatches, ...(app ? { app } : {}) };
+    try { void cloud.definitionSourceReport(report).catch(() => undefined); } catch { /* a report never fails a pull */ }
+  }
+}
+
+/** What a pull would change, per the candidate's provenance: the families its pulled sources decide, their rows, and
+ *  the rows whose unit / taper they contribute. `pulled` null = a v1 profile adopted as a whole (every family; units
+ *  and tapers counted on its rows). */
+function winsOf(doc: BuiltCache, pulled: ReadonlySet<string> | null): { families: number; rows: number; units: number; tapers: number } {
+  const ranges = (doc.ranges ?? {}) as Record<string, Record<string, { unit?: unknown; taper?: unknown }>>;
+  let families = 0;
+  let rows = 0;
+  if (pulled === null) {
+    let units = 0;
+    let tapers = 0;
+    for (const [fam, byPid] of Object.entries(ranges)) {
+      if (isSyntheticFamilyKey(fam)) continue;
+      families += 1;
+      for (const r of Object.values(byPid)) {
+        rows += 1;
+        if (typeof r.unit === 'string' && r.unit.length > 0) units += 1;
+        if (r.taper !== undefined && r.taper !== null) tapers += 1;
+      }
+    }
+    return { families, rows, units, tapers };
+  }
+  const prov = (doc as unknown as ProfileDoc).provenance;
+  for (const [fam, src] of Object.entries(prov?.existence ?? {})) {
+    if (isSyntheticFamilyKey(fam) || !pulled.has(src)) continue;
+    families += 1;
+    rows += Object.keys(ranges[fam] ?? {}).length;
+  }
+  const sum = (m: Record<string, number> | undefined) => [...pulled].reduce((n, sid) => n + (m && Object.prototype.hasOwnProperty.call(m, sid) ? m[sid]! : 0), 0);
+  return { families, rows, units: sum(prov?.units), tapers: sum(prov?.tapers) };
+}
+
+/** The definitions diff summary the candidate would have once applied (the same computation as
+ *  `GET /device/definitions/diff`, over the candidate instead of the applied profile); null without a diff context. */
+function candidateDiffSummary(registry: DeviceRegistry, id: Identity, doc: BuiltCache): DefinitionsDiffDTO['summary'] | null {
+  const ctx = registry.definitionsDiffContext();
+  if (!ctx || ctx.model !== id.model) return null;
+  try {
+    const profile = runtimeProfileFrom(doc, ctx.staticProfile);
+    const r = definitionsDiff({
+      model: id.model, firmware: id.firmware, state: ctx.caps.drift, staticProfile: ctx.staticProfile,
+      applied: { key: id.key, doc, profile }, placedEids: ctx.placedEids, unmappedEids: ctx.unmappedEids
+    });
+    return r.ok ? r.diff.summary : null;
+  } catch {
+    return null;
+  }
+}
+
+/** The dry-run preview of a candidate: its coverage, the diff summary it would have, what the pulled sources would
+ *  decide (`wins`) and whether (and how far) a device check is needed. Pure: no traffic, no store write. */
+function pullPreview(registry: DeviceRegistry, id: Identity, doc: BuiltCache, pulled: ReadonlySet<string> | null, plan: HostSpotCheckPlan): Record<string, unknown> {
+  return {
+    coverage: profileSummaryOf(doc, id.model).coverage,
+    diff: candidateDiffSummary(registry, id, doc),
+    wins: winsOf(doc, pulled),
+    spotCheck: { needed: plan.status !== 'not-needed', status: plan.status, eligible: plan.eligible, planned: plan.targets.length, unverifiable: plan.pools.unverifiable }
+  };
+}
+
+/** The v2 half of the pull (see `cloudCachePull`). */
+async function pullV2(cloud: V2Cloud, store: Store, registry: DeviceRegistry, id: Identity, chosen: readonly OfferedSource[], opts: CloudPullOptions): Promise<ImportResult> {
+  const pulledAt = new Date().toISOString();
+  const incoming: RawSource[] = [];
+  for (const offered of chosen) {
+    const got = await fetchBoundSource(cloud, registry, id, offered.row);
+    if ('result' in got) return got.result;
+    incoming.push(got.source);
+  }
+  let merged: MergedProfile;
+  try {
+    merged = mergeSourcesIntoStored(store, {
+      key: id.key, model: id.model, firmware: id.firmware, incoming: foreignSources(incoming, 'cloud'), replace: opts.replace, extras: { pulledAt }, now: pulledAt
+    });
+  } catch (e) {
+    return mergeFailure(e);
+  }
+  if (merged.derivationFailed !== undefined) return notDerivable(id, merged.derivationFailed);
+  const rev = docRevision(store, id.key);
+  const doc = merged.doc;
+  // every cloud source of the candidate counts as cloud for the check (also one an earlier pull stored); the pulled ones
+  // by their ids in the candidate — one cloud source per kind: a pulled source replaced the stored cloud source of its kind
+  const cloudSources = doc.raw.sources.filter((s) => s.origin === 'cloud');
+  const rowBySource = new Map<string, OfferedSource>();
+  for (const s of cloudSources) {
+    const o = chosen.find((c) => c.row.kind === s.kind);
+    if (o) rowBySource.set(s.id, o);
+  }
+  const gates = gatesOf(registry);
+  const plan = planFor(registry, store, id, doc as unknown as BuiltCache, cloudSources.map((s) => s.id), gates);
+  if (opts.dryRun) {
+    return { code: 200, body: { ok: true, dryRun: true, sources: chosen.map((c) => c.summary), ...pullPreview(registry, id, doc as unknown as BuiltCache, new Set(rowBySource.keys()), plan) } };
+  }
+  const v = await verifyCandidate(registry, id, plan, gates);
+  if (v.state === 'refused') return v.result;
+  if (v.state === 'ran' && v.result.verdict !== 'passed') {
+    if (v.result.verdict === 'failed') {
+      const blamed = rowsDeciding(doc, rowBySource, v.result.failures.map((f) => f.family));
+      settleVerdicts(cloud, store, id.key, blamed, 'failed', v.result, opts.app);
+    }
+    return checkNotPassed(registry, id, v.result);
+  }
+  const refused = await adoptCandidate(store, registry, id, doc, rev, merged.kept, v.state === 'ran');
+  if (refused) return refused;
+  if (v.state === 'ran') settleVerdicts(cloud, store, id.key, rowsDeciding(doc, rowBySource, plan.targets.map((t) => t.family)), 'passed', v.result, opts.app);
+  const coverage = profileSummaryOf(doc as unknown as BuiltCache, id.model).coverage;
+  return {
+    code: 200,
+    body: {
+      ok: true, pulled: true, key: id.key, model: id.model, firmware: id.firmware, source: 'cloud', format: 2, merged: merged.kept > 0,
+      adopted: chosen.map((c) => ({ id: c.row.id, kind: c.row.kind, tier: c.row.tier })),
+      spotCheck: v.state === 'ran'
+        ? { verdict: 'passed', checked: v.result.checked, answered: v.result.answered, mismatches: 0, durationMs: v.result.durationMs, unverifiable: plan.pools.unverifiable }
+        : { verdict: 'not-needed', checked: 0, answered: 0, mismatches: 0, durationMs: 0, unverifiable: plan.pools.unverifiable },
+      coverage: { complete: coverage.complete, gaps: coverage.gaps }
+    }
+  };
+}
+
+/** The v1 half of the pull (see `cloudCachePull`): the M3 path, plus the spot check on a unit that can be checked.
+ *  `rejectedBefore`: a v2 row this install rejected, answered (409 `spot-check-rejected-before`) when the v1 store has
+ *  no row either. */
+async function pullV1(cloud: DeviceProfileCloud, store: Store, registry: DeviceRegistry, id: Identity, opts: CloudPullOptions, rejectedBefore: string | null): Promise<ImportResult> {
   const cached = LAST_CHECK.get(registry);
   const row = cached?.key === id.key ? cached.row : await cloud.deviceProfileGet(id.model, id.firmware, CURRENT_CACHE_SCHEMA);
-  if (!row) return { code: 404, body: { error: 'no cloud profile for this device+firmware' } };
+  if (!row) return rejectedBefore ? rejectedBeforeResult(rejectedBefore) : { code: 404, body: { error: 'no cloud profile for this device+firmware' } };
 
   const p = row.profile as { meta?: Record<string, unknown> } | null;
   if (!p || typeof p !== 'object' || !p.meta) return { code: 422, body: { error: 'cloud profile malformed' } };
   const pulledAt = new Date().toISOString();
   const raw = readableRaw(p);
-  let kept = 0;
-  let stored: Record<string, unknown>;
+  const checkable = spotCheckSupported(registry);
+  let candidate: { doc: BuiltCache; kept: number; cloudSourceIds?: string[]; pulled: ReadonlySet<string> | null };
   if (raw) {
     // nothing a row says about its raw sources is trusted before it passed the strict shape check (rawValidation.ts):
     // a malformed or hostile source set is refused like a malformed row, nothing stored
@@ -516,25 +975,26 @@ export async function cloudCachePull(cloud: DeviceProfileCloud | null, store: St
     const incoming = foreignSources(checked.sources, 'cloud');
     const foreign = incoming.find((s) => s.firmware !== null && s.firmware !== id.firmware);
     if (foreign) return { code: 409, body: { error: 'firmware-differs', expected: id.firmware, got: foreign.firmware } };
+    let merged: MergedProfile;
     try {
-      const merged = mergeSourcesIntoStored(store, {
+      merged = mergeSourcesIntoStored(store, {
         key: id.key, model: id.model, firmware: id.firmware, incoming,
         replace: opts.replace, extras: { pulledAt, contentHash: row.contentHash }, now: pulledAt
       });
-      kept = merged.kept;
-      stored = merged.doc as unknown as Record<string, unknown>;
-      persistProfile(store, id.key, stored);
-      if (merged.derivationFailed !== undefined) {
-        // the stored doc was stale and still does not derive with the cloud sources added: kept (nothing lost)
-        await registry.applyRuntimeCache();
-        return { code: 422, body: { error: 'derivation-failed', message: merged.derivationFailed, stored: true, key: id.key } };
-      }
     } catch (e) {
-      if (e instanceof ProfileMergeRefused) return { code: 409, body: refusalBody(e.refusal) };
-      if (e instanceof ProfileUserDataError) return { code: 422, body: { error: 'contains-user-data', message: e.message } };
-      if (e instanceof ProfileDerivationError && e.code === 'firmware-mismatch') return { code: 409, body: { error: 'firmware-differs', message: e.message } };
-      return { code: 422, body: { error: 'derivation-failed', message: (e as Error).message } };
+      return mergeFailure(e);
     }
+    if (merged.derivationFailed !== undefined) {
+      // a unit that can be checked never stores cloud sources it could not check; elsewhere (today's path) the stale
+      // doc keeps every source, stored and new (nothing lost)
+      if (checkable || opts.dryRun) return notDerivable(id, merged.derivationFailed);
+      if (!sameUnit(registry, id)) return unitChanged();
+      try { persistProfile(store, id.key, merged.doc); } catch (e) { return mergeFailure(e); }
+      await registry.applyRuntimeCache();
+      return { code: 422, body: { error: 'derivation-failed', message: merged.derivationFailed, stored: true, key: id.key } };
+    }
+    const cloudIds = merged.doc.raw.sources.filter((s) => s.origin === 'cloud').map((s) => s.id);
+    candidate = { doc: merged.doc as unknown as BuiltCache, kept: merged.kept, cloudSourceIds: cloudIds, pulled: new Set(cloudIds) };
   } else {
     const verdict = checkProfileSchema(p);
     if (!verdict.usable) return { code: 409, body: { error: 'cloud-profile-stale', ...staleFields(verdict) } };
@@ -562,21 +1022,39 @@ export async function cloudCachePull(cloud: DeviceProfileCloud | null, store: St
     // Derived tables only (a raw envelope this build cannot read is dropped, never stored verbatim). Source becomes
     // 'cloud' for surfacing; the build kind it originally came from rides in `origin`.
     const tables = publishableProfile(p as Record<string, unknown>);
-    stored = { ...tables, meta: { ...(tables.meta as Record<string, unknown>), source: 'cloud' as const, origin: p.meta.source, pulledAt, contentHash: row.contentHash } };
-    try {
-      persistProfile(store, id.key, stored);
-    } catch (e) {
-      return { code: 422, body: { error: 'contains-user-data', message: (e as Error).message } };
-    }
+    const doc = { ...tables, meta: { ...(tables.meta as Record<string, unknown>), source: 'cloud' as const, origin: p.meta.source, pulledAt, contentHash: row.contentHash } };
+    candidate = { doc: doc as unknown as BuiltCache, kept: 0, pulled: null };
   }
-  await registry.applyRuntimeCache();
-  registry.emitEvent({ type: 'cacheBuild', phase: 'done', done: 0, total: 0, key: id.key, model: id.model, firmware: id.firmware });
-  if (kept > 0) registry.emitEvent({ type: 'definitions', reason: 'merged', key: id.key });
+  const gates = gatesOf(registry);
+  // a unit without a spot check keeps today's path: nothing to plan
+  const plan: HostSpotCheckPlan = checkable
+    ? planFor(registry, store, id, candidate.doc, candidate.cloudSourceIds, gates)
+    : { status: 'not-needed', eligible: 0, needed: SPOT_CHECK_LIMITS.minTargets, pools: { new: 0, changed: 0, other: 0, unverifiable: 0 }, targets: [], winners: [] };
+  if (opts.dryRun) {
+    return {
+      code: 200,
+      body: {
+        ok: true, dryRun: true, version: 1, meta: { source: row.source, recordCount: row.recordCount, createdAt: row.createdAt, contentHash: row.contentHash },
+        ...pullPreview(registry, id, candidate.doc, candidate.pulled, plan)
+      }
+    };
+  }
+  const rev = docRevision(store, id.key);
+  const v = await verifyCandidate(registry, id, plan, gates);
+  if (v.state === 'refused') return v.result;
+  // a v1 row has no row id: no verdict is stored, no report sent
+  if (v.state === 'ran' && v.result.verdict !== 'passed') return checkNotPassed(registry, id, v.result);
+  const refused = await adoptCandidate(store, registry, id, candidate.doc, rev, candidate.kept, v.state === 'ran');
+  if (refused) return refused;
   return {
     code: 200,
     body: {
       ok: true, pulled: true, key: id.key, model: id.model, firmware: id.firmware, source: 'cloud', contentHash: row.contentHash,
-      ...(raw ? { format: 2, merged: kept > 0 } : {})
+      ...(raw ? { format: 2, merged: candidate.kept > 0 } : {}),
+      ...(v.state === 'ran'
+        ? { spotCheck: { verdict: 'passed', checked: v.result.checked, answered: v.result.answered, mismatches: 0, durationMs: v.result.durationMs, unverifiable: plan.pools.unverifiable } }
+        // a unit without a spot check keeps the M3 path: marked, so a client can tell an unchecked adoption
+        : checkable ? {} : { spotCheck: { verdict: 'unavailable' } })
     }
   };
 }
