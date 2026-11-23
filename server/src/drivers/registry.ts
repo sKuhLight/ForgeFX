@@ -30,7 +30,8 @@ const nodeDeps: RegistryDeps = {
   // a profile with an outdated/unknown schema is not applied (the bundled profile stays), see profileSchema.ts.
   loadDeviceCache: (key) => loadUsableProfile(store, key),
   // The walk-scope development override (FORGEFX_WALK_SCOPE_OVERRIDE, services/walkScope.ts): read from the Node
-  // environment at call time, here only — a Browser Direct registry has no such hook. Ignored in production.
+  // environment at call time, here only — a Browser Direct registry has no such hook. Like every development hook it
+  // needs the explicit opt-in FORGEFX_DEV_HOOKS=1 and is ignored in production (devHooks.ts).
   walkScopeOverride: () => walkScopeOverrideFromEnv(process.env)
 };
 

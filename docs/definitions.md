@@ -90,7 +90,8 @@ Served by `GET /device` and `GET /device/detect` on every device:
 ```json
 "definitions": { "genericParams": true, "catalogFirmware": "12.0",
   "profile": { "key": "11_99p0", "source": "editor-cache", "byteExact": true, "firmware": "99.0", "suspectFamilies": [] },
-  "drift": "none", "contribute": true }
+  "drift": "none", "contribute": true,
+  "walk": { "extendedIds": false, "above160": false, "blockProbe": false, "farIds": false }, "portable": true }
 ```
 - `genericParams`: the device serves `?generic=1` (gen-3 grid devices with self-describe: Axe-Fx III, FM3,
   FM9). Others ignore the flag and answer the classic shape without a `definitions` block.
@@ -102,6 +103,14 @@ Served by `GET /device` and `GET /device/detect` on every device:
 - `contribute`: the device can contribute its editor definitions file (see below): a `genericParams` device
   that imports editor caches and whose firmware was read. Whether the cloud wants the file is not a device
   fact; it is in the contribution status.
+- `walk`: how far a read-only definition walk may query the unit on its running firmware: `extendedIds`
+  (ids above 127 of known tables), `above160` (the placeable blocks above effect id 160), `blockProbe` (the
+  single-block probe), `farIds` (never enabled). Each is true only on a model and firmware it has been
+  verified on; all false on an unknown firmware. With `extendedIds` or `above160`, a read-only
+  `POST /device/cache/build` defaults to `scope: "extended"` (a full build only on request): the firmware is
+  re-read, the standard walk is stored first, then a bounded read-only extension walk adds to it; the terminal
+  `cacheBuild` `done` event says `extension: "done" | "skipped" | "aborted"` (with an `abortReason` code;
+  an aborted extension keeps the standard walk's result).
 
 ## Checking it: `profile-check`
 `server/scripts/profile-check.ts` checks that every row a profile describes is listed or hidden, and that
@@ -129,10 +138,16 @@ npm run profile-check -- --url http://127.0.0.1:5056 [--eid 1] [--profile <file>
   generic support), or any request that failed at the transport level (connection refused, timeout,
   redirect); requests never follow redirects.
 
-## Testing hook
-`FORGEFX_DEFS_FORCE_GENERIC="CHORUS:8"` (comma-separated `FAMILY:pid`, a bare pid joins the previous
-family) serves the listed ids as generic parameters whatever the catalog knows. For testing only:
-default off, read from the process environment, never read by the browser runtime.
+## Development hooks
+For testing and acceptance runs only. Every hook is read from the process environment (never by the browser
+runtime) and is ignored unless `FORGEFX_DEV_HOOKS=1` is set as well, and always when `NODE_ENV=production`;
+an ignored hook is reported with one warning line.
+- `FORGEFX_DEFS_FORCE_GENERIC="CHORUS:8"` (comma-separated `FAMILY:pid`, a bare pid joins the previous
+  family) serves the listed ids as generic parameters whatever the catalog knows.
+- `FORGEFX_DEFS_HIDE_FAMILY=RESONATOR` hides one catalog family, so its blocks are served like blocks a newer
+  firmware added.
+- `FORGEFX_WALK_SCOPE_OVERRIDE=extended,above160,probe` opens the named `walk` gates (see above) for the
+  running firmware (never `farIds`, nothing on an unknown firmware).
 
 ## Contributing the editor's definitions file
 A firmware the bundled catalog does not describe yet is supported fastest from the official editor's

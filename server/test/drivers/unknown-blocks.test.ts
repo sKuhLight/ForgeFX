@@ -636,7 +636,7 @@ async function hideHookScope(): Promise<void> {
   const warn = console.warn;
   console.warn = (...a: unknown[]) => { warnings.push(a.map(String).join(' ')); };
   try {
-    await withEnv({ FORGEFX_DEFS_HIDE_FAMILY: 'RESONATOR', NODE_ENV: undefined }, () => {
+    await withEnv({ FORGEFX_DEFS_HIDE_FAMILY: 'RESONATOR', FORGEFX_DEV_HOOKS: '1', NODE_ENV: undefined }, () => {
       assertEqual(hiddenFamily(), 'RESONATOR', 'the hook names the family');
       const cat = profileCatalogFor(FM3);
       assertEqual(Object.prototype.hasOwnProperty.call(cat.familyFirstEid ?? {}, 'RESONATOR'), false, 'familyFirstEid: dropped');
@@ -656,13 +656,13 @@ async function hideHookScope(): Promise<void> {
     assertEqual(profileCatalogFor(FM3).familyFirstEid?.RESONATOR, 162, 'unset: familyFirstEid has it again');
     assertEqual(staticRoster(FM3).get(162)?.family, 'RESONATOR', 'unset: the static roster has it again');
     warnings.length = 0;
-    await withEnv({ FORGEFX_DEFS_HIDE_FAMILY: 'RESONATOR', NODE_ENV: 'production' }, () => {
+    await withEnv({ FORGEFX_DEFS_HIDE_FAMILY: 'RESONATOR', FORGEFX_DEV_HOOKS: '1', NODE_ENV: 'production' }, () => {
       assertEqual(hiddenFamily(), null, 'production: ignored');
       assertEqual(profileCatalogFor(FM3).familyFirstEid?.RESONATOR, 162, 'production: nothing hidden');
     });
     assertEqual(warnings.length === 1 && warnings[0]!.includes('ignored in production'), true, 'production: one warning that it is ignored');
     warnings.length = 0;
-    await withEnv({ FORGEFX_DEFS_HIDE_FAMILY: 'resonator', NODE_ENV: undefined }, () => {
+    await withEnv({ FORGEFX_DEFS_HIDE_FAMILY: 'resonator', FORGEFX_DEV_HOOKS: '1', NODE_ENV: undefined }, () => {
       assertEqual(hiddenFamily(), null, 'malformed (lower case): ignored');
       hiddenFamily();
     });
@@ -673,7 +673,7 @@ async function hideHookScope(): Promise<void> {
 // ── 10. leave-one-out RESONATOR (162, above 160): likely → probe → confirmed section:39 ────────────────────────────
 async function leaveOneOutResonator(): Promise<void> {
   clearDoc();
-  await withEnv({ FORGEFX_DEFS_HIDE_FAMILY: 'RESONATOR', NODE_ENV: undefined }, async () => {
+  await withEnv({ FORGEFX_DEFS_HIDE_FAMILY: 'RESONATOR', FORGEFX_DEV_HOOKS: '1', NODE_ENV: undefined }, async () => {
     await quietly(async () => {
       const stride = FM3P.rangeSections.RESONATOR!.stride; // 40
       const rows = (section: number) => widenTable(familyRecords('RESONATOR', section), section, stride);
@@ -721,7 +721,7 @@ async function leaveOneOutFormant(): Promise<void> {
   const doc = profileDoc([eCache, walk]); // derived without the hook
   assertEqual(doc.blockMap.some((e) => e.eid === 98), false, 'unhidden: 98 is a FORMANT block, not in the block map');
   s.putDoc('deviceCaches', KEY, doc);
-  await withEnv({ FORGEFX_DEFS_HIDE_FAMILY: 'FORMANT', NODE_ENV: undefined }, async () => {
+  await withEnv({ FORGEFX_DEFS_HIDE_FAMILY: 'FORMANT', FORGEFX_DEV_HOOKS: '1', NODE_ENV: undefined }, async () => {
     silent(() => hiddenFamily());
     const loaded = upgradeStoredProfile(s, KEY);
     assertEqual(`${loaded.state}/${loaded.state === 'usable' ? loaded.rederived : ''}`, 'usable/revision', 'hidden: the stored doc re-derives');
@@ -745,15 +745,15 @@ async function walkScopeGatesFailClosed(): Promise<void> {
   assertEqual(JSON.stringify(walkScopeGates(FM3, { major: 13, minor: 0 }, new Set(['probe']))), '{"extendedIds":false,"above160":false,"blockProbe":true,"farIds":false}', 'override probe: blockProbe only');
   const p = parseWalkScopeOverride(' extended , probe, farIds,,above160 ');
   assertEqual(`${[...p.flags].join(',')}|${p.malformed.join(',')}`, 'extended,probe,above160|farIds', 'override tokens (farIds is never one)');
-  const prod = silent(() => walkScopeOverrideFromEnv({ FORGEFX_WALK_SCOPE_OVERRIDE: 'probe', NODE_ENV: 'production' }));
+  const prod = silent(() => walkScopeOverrideFromEnv({ FORGEFX_WALK_SCOPE_OVERRIDE: 'probe', FORGEFX_DEV_HOOKS: '1', NODE_ENV: 'production' }));
   assertEqual(prod.size, 0, 'production: the override is ignored');
-  const dev = silent(() => walkScopeOverrideFromEnv({ FORGEFX_WALK_SCOPE_OVERRIDE: 'probe' }));
+  const dev = silent(() => walkScopeOverrideFromEnv({ FORGEFX_WALK_SCOPE_OVERRIDE: 'probe', FORGEFX_DEV_HOOKS: '1' }));
   assertEqual([...dev].join(','), 'probe', 'development: the override opens the probe');
   // a registry without the hook (Browser Direct) keeps every gate closed; the Node hook reads the environment
   const r = await makeRig({ probe: false });
   try {
     assertEqual(r.registry.walkScopeGates().blockProbe, false, 'no override: closed');
-    const viaEnv = await withEnv({ FORGEFX_WALK_SCOPE_OVERRIDE: 'probe', NODE_ENV: undefined }, async () => {
+    const viaEnv = await withEnv({ FORGEFX_WALK_SCOPE_OVERRIDE: 'probe', FORGEFX_DEV_HOOKS: '1', NODE_ENV: undefined }, async () => {
       const m = new MockTransport('serial', 'mock-env');
       m.reply = (req) => (isIdentifyBroadcast(req) ? [handshakeReply(FM3)] : req[5] === 0x08 ? [firmwareVersionReply(FM3, 13, 0)] : []);
       const reg = __createRegistryForTest({ resolveConn: async () => ({ transport: 'serial', id: m.label }), openConn: () => m });
@@ -929,7 +929,7 @@ async function devHookNeverShared(): Promise<void> {
     const flags = parseContributionFlags({ consent: true, consentVersion: 2 });
     assert(flags.ok, 'fixture: contribution flags');
     putDoc(await byteDoc());
-    await withEnv({ FORGEFX_DEFS_HIDE_FAMILY: 'FORMANT', NODE_ENV: undefined }, async () => {
+    await withEnv({ FORGEFX_DEFS_HIDE_FAMILY: 'FORMANT', FORGEFX_DEV_HOOKS: '1', NODE_ENV: undefined }, async () => {
       silent(() => hiddenFamily());
       const pub = await cloudCachePublish(cloud, store.defaultStore, r.registry);
       assertEqual(`${pub.code}/${(pub.body as { error?: string }).error}`, '409/dev-hook-active', 'hook active: publish refused');

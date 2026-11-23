@@ -51,6 +51,7 @@ import type {
   BlockParamsDTO, BlockParamsV2DTO, BlockParamsOpts, NamedParamV2, EnumParamV2, ParamMeta, UnresolvedReason, BlockMapMeta
 } from './types.js';
 import { validatedPresetDump } from './sendPolicy.js';
+import { devHookValue, processEnv } from '../devHooks.js';
 
 // slug → { name, page=base effect id } from the authoritative codec base table (replaces the old
 // defs.js pack lookup; block names + base ids are codec facts, not editor-cache definitions).
@@ -591,16 +592,20 @@ export function parseForcedGeneric(raw: string): { pids: ReadonlyMap<string, Rea
 /** The last hook value parsed (re-parsed only when the variable changes, so a malformed value warns once). */
 let forcedGeneric: { raw: string; pids: ReadonlyMap<string, ReadonlySet<number>> } | undefined;
 
+/** Name of the diagnostic hook's environment variable. */
+export const FORCE_GENERIC_ENV = 'FORGEFX_DEFS_FORCE_GENERIC';
+
 /** Diagnostic hook, off by default: pids to serve as generic params whatever the catalog names them, from
  *  `FORGEFX_DEFS_FORCE_GENERIC` (see parseForcedGeneric; for testing only). Read through a guarded process
- *  access: a browser runtime has none and never forces anything. */
+ *  access: a browser runtime has none and never forces anything. Like every development hook it needs the explicit
+ *  opt-in `FORGEFX_DEV_HOOKS=1` and is ignored when `NODE_ENV=production` (devHooks.ts `devHookValue`). */
 function forcedGenericPids(family: string): ReadonlySet<number> | undefined {
-  const raw = typeof process !== 'undefined' ? process.env?.FORGEFX_DEFS_FORCE_GENERIC : undefined;
+  const raw = devHookValue(processEnv(), FORCE_GENERIC_ENV);
   if (!raw) return undefined;
   if (forcedGeneric?.raw !== raw) {
     const parsed = parseForcedGeneric(raw);
     if (parsed.malformed.length > 0) {
-      console.warn(`[forgefx] FORGEFX_DEFS_FORCE_GENERIC: ignored malformed ${parsed.malformed.length === 1 ? 'entry' : 'entries'} ${parsed.malformed.map((e) => JSON.stringify(e)).join(', ')} (expected FAMILY:pid[,pid...])`);
+      console.warn(`[forgefx] ${FORCE_GENERIC_ENV}: ignored malformed ${parsed.malformed.length === 1 ? 'entry' : 'entries'} ${parsed.malformed.map((e) => JSON.stringify(e)).join(', ')} (expected FAMILY:pid[,pid...])`);
     }
     forcedGeneric = { raw, pids: parsed.pids };
   }

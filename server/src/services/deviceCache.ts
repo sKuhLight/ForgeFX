@@ -10,9 +10,10 @@
 // the codec's cache subpath is itself browser-safe. NO node:/fastify/transport VALUE imports — this
 // module is in the runtime router's import graph (check-browser-safe.ts enforces it).
 import {
-  RAW_FORMAT, buildProfileDoc, enumHintsFromRanges, liveWalkDetailed, rawFromLiveWalk,
-  type BuiltCache, type CacheRecord, type LiveEnumHint, type LiveSourceScope, type LiveTransport, type LiveWalkOptions,
-  type LiveWalkResult, type LiveWalkWriteHooks, type ProfileCoverage, type RawSourceKind, type SourceSummary
+  LIVE_WALK_LIMITS, LiveWalkAbortError, RAW_FORMAT, WalkBoundError, buildProfileDoc, enumHintsFromRanges, guardWalkTransport,
+  isPlaceholderRecord, liveWalkDetailed, liveWalkScope, rawFromLiveWalk,
+  type BuiltCache, type CacheRecord, type LiveEnumHint, type LiveRawSource, type LiveSourceScope, type LiveTransport,
+  type LiveWalkOptions, type LiveWalkResult, type LiveWalkWriteHooks, type ProfileCoverage, type RawSourceKind, type SourceSummary
 } from 'forgefx-midi/cache';
 import { isFractalHeaderFrame } from 'forgefx-midi/shared';
 import { deviceCacheKey, fullCaptureAllowedOnFirmware, type DeviceRegistry } from '../drivers/registryCore.js';
@@ -23,9 +24,10 @@ import {
   upgradeStoredProfile, type ProfileFormat, type StaleReason, type StoredProfile
 } from '../profileSchema.js';
 import { catalogForModel, deriveOptionsFor, paramsForModel, staticRoster, type StaticBlockRef } from '../profileCatalog.js';
-import { mergeRefusal, mergeSourcesIntoStored, refusalBody, type MergeRefusal } from './profileMerge.js';
+import { mergeRefusal, mergeSourcesIntoStored, refusalBody, type MergeRefusal, type MergedProfile } from './profileMerge.js';
+import type { WalkScopeGates } from './walkScope.js';
 import type { Store } from '../runtime/store.js';
-import type { Transport } from '../transport/types.js';
+import { isTransportTimeout, type Transport } from '../transport/types.js';
 
 /** Injectable walk (defaults to the codec's `liveWalkDetailed`) — tests fake it so they never septet-encode
  *  wire frames. Resolves to the walk result (records + reply-loss statistics, persisted with the raw source),
@@ -47,8 +49,15 @@ interface CacheJob {
   /** The running firmware the job was started on (gates the enum hints, see `enumHintsVerifiedOn`). */
   fw: { major: number; minor: number };
   mode: BuildMode;
-  /** Requested walk scope ('extended' needs a verified firmware; none is verified yet, so it walks standard). */
+  /** Effective walk scope: the request's, else 'extended' for a read-only build when a walk-scope gate is open (see
+   *  `BuildScope`). */
   scope: BuildScope;
+  /** The walk-scope gates of the running firmware at the start of the job, on a fresh firmware read when the scope
+   *  could be extended (all closed when that read failed); see `startClaimedBuild`. */
+  gates: WalkScopeGates;
+  /** The extension walk (phase B) runs after the standard walk: the scope is 'extended' and the gates open blocks
+   *  for it (`extensionWalkLimits`). False with an 'extended' scope = the extension is reported 'skipped'. */
+  phaseB: boolean;
   /** Replace the whole stored doc instead of merging the new source into it. */
   replace: boolean;
   controller: AbortController;
@@ -56,10 +65,14 @@ interface CacheJob {
   promise: Promise<void>;
 }
 
-/** Walk scope of a build: 'standard' = ids 0..127 of blocks 0..160; 'extended' = also the ids above 127 of
- *  known contiguous tables and the roster blocks above 160 — only on a (model, firmware) where that has been
- *  verified (none in this build: an extended request walks the standard scope and reports `extension:
- *  'skipped'`). */
+/** Walk scope of a build: 'standard' = ids 0..127 of blocks 0..160 (phase A, today's walk); 'extended' = phase A,
+ *  then the extension walk (phase B, `extensionWalkLimits`): the ids above 127 of known contiguous tables longer
+ *  than 128 slots and of the low region of a non-contiguous table (gate `extendedIds`), and the present roster
+ *  blocks above 160 (gate `above160`) — only on a (model, firmware) whose gate is open (`WALK_SCOPE_VERIFIED_FW`,
+ *  empty in this build, or the development override). An 'extended' request whose gates open nothing walks the
+ *  standard scope and reports `extension: 'skipped'`. Without a requested scope a READ-ONLY build is 'extended' when
+ *  a gate is open, else 'standard'; a full build is 'standard' (full mode is unchanged; its extension, read-only and
+ *  above 160 only, runs on an explicit 'extended'). */
 export type BuildScope = 'standard' | 'extended';
 
 /** Options of a build start (the route body plus the test seam). */
@@ -67,6 +80,8 @@ export interface CacheBuildOptions {
   /** Walk even when the stored doc already holds a complete source of the requested kind. */
   force?: boolean;
   mode?: BuildMode;
+  /** Requested scope; absent = 'extended' for a read-only build when a walk-scope gate of the running firmware is
+   *  open, else 'standard' (any other value = 'standard'). */
   scope?: BuildScope;
   /** Replace the whole stored doc (old behaviour) instead of merging the walk into it. */
   replace?: boolean;
@@ -201,8 +216,49 @@ export { staticRoster, type StaticBlockRef };
  *  stop run beyond the known size. Mode cap: read-only 127 (HW-proven envelope), full 511. */
 export function walkBlockLimits(model: number, mode: BuildMode, stored?: BuiltCache | null): WalkBlockLimits {
   const limits: WalkBlockLimits = { knownSize: {}, bound: {} };
+  const tables = limitTables(model, stored);
+  if (!tables) return limits; // no gen-3 catalog for this model: codec defaults everywhere
+  const cap = mode === 'full' ? WALK_MAX_PARAM_ID_FULL : WALK_MAX_PARAM_ID;
+  for (let block = 0; block <= WALK_BOUND_MAX_BLOCK; block++) {
+    const t = tables.blockTable(block);
+    if (!t) {
+      if (mode === 'full') limits.bound[block] = WALK_MAX_PARAM_ID; // unknown block: the HW-proven envelope
+      continue;
+    }
+    if (!t.contiguous) {
+      limits.bound[block] = Math.min(lastLowContiguousId(t.ids) + WALK_BOUND_MARGIN, cap); // not a contiguous table
+      continue;
+    }
+    limits.bound[block] = Math.min(t.stride - 1 + WALK_BOUND_MARGIN, cap);
+    if (t.present) limits.knownSize[block] = t.stride;
+  }
+  return limits;
+}
+
+/** A block of the model's static roster with a known table: what the standard and the extension limits derive from. */
+interface BlockTable {
+  family: string;
+  /** Wire stride of the family (local editor-cache data, else the catalog's). */
+  stride: number;
+  /** Ordinary param ids of the family's reference table, ascending (local editor-cache rows, else the catalog's). */
+  ids: number[];
+  /** Every reference id lies below the stride. */
+  contiguous: boolean;
+  /** The unit has this instance (`instanceLimits[slug] ?? defaultInstances`; a family without a slug always). */
+  present: boolean;
+  /** The family's editor slug (a placeable block), when it has one. */
+  slug?: string;
+  /** Ids of the reference table's enum rows (the extension walk's label budget). */
+  enumIds: number[];
+}
+
+/** The per-block table facts of a model for the walk limits: the STATIC catalog, replaced per family by the LOCAL
+ *  editor-cache data of the stored doc (`localByteSource`; see `walkBlockLimits`). Null without a gen-3 catalog.
+ *  `blockTable(block)`: undefined for a block with no known table — unrostered, named from the roster only
+ *  (`roster`, FORGEFX-45: no bound derived from a family it is not proven to be), or without a usable stride. */
+function limitTables(model: number, stored: BuiltCache | null | undefined): { blockTable(block: number): BlockTable | undefined } | null {
   const profile: DeviceProfile | undefined = PROFILES[model];
-  if (!profile) return limits; // no gen-3 catalog for this model: codec defaults everywhere
+  if (!profile) return null;
   const exact = localByteSource(stored, model);
   const strides: Record<string, number> = {};
   for (const [family, meta] of Object.entries(profile.rangeSections)) {
@@ -211,7 +267,6 @@ export function walkBlockLimits(model: number, mode: BuildMode, stored?: BuiltCa
   for (const [family, meta] of Object.entries(exact?.rangeSections ?? {})) {
     if (usableStride(meta.stride)) strides[family] = Math.floor(meta.stride);
   }
-  const cap = mode === 'full' ? WALK_MAX_PARAM_ID_FULL : WALK_MAX_PARAM_ID;
   // Ordinary param ids (below the 0xff00 special records) of a family: the byte-exact cache's rows when it
   // carries any for the family (exact for the firmware), else the static catalog's params and ranges.
   const idsOf = (family: string): number[] => {
@@ -221,27 +276,142 @@ export function walkBlockLimits(model: number, mode: BuildMode, stored?: BuiltCa
       : [...(profile.params[family] ?? []).map((d) => d.paramId), ...Object.keys(profile.ranges[family] ?? {}).map(Number)];
     return [...new Set(ids)].filter((i) => Number.isInteger(i) && i >= 0 && i < 0xff00).sort((x, y) => x - y);
   };
+  // Enum rows of a family: the byte-exact cache's rows when it carries any (as `walkEnumHints`), else the catalog's.
+  const enumIdsOf = (family: string): number[] => {
+    const exactRows = exact?.ranges?.[family];
+    const rows = exactRows && Object.keys(exactRows).length > 0 ? exactRows : profile.ranges[family] ?? {};
+    return Object.entries(rows)
+      .filter(([, r]) => r.kind === 'enum')
+      .map(([id]) => Number(id))
+      .filter((i) => Number.isInteger(i) && i >= 0)
+      .sort((x, y) => x - y);
+  };
   const roster = staticRoster(model);
+  // per family, computed once (the instances of a family share its table)
+  const perFamily = new Map<string, { ids: number[]; enumIds: number[] }>();
+  const tableOf = (family: string) => {
+    let t = perFamily.get(family);
+    if (!t) perFamily.set(family, (t = { ids: idsOf(family), enumIds: enumIdsOf(family) }));
+    return t;
+  };
+  return {
+    blockTable(block: number): BlockTable | undefined {
+      const ref = roster.get(block);
+      // a block the effect-id table names from the roster only (`roster`, FORGEFX-45) is no known table: no known
+      // size, no bound derived from a family it is not proven to be — treated like an unknown block
+      if (!ref || ref.roster) return undefined;
+      const stride = strides[ref.family];
+      if (stride === undefined) return undefined;
+      const { ids, enumIds } = tableOf(ref.family);
+      return {
+        family: ref.family,
+        stride,
+        ids,
+        contiguous: !(ids.length > 0 && ids[ids.length - 1]! + 1 > stride),
+        present: !ref.slug || ref.instance <= (profile.instanceLimits[ref.slug] ?? profile.defaultInstances),
+        ...(ref.slug ? { slug: ref.slug } : {}),
+        enumIds
+      };
+    }
+  };
+}
+
+/** The walk-scope gates an extension walk runs under (`WalkScopeGates` without the block probe). */
+export type ExtensionGates = Pick<WalkScopeGates, 'extendedIds' | 'above160' | 'farIds'>;
+
+/** Effect ids the extension walk never queries, whatever a table says: the system table (block 0, which answers
+ *  pseudo definitions far past its end) and the non-effect blocks of the shared gen-3 roster above 160 (190, 199,
+ *  200). */
+const NEVER_EXTENDED_BLOCKS: ReadonlySet<number> = new Set([0, 190, 199, 200]);
+
+/** The only families whose blocks above 160 an extension walks (the placeable effect families there, contract §5.2):
+ *  pinned by name, so a roster entry the codec adds above 160 is never walked until it is listed here. */
+const ABOVE160_FAMILIES: ReadonlySet<string> = new Set(['RESONATOR', 'LOOPER', 'PLEX', 'FDBKSEND', 'FDBKRET', 'MULTIPLEXER']);
+
+/** Label queries the extension walk's query budget allows per enum row of a walked table. */
+const BUDGET_LABELS_PER_ENUM = 64;
+
+/** Per-block limits of the extension walk (phase B, read-only), see `extensionWalkLimits`. */
+export interface ExtensionWalkLimits extends WalkBlockLimits {
+  /** Blocks the extension walk visits, ascending (an empty list: nothing to extend). */
+  blocks: number[];
+  /** Explicit far ids per block (`paramIdsByBlock`), only with the `farIds` gate. */
+  idLists: Record<number, number[]>;
+  /** Blocks walked past id 127: contiguous tables longer than 128 slots, the low region of a non-contiguous table. */
+  extendedBlocks: number[];
+  /** Blocks above the standard block range (160): present roster blocks. */
+  above160Blocks: number[];
+  /** Enum rows of each block's reference table at or below its bound (the label share of the query budget). */
+  enums: Record<number, number>;
+}
+
+/** Known table sizes, hard ceilings and the block list of the EXTENSION walk (phase B) for `model` under `gates`:
+ *  the same table facts as `walkBlockLimits` (the static catalog, or the LOCAL editor-cache data of the stored doc —
+ *  `localByteSource`; a cloud, definitions-file or live source never widens a bound), never a guess:
+ *   - Contiguous table longer than 128 slots (gate `extendedIds`; present instances only): re-walked whole with the
+ *     hard bound `min(stride - 1 + 32, 255)` and the known size `stride` (FM3 DISTORT 175, CONTROLLERS 161).
+ *   - Non-contiguous table (gate `extendedIds`): its low region, bound `min(lastLowContiguousId + 32, 255)`, no known
+ *     size (FM3 GLOBAL 163); its far ids (the reference ids above that bound) as an explicit id list only with the
+ *     `farIds` gate (implemented, never enabled).
+ *   - Roster block above 160 (gate `above160`): only a family of `ABOVE160_FAMILIES` (Resonator, Looper, Plex, Send,
+ *     Return, Multiplexer) with an editor slug, whose instance the unit has, with a contiguous table: bound `min(stride - 1 + 32, 255)` (at most 127 without the `extendedIds`
+ *     gate) and known size `stride`.
+ *   - Never: block 0, 190, 199, 200, an unrostered or roster-only block, an absent instance, a table of 128 slots or
+ *     fewer up to block 160 (the standard walk covers it whole).
+ *  A FULL-mode build's standard walk already reaches every known table's extended bound (its cap is 511), so for it
+ *  only the blocks above 160 are left (walked read-only). */
+export function extensionWalkLimits(
+  model: number,
+  stored: BuiltCache | null | undefined,
+  gates: ExtensionGates,
+  mode: BuildMode = 'read-only'
+): ExtensionWalkLimits {
+  const out: ExtensionWalkLimits = { knownSize: {}, bound: {}, blocks: [], idLists: {}, extendedBlocks: [], above160Blocks: [], enums: {} };
+  const tables = limitTables(model, stored);
+  if (!tables) return out;
+  const extCap = LIVE_WALK_LIMITS.extendedReadOnlyMaxParamId;
+  const add = (block: number, t: BlockTable, bound: number, knownSize: number | null, kind: 'extended' | 'above160'): void => {
+    out.blocks.push(block);
+    out.bound[block] = bound;
+    if (knownSize !== null) out.knownSize[block] = knownSize;
+    out.enums[block] = t.enumIds.filter((id) => id <= bound).length;
+    (kind === 'extended' ? out.extendedBlocks : out.above160Blocks).push(block);
+  };
   for (let block = 0; block <= WALK_BOUND_MAX_BLOCK; block++) {
-    const ref = roster.get(block);
-    // a block the effect-id table names from the roster only (`roster`, FORGEFX-45) is no known table: no known size,
-    // no bound derived from a family it is not proven to be — treated like an unknown block
-    const family = ref?.roster ? undefined : ref?.family;
-    const stride = family ? strides[family] : undefined;
-    if (family === undefined || stride === undefined) {
-      if (mode === 'full') limits.bound[block] = WALK_MAX_PARAM_ID; // unknown block: the HW-proven envelope
+    if (NEVER_EXTENDED_BLOCKS.has(block)) continue;
+    const t = tables.blockTable(block);
+    if (!t || !t.present) continue;
+    if (block <= LIVE_WALK_LIMITS.standardMaxBlock) {
+      if (mode === 'full' || !gates.extendedIds) continue;
+      if (t.contiguous) {
+        if (t.stride <= WALK_MAX_PARAM_ID + 1) continue; // the standard walk covers it whole
+        add(block, t, Math.min(t.stride - 1 + WALK_BOUND_MARGIN, extCap), t.stride, 'extended');
+        continue;
+      }
+      const bound = Math.min(lastLowContiguousId(t.ids) + WALK_BOUND_MARGIN, extCap);
+      const far = gates.farIds ? t.ids.filter((id) => id > bound) : [];
+      if (bound <= WALK_MAX_PARAM_ID && far.length === 0) continue;
+      add(block, t, bound, null, 'extended');
+      if (far.length > 0) out.idLists[block] = far;
       continue;
     }
-    const ids = idsOf(family);
-    if (ids.length > 0 && ids[ids.length - 1]! + 1 > stride) {
-      limits.bound[block] = Math.min(lastLowContiguousId(ids) + WALK_BOUND_MARGIN, cap); // not a contiguous table
-      continue;
-    }
-    limits.bound[block] = Math.min(stride - 1 + WALK_BOUND_MARGIN, cap);
-    const present = !ref?.slug || ref.instance <= (profile.instanceLimits[ref.slug] ?? profile.defaultInstances);
-    if (present) limits.knownSize[block] = stride;
+    if (!gates.above160 || !ABOVE160_FAMILIES.has(t.family) || !t.slug || !t.contiguous) continue;
+    add(block, t, Math.min(t.stride - 1 + WALK_BOUND_MARGIN, gates.extendedIds ? extCap : WALK_MAX_PARAM_ID), t.stride, 'above160');
   }
-  return limits;
+  return out;
+}
+
+/** The query budget of an extension walk: per block (bound + 1) × 2 (a definition and a value read per id) plus 64
+ *  label queries per enum row of its reference table, plus two queries per listed far id (the id and its liveness
+ *  re-read). Counted in the host adapter (`walkAdapter`): the first query past it aborts the walk. */
+export function extensionQueryBudget(limits: Pick<ExtensionWalkLimits, 'blocks' | 'bound' | 'enums' | 'idLists'>): number {
+  let budget = 0;
+  for (const block of limits.blocks) {
+    budget += ((limits.bound[block] ?? WALK_MAX_PARAM_ID) + 1) * 2;
+    budget += BUDGET_LABELS_PER_ENUM * (limits.enums[block] ?? 0);
+    budget += 2 * (limits.idLists[block]?.length ?? 0);
+  }
+  return budget;
 }
 
 /** `isLocalByteProfile` lives in profileSchema.ts (the summary's `no-raw` fixes need it too); re-exported here. */
@@ -361,8 +531,9 @@ export function walkEnumHints(model: number, stored?: BuiltCache | null): Record
 }
 
 /** Adapt the registry's shared Transport to the codec's minimal LiveTransport: one query → the first
- *  matching Fractal reply frame, or null on timeout. The matcher mirrors the CaptureRig's HW-proven
- *  `sd_query` (fas-re tools/live/capture_v2.py): a reply matches only when it echoes the query's
+ *  matching Fractal reply frame, or null on timeout (no frame, or a transport timeout rejection:
+ *  `isTransportTimeout`; any other rejection still rejects). The matcher mirrors the hardware-proven
+ *  capture tooling's query matcher: a reply matches only when it echoes the query's
  *  view (inner[0] = f[6]), BLOCK-HIGH (inner[3] = f[9]), PARAM-LOW (inner[4] = f[10]) and PARAM-HIGH
  *  (inner[5] = f[11]). The device does NOT echo block-LOW — its inner[2] is a constant (0x01), so the
  *  old code's `f[8] === query-block-low` check compared a constant against the block byte and could never
@@ -381,10 +552,15 @@ export function adaptRequest(transport: Transport, query: Uint8Array): Promise<U
     && f[11] === bytes[11]; // inner[5] — param-HIGH echo (id>127)
   return transport
     .request(bytes, { timeoutMs: 1000, quietMs: 20, match: (fs) => fs.some((f) => isEcho(f)) })
-    .then((frames) => {
-      const hit = frames.find((f) => isEcho(f));
-      return hit ? Uint8Array.from(hit) : null;
-    });
+    .then(
+      (frames) => {
+        const hit = frames.find((f) => isEcho(f));
+        return hit ? Uint8Array.from(hit) : null;
+      },
+      // a transport that reports silence as a typed timeout (the browser-direct ones) instead of resolving no frames:
+      // the same lost reply, which the walk retries and counts — never a rejected walk
+      (e: unknown) => (isTransportTimeout(e) ? null : Promise.reject(e))
+    );
 }
 
 /** Pacing the walk always runs with (see WALK_PACE_MS / WALK_BLOCK_PAUSE_MS) — exported so other read-only
@@ -397,6 +573,15 @@ export interface WalkSetup {
   limits: WalkBlockLimits;
   /** The walk got label-list hints (`enumHintsVerifiedOn` the firmware). */
   hinted: boolean;
+}
+
+/** The USABLE stored profile of `model` on firmware `fw` (null when none, stale or the firmware is unknown): the only
+ *  stored doc whose LOCAL editor-cache data may refine walk limits and hints (`localByteSource`). Only read. */
+function usableStoredProfile(store: Store, model: number, fw: { major: number; minor: number } | null): BuiltCache | null {
+  // A byte-exact stored cache for this firmware (force-rebuild over an editor-cache import) is exact device data and
+  // refines the catalog; a stale one (outdated schema) is not trusted for that either.
+  const stored = fw ? loadStoredProfile(store, deviceCacheKey(model, fw.major, fw.minor)) : null;
+  return stored?.state === 'usable' ? stored.profile : null;
 }
 
 /** Build the live walk's options exactly as the cache build runs it — pacing, the 7-bit (read-only) or
@@ -412,13 +597,10 @@ export function walkSetup(
   extra: { signal?: AbortSignal; onProgress?: LiveWalkOptions['onProgress']; write?: LiveWalkWriteHooks } = {}
 ): WalkSetup {
   const full = mode === 'full';
-  // Per-block known table size + hard ceiling (see walkBlockLimits). A byte-exact stored cache for this
-  // firmware (force-rebuild over an editor-cache import) is exact device data and refines the catalog;
-  // a stale one (outdated schema) is not trusted for that either.
-  const stored = fw ? loadStoredProfile(store, deviceCacheKey(model, fw.major, fw.minor)) : null;
-  // Only the LOCAL editor-cache data of the stored doc refines limits and hints (walkBlockLimits / walkEnumHints
-  // take it through localByteSource): a merged live, cloud or file source never does.
-  const usable = stored?.state === 'usable' ? stored.profile : null;
+  // Per-block known table size + hard ceiling (see walkBlockLimits). Only the LOCAL editor-cache data of the stored
+  // doc refines limits and hints (walkBlockLimits / walkEnumHints take it through localByteSource): a merged live,
+  // cloud or file source never does.
+  const usable = usableStoredProfile(store, model, fw);
   const limits = walkBlockLimits(model, mode, usable);
   const hinted = enumHintsVerifiedOn(model, fw);
   const opts: LiveWalkOptions = {
@@ -438,12 +620,129 @@ export function walkSetup(
   return { opts, limits, hinted };
 }
 
+/** The walk options of an extension walk (phase B), its limits and its query budget. */
+export interface ExtensionSetup {
+  opts: LiveWalkOptions;
+  limits: ExtensionWalkLimits;
+  /** Queries the host adapter lets through (`extensionQueryBudget`). */
+  budget: number;
+  /** The watchdog's absolute param ceiling (`walkAdapter`): the extended read-only cap 255, or the highest listed far
+   *  id when far ids are listed (each still has to be in its block's list). */
+  cap: number;
+  /** The walk got label-list hints (`enumHintsVerifiedOn` the firmware). */
+  hinted: boolean;
+}
+
+/** Build the EXTENSION walk's options (phase B) for `model` on the running firmware `fw` under the walk-scope `gates`:
+ *  the blocks, bounds, known sizes and far-id lists of `extensionWalkLimits` (the usable stored profile's LOCAL
+ *  editor-cache data refines them, as in the standard walk), the same pacing, the label hints of those blocks on a
+ *  hinted firmware, and the abort rules of an extension: the first implausible definition reply at id 128 or above
+ *  (`abortOnImplausibleFrom`) and any definition query left unanswered (`abortOnSilence`, stricter than the
+ *  liveness check: every address an extension queries is known to answer). Always READ-ONLY: no mode, no write
+ *  hooks, whatever the build's mode. */
+export function extensionWalkSetup(
+  store: Store,
+  model: number,
+  fw: { major: number; minor: number } | null,
+  gates: ExtensionGates,
+  mode: BuildMode,
+  extra: { signal?: AbortSignal; onProgress?: LiveWalkOptions['onProgress'] } = {}
+): ExtensionSetup {
+  const usable = usableStoredProfile(store, model, fw);
+  const limits = extensionWalkLimits(model, usable, gates, mode);
+  const hinted = enumHintsVerifiedOn(model, fw);
+  const hints: Record<number, Record<number, LiveEnumHint>> = {};
+  if (hinted) {
+    const all = walkEnumHints(model, usable);
+    for (const block of limits.blocks) if (all[block]) hints[block] = all[block]!;
+  }
+  const opts: LiveWalkOptions = {
+    model,
+    blocks: [...limits.blocks],
+    interQueryMs: WALK_PACE_MS,
+    blockPauseMs: WALK_BLOCK_PAUSE_MS,
+    maxParamId: WALK_MAX_PARAM_ID,
+    paramKnownSizeByBlock: { ...limits.knownSize },
+    paramBoundByBlock: { ...limits.bound },
+    ...(Object.keys(limits.idLists).length > 0 ? { paramIdsByBlock: { ...limits.idLists } } : {}),
+    ...(hinted ? { enumHintByBlock: hints } : {}),
+    abortOnImplausibleFrom: WALK_MAX_PARAM_ID + 1,
+    abortOnSilence: true,
+    ...(extra.signal ? { signal: extra.signal } : {}),
+    ...(extra.onProgress ? { onProgress: extra.onProgress } : {})
+  };
+  const cap = Math.max(LIVE_WALK_LIMITS.extendedReadOnlyMaxParamId, ...Object.values(limits.idLists).flat());
+  return { opts, limits, budget: extensionQueryBudget(limits), cap, hinted };
+}
+
 /** The highest param id the walk queries in `block` under `opts`: the block's hard bound, else the
  *  walk's `maxParamId` (the mode default when unset). The diagnostic capture's query-bound watchdog. */
 export function walkQueryBound(opts: Pick<LiveWalkOptions, 'paramBoundByBlock' | 'maxParamId' | 'mode'>, block: number): number {
   const b = opts.paramBoundByBlock?.[block];
   if (b !== undefined && Number.isInteger(b)) return b;
   return opts.maxParamId ?? (opts.mode === 'full' ? WALK_MAX_PARAM_ID_FULL : WALK_MAX_PARAM_ID);
+}
+
+/** An extension walk sent as many queries as its budget allows (`extensionQueryBudget`): the next one is refused
+ *  before it reaches the device and the walk rejects. */
+export class WalkBudgetError extends Error {
+  readonly code = 'walk-budget';
+  readonly budget: number;
+  constructor(budget: number) {
+    super(`liveWalk: query budget of ${budget} queries exhausted; walk aborted`);
+    this.name = 'WalkBudgetError';
+    this.budget = budget;
+  }
+}
+
+/** The host side of one walk phase: the registry's transport through `adaptRequest`, behind the bound watchdog —
+ *  the codec's `guardWalkTransport`: every outgoing query is decoded, and one for a block outside the scope of `opts`,
+ *  above the block's ceiling (`walkQueryBound` of the codec: its hard bound, known size or `maxParamId`) or above
+ *  `cap` rejects with `WalkBoundError` and is never sent (defense in depth: independent of the walk implementation)
+ *  — and, with a `budget`, a counter of the queries that pass: the first one past it rejects with `WalkBudgetError`,
+ *  unsent. `sent()` = queries handed to the transport; `silentBlocks()` = the blocks at least one of them got no reply
+ *  in (where a walk's reply-loss statistics can come from). */
+export function walkAdapter(
+  transport: Transport, opts: LiveWalkOptions, cap: number, budget?: number
+): LiveTransport & { sent(): number; refused(): WalkBoundError | WalkBudgetError | null; silentBlocks(): ReadonlySet<number> } {
+  let sent = 0;
+  let overrun: WalkBudgetError | null = null;
+  let hit: WalkBoundError | null = null;
+  const silent = new Set<number>();
+  const counted: LiveTransport = {
+    request: (q) => {
+      if (budget !== undefined && sent >= budget) {
+        overrun ??= new WalkBudgetError(budget);
+        return Promise.reject(overrun);
+      }
+      sent += 1;
+      return adaptRequest(transport, q).then((reply) => {
+        if (reply === null) silent.add((q[8]! & 0x7f) | ((q[9]! & 0x7f) << 7));
+        return reply;
+      });
+    }
+  };
+  const guarded = guardWalkTransport(counted, opts, { maxParamId: cap });
+  return {
+    request: (q) => guarded.request(q).catch((e: unknown) => {
+      if (e instanceof WalkBoundError && hit === null) {
+        hit = e;
+        console.warn(`[forgefx] walk watchdog: ${e.message} — not sent, the walk is stopped`);
+      }
+      throw e;
+    }),
+    sent: () => sent,
+    // what the adapter refused (the first watchdog hit, which outranks a budget overrun): a walk implementation that
+    // swallowed the rejection and resolved anyway is still judged by it (`refusedBy`)
+    refused: () => hit ?? overrun,
+    silentBlocks: () => silent
+  };
+}
+
+/** Throws what a walk adapter refused during a walk that nevertheless resolved (see `walkAdapter`). */
+function refusedBy(adapter: { refused(): WalkBoundError | WalkBudgetError | null }): void {
+  const r = adapter.refused();
+  if (r) throw r;
 }
 
 /** Highest effect id the codec's default live walk visits (its DEFAULT_MAX_BLOCK): the standard scope's
@@ -462,10 +761,211 @@ function walkResultOf(r: CacheRecord[] | LiveWalkResult): LiveWalkResult {
 /** The raw-source kind a build of `mode` produces. */
 const liveKindOf = (mode: BuildMode): Extract<RawSourceKind, 'live-full' | 'live-readonly'> => (mode === 'full' ? 'live-full' : 'live-readonly');
 
+/** Phase A's live source joined by the extension walk's result (`extension: 'done'`): the extension's records
+ *  replace phase A's for every block it walked (it re-walks a block whole, from id 0, to its wider bound) and add the
+ *  blocks only it walked; the scope is the union (the walked blocks' ceilings, far-id lists, `extended` /
+ *  `above160` set for what the extension covered); bound hits are phase A's for the blocks the extension did not walk
+ *  plus the extension's. Same id, kind, origin, capture time and firmware as phase A's source, so it takes that
+ *  source's slot in the document. Records ordered by block, each block in walk order.
+ *  Reply statistics: queries and pseudo replies are summed; placeholder slots are phase A's kept placeholder records
+ *  plus the extension's. Phase A's reply-LOSS counters (lost, recovered, unresolved, missing slots, silent addresses)
+ *  are dropped only when `aSilentBlocks` — the blocks phase A got a lost reply in (`walkAdapter.silentBlocks`) — is
+ *  non-empty and holds only blocks the extension re-walked (their losses are superseded); otherwise, or without it,
+ *  they are summed (a loss that cannot be placed is never dropped). */
+export function joinExtension(
+  a: LiveRawSource,
+  walked: LiveWalkResult,
+  opts: LiveWalkOptions,
+  flags: { extended: boolean; above160: boolean },
+  aSilentBlocks?: ReadonlySet<number>
+): LiveRawSource {
+  const scopeB = liveWalkScope(opts, { extended: flags.extended, above160: flags.above160, hinted: a.scope.hinted });
+  const b = rawFromLiveWalk(walked, scopeB, { kind: a.kind, capturedAt: a.capturedAt, firmware: a.firmware, origin: a.origin });
+  const walkedB = new Set(scopeB.blocks);
+  const byBlock = new Map<number, LiveRawSource['records']>();
+  const push = (r: LiveRawSource['records'][number]) => {
+    const list = byBlock.get(r.section);
+    if (list) list.push(r);
+    else byBlock.set(r.section, [r]);
+  };
+  const keptA = a.records.filter((r) => !walkedB.has(r.section));
+  for (const r of keptA) push(r);
+  for (const r of b.records) push(r);
+  const records = [...byBlock.keys()].sort((x, y) => x - y).flatMap((block) => byBlock.get(block)!);
+  const bounds: Record<number, number> = { ...a.scope.bounds };
+  for (const block of scopeB.blocks) bounds[block] = scopeB.bounds[block] ?? scopeB.maxParamId;
+  const idLists: Record<number, number[]> = {};
+  for (const [block, ids] of Object.entries(a.scope.idLists ?? {})) if (!walkedB.has(Number(block))) idLists[Number(block)] = [...ids];
+  for (const [block, ids] of Object.entries(scopeB.idLists ?? {})) idLists[Number(block)] = [...ids];
+  const pa = a.walk.pseudoReplies;
+  const pb = b.walk.pseudoReplies;
+  const pseudoReplies = pa || pb
+    ? {
+      endMarker: (pa?.endMarker ?? 0) + (pb?.endMarker ?? 0),
+      duplicateId: (pa?.duplicateId ?? 0) + (pb?.duplicateId ?? 0),
+      implausible: (pa?.implausible ?? 0) + (pb?.implausible ?? 0)
+    }
+    : undefined;
+  const lossSuperseded = aSilentBlocks !== undefined && aSilentBlocks.size > 0 && [...aSilentBlocks].every((block) => walkedB.has(block));
+  const lossA = (n: number) => (lossSuperseded ? 0 : n);
+  const placeholdersA = Math.min(a.walk.placeholderSlots, keptA.filter((r) => (r as { placeholder?: boolean }).placeholder === true).length);
+  return {
+    ...a,
+    scope: {
+      blocks: [...new Set([...a.scope.blocks, ...scopeB.blocks])].sort((x, y) => x - y),
+      maxParamId: a.scope.maxParamId,
+      bounds,
+      ...(Object.keys(idLists).length > 0 ? { idLists } : {}),
+      extended: a.scope.extended || flags.extended,
+      above160: a.scope.above160 || flags.above160,
+      hinted: a.scope.hinted
+    },
+    walk: {
+      queries: a.walk.queries + b.walk.queries,
+      lostReplies: lossA(a.walk.lostReplies) + b.walk.lostReplies,
+      recoveredReplies: lossA(a.walk.recoveredReplies) + b.walk.recoveredReplies,
+      unresolvedReplies: lossA(a.walk.unresolvedReplies) + b.walk.unresolvedReplies,
+      placeholderSlots: placeholdersA + b.walk.placeholderSlots,
+      missingSlots: lossA(a.walk.missingSlots) + b.walk.missingSlots,
+      silentAddresses: lossA(a.walk.silentAddresses) + b.walk.silentAddresses,
+      ...(pseudoReplies ? { pseudoReplies } : {}),
+      boundHits: [...a.walk.boundHits.filter((h) => !walkedB.has(h.block)), ...b.walk.boundHits],
+      extension: 'done'
+    },
+    records
+  };
+}
+
+/** The longest `abortReason` stored (the `.axisdefs` validator's limit for it). */
+const ABORT_REASON_MAX = 256;
+
+/** An extension stopped for a reason the build itself found (not a walk rejection): the fixed-vocabulary reason. */
+class ExtensionAbort extends Error {
+  readonly reason: string;
+  constructor(reason: string, detail: string) {
+    super(detail);
+    this.name = 'ExtensionAbort';
+    this.reason = reason;
+  }
+}
+
+/** Why an extension walk stopped, as stored with the source and sent with the terminal event: a FIXED vocabulary —
+ *  `implausible-reply (block b, param p)`, `silent-run (block b)`, `query-budget (n queries)`, `cancelled`,
+ *  `empty-block (block b)`, `walk-failed`, `derivation-failed` — never an error message (which may carry anything, a
+ *  path included); at most 256 characters. The details go to the log (`runExtension`). */
+function extensionAbortReason(e: unknown, signal: AbortSignal): string {
+  let reason: string;
+  if (signal.aborted) reason = 'cancelled';
+  else if (e instanceof ExtensionAbort) reason = e.reason;
+  else if (e instanceof LiveWalkAbortError) {
+    reason = e.code === 'implausible-reply' ? `implausible-reply (block ${e.block}, param ${e.param})` : `silent-run (block ${e.block})`;
+  } else if (e instanceof WalkBudgetError) reason = `query-budget (${e.budget} queries)`;
+  else reason = 'walk-failed';
+  return reason.slice(0, ABORT_REASON_MAX);
+}
+
+/** Outcome of an extension walk (phase B). */
+type ExtensionOutcome = { extension: 'done' | 'skipped' } | { extension: 'aborted'; abortReason: string };
+
+/** Phase A's source stored again with its extension outcome (`skipped` / `aborted` + reason), merged and persisted
+ *  like phase A was. Best effort: phase A's doc as persisted stays when this fails. */
+async function markPhaseA(
+  store: Store, registry: DeviceRegistry, job: CacheJob, sourceA: LiveRawSource, outcome: Exclude<ExtensionOutcome, { extension: 'done' }>
+): Promise<void> {
+  try {
+    const marked: LiveRawSource = {
+      ...sourceA,
+      walk: { ...sourceA.walk, extension: outcome.extension, ...('abortReason' in outcome ? { abortReason: outcome.abortReason } : {}) }
+    };
+    const now = new Date().toISOString();
+    const again = mergeSourcesIntoStored(store, { key: job.key, model: job.model, firmware: job.firmware, incoming: [marked], extras: { builtAt: now }, now });
+    if (again.derivationFailed === undefined) {
+      persistProfile(store, job.key, again.doc);
+      await registry.applyRuntimeCache();
+    }
+  } catch {
+    // phase A's doc as persisted stays
+  }
+}
+
+/** Phase B of a build: the extension walk over the blocks and bounds `extensionWalkSetup` plans, behind the bound
+ *  watchdog and the query budget (`walkAdapter`, cap 255 or the highest listed far id), read-only. Its result joins
+ *  phase A's source (`joinExtension`), the doc is re-derived (merged with the stored doc as phase A left it) and
+ *  persisted again. Nothing to walk (the setup, recomputed after phase A, has no block): `skipped`.
+ *  Phase A is already persisted and applied and is never discarded: when the extension stops — the first implausible
+ *  reply at id 128 or above, an unanswered definition query, a failed liveness check, the budget, a cancel, a block
+ *  where phase A found definitions and the extension none, or a re-derivation of its result that fails — phase A's
+ *  source is stored again marked `extension: 'aborted'` with the `abortReason` (its gaps stay). A watchdog hit
+ *  (`WalkBoundError`: a query outside the plan) is a code bug: it rejects — also when the walk swallowed the refusal
+ *  and failed or finished otherwise — the build ends with an error, and nothing of phase B is persisted. */
+async function runExtension(
+  store: Store, registry: DeviceRegistry, job: CacheJob, walkImpl: WalkImpl, transport: Transport, sourceA: LiveRawSource,
+  aSilentBlocks: ReadonlySet<number>, onProgress: LiveWalkOptions['onProgress']
+): Promise<ExtensionOutcome> {
+  const { key, model, firmware, fw, mode, controller } = job;
+  const setup = extensionWalkSetup(store, model, fw, job.gates, mode, { signal: controller.signal, onProgress });
+  if (setup.limits.blocks.length === 0) {
+    await markPhaseA(store, registry, job, sourceA, { extension: 'skipped' });
+    return { extension: 'skipped' };
+  }
+  const adapter = walkAdapter(transport, setup.opts, setup.cap, setup.budget);
+  let merged: MergedProfile | null = null;
+  let abortReason = 'cancelled';
+  try {
+    job.progress = { done: 0, total: setup.limits.blocks.length, phase: 'walking' };
+    registry.emitEvent({ type: 'cacheBuild', phase: 'walking', done: 0, total: setup.limits.blocks.length, key, model, firmware });
+    const walked = walkResultOf(await walkImpl(adapter, setup.opts));
+    refusedBy(adapter);
+    if (!controller.signal.aborted) {
+      // a block phase A found definitions in that the extension (re-walking it whole) answered none for: not a table
+      // that grew but a walk that went wrong — keep phase A
+      const realIn = (records: ReadonlyArray<Parameters<typeof isPlaceholderRecord>[0] & { section: number }>, block: number) =>
+        records.some((r) => r.section === block && !isPlaceholderRecord(r));
+      for (const block of setup.limits.blocks) {
+        if (realIn(sourceA.records, block) && !realIn(walked.records, block)) {
+          throw new ExtensionAbort(`empty-block (block ${block})`, `the extension walk found no definition in block ${block}`);
+        }
+      }
+      const joined = joinExtension(sourceA, walked, setup.opts, {
+        extended: setup.limits.extendedBlocks.length > 0, above160: setup.limits.above160Blocks.length > 0
+      }, aSilentBlocks);
+      const now = new Date().toISOString();
+      try {
+        merged = mergeSourcesIntoStored(store, { key, model, firmware, incoming: [joined], extras: { builtAt: now }, now });
+      } catch (e) {
+        throw new ExtensionAbort('derivation-failed', e instanceof Error ? e.message : String(e));
+      }
+      if (merged.derivationFailed !== undefined) throw new ExtensionAbort('derivation-failed', merged.derivationFailed);
+      if (controller.signal.aborted) merged = null; // a late cancel discards the extension
+    }
+  } catch (e) {
+    // the watchdog first: a refused query is never a quiet abort, whatever the walk made of the refusal
+    const refused = adapter.refused();
+    if (refused instanceof WalkBoundError) throw refused;
+    if (e instanceof WalkBoundError) throw e;
+    merged = null;
+    abortReason = extensionAbortReason(e, controller.signal);
+    if (abortReason === 'walk-failed' || abortReason === 'derivation-failed') {
+      console.warn(`[forgefx] cache build ${key}: extension ${abortReason}: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+  if (merged) {
+    persistProfile(store, key, merged.doc);
+    await registry.applyRuntimeCache();
+    return { extension: 'done' };
+  }
+  // phase A stays: its source again, marked aborted
+  console.warn(`[forgefx] cache build ${key}: extension walk aborted (${abortReason}); the standard walk is kept`);
+  await markPhaseA(store, registry, job, sourceA, { extension: 'aborted', abortReason });
+  return { extension: 'aborted', abortReason };
+}
+
 /** The detached build task: pause telemetry, walk → raw source → merge into the stored doc → persist → swap
- *  profile, emit terminal event, resume telemetry. Never rejects (all outcomes are emitted, not thrown). The
- *  walk's records are kept as a live raw source (unresolved replies included: the coverage reports them as a
- *  blocking gap), merged with the doc's other sources by the codec's precedence, unless `replace`. */
+ *  profile, then (an 'extended' scope with blocks to extend) the extension walk (`runExtension`, phase B), emit the
+ *  terminal event, resume telemetry. Never rejects (all outcomes are emitted, not thrown). The walk's records are
+ *  kept as a live raw source (unresolved replies and bound hits included: the coverage reports them as blocking
+ *  gaps), merged with the doc's other sources by the codec's precedence, unless `replace`. Every walk query passes the
+ *  bound watchdog (`walkAdapter`; a hit ends the build with an error, nothing of that phase persisted). */
 async function runBuild(store: Store, registry: DeviceRegistry, job: CacheJob, walkImpl: WalkImpl): Promise<void> {
   const { key, model, firmware, fw, mode, controller } = job;
   const full = mode === 'full';
@@ -473,7 +973,6 @@ async function runBuild(store: Store, registry: DeviceRegistry, job: CacheJob, w
   registry.emitEvent({ type: 'cacheBuild', phase: 'walking', done: 0, total: 0, key, model, firmware });
   try {
     const transport = await registry.transport();
-    const adapter: LiveTransport = { request: (q) => adaptRequest(transport, q) };
     // FULL mode writes: the codec BUILDS the continuous-SET frame and hands us finished bytes → we just
     // put them on the wire via the transport's serialized raw send (the same sendQueued gen-3 writes use,
     // so a SET never injects mid-read). reloadPreset re-selects the CURRENT preset through the gen-3
@@ -487,21 +986,20 @@ async function runBuild(store: Store, registry: DeviceRegistry, job: CacheJob, w
         reloadPreset: () => driver.reloadPreset?.() ?? Promise.resolve()
       };
     }
-    const setup = walkSetup(store, model, fw, mode, {
-      signal: controller.signal,
-      write,
-      onProgress: (p) => {
-        if (controller.signal.aborted) return;
-        if (p.phase === 'done') {
-          job.progress = { done: p.blockCount, total: p.blockCount, phase: 'building' };
-          registry.emitEvent({ type: 'cacheBuild', phase: 'building', done: p.blockCount, total: p.blockCount, key, model, firmware });
-        } else {
-          job.progress = { done: p.blockIndex, total: p.blockCount, phase: 'walking' };
-          registry.emitEvent({ type: 'cacheBuild', phase: 'walking', done: p.blockIndex, total: p.blockCount, key, model, firmware });
-        }
+    const onProgress: LiveWalkOptions['onProgress'] = (p) => {
+      if (controller.signal.aborted) return;
+      if (p.phase === 'done') {
+        job.progress = { done: p.blockCount, total: p.blockCount, phase: 'building' };
+        registry.emitEvent({ type: 'cacheBuild', phase: 'building', done: p.blockCount, total: p.blockCount, key, model, firmware });
+      } else {
+        job.progress = { done: p.blockIndex, total: p.blockCount, phase: 'walking' };
+        registry.emitEvent({ type: 'cacheBuild', phase: 'walking', done: p.blockIndex, total: p.blockCount, key, model, firmware });
       }
-    });
+    };
+    const setup = walkSetup(store, model, fw, mode, { signal: controller.signal, write, onProgress });
+    const adapter = walkAdapter(transport, setup.opts, full ? WALK_MAX_PARAM_ID_FULL : WALK_MAX_PARAM_ID);
     const walked = walkResultOf(await walkImpl(adapter, setup.opts));
+    refusedBy(adapter);
     if (controller.signal.aborted) throw new Error('cancelled'); // a late abort discards the result
     const capturedAt = new Date().toISOString();
     const scope: LiveSourceScope = {
@@ -512,28 +1010,32 @@ async function runBuild(store: Store, registry: DeviceRegistry, job: CacheJob, w
       above160: false,
       hinted: setup.hinted
     };
-    // An extended request walks the standard scope until a firmware is verified for it (none yet).
-    const extension = job.scope === 'extended' ? ('skipped' as const) : undefined;
+    // An extended scope whose gates open nothing to extend walks the standard scope only: 'skipped'.
+    const skipped = job.scope === 'extended' && !job.phaseB;
     const source = rawFromLiveWalk(walked, scope, {
-      kind: liveKindOf(mode), capturedAt, firmware, origin: 'local', ...(extension ? { extension } : {})
+      kind: liveKindOf(mode), capturedAt, firmware, origin: 'local', ...(skipped ? { extension: 'skipped' as const } : {})
     });
     const merged = mergeSourcesIntoStored(store, {
       key, model, firmware, incoming: [source], replace: job.replace, extras: { builtAt: capturedAt }, now: capturedAt
     });
     if (controller.signal.aborted) throw new Error('cancelled');
+    // phase A is persisted and applied before any extension query: an extension never puts it at risk
     persistProfile(store, key, merged.doc);
     await registry.applyRuntimeCache(); // adopt the freshly-built device-true profile immediately
-    const total = job.progress.total;
     if (merged.derivationFailed !== undefined) {
       // the stored doc was stale (its sources did not derive) and still does not derive with the walk added: the
       // walk is kept with the other sources (nothing lost), the doc stays stale — a terminal error, not 'done'
+      const total = job.progress.total;
       registry.emitEvent({
         type: 'cacheBuild', phase: 'error', done: total, total, key, model, firmware,
         error: `derivation-failed: ${merged.derivationFailed} (the walk was stored next to the profile's other sources)`
       });
       return;
     }
-    registry.emitEvent({ type: 'cacheBuild', phase: 'done', done: total, total, key, model, firmware, ...(extension ? { extension } : {}) });
+    let outcome: { extension: 'done' | 'skipped' | 'aborted'; abortReason?: string } | undefined = skipped ? { extension: 'skipped' } : undefined;
+    if (job.phaseB) outcome = await runExtension(store, registry, job, walkImpl, transport, source, adapter.silentBlocks(), onProgress);
+    const total = job.progress.total;
+    registry.emitEvent({ type: 'cacheBuild', phase: 'done', done: total, total, key, model, firmware, ...(outcome ?? {}) });
     if (merged.kept > 0) registry.emitEvent({ type: 'definitions', reason: 'merged', key });
   } catch (e) {
     const phase = controller.signal.aborted ? 'cancelled' : 'error';
@@ -612,21 +1114,31 @@ export async function cacheStatus(store: Store, registry: DeviceRegistry): Promi
 /** Coverage fixes a repeat walk of the same kind and scope can deliver. A blocking gap whose fixes do not include
  *  one of these (`high-ids` / `blocks-above-160` / `rosters` → `read-extended` / `import-editor-cache`,
  *  `disagreement` → `import-editor-cache`) does not make a build walk again: the same walk would leave it open.
- *  (`read-extended` joins once an extended scope is verified for a firmware, WP-F6.) */
+ *  (A build with an extension walks again while the stored source does not cover it, see `buildSatisfied`.) */
 const REWALK_FIXES: ReadonlySet<string> = new Set(['read-from-device']);
+
+/** What an extension walk of this build would add (`extensionWalkLimits`): ids above 127, blocks above 160. */
+interface ExtensionNeed { extended: boolean; above160: boolean }
 
 /** Does the stored profile already satisfy a build of `mode` (`already: true`, contract §4.1)? Only a format-2 doc
  *  that holds a LOCAL live source of the requested kind (a read-only request is also satisfied by a full walk,
  *  its superset) and whose coverage has no blocking gap a repeat walk could fix (`REWALK_FIXES`). A legacy
  *  format-1 live doc holds no raw source: the build walks and writes a format-2 doc in its place (the `no-raw`
  *  gap's `read-from-device` fix); a legacy local editor-cache import is handled before (`startClaimedBuild`).
- *  Anything else walks and merges. */
-function buildSatisfied(stored: Extract<StoredProfile, { state: 'usable' }>, mode: BuildMode, model: number): boolean {
+ *  A build with an extension (`need`) is satisfied only by such a source whose scope already covers it
+ *  (`scope.extended` / `scope.above160`, set by a completed extension): one whose extension was skipped or
+ *  aborted walks again. The extension's `read-extended` fix is deliberately not a re-walk fix: an extended source
+ *  that still leaves high ids open would be walked again by every build. Anything else walks and merges. */
+function buildSatisfied(stored: Extract<StoredProfile, { state: 'usable' }>, mode: BuildMode, model: number, need: ExtensionNeed): boolean {
   if (stored.format !== 2) return false;
   const kinds: readonly RawSourceKind[] = mode === 'full' ? ['live-full'] : ['live-readonly', 'live-full'];
   const summary = profileSummaryOf(stored.profile, model);
   const rewalkGap = summary.coverage.gaps.some((g) => g.blocking && g.fix.some((f) => REWALK_FIXES.has(f)));
-  return summary.sources.some((s) => kinds.includes(s.kind) && s.origin === 'local') && !rewalkGap;
+  if (rewalkGap || !summary.sources.some((s) => kinds.includes(s.kind) && s.origin === 'local')) return false;
+  if (!need.extended && !need.above160) return true;
+  return (readableRaw(stored.profile)?.sources ?? []).some((s) =>
+    s.kind !== 'editor-cache' && kinds.includes(s.kind) && s.origin === 'local'
+    && (!need.extended || s.scope.extended) && (!need.above160 || s.scope.above160));
 }
 
 /** TEST-ONLY: the walk a build runs when its caller passes no `walkImpl` (a route has no way to pass one), per
@@ -644,9 +1156,12 @@ export function __setDefaultWalkForTest(registry: DeviceRegistry, walk: WalkImpl
  *  complete local source of the requested kind (`buildSatisfied`; `force` walks anyway and replaces that
  *  source), or is a legacy (format-1) local editor-cache import (byte data a walk cannot improve and no raw to
  *  merge with: `force` answers 409 `local-profile-better`, only `replace` walks over it). A doc a newer build
- *  wrote answers 409 `newer-profile` unless `replace` (see profileMerge.ts `mergeRefusal`). `scope` 'extended'
- *  walks the standard scope until a firmware is verified for more. `walkImpl` is a test seam (defaults to the
- *  codec's liveWalkDetailed). */
+ *  wrote answers 409 `newer-profile` unless `replace` (see profileMerge.ts `mergeRefusal`). `scope` (see
+ *  `BuildScope`; default 'extended' for a read-only build when a walk-scope gate of the running firmware, read afresh,
+ *  is open): an 'extended' build
+ *  runs the extension walk (phase B, `runExtension`) after the standard walk, when its gates open blocks to extend;
+ *  the terminal `done` event carries `extension: 'done' | 'skipped' | 'aborted'` (+ `abortReason`). `walkImpl` is a
+ *  test seam (defaults to the codec's liveWalkDetailed; it runs once per phase). */
 export async function startCacheBuild(store: Store, registry: DeviceRegistry, opts?: CacheBuildOptions): Promise<StartResult> {
   await registry.driver(); // ensure detection ran
   const caps = registry.activeCapabilities();
@@ -688,8 +1203,10 @@ async function startClaimedBuild(store: Store, registry: DeviceRegistry, opts: C
   // version; a silent unit is unknown and therefore refused (fail closed). Same 501/capability shape as the
   // gates above, plus additive `reason: 'firmware'` / `firmware` / `message` fields. Read-only mode is
   // intentionally NOT gated by this rule (the released read-only walk is hardware-proven on FM3 firmware 13.0).
+  let fwFresh = false; // the firmware below was re-read for this build (not the one cached at detect)
   if (mode === 'full') {
     const fwNow = await registry.refreshFirmware();
+    fwFresh = true;
     if (!fullCaptureAllowedOnFirmware(registry.detectedModelId, fwNow)) {
       return done({
         code: 501,
@@ -706,16 +1223,43 @@ async function startClaimedBuild(store: Store, registry: DeviceRegistry, opts: C
     }
   }
   const model = registry.detectedModelId;
-  const fw = registry.firmwareInfo();
+  let fw = registry.firmwareInfo();
   if (model < 0 || !fw) return done({ code: 503, body: { error: 'no device detected or firmware unknown' } });
-  const key = deviceCacheKey(model, fw.major, fw.minor);
+  // The walk scope: the requested one, else 'extended' for a READ-ONLY build when a walk-scope gate of the running
+  // firmware is open (a full build stays standard unless 'extended' is asked for: full mode is unchanged). The gates
+  // are judged on a FRESH firmware read, never on the version cached at detect (the unit may have been updated since):
+  // whenever the scope could be extended the firmware is re-read first, and the key and the gates come from that read.
+  // A version that cannot be read fails closed: the standard scope only (the cached version keys the build).
+  let gates: WalkScopeGates = registry.walkScopeGates();
+  const extending = (g: WalkScopeGates) => g.extendedIds || g.above160;
+  const couldExtend = opts?.scope === 'extended' || (opts?.scope === undefined && mode === 'read-only' && extending(gates));
+  if (couldExtend && !fwFresh) {
+    const fresh = await registry.refreshFirmware({ keepOnSilence: true });
+    if (fresh) {
+      fw = fresh;
+      gates = registry.walkScopeGates();
+    } else {
+      gates = { extendedIds: false, above160: false, blockProbe: false, farIds: false };
+    }
+  }
+  const scope: BuildScope = opts?.scope === undefined
+    ? (mode === 'read-only' && extending(gates) ? 'extended' : 'standard')
+    : opts.scope === 'extended' ? 'extended' : 'standard';
+  const firmware = fw;
+  const key = deviceCacheKey(model, firmware.major, firmware.minor);
   const replace = opts?.replace === true;
   // Only a USABLE profile can count as "already built" (a stale one is rebuilt without `force` and merged into or
   // replaced by the new build; it is never deleted up front, a cancelled/failed build leaves it), and only when it
   // already holds what this build would add (`buildSatisfied`).
   const stored = loadStoredProfile(store, key);
+  // The extension (phase B) runs when the scope is 'extended' and has blocks to extend (`extensionWalkLimits`, from the
+  // same usable stored doc the walk limits read); otherwise an 'extended' scope reports `extension: 'skipped'`.
+  const planned = scope === 'extended'
+    ? extensionWalkLimits(model, stored.state === 'usable' ? stored.profile : null, gates, mode)
+    : null;
+  const need: ExtensionNeed = { extended: (planned?.extendedBlocks.length ?? 0) > 0, above160: (planned?.above160Blocks.length ?? 0) > 0 };
   const already = (): { started: false; result: StartResult } => {
-    registry.emitEvent({ type: 'cacheBuild', phase: 'already-built', done: 0, total: 0, key, model, firmware: fw.version });
+    registry.emitEvent({ type: 'cacheBuild', phase: 'already-built', done: 0, total: 0, key, model, firmware: firmware.version });
     return done({ code: 200, body: { ok: true, already: true } });
   };
   // A doc a newer build wrote, or a raw-less doc that outranks this walk, is never rewritten (409 unless `replace`).
@@ -727,12 +1271,14 @@ async function startClaimedBuild(store: Store, registry: DeviceRegistry, opts: C
     // reconstruction. Already built; `force` is refused below (409 local-profile-better), `replace: true` replaces
     // it (the old behaviour).
     if (refusal) return already();
-    if (buildSatisfied(stored, mode, model)) return already();
+    if (buildSatisfied(stored, mode, model, need)) return already();
   }
   if (refusal) return done({ code: 409, body: refusalBody(refusal) });
   const job: CacheJob = {
-    key, model, firmware: fw.version, fw: { major: fw.major, minor: fw.minor }, mode,
-    scope: opts?.scope === 'extended' ? 'extended' : 'standard',
+    key, model, firmware: firmware.version, fw: { major: firmware.major, minor: firmware.minor }, mode,
+    scope,
+    gates,
+    phaseB: (planned?.blocks.length ?? 0) > 0,
     replace,
     controller: new AbortController(),
     progress: { done: 0, total: 0, phase: 'walking' },

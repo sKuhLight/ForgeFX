@@ -10,11 +10,13 @@
 //
 // A development override (`FORGEFX_WALK_SCOPE_OVERRIDE=extended,above160,probe`) opens flags for an acceptance run.
 // It is read from the Node environment by the Node registry only (drivers/registry.ts → `RegistryDeps.walkScopeOverride`),
-// never in Browser Direct (its registry has no such hook), ignored when NODE_ENV=production, and announced with one
-// warning line. It never opens `farIds`, and it opens nothing while the running firmware is unknown.
+// never in Browser Direct (its registry has no such hook). Like every development hook it needs the explicit opt-in
+// `FORGEFX_DEV_HOOKS=1` and is ignored when NODE_ENV=production (devHooks.ts `devHookValue`); it is announced with
+// one warning line. It never opens `farIds`, and it opens nothing while the running firmware is unknown.
 //
-// Pure and browser-safe: no imports at all (the registry core, the probe service and the gen-3 driver all use it,
-// so it must not import any of them).
+// Pure and browser-safe: its only import is the import-free leaf devHooks.ts (the registry core, the probe service and
+// the gen-3 driver all use this module, so it must not import any of them).
+import { devHookValue } from '../devHooks.js';
 
 export type WalkScopeFlag = 'extendedIds' | 'above160' | 'blockProbe' | 'farIds';
 export type FwList = ReadonlyArray<Readonly<{ major: number; minor: number }>>;
@@ -49,27 +51,21 @@ export function parseWalkScopeOverride(raw: string): { flags: Set<WalkScopeOverr
   return { flags, malformed };
 }
 
-/** The last environment value seen (re-parsed and re-announced only when it changes). */
-let announced: { key: string; flags: WalkScopeOverride } | undefined;
+/** The last active value seen (re-parsed and re-announced only when it changes). */
+let announced: { raw: string; flags: WalkScopeOverride } | undefined;
 
 /** The override from a Node environment (`process.env` of the Node registry): empty when unset, and ignored (empty)
- *  when `NODE_ENV=production`. One warning line per distinct value: what is opened, or that it is ignored. */
+ *  without the explicit opt-in `FORGEFX_DEV_HOOKS=1` or when `NODE_ENV=production` (devHooks.ts, which announces
+ *  that with one warning line). One warning line per distinct active value: what it opens. */
 export function walkScopeOverrideFromEnv(env: Readonly<Record<string, string | undefined>>): WalkScopeOverride {
-  const raw = env[WALK_SCOPE_OVERRIDE_ENV];
-  if (!raw || raw.trim() === '') return NONE;
-  const production = env.NODE_ENV === 'production';
-  const key = `${production ? 'p' : 'd'}|${raw}`;
-  if (announced?.key === key) return announced.flags;
-  let flags: WalkScopeOverride = NONE;
-  if (production) {
-    console.warn(`[forgefx] ${WALK_SCOPE_OVERRIDE_ENV} is ignored in production`);
-  } else {
-    const parsed = parseWalkScopeOverride(raw);
-    flags = parsed.flags;
-    const bad = parsed.malformed.length > 0 ? ` (ignored: ${parsed.malformed.map((m) => JSON.stringify(m)).join(', ')})` : '';
-    console.warn(`[forgefx] ${WALK_SCOPE_OVERRIDE_ENV}: development override opens ${flags.size > 0 ? [...flags].join(', ') : 'nothing'} for the running firmware${bad}`);
-  }
-  announced = { key, flags };
+  const raw = devHookValue(env, WALK_SCOPE_OVERRIDE_ENV);
+  if (raw === undefined) return NONE;
+  if (announced?.raw === raw) return announced.flags;
+  const parsed = parseWalkScopeOverride(raw);
+  const flags: WalkScopeOverride = parsed.flags;
+  const bad = parsed.malformed.length > 0 ? ` (ignored: ${parsed.malformed.map((m) => JSON.stringify(m)).join(', ')})` : '';
+  console.warn(`[forgefx] ${WALK_SCOPE_OVERRIDE_ENV}: development override opens ${flags.size > 0 ? [...flags].join(', ') : 'nothing'} for the running firmware${bad}`);
+  announced = { raw, flags };
   return flags;
 }
 

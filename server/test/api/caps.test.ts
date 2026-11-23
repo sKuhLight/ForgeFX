@@ -567,7 +567,7 @@ async function definitionsKeyOrder(): Promise<void> {
       assertEqual(keys.filter((k) => k !== 'definitions').join(','), previous.join(','), `${name}: every previous key keeps its place, none is added or dropped`);
       assertEqual(keys[keys.indexOf('virtualEffects') + 1], 'definitions', `${name}: definitions follows virtualEffects`);
       assertEqual(keys[keys.indexOf('definitions') + 1], 'telemetryControl', `${name}: definitions comes before telemetryControl`);
-      assertEqual(Object.keys(caps.definitions as object).join(','), 'genericParams,catalogFirmware,profile,drift,contribute,portable', `${name}: definitions key order`);
+      assertEqual(Object.keys(caps.definitions as object).join(','), 'genericParams,catalogFirmware,profile,drift,contribute,walk,portable', `${name}: definitions key order`);
       const profile = (caps.definitions as { profile: Record<string, unknown> | null }).profile;
       if (profile) {
         // the profile v2 fields are appended after the M2 ones (contract §7), coverage as { complete, gaps }

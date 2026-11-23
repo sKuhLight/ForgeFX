@@ -206,8 +206,10 @@ export async function buildApp(registry: DeviceRegistry, opts: AppOptions = {}):
   // it has not been verified on — FAIL CLOSED: full mode on unknown/unreadable firmware is 501 too, no longer 503;
   // 503 no device/firmware for read-only; 409 already building). Read-only is never firmware-gated.
   // Profile v2: the walk MERGES into the stored doc (`replace: true` replaces it); `already` only when the doc holds
-  // a complete local source of the requested kind; `scope` 'standard' | 'extended' (extended walks standard until
-  // a firmware is verified for it; the terminal `done` event then carries `extension: 'skipped'`).
+  // a complete local source of the requested kind; `scope` 'standard' | 'extended' (default 'extended' for a
+  // read-only build when a walk-scope gate of the freshly read firmware is open): an extended build adds the
+  // read-only extension walk (phase B) after the standard walk, which is persisted first; the terminal `done` event
+  // carries `extension: 'done' | 'skipped' | 'aborted'` (+ `abortReason`), see services/deviceCache.ts.
   app.post<{ Body: { force?: boolean; mode?: 'read-only' | 'full'; scope?: 'standard' | 'extended'; replace?: boolean } }>('/device/cache/build', async (req, reply) => {
     const r = await deviceCache.startCacheBuild(store.defaultStore, registry, {
       force: req.body?.force, mode: req.body?.mode, scope: req.body?.scope, replace: req.body?.replace === true

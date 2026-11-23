@@ -330,7 +330,9 @@ export async function runBlockParamsV2Tests(): Promise<void> {
   // ---- 12. the diagnostic hook serves a chosen pid as a generic param ---------------------------------
   {
     const prior = process.env.FORGEFX_DEFS_FORCE_GENERIC;
+    const priorOptIn = process.env.FORGEFX_DEV_HOOKS;
     try {
+      process.env.FORGEFX_DEV_HOOKS = '1'; // every development hook needs the explicit opt-in (devHooks.ts)
       process.env.FORGEFX_DEFS_FORCE_GENERIC = 'DELAY:3, CHORUS:8';
       const r = await v2Of(FM3, DELAY, { [DELAY]: { values: body(stride), channel: 0 } });
       const forced = r.enums.find((e) => e.id === 3)!;
@@ -342,6 +344,8 @@ export async function runBlockParamsV2Tests(): Promise<void> {
     } finally {
       if (prior === undefined) delete process.env.FORGEFX_DEFS_FORCE_GENERIC;
       else process.env.FORGEFX_DEFS_FORCE_GENERIC = prior;
+      if (priorOptIn === undefined) delete process.env.FORGEFX_DEV_HOOKS;
+      else process.env.FORGEFX_DEV_HOOKS = priorOptIn;
     }
     const plain = await v2Of(FM3, DELAY, { [DELAY]: { values: body(stride), channel: 0 } });
     assertEqual(plain.enums.find((e) => e.id === 3)!.name, 'Bypass Mode', 'off by default');
@@ -436,8 +440,10 @@ export async function runBlockParamsV2Tests(): Promise<void> {
     // The III maps every audio block through its effect-id table since FORGEFX-45, so dropping the slug mapping no longer
     // leaves eid 70 without a family: the development hook hides the DELAY family instead (codec slug kept, no family)
     const prior = process.env.FORGEFX_DEFS_HIDE_FAMILY;
+    const priorOptIn = process.env.FORGEFX_DEV_HOOKS;
     const warn = console.warn;
     console.warn = () => {};
+    process.env.FORGEFX_DEV_HOOKS = '1';
     process.env.FORGEFX_DEFS_HIDE_FAMILY = 'DELAY';
     try {
       assertEqual(SLUG_FAMILY['delay'], 'DELAY', 'premise: the codec slug still names the family');
@@ -449,6 +455,8 @@ export async function runBlockParamsV2Tests(): Promise<void> {
     } finally {
       if (prior === undefined) delete process.env.FORGEFX_DEFS_HIDE_FAMILY;
       else process.env.FORGEFX_DEFS_HIDE_FAMILY = prior;
+      if (priorOptIn === undefined) delete process.env.FORGEFX_DEV_HOOKS;
+      else process.env.FORGEFX_DEV_HOOKS = priorOptIn;
       console.warn = warn;
     }
     console.log('  drivers/block-params-v2: an unmapped block with a codec slug — generic "Block <eid>" / slug "" / page -1, classic unchanged');
@@ -462,10 +470,12 @@ export async function runBlockParamsV2Tests(): Promise<void> {
     assertEqual(JSON.stringify(p.malformed), JSON.stringify(['CHORUS:8:9', '12', 'chorus:4', 'MIXER:99999']), 'malformed: an extra field, a bare pid after a malformed entry, lower case, no wire pid');
     assertEqual(JSON.stringify(parseForcedGeneric('8').malformed), JSON.stringify(['8']), 'a bare pid with no family before it');
     const prior = process.env.FORGEFX_DEFS_FORCE_GENERIC;
+    const priorOptIn = process.env.FORGEFX_DEV_HOOKS;
     const realWarn = console.warn;
     const warnings: string[] = [];
     console.warn = (...a: unknown[]) => { warnings.push(a.map(String).join(' ')); };
     try {
+      process.env.FORGEFX_DEV_HOOKS = '1';
       process.env.FORGEFX_DEFS_FORCE_GENERIC = 'DELAY:3, CHORUS:8:9';
       const r = await v2Of(FM3, DELAY, { [DELAY]: { values: body(stride), channel: 0 } });
       await v2Of(FM3, DELAY, { [DELAY]: { values: body(stride), channel: 0 } });
@@ -479,6 +489,8 @@ export async function runBlockParamsV2Tests(): Promise<void> {
       console.warn = realWarn;
       if (prior === undefined) delete process.env.FORGEFX_DEFS_FORCE_GENERIC;
       else process.env.FORGEFX_DEFS_FORCE_GENERIC = prior;
+      if (priorOptIn === undefined) delete process.env.FORGEFX_DEV_HOOKS;
+      else process.env.FORGEFX_DEV_HOOKS = priorOptIn;
     }
     console.log('  drivers/block-params-v2: FORGEFX_DEFS_FORCE_GENERIC — strict FAMILY:pid[,pid...] entries, malformed ones ignored with one warning');
   }

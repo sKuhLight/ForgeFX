@@ -193,7 +193,8 @@ export interface RegistryDeps {
    *  the schema anyway, so a hook that forgets cannot make a stale profile live. */
   loadDeviceCache?(key: string): BuiltCache | null | Promise<BuiltCache | null>;
   /** The walk-scope development override (services/walkScope.ts), read at call time. Only the Node registry supplies it
-   *  (from its environment, ignored in production); absent → no override (Browser Direct, the fail-closed default). */
+   *  (from its environment, with the opt-in FORGEFX_DEV_HOOKS=1, ignored in production); absent → no override
+   *  (Browser Direct, the fail-closed default). */
   walkScopeOverride?(): WalkScopeOverride;
 }
 
@@ -271,9 +272,14 @@ export class DeviceRegistry {
    *  (model, firmware) table plus the Node registry's development override. Every flag false while no model is
    *  identified or the firmware is unknown (fail closed). No device traffic. */
   walkScopeGates(): WalkScopeGates {
+    return this.#walkGatesFor(this.#modelId);
+  }
+
+  /** The walk-scope gates of model `mid` on the running firmware (see `walkScopeGates`). */
+  #walkGatesFor(mid: number): WalkScopeGates {
     let override: WalkScopeOverride | undefined;
     try { override = this.#deps.walkScopeOverride?.(); } catch { override = undefined; }
-    return walkScopeGates(this.#modelId, this.#modelId >= 0 ? this.#firmware : null, override);
+    return walkScopeGates(mid, mid >= 0 ? this.#firmware : null, override);
   }
 
   get profile() { return this.#prof; }
@@ -289,9 +295,17 @@ export class DeviceRegistry {
   /** Re-read the running firmware (fn 0x08, the same path detect() uses) for the CURRENT model and
    *  return it — null when the device is silent / replies for another model / reports major 0. The
    *  previous value is always cleared first, so a unit that changed firmware (or went quiet) since
-   *  detect() never leaves a stale version behind. Used by the full-capture gate right before it decides. */
-  async refreshFirmware(): Promise<{ major: number; minor: number; version: string; build: string } | null> {
+   *  detect() never leaves a stale version behind. Used by the full-capture gate right before it decides.
+   *  `keepOnSilence`: when the read gets no version, the previously read value is kept (and null still returned) —
+   *  the walk-scope gate of a read-only build uses it: an unreadable version only narrows that build to the standard
+   *  scope, it must not unset the firmware the rest of the session relies on. */
+  async refreshFirmware(opts: { keepOnSilence?: boolean } = {}): Promise<{ major: number; minor: number; version: string; build: string } | null> {
+    const before = this.#firmware;
     await this.#populateFirmware(this.#modelId);
+    if (this.#firmware === null && opts.keepOnSilence) {
+      this.#firmware = before;
+      return null;
+    }
     return this.#firmware;
   }
   /** Public emit seam: services (device-cache build progress) publish on the same SSE bus the drivers
@@ -652,8 +666,10 @@ export class DeviceRegistry {
     });
     // editor-cache contribution: the generic-params trio, an editor-cache importer, a firmware to key the file by
     const contribute = gen3Grid && d.capabilities.cacheImport && running !== null;
+    // the walk-scope gates of the running firmware: only a gen-3 grid driver walks definitions at all
+    const walk: WalkScopeGates = gen3Grid ? this.#walkGatesFor(mid) : { extendedIds: false, above160: false, blockProbe: false, farIds: false };
     // `.axisdefs` export/import: the same gen-3 grid trio (stored sources to write, a catalog to derive against)
-    return { caps: { genericParams: gen3Grid, catalogFirmware, profile, drift, contribute, portable: gen3Grid }, applied };
+    return { caps: { genericParams: gen3Grid, catalogFirmware, profile, drift, contribute, walk, portable: gen3Grid }, applied };
   }
 
   /** What `GET /device/definitions/diff` reads, all of it state the registry and the driver already hold (no

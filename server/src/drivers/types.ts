@@ -196,6 +196,12 @@ export interface DefinitionsCaps {
    *  driver that imports editor caches and whose firmware was read. Whether the cloud wants the file, and
    *  whether a cloud is configured at all, is in the contribution status, not here. */
   contribute: boolean;
+  /** The walk-scope gates of the running firmware (services/walkScope.ts): how far a read-only definition walk may
+   *  query the unit beyond the standard scope — `extendedIds` (ids above 127 of known tables), `above160` (roster
+   *  blocks above effect id 160), `blockProbe` (`POST /device/definitions/blocks/:eid/probe`), `farIds` (never
+   *  enabled). True only on a (model, firmware) verified for it (or under the development override); all false
+   *  on unknown firmware and on devices without a definition walk. */
+  walk: WalkScopeGates;
   /** The stored definitions can be exported to and imported from a `.axisdefs` file (`/device/definitions/export`,
    *  `/device/definitions/import`): a gen-3 grid driver (the generic-params trio). Whether a profile is stored to
    *  export is the route's answer (404 `no-profile`), not this flag's. */
@@ -366,8 +372,14 @@ export type DeviceEvent =
    *  for but a cache already existed. `done`/`total` are the block-sweep counters; `key`/`model`/
    *  `firmware` identify the cache; `error` carries the failure message on 'error'. */
   | { type: 'cacheBuild'; phase: 'walking' | 'building' | 'done' | 'error' | 'cancelled' | 'already-built'; done: number; total: number; key?: string; model?: number; firmware?: string; error?: string;
-      /** Terminal phases of a build that asked for the extended scope: whether the extension walk ran. */
-      extension?: 'done' | 'skipped' | 'aborted' }
+      /** Terminal `done` of a build with the extended scope: the extension walk (phase B) completed (`done`), had
+       *  nothing to walk under the running firmware's gates (`skipped`), or stopped (`aborted`: the standard walk's
+       *  result is kept, `abortReason` says why). */
+      extension?: 'done' | 'skipped' | 'aborted';
+      /** With `extension: 'aborted'`: why the extension walk stopped, a fixed vocabulary (never an error message):
+       *  `implausible-reply (block b, param p)`, `silent-run (block b)`, `query-budget (n queries)`, `cancelled`,
+       *  `empty-block (block b)`, `walk-failed`, `derivation-failed`. */
+      abortReason?: string }
   /** The stored device-definition profile of `key` changed without a build walk of its own: re-derived from its
    *  raw sources (`rederived`), new sources merged into it (`merged`), a definitions file imported
    *  (`imported`), an unknown block probed (`block-probe`, with `eid`). Or (`unmapped-blocks`, gen-3 grid drivers)

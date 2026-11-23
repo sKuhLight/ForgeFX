@@ -60,6 +60,7 @@ import type {
   EditorLayoutRow, EditorLayoutControl, EditorFwRange, EditorWidgetKind,
 } from 'forgefx-midi/gen3/fm3';
 import { AM4_LAYOUTS } from 'forgefx-midi/am4';
+import { devHookValue, processEnv } from './devHooks.js';
 
 /** One served layout control: the codec's control, plus what the generic response adds (the classic response
  *  serves the editor's controls as they are):
@@ -99,8 +100,8 @@ export type DeviceLayout = {
 // ── development hook: hide one catalog family ─────────────────────────────────────────────────────────────────────
 /** Name of the leave-one-out development hook's environment variable. */
 export const HIDE_FAMILY_ENV = 'FORGEFX_DEFS_HIDE_FAMILY';
-/** The last hook value seen (re-checked and re-announced only when it changes). */
-let hideState: { key: string; family: string | null } | undefined;
+/** The last active hook value seen (re-checked and re-announced only when it changes). */
+let hideState: { raw: string; family: string | null } | undefined;
 
 /**
  * Development hook, off by default: `FORGEFX_DEFS_HIDE_FAMILY=<FAMILY>` (a catalog family symbol, upper case) hides that
@@ -110,24 +111,22 @@ let hideState: { key: string; family: string | null } | undefined;
  * derivation catalog (voter params and seeds, `familyFirstEid`, instance counts, rosters, reference rows and the
  * section inventory — so its editor-cache section stays `section:<tag>`), see profileCatalog.ts. The bundled display
  * tables (params, ranges, labels) are left alone. Read through a guarded process access (M2's diagnostic-hook
- * pattern): a browser runtime has none and never hides anything. Ignored when `NODE_ENV=production`. One warning line
- * per distinct value. A malformed value (not an upper-case symbol) is ignored.
+ * pattern): a browser runtime has none and never hides anything. Like every development hook it needs the explicit
+ * opt-in `FORGEFX_DEV_HOOKS=1` and is ignored when `NODE_ENV=production` (devHooks.ts `devHookValue`, which announces
+ * an ignored value). One warning line per distinct active value. A malformed value (not an upper-case symbol) is
+ * ignored.
  */
 export function hiddenFamily(): string | null {
-  const env = typeof process !== 'undefined' ? process.env : undefined;
-  const raw = env?.[HIDE_FAMILY_ENV]?.trim();
+  const raw = devHookValue(processEnv(), HIDE_FAMILY_ENV)?.trim();
   if (!raw) return null;
-  const production = env?.NODE_ENV === 'production';
-  const key = `${production ? 'p' : 'd'}|${raw}`;
-  if (hideState?.key === key) return hideState.family;
+  if (hideState?.raw === raw) return hideState.family;
   let family: string | null = null;
-  if (production) console.warn(`[forgefx] ${HIDE_FAMILY_ENV} is ignored in production`);
-  else if (!/^[A-Z][A-Z0-9_]*$/.test(raw)) console.warn(`[forgefx] ${HIDE_FAMILY_ENV}: ignored malformed value ${JSON.stringify(raw)} (expected a catalog family symbol, e.g. RESONATOR)`);
+  if (!/^[A-Z][A-Z0-9_]*$/.test(raw)) console.warn(`[forgefx] ${HIDE_FAMILY_ENV}: ignored malformed value ${JSON.stringify(raw)} (expected a catalog family symbol, e.g. RESONATOR)`);
   else {
     family = raw;
     console.warn(`[forgefx] ${HIDE_FAMILY_ENV}: the ${raw} family is hidden from the bundled catalog for this session (development hook)`);
   }
-  hideState = { key, family };
+  hideState = { raw, family };
   return family;
 }
 
