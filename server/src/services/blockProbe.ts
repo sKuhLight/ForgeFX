@@ -165,24 +165,36 @@ interface ProbeJob {
   settled: Promise<unknown>;
 }
 
-/** The walk, the merge and the answer of a claimed probe (see the module comment). */
-async function runProbe(job: ProbeJob): Promise<StartResult> {
-  const { store, registry, model, eid, key, firmware, opts } = job;
-  // the ceiling: the widest editor-cache section the block's bulk shape fits, plus the stop run, at most the probe cap
-  const fits = await job.probeShape(eid);
+/** The walk of one block probe: blocks [eid], read-only (no mode, no write hook), no known size (the stop run stays
+ *  active), `readValues`, no label hints, the build's pacing, and the ceiling min(T.stride − 1 + 32, 127) for the widest
+ *  editor-cache section T the block's bulk shape fits (`fits`, the driver's `probeShape`; none or null → 127). `cap` is
+ *  the watchdog's absolute ceiling (the probe cap 127). Shared by the probe route and the diagnostic capture's
+ *  `blockProbe` step (services/diagnosticCapture.ts), so both walk a block alike. */
+export function probeWalkPlan(
+  model: number, eid: number, fits: ReadonlyArray<{ tag: number; stride: number }> | null, signal?: AbortSignal
+): { opts: LiveWalkOptions; ceiling: number; cap: number } {
   const widest = (fits ?? []).reduce((m, f) => Math.max(m, f.stride), 0);
   const cap = LIVE_WALK_LIMITS.probeMaxParamId;
   const ceiling = widest > 0 ? Math.min(widest - 1 + LIVE_WALK_LIMITS.stopRun, cap) : cap;
-  const controller = new AbortController();
-  const walkOpts: LiveWalkOptions = {
+  const opts: LiveWalkOptions = {
     model,
     blocks: [eid],
     maxParamId: ceiling,
     readValues: true,
     interQueryMs: WALK_PACING.interQueryMs,
     blockPauseMs: WALK_PACING.blockPauseMs,
-    signal: controller.signal
+    ...(signal ? { signal } : {})
   };
+  return { opts, ceiling, cap };
+}
+
+/** The walk, the merge and the answer of a claimed probe (see the module comment). */
+async function runProbe(job: ProbeJob): Promise<StartResult> {
+  const { store, registry, model, eid, key, firmware, opts } = job;
+  // the ceiling: the widest editor-cache section the block's bulk shape fits, plus the stop run, at most the probe cap
+  const fits = await job.probeShape(eid);
+  const controller = new AbortController();
+  const { opts: walkOpts, cap } = probeWalkPlan(model, eid, fits, controller.signal);
   const transport = await registry.transport();
   const adapter: LiveTransport = { request: (q) => adaptRequest(transport, q) };
   const guarded = guardWalkTransport(adapter, walkOpts, { maxParamId: cap });

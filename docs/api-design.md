@@ -673,6 +673,58 @@ derived again and applied, and SSE `definitions` (`block-probe`, with `eid`) is 
 ADR 0002's `state` is derived from it); a walk that binds nothing answers a `candidate` entry without candidates. `422
 derivation-failed` (`stored: true` when the probe was kept next to a stale document; the event is sent then too).
 
+### Diagnostic capture: definition-walk steps (`POST /diagnostics/capture`)
+The device diagnostic (`POST /diagnostics/capture`, both twins, refused over Remote) has three optional steps that collect
+the evidence a `walk` flag of a model and firmware is enabled on. They are **never** part of the default steps: a run
+includes them only when the request names them in `steps`, e.g.
+`{ "acknowledged": true, "steps": ["info", "readonlyWalk", "above160Walk", "blockProbe"], "unverifiedScope": true }`.
+`unverifiedScope` (boolean, default false; any other type → **400** `invalid-request`) lets them run on a firmware their
+gate does not list (below). Steps always run in this
+order: `info`, `readonlyWalk`, `labelProbe`, `extendedWalk`, `above160Walk`, `blockProbe`, `dumpHeaderProbe`,
+`reloadProbe`, `fullWalk` (the definition-walk steps come before every step that may switch presets, so the probe reads
+the edit buffer as the user left it).
+
+| Step | Reads | Gate it reports on |
+|---|---|---|
+| `extendedWalk` | the ids above 127 of the known tables of blocks 0..160 — the extension walk of an extended build | `walk.extendedIds` |
+| `above160Walk` | the placeable blocks above effect id 160 the unit has, at most id 127 | `walk.above160` |
+| `blockProbe` | each block of a fresh read of the edit-buffer grid that the bundled tables do not place (and, on the Axe-Fx III, each placeable one its effect-id table names from the block roster only; never a virtual block): the probe route's walk | `walk.blockProbe` |
+
+Each step re-reads the firmware first (no answer: `skipped`, nothing sent) and records its gate in its result:
+`gate: { flag, firmware, verified, devOverride, unverifiedScope, allowance }` with `allowance` `verified` (the firmware is
+listed), `dev-override` (only the development override opens it) or `diagnostic` (neither). A `diagnostic` step runs only
+with `unverifiedScope: true` — it is how the evidence is collected; without it the step is `skipped` and nothing is sent
+past the firmware read. Every run, listed or not, follows the same rules: read-only, the build's bounds, caps and query
+budget, every query checked against the plan before it is sent (a query outside it is never sent and ends the whole run as
+`query-bound`), and nothing stored or applied (the stored profile and the runtime profile are never changed).
+`blockProbe` reads a block above effect id 160 only when `walk.above160` is true or this run's `above160Walk` **passed**
+(`passed: true` in its result, not merely `ok`; else the block is `skipped`), and asks for a liveness reply after each
+block (no reply ends the run as `device-silent`); one probe takes at most 60 s, and the step stops at the first probe that
+does not finish. Its grid read sends no `definitions` event during the run.
+
+Step results (inside the bundle's `steps[].result`, additive; bundle `schema` stays 1):
+- every one: `labels: "unscreened"` (below) and `gate`.
+- `extendedWalk` / `above160Walk`: `plan { blocks, bounds, knownSize, budget, cap, hinted }`, `outcome`
+  (`done` | `aborted`, with `abortReason` in the build's vocabulary: `implausible-reply (block b, param p)`,
+  `silent-run (block b)`, `query-budget (n queries)`, `empty-block (block b)`), `passed` (`done` with no implausible,
+  lost or unresolved reply and at least one real definition in every planned block), `emptyBlockCheck` (`passed`,
+  `failed`, `not-run` without a completed `readonlyWalk` in the run, `not-applicable` above 160), `blocks[] { block,
+  family, bound, knownSize, records, lastReal }`, `walk` (reply statistics) and `source`, the records as a
+  `live-readonly` raw source (the profile documents' own shape). An abort rule fails the step; the run carries on while
+  the unit answers.
+- `blockProbe`: `placedBlocks` (a count), `above160` (`verified`, `dev-override`, `this-run` or `not-shown`) and
+  `targets[] { eid, kind: "unknown" | "roster", family?, status, reason?, fits, ceiling, ceilingFrom, walk, source,
+  blockMap, aliveAfter }` — `ceilingFrom` `shape` (the widest fitting section), `catalog` (a roster-only block without a
+  fitting section: its family's catalog stride) or `cap` (127); `source` is a `live-probe` raw source, `blockMap` the
+  entry the block map would get with the probe merged into the stored profile (computed only, never stored). `status`
+  `aborted` = the block the run ended on; `pending` = not reached.
+
+The wire log and its redaction are unchanged: the steps' frames are in `frames`, dump payloads of the grid read are cut.
+**Label and value text of these steps is not screened:** the definition and label replies (in `frames` and in the
+results' `source` records) are kept verbatim, and a block's lists or formatted values can carry names the user chose (for
+example the names of files loaded into a block). The bundle says so with `redaction.unscreenedLabels: true` whenever one
+of these steps talked to the unit.
+
 ### Events (`GET /events`, relayed over Remote)
 `{ "type": "definitions", "reason": "<reason>", "key": "11_99p0", "eid"?: 203 }`: re-read `capabilities.definitions`,
 `GET /device/cache` and the open block.

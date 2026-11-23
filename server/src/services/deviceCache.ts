@@ -749,8 +749,9 @@ function refusedBy(adapter: { refused(): WalkBoundError | WalkBudgetError | null
  *  block range, recorded in the live raw source's scope. */
 const LIVE_WALK_MAX_BLOCK = 160;
 
-/** A walk result from a `WalkImpl`: the detailed result as is, bare records with zeroed statistics. */
-function walkResultOf(r: CacheRecord[] | LiveWalkResult): LiveWalkResult {
+/** A walk result from a `WalkImpl`: the detailed result as is, bare records with zeroed statistics. Exported for the
+ *  diagnostic capture's definition-walk steps (services/diagnosticCapture.ts). */
+export function walkResultOf(r: CacheRecord[] | LiveWalkResult): LiveWalkResult {
   if (!Array.isArray(r)) return r;
   return {
     records: r, queries: 0, enumLabels: 0, lostReplies: 0, recoveredReplies: 0, unresolvedReplies: 0,
@@ -852,8 +853,9 @@ class ExtensionAbort extends Error {
 /** Why an extension walk stopped, as stored with the source and sent with the terminal event: a FIXED vocabulary —
  *  `implausible-reply (block b, param p)`, `silent-run (block b)`, `query-budget (n queries)`, `cancelled`,
  *  `empty-block (block b)`, `walk-failed`, `derivation-failed` — never an error message (which may carry anything, a
- *  path included); at most 256 characters. The details go to the log (`runExtension`). */
-function extensionAbortReason(e: unknown, signal: AbortSignal): string {
+ *  path included); at most 256 characters. The details go to the log (`runExtension`). Exported for the diagnostic
+ *  capture's extension steps, which record the same vocabulary. */
+export function extensionAbortReason(e: unknown, signal: AbortSignal): string {
   let reason: string;
   if (signal.aborted) reason = 'cancelled';
   else if (e instanceof ExtensionAbort) reason = e.reason;

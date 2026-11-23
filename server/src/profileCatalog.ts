@@ -192,6 +192,17 @@ function effectIdTableFor(model: number): readonly RosterTableRow[] | undefined 
   return model === 0x11 ? FM3_EFFECT_ID_TABLE : model === 0x12 ? FM9_EFFECT_ID_TABLE : model === 0x10 ? AXE3_EFFECT_ID_TABLE : undefined;
 }
 
+/** How the model's effect-id table addresses `eid` ('block' for a placeable block, 'virtual', …): the entry whose
+ *  reserved ids (its first id up to the shared roster's reserved count) hold it; undefined when no entry does. */
+export function effectIdAddressing(model: number, eid: number): string | undefined {
+  for (const e of effectIdTableFor(model) ?? []) {
+    if (e.firstId === null) continue;
+    const span = Math.max(1, GEN3_RESERVED_IDS.get(e.firstId) ?? e.instances);
+    if (eid >= e.firstId && eid < e.firstId + span) return e.addressing;
+  }
+  return undefined;
+}
+
 /** Block address -> family through the model's STATIC roster only, never a section→family vote of a walk
  *  (per-block walk options keyed through a vote would land on the wrong block whenever the vote is wrong).
  *  Shared by the walk limits and hints (services/deviceCache.ts) and the gen-3 driver's runtime

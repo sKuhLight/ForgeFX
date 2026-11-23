@@ -10,6 +10,14 @@
 //                   and that only a hinted walk would label-walk (a non-zero default ordinal): ONE label query at
 //                   the first ordinal (sub = min), then a liveness query; effect blocks first, Controllers,
 //                   Modifier, Global last; stops at the first missing reply. No walk in the run → skipped.
+//   extendedWalk    opt-in; the device-cache build's extension walk (services/deviceCache.ts, `extensionWalkSetup`)
+//                   restricted to param ids above 127 of the known contiguous tables of blocks 0..160
+//   above160Walk    opt-in; the same extension walk restricted to the present roster blocks above effect id 160
+//                   (ceiling 127, as without the extended-ids gate)
+//   blockProbe      opt-in; the block probe's single-block walk (services/blockProbe.ts, `probeWalkPlan`) of every block
+//                   of a fresh edit-buffer grid read that the static tables do not place, or name from the block
+//                   roster only; above effect id 160 only once definition reads there are verified on the firmware or
+//                   this run's above160Walk passed
 //   dumpHeaderProbe stored-slot dumps (0, 127, 128, last, up to three unused slots) + the edit buffer: which
 //                   preset number each 0x77 header names (dump payloads are never kept)
 //   reloadProbe     re-select the current preset by SysEx and verify the preset number — only when the edit
@@ -17,6 +25,22 @@
 //                   edits (`unsavedEdits: 'save' | 'discard'`, see GET /diagnostics/capture/preflight)
 //   fullWalk        opt-in; the full walk under every existing gate (fullCapture + verified firmware), and
 //                   under the same edit-buffer rule (it reloads the preset after each block)
+//
+// The three definition-walk steps (extendedWalk, above160Walk, blockProbe) collect evidence for the walk-scope gates
+// (services/walkScope.ts): they are never in DEFAULT_STEPS and run only when a request names them. Each re-reads the
+// firmware first (unknown → skipped) and records its gate in the result (`gate.allowance`: 'verified', 'dev-override'
+// or 'diagnostic'). On a (model, firmware) whose gate is not verified they run — like the label probe, the step IS the
+// verification — only when the request also says `unverifiedScope: true` (else skipped, nothing sent past the firmware
+// read), and only as the build would on a verified one: read-only (no write hook), with the walk's
+// bounds and caps from the static catalog or the local editor-cache data, every query behind the WP-F6 host adapter's
+// bound watchdog and query budget (`walkAdapter`: an out-of-plan query is never sent and aborts the run as
+// 'query-bound'), the extension's abort rules (an implausible reply at id 128 or above, an unanswered definition
+// query, the budget: the step fails with the build's `abortReason` vocabulary and the run carries on only while the
+// unit answers), a liveness check after each probed block, and NOTHING stored: the stored device profile and the
+// applied runtime profile are never written (a probe's would-be block-map entry is computed, not persisted). Their
+// records go into the step result as raw sources (the profile documents' own `live-readonly` / `live-probe` shape).
+// Their label and value text is kept verbatim (`labels: 'unscreened'` in the result, `redaction.unscreenedLabels` in
+// the bundle): a block's lists may carry names the user chose.
 //
 // Mutually exclusive with the device-cache build (services/deviceJobs.ts). A watchdog aborts the run when a
 // walk query would exceed the walk's hard bound or when nothing is received for 60 s while a step runs; an
@@ -31,33 +55,50 @@
 // the upload goes through an injected cloud client. NO node:/fastify/transport VALUE imports beyond the
 // browser-safe transport types (check-browser-safe.ts enforces it).
 import {
-  buildCache, buildDefQuery, buildEnumQuery, decodeReply, isSyntheticFamilyKey, parseDisplayValue, HW_SEEDS, liveWalkDetailed, VIEW_DEFINITION, VIEW_VALUE,
-  type BuiltCache, type CacheRecord, type LiveDefinition, type LiveEnumHint, type LiveTransport, type LiveWalkOptions, type LiveWalkResult
+  buildCache, buildDefQuery, buildEnumQuery, decodeReply, isPlaceholderRecord, isSyntheticFamilyKey, liveWalkScope, parseDisplayValue, rawFromLiveWalk,
+  HW_SEEDS, LIVE_WALK_LIMITS, LiveWalkAbortError, liveWalkDetailed, VIEW_DEFINITION, VIEW_VALUE, WalkBoundError,
+  type BlockMapEntry, type BuiltCache, type CacheRecord, type LiveDefinition, type LiveEnumHint, type LiveRawSource, type LiveTransport,
+  type LiveWalkOptions, type LiveWalkResult
 } from 'forgefx-midi/cache';
 import { DEVICE_MODELS } from 'forgefx-midi/shared';
 import { VERSION as CODEC_VERSION } from 'forgefx-midi';
 import { deviceCacheKey, diagnosticCaptureSupported, fullCaptureAllowedOnFirmware, type DeviceRegistry } from '../drivers/registryCore.js';
 import type { DeviceDriver, DiagnosticDump } from '../drivers/types.js';
 import { PROFILES } from '../devices.js';
+import { catalogFamilyOfBlock, effectIdAddressing } from '../profileCatalog.js';
 import { loadStoredProfile } from '../profileSchema.js';
 import type { DiagnosticUploadMeta } from '../runtime/cloud.js';
 import type { Store } from '../runtime/store.js';
 import { isTransportTimeout, type Transport } from '../transport/types.js';
+import { PROBE_TIMEOUT_MS, probeWalkPlan } from './blockProbe.js';
 import {
-  adaptRequest, enumHintsVerifiedOn, localByteSource, paramsForModel, staticRoster, walkBlockLimits, walkEnumHints, walkQueryBound, walkSetup,
-  WALK_PACING, type BuildMode
+  adaptRequest, enumHintsVerifiedOn, extensionAbortReason, extensionWalkSetup, localByteSource, paramsForModel, staticRoster, walkAdapter,
+  walkBlockLimits, walkEnumHints, walkQueryBound, walkResultOf, walkSetup, WalkBudgetError, WALK_PACING,
+  type BuildMode, type ExtensionGates
 } from './deviceCache.js';
 import { claimDevice, deviceBusy, releaseDevice } from './deviceJobs.js';
+import { ProfileMergeRefused, mergeSourcesIntoStored } from './profileMerge.js';
+import { walkScopeGates, type WalkScopeFlag, type WalkScopeGates } from './walkScope.js';
 
 // ── public shapes (the HTTP contract both surfaces serve) ──
 
-export type StepName = 'info' | 'readonlyWalk' | 'labelProbe' | 'dumpHeaderProbe' | 'reloadProbe' | 'fullWalk';
+export type StepName =
+  | 'info' | 'readonlyWalk' | 'labelProbe' | 'extendedWalk' | 'above160Walk' | 'blockProbe' | 'dumpHeaderProbe' | 'reloadProbe' | 'fullWalk';
 export type StepStatus = 'pending' | 'running' | 'ok' | 'failed' | 'aborted' | 'skipped';
 
-/** Every step, in the order a run executes them. */
-export const STEP_ORDER: readonly StepName[] = ['info', 'readonlyWalk', 'labelProbe', 'dumpHeaderProbe', 'reloadProbe', 'fullWalk'];
-/** The steps of a run that names none. `fullWalk` is opt-in (`includeFullWalk: true`). */
+/** Every step, in the order a run executes them. The definition-walk steps run after the standard walk (whose findings
+ *  the extension checks against) and before every step that may switch presets (reloadProbe, fullWalk): the block
+ *  probe reads the edit buffer as the user left it, and above160Walk precedes the probe it may clear for blocks above
+ *  effect id 160. */
+export const STEP_ORDER: readonly StepName[] = [
+  'info', 'readonlyWalk', 'labelProbe', 'extendedWalk', 'above160Walk', 'blockProbe', 'dumpHeaderProbe', 'reloadProbe', 'fullWalk'
+];
+/** The steps of a run that names none. `fullWalk` is opt-in (`includeFullWalk: true`); `extendedWalk`, `above160Walk`
+ *  and `blockProbe` are opt-in too: they run only when a request names them in `steps`. */
 export const DEFAULT_STEPS: readonly StepName[] = ['info', 'readonlyWalk', 'labelProbe', 'dumpHeaderProbe', 'reloadProbe'];
+
+/** The walk-scope gate each definition-walk step collects evidence for. */
+const STEP_GATE: Readonly<Partial<Record<StepName, WalkScopeFlag>>> = { extendedWalk: 'extendedIds', above160Walk: 'above160', blockProbe: 'blockProbe' };
 
 export interface CaptureStatus {
   state: 'idle' | 'running' | 'done' | 'failed' | 'cancelled';
@@ -92,7 +133,9 @@ export interface CaptureBundle {
   steps: CaptureStep[];
   frames: CaptureFrame[];
   logs: CaptureLog[];
-  redaction: { presetNames: number; dumpPayloadFrames: number };
+  /** `unscreenedLabels` (ADDITIVE): present when a definition-walk step (extendedWalk, above160Walk, blockProbe) talked
+   *  to the unit — its label and value text is kept verbatim and may carry names the user chose. */
+  redaction: { presetNames: number; dumpPayloadFrames: number; unscreenedLabels?: true };
   /** ADDITIVE: present only when the wire log was too large for the bundle and frames were dropped (the
    *  first and last frames and the frames around each failure / abort are kept). */
   framesTruncated?: { kept: number; dropped: number };
@@ -159,6 +202,8 @@ export interface CaptureOptions {
   maxBundleJsonBytes?: number;
   /** How long an aborted run keeps the device (claim + telemetry hold) for a step still on the link. */
   releaseGraceMs?: number;
+  /** Longest walk of one probed block in the `blockProbe` step (default: the probe route's PROBE_TIMEOUT_MS). */
+  probeTimeoutMs?: number;
   /** Scrubbed from log lines (defaults to this process's home directory, user and host name). */
   identity?: HostIdentity;
   /** Clock (ms). */
@@ -217,6 +262,10 @@ interface Job {
   t0: number;
   startedAt: string;
   includeFullWalk: boolean;
+  /** The request's `unverifiedScope: true`: the definition-walk steps may run on a firmware their gate does not list. */
+  unverifiedScope: boolean;
+  /** This run's above160Walk passed (`passed` in its result): the block probe may read blocks above effect id 160. */
+  above160Passed: boolean;
   controller: AbortController;
   /** Rejects when the run is aborted (cancel, watchdog): every step and liveness check races it. */
   aborted: Promise<never>;
@@ -285,11 +334,18 @@ export function captureStatus(registry: DeviceRegistry): CaptureStatus {
   return last ? last.status : { state: 'idle', resultAvailable: false };
 }
 
-/** POST /diagnostics/capture — body `{ acknowledged: true, steps?, includeFullWalk? }`. 202 started; 400 not
- *  acknowledged / bad steps; 409 busy (a capture or a cache build runs); 503 no device; 501 not a gen-3 unit. */
+/** POST /diagnostics/capture — body `{ acknowledged: true, steps?, includeFullWalk?, unverifiedScope? }`. 202 started;
+ *  400 not acknowledged / bad steps / `invalid-request` (`unverifiedScope` present but not a boolean); 409 busy (a
+ *  capture or a cache build runs); 503 no device; 501 not a gen-3 unit. `unverifiedScope: true` lets the definition-walk
+ *  steps run on a firmware their gate does not list (see the module comment). */
 export async function startCapture(store: Store, registry: DeviceRegistry, body: unknown, opts: CaptureOptions = {}): Promise<CaptureResult> {
-  const b = (body && typeof body === 'object' ? body : {}) as { acknowledged?: unknown; steps?: unknown; includeFullWalk?: unknown; unsavedEdits?: unknown; token?: unknown; preset?: unknown };
+  const b = (body && typeof body === 'object' ? body : {}) as {
+    acknowledged?: unknown; steps?: unknown; includeFullWalk?: unknown; unsavedEdits?: unknown; token?: unknown; preset?: unknown; unverifiedScope?: unknown
+  };
   if (b.acknowledged !== true) return { code: 400, body: { error: 'not-acknowledged' } };
+  if (b.unverifiedScope !== undefined && typeof b.unverifiedScope !== 'boolean') {
+    return { code: 400, body: { error: 'invalid-request', message: 'unverifiedScope must be a boolean' } };
+  }
   if (b.unsavedEdits !== undefined && b.unsavedEdits !== 'save' && b.unsavedEdits !== 'discard') {
     return { code: 400, body: { error: 'bad-unsaved-edits', message: "unsavedEdits must be 'save' or 'discard'" } };
   }
@@ -325,6 +381,8 @@ export async function startCapture(store: Store, registry: DeviceRegistry, body:
     store, registry, opts: merged, now, t0,
     startedAt: new Date(t0).toISOString(),
     includeFullWalk,
+    unverifiedScope: b.unverifiedScope === true,
+    above160Passed: false,
     controller,
     aborted: new Promise<never>((_res, rej) => {
       controller.signal.addEventListener('abort', () => rej(new AbortedError(`run aborted: ${job.abortReason ?? 'aborted'}`)), { once: true });
@@ -551,10 +609,15 @@ function abortJob(job: Job, reason: string): void {
  *  settles on its own later; its result is ignored (the bundle is built from a copy), but the run keeps the
  *  device until it has (see `job.inflight`). */
 function raceAbort<T>(job: Job, p: Promise<T>): Promise<T> {
+  track(job, p);
+  return Promise.race([p, job.aborted]);
+}
+
+/** Keep the device the run's until `p` has settled (see `job.inflight`). */
+function track(job: Job, p: Promise<unknown>): void {
   const settled: Promise<void> = p.then(() => {}, () => {});
   job.inflight.add(settled);
   void settled.then(() => job.inflight.delete(settled));
-  return Promise.race([p, job.aborted]);
 }
 
 async function runCapture(job: Job): Promise<void> {
@@ -626,6 +689,9 @@ const STEPS: Record<StepName, StepImpl> = {
   info: stepInfo,
   readonlyWalk: (job, step) => stepWalk(job, step, 'read-only'),
   labelProbe: stepLabelProbe,
+  extendedWalk: (job, step) => stepExtension(job, step, 'extendedIds'),
+  above160Walk: (job, step) => stepExtension(job, step, 'above160'),
+  blockProbe: stepBlockProbe,
   dumpHeaderProbe: stepDumpHeaderProbe,
   reloadProbe: stepReloadProbe,
   fullWalk: stepFullWalk
@@ -1003,6 +1069,363 @@ async function stepLabelProbe(job: Job, step: StepRecord): Promise<StepOutcome> 
   if (stop) {
     result.stoppedAt = stop;
     return { status: 'failed', note: 'stopped at the first missing reply', error: `no reply to the ${stop.query} query (block ${stop.block}, param ${stop.param})` };
+  }
+  return {};
+}
+
+// ── steps: extendedWalk / above160Walk / blockProbe (definition walks beyond the standard scope) ──
+
+/** The firmware and the walk-scope gates a definition-walk step runs under. */
+interface ScopeGate {
+  fw: { major: number; minor: number };
+  firmware: string;
+  /** The gates of the running firmware as the registry applies them (the verified table, plus the Node registry's
+   *  development override). */
+  gates: WalkScopeGates;
+  /** The verified table alone. */
+  verified: WalkScopeGates;
+}
+
+/** Re-read the firmware (gates are judged on a fresh read, never on the version cached at detect; an unanswered read
+ *  fails closed: skipped) and record the step's gate into `result.gate`: `verified` (the (model, firmware) is listed in
+ *  `WALK_SCOPE_VERIFIED_FW`), `devOverride` (only the development override opens it), `unverifiedScope` (the request's
+ *  flag) and `allowance` — 'verified', 'dev-override', or 'diagnostic' (neither: the step runs as evidence collection
+ *  under the rules of the module comment, and only with `unverifiedScope: true`; without it the step is skipped and
+ *  nothing is sent past the firmware read). A model without a definitions catalog is skipped (no bounds to walk by).
+ *  Every definition-walk step's result says its label and value text is unscreened (`labels`). */
+async function scopeGate(job: Job, flag: WalkScopeFlag, result: Record<string, unknown>): Promise<{ ok: true; gate: ScopeGate } | { ok: false; outcome: StepOutcome }> {
+  result.labels = 'unscreened';
+  const fw = await job.registry.refreshFirmware({ keepOnSilence: true });
+  throwIfAborted(job);
+  if (!fw) {
+    result.gate = { flag, firmware: null, unverifiedScope: job.unverifiedScope };
+    return { ok: false, outcome: { status: 'skipped', note: 'needs a known firmware version (the firmware read got no answer)' } };
+  }
+  job.firmware = fw.version;
+  job.fw = { major: fw.major, minor: fw.minor };
+  const verified = walkScopeGates(job.model, job.fw);
+  const gates = job.registry.walkScopeGates();
+  const allowance = verified[flag] ? 'verified' : gates[flag] ? 'dev-override' : 'diagnostic';
+  result.gate = { flag, firmware: fw.version, verified: verified[flag], devOverride: gates[flag] && !verified[flag], unverifiedScope: job.unverifiedScope, allowance };
+  if (!PROFILES[job.model]) return { ok: false, outcome: { status: 'skipped', note: 'no definitions catalog for this device' } };
+  if (allowance === 'diagnostic') {
+    if (!job.unverifiedScope) {
+      return { ok: false, outcome: { status: 'skipped', note: `${flag} is not verified on firmware ${fw.version}; the request must set unverifiedScope: true to run it` } };
+    }
+    log(job, 'warn', `${flag} is not verified on firmware ${fw.version}: read-only diagnostic run (unverifiedScope), nothing is stored`);
+  }
+  return { ok: true, gate: { fw: job.fw, firmware: fw.version, gates, verified } };
+}
+
+/** One walk of a definition-walk step through the build's host adapter (`walkAdapter`: the bound watchdog, and with a
+ *  `budget` the query budget). A query outside the walk's plan is never sent and aborts the whole run ('query-bound',
+ *  like the standard walks' watchdog) — also when the walk swallowed the refusal and finished. No query leaves once the
+ *  run or `signal` (one probed block's own stop) is aborted. The walk is tracked: the device stays the run's until it
+ *  has settled. */
+async function walkWithWatchdog(
+  job: Job, opts: LiveWalkOptions, cap: number, budget?: number, signal?: AbortSignal
+): Promise<{ walked: LiveWalkResult; sent: number }> {
+  const transport = await job.registry.transport();
+  const adapter = walkAdapter(transport, opts, cap, budget);
+  const guarded: LiveTransport = {
+    request: (q) => {
+      if (job.controller.signal.aborted) return Promise.reject(new AbortedError(`run aborted: ${job.abortReason ?? 'aborted'}`));
+      if (signal?.aborted) return Promise.reject(new Error('the walk was stopped'));
+      return adapter.request(q).catch((e: unknown) => {
+        if (e instanceof WalkBoundError) abortJob(job, 'query-bound');
+        throw e;
+      });
+    }
+  };
+  const walk = (job.opts.walkImpl ?? liveWalkDetailed)(guarded, opts);
+  track(job, walk);
+  const walked = walkResultOf(await walk);
+  const refused = adapter.refused();
+  if (refused instanceof WalkBoundError) {
+    abortJob(job, 'query-bound');
+    throw refused;
+  }
+  if (refused) throw refused; // a budget overrun the walk swallowed
+  throwIfAborted(job);
+  return { walked, sent: adapter.sent() };
+}
+
+/** The reply statistics of a definition walk, for a step result. */
+function walkStats(walked: LiveWalkResult, sent: number): Record<string, unknown> {
+  return {
+    queries: walked.queries, sent, enumLabels: walked.enumLabels, lostReplies: walked.lostReplies, recoveredReplies: walked.recoveredReplies,
+    unresolvedReplies: walked.unresolvedReplies, placeholderSlots: walked.placeholderSlots, missingSlots: walked.missingSlots,
+    silentAddresses: walked.silentAddresses, pseudoReplies: walked.pseudoReplies ?? null,
+    boundHits: (walked as { boundHits?: unknown }).boundHits ?? []
+  };
+}
+
+/** The real definitions of `block` in a walk's records (no placeholder slot, no special record). */
+const realRecords = (records: readonly CacheRecord[], block: number): CacheRecord[] =>
+  records.filter((r) => r.section === block && r.id < 0xff00 && !isPlaceholderRecord(r));
+
+/** A walk's records as a raw source of the profile documents' own shape (records without offsets, the walk's scope and
+ *  statistics) — for the bundle only, never stored. Null when the records cannot be packed (the frames still hold them). */
+function rawSourceOf(
+  job: Job, walked: LiveWalkResult, opts: LiveWalkOptions, flags: { extended?: boolean; above160?: boolean; hinted?: boolean }, kind: LiveRawSource['kind']
+): LiveRawSource | null {
+  try {
+    return rawFromLiveWalk(walked, liveWalkScope(opts, flags), { kind, capturedAt: new Date(job.now()).toISOString(), firmware: job.firmware, origin: 'local' });
+  } catch {
+    return null;
+  }
+}
+
+/** extendedWalk / above160Walk: the build's extension walk (`extensionWalkSetup`: the blocks, bounds, known sizes,
+ *  label hints, query budget and abort rules of phase B, refined only by the LOCAL editor-cache data of the stored
+ *  profile) for ONE gate dimension each — `extendedIds`: ids above 127 of the known contiguous tables of blocks 0..160;
+ *  `above160`: the present roster blocks above effect id 160 at the standard ceiling (127, as without the extended-ids
+ *  gate). Read-only, behind the bound watchdog and the budget (`walkWithWatchdog`); nothing stored. An abort rule (an
+ *  implausible reply at id 128 or above, an unanswered definition query, the budget) fails the step with the build's
+ *  `abortReason`; so does a block this run's read-only walk found definitions in that the extension, re-walking it
+ *  whole, answered none for (`empty-block`). */
+async function stepExtension(job: Job, step: StepRecord, flag: 'extendedIds' | 'above160'): Promise<StepOutcome> {
+  const result: Record<string, unknown> = {};
+  step.result = result;
+  const g = await scopeGate(job, flag, result);
+  if (!g.ok) return g.outcome;
+  const gates: ExtensionGates = flag === 'extendedIds'
+    ? { extendedIds: true, above160: false, farIds: false }
+    : { extendedIds: false, above160: true, farIds: false };
+  const setup = extensionWalkSetup(job.store, job.model, g.gate.fw, gates, 'read-only', {
+    signal: job.controller.signal,
+    onProgress: (p) => {
+      step.progress = p.phase === 'done' ? { done: p.blockCount, total: p.blockCount } : { done: p.blockIndex, total: p.blockCount };
+    }
+  });
+  const { limits } = setup;
+  result.plan = { blocks: [...limits.blocks], bounds: { ...limits.bound }, knownSize: { ...limits.knownSize }, budget: setup.budget, cap: setup.cap, hinted: setup.hinted };
+  if (limits.blocks.length === 0) {
+    return { status: 'skipped', note: flag === 'extendedIds' ? 'no known table of this device reaches past id 127' : `no block above effect id ${LIVE_WALK_LIMITS.standardMaxBlock} to read on this device` };
+  }
+  // the empty-block comparison needs this run's completed read-only walk; it never covers blocks above 160
+  result.emptyBlockCheck = flag === 'above160' ? 'not-applicable' : job.walk ? 'pending' : 'not-run';
+  result.passed = false;
+  let walked: LiveWalkResult;
+  let sent: number;
+  try {
+    ({ walked, sent } = await walkWithWatchdog(job, setup.opts, setup.cap, setup.budget));
+  } catch (e) {
+    if (job.controller.signal.aborted || e instanceof WalkBoundError || e instanceof AbortedError) throw e;
+    if (e instanceof LiveWalkAbortError || e instanceof WalkBudgetError) {
+      const reason = extensionAbortReason(e, job.controller.signal);
+      result.outcome = 'aborted';
+      result.abortReason = reason;
+      if (result.emptyBlockCheck === 'pending') result.emptyBlockCheck = 'not-run';
+      return { status: 'failed', note: 'stopped by the walk\'s abort rules', error: reason };
+    }
+    throw e;
+  }
+  const roster = staticRoster(job.model);
+  const emptied: number[] = [];
+  const blocks = limits.blocks.map((block) => {
+    const real = realRecords(walked.records, block);
+    if (real.length === 0 && job.walk && [...job.walk.real].some((k) => k.startsWith(`${block}:`))) emptied.push(block);
+    return {
+      block, family: roster.get(block)?.family ?? null, bound: limits.bound[block] ?? null, knownSize: limits.knownSize[block] ?? null,
+      records: real.length, lastReal: real.length > 0 ? Math.max(...real.map((r) => r.id)) : null
+    };
+  });
+  result.blocks = blocks;
+  result.walk = walkStats(walked, sent);
+  const source = rawSourceOf(job, walked, setup.opts, { extended: flag === 'extendedIds', above160: flag === 'above160', hinted: setup.hinted }, 'live-readonly');
+  if (source) result.source = source;
+  else result.sourceError = 'the records could not be packed';
+  if (result.emptyBlockCheck === 'pending') result.emptyBlockCheck = emptied.length > 0 ? 'failed' : 'passed';
+  if (emptied.length > 0) {
+    // not a table that grew but a walk that went wrong (a build keeps its standard walk for such a block)
+    result.outcome = 'aborted';
+    result.abortReason = `empty-block (block ${emptied[0]})`;
+    return { status: 'failed', note: 'stopped by the walk\'s abort rules', error: `empty-block (block ${emptied[0]})` };
+  }
+  result.outcome = 'done';
+  // The hardware-check criteria for definition reads above 160 (no implausible reply, no lost or unresolved reply, a
+  // real table in every planned block): 'ok' alone only says every query was answered — capped at 127, this walk never
+  // reaches the implausible-reply abort (it starts at id 128).
+  result.passed = (walked.pseudoReplies?.implausible ?? 0) === 0 && walked.lostReplies === 0 && walked.unresolvedReplies === 0
+    && blocks.every((x) => x.records > 0);
+  if (flag === 'above160') job.above160Passed = result.passed === true;
+  return {};
+}
+
+/** Highest effect id (the 14-bit block address). */
+const MAX_EID = 0x3fff;
+
+/** One placed block the `blockProbe` step reads, as recorded in its result. */
+interface ProbeTargetResult {
+  eid: number;
+  /** 'unknown': the static tables do not place it (no catalog or roster family); 'roster': the model's effect-id table
+   *  names its family from the block roster only, which no device read has confirmed. */
+  kind: 'unknown' | 'roster';
+  family?: string;
+  /** 'pending' = not reached; 'running' = being probed (a run that ends meanwhile leaves it 'aborted', see finish). */
+  status: 'pending' | 'running' | 'ok' | 'skipped' | 'failed' | 'timeout' | 'aborted';
+  reason?: string;
+  /** The editor-cache sections the block's bulk read fits (the driver's `probeShape`; null: no section to fit). */
+  fits?: Array<{ tag: number; stride: number }> | null;
+  /** Highest param id the walk queried (`probeWalkPlan`), and what sized it: the bulk shape's widest fitting section,
+   *  the catalog stride of a roster-only block's family (no fitting section), or the probe cap 127. */
+  ceiling?: number;
+  ceilingFrom?: 'shape' | 'catalog' | 'cap';
+  walk?: Record<string, unknown>;
+  /** The probe's records as a `live-probe` raw source (never stored). */
+  source?: LiveRawSource;
+  /** What the block map would say with this probe merged into the stored profile — computed, never stored. */
+  blockMap?: BlockMapEntry | null;
+  blockMapNote?: string;
+  /** The liveness query after the probe was answered. */
+  aliveAfter?: boolean;
+}
+
+/** The blocks of the edit-buffer grid the probe step reads, in grid-read order (ascending): those the static tables do
+ *  not place (`catalogFamilyOfBlock`, as the probe route's `known-block` rule; the development hook's hidden family
+ *  counts as unknown) and those the model's effect-id table names from the block roster only (Axe-Fx III, unconfirmed:
+ *  a probe's records are the evidence that can confirm them). Never a block the table addresses other than as a
+ *  placeable block (a virtual one, like the route's `known-block` rule). */
+function probeTargets(model: number, placed: readonly number[]): ProbeTargetResult[] {
+  const roster = staticRoster(model);
+  const out: ProbeTargetResult[] = [];
+  for (const eid of placed) {
+    if (!Number.isInteger(eid) || eid < 1 || eid > MAX_EID) continue;
+    const addressing = effectIdAddressing(model, eid);
+    if (addressing !== undefined && addressing !== 'block') continue;
+    if (catalogFamilyOfBlock(model, eid) === undefined) {
+      out.push({ eid, kind: 'unknown', status: 'pending' });
+      continue;
+    }
+    const ref = roster.get(eid);
+    if (ref?.roster && addressing === 'block') out.push({ eid, kind: 'roster', family: ref.family, status: 'pending' });
+  }
+  return out;
+}
+
+/** The catalog stride of `family` on `model` (a usable slot count), or null. */
+function catalogStride(model: number, family: string | undefined): number | null {
+  const stride = family ? PROFILES[model]?.rangeSections[family]?.stride : undefined;
+  return typeof stride === 'number' && Number.isFinite(stride) && stride >= 1 ? Math.floor(stride) : null;
+}
+
+/** What the block map would say of `eid` with `source` merged into the stored profile — the probe route's merge, read
+ *  only (`mergeSourcesIntoStored` writes nothing) and never persisted. Null with a note when the merge is refused or
+ *  the result does not derive. */
+function wouldBeBlockMap(job: Job, gate: ScopeGate, eid: number, source: LiveRawSource): { blockMap: BlockMapEntry | null; blockMapNote?: string } {
+  try {
+    const merged = mergeSourcesIntoStored(job.store, {
+      key: deviceCacheKey(job.model, gate.fw.major, gate.fw.minor), model: job.model, firmware: gate.firmware, incoming: [source],
+      now: source.capturedAt ?? new Date(job.now()).toISOString()
+    });
+    if (merged.derivationFailed !== undefined) return { blockMap: null, blockMapNote: 'derivation-failed' };
+    return { blockMap: merged.doc.blockMap.find((e) => e.eid === eid) ?? null };
+  } catch (e) {
+    return { blockMap: null, blockMapNote: e instanceof ProfileMergeRefused ? e.refusal.error : 'derivation-failed' };
+  }
+}
+
+/** blockProbe: the block probe's walk (`probeWalkPlan`: one block, read-only, no known size, values read, no label
+ *  hints, ceiling from the block's bulk shape — for a roster-only block without a fitting section its family's catalog
+ *  stride — at most 127) of every target of a FRESH edit-buffer grid read (`probeTargets`; the read announces no
+ *  unmapped-block change mid-run), one after the other, each behind the bound watchdog with the probe route's timeout,
+ *  followed by a liveness query (no answer ends the run as 'device-silent'). A target above effect id 160 is read only
+ *  when definition reads there are verified (or opened by the development override) on the firmware, or this run's
+ *  above160Walk PASSED (`passed` in its result, not merely 'ok'); else it is skipped. The step stops at the first probe
+ *  that does not finish (a failed walk, the timeout). Nothing is stored: each probe's records, its statistics and the
+ *  would-be block-map entry go into the result. */
+async function stepBlockProbe(job: Job, step: StepRecord): Promise<StepOutcome> {
+  const result: Record<string, unknown> = {};
+  step.result = result;
+  const g = await scopeGate(job, 'blockProbe', result);
+  if (!g.ok) return g.outcome;
+  const { registry, model } = job;
+  const driver = await registry.driver();
+  const caps = registry.activeCapabilities();
+  if (!caps || caps.slotModel !== 'grid' || !caps.selfDescribe || !driver.placedEffectIds || !driver.probeShape) {
+    return { status: 'skipped', note: 'this device cannot probe placed blocks' };
+  }
+  await (driver.freshGrid ? driver.freshGrid({ silent: true }) : driver.grid());
+  throwIfAborted(job);
+  const placed = driver.placedEffectIds() ?? [];
+  const targets = probeTargets(model, placed);
+  const above160 = g.gate.gates.above160
+    ? (g.gate.verified.above160 ? 'verified' : 'dev-override')
+    : job.above160Passed ? 'this-run' : 'not-shown';
+  Object.assign(result, { placedBlocks: placed.length, above160, targets });
+  if (targets.length === 0) return { status: 'skipped', note: 'no placed block without a known family' };
+  const timeoutMs = job.opts.probeTimeoutMs ?? PROBE_TIMEOUT_MS;
+  let stop: { eid: number; reason: string } | null = null;
+  for (const [i, t] of targets.entries()) {
+    throwIfAborted(job);
+    step.progress = { done: i, total: targets.length };
+    if (t.eid > LIVE_WALK_LIMITS.standardMaxBlock && above160 === 'not-shown') {
+      t.status = 'skipped';
+      t.reason = `definition reads above effect id ${LIVE_WALK_LIMITS.standardMaxBlock} are not verified on this firmware and no above160Walk passed in this run`;
+      continue;
+    }
+    t.status = 'running';
+    const fits = await driver.probeShape(t.eid);
+    throwIfAborted(job);
+    const stopWalk = new AbortController();
+    const onAbort = () => stopWalk.abort();
+    job.controller.signal.addEventListener('abort', onAbort, { once: true });
+    // a roster-only block no editor-cache section fits: its family's catalog stride sizes the walk (never above 127)
+    const shaped = fits !== null && fits.length > 0;
+    const stride = !shaped && t.kind === 'roster' ? catalogStride(model, t.family) : null;
+    const plan = probeWalkPlan(model, t.eid, shaped ? fits : stride !== null ? [{ tag: -1, stride }] : null, stopWalk.signal);
+    t.fits = fits ? fits.map((f) => ({ tag: f.tag, stride: f.stride })) : null;
+    t.ceiling = plan.ceiling;
+    t.ceilingFrom = shaped ? 'shape' : stride !== null ? 'catalog' : 'cap';
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let outcome: { walked: LiveWalkResult; sent: number } | 'timeout';
+    try {
+      const walk = walkWithWatchdog(job, plan.opts, plan.cap, undefined, stopWalk.signal);
+      walk.catch(() => {}); // raced below: after a timeout its late rejection is expected
+      const timeout = new Promise<'timeout'>((r) => { timer = setTimeout(() => r('timeout'), timeoutMs); });
+      outcome = await Promise.race([walk, timeout]);
+    } catch (e) {
+      if (job.controller.signal.aborted || e instanceof WalkBoundError || e instanceof AbortedError) throw e;
+      t.status = 'failed';
+      t.reason = scrub(e instanceof Error ? e.message : String(e), job.label, job.identity);
+      stop = { eid: t.eid, reason: t.reason };
+      break;
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+      job.controller.signal.removeEventListener('abort', onAbort);
+    }
+    if (outcome === 'timeout') {
+      stopWalk.abort();
+      t.status = 'timeout';
+      t.reason = 'probe-timeout';
+      stop = { eid: t.eid, reason: 'probe-timeout' };
+      break;
+    }
+    const { walked, sent } = outcome;
+    t.walk = walkStats(walked, sent);
+    const source = rawSourceOf(job, walked, plan.opts, { above160: t.eid > LIVE_WALK_LIMITS.standardMaxBlock, hinted: false }, 'live-probe');
+    if (source) {
+      t.source = source;
+      Object.assign(t, wouldBeBlockMap(job, g.gate, t.eid, source));
+    }
+    t.status = 'ok';
+    // the unit must still answer after each probed block
+    t.aliveAfter = await deviceAlive(job);
+    if (!t.aliveAfter) {
+      abortJob(job, 'device-silent');
+      throwIfAborted(job);
+    }
+  }
+  step.progress = { done: targets.length, total: targets.length };
+  if (stop) {
+    for (const t of targets) {
+      if (t.status === 'pending') { t.status = 'skipped'; t.reason = 'not run: the step stopped at an earlier block'; }
+    }
+    return { status: 'failed', note: 'stopped at the first probe that did not finish', error: `the probe of block ${stop.eid} did not finish (${stop.reason})` };
+  }
+  if (targets.every((t) => t.status === 'skipped')) {
+    return { status: 'skipped', note: `every placed block without a known family lies above effect id ${LIVE_WALK_LIMITS.standardMaxBlock}; run above160Walk with this step` };
   }
   return {};
 }
@@ -1507,7 +1930,16 @@ function finish(job: Job): void {
     for (const s of job.steps) {
       if (s.status === 'running') s.status = 'aborted';
       else if (s.status === 'pending') { s.status = 'skipped'; s.note = `not run: ${job.abortReason ?? 'run ended'}`; }
+      // a probed block the run ended on (its walk may still settle later: the bundle records it as interrupted)
+      const targets = (s.result as { targets?: ProbeTargetResult[] } | undefined)?.targets;
+      if (Array.isArray(targets)) {
+        for (const t of targets) {
+          if (t.status === 'running') { t.status = 'aborted'; t.reason = `not finished: ${job.abortReason ?? 'run ended'}`; }
+        }
+      }
     }
+    // a definition-walk step that talked to the unit keeps its label and value text verbatim (see the module comment)
+    const unscreened = job.steps.some((s) => STEP_GATE[s.name] !== undefined && s.status !== 'skipped' && s.status !== 'pending');
     const state: CaptureBundle['state'] = job.abortReason === 'cancelled' ? 'cancelled' : job.abortReason ? 'failed' : 'done';
     log(job, 'info', `capture ${job.id} ended: ${state}${job.abortReason ? ` (${job.abortReason})` : ''}`);
     job.finished = true;
@@ -1533,7 +1965,7 @@ function finish(job: Job): void {
       }),
       frames: [],
       logs: job.logs.slice(),
-      redaction: { ...job.redaction }
+      redaction: { ...job.redaction, ...(unscreened ? { unscreenedLabels: true as const } : {}) }
     };
     const rest = JSON.stringify(base).length;
     const max = job.opts.maxBundleJsonBytes ?? MAX_BUNDLE_JSON_BYTES;

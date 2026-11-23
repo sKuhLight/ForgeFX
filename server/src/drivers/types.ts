@@ -572,6 +572,10 @@ export interface DeviceDriver {
   /** Gen-3 grid drivers: effect ids of the blocks in the edit-buffer grid as last read, sorted and unique (no device
    *  traffic); null before the first grid read of the session. */
   placedEffectIds?(): number[] | null;
+  /** Gen-3 grid drivers: the edit-buffer grid read afresh (one dump read, never a cached or in-flight read), which also
+   *  refreshes `placedEffectIds` — the diagnostic capture's block probe step reads its targets from it. `silent`: no
+   *  `definitions` / `unmapped-blocks` event from this read (the next grid read or profile swap announces the change). */
+  freshGrid?(opts?: { silent?: boolean }): Promise<PresetGridDTO>;
   /** Gen-3 grid drivers: the editor-cache sections of the applied profile a placed block's bulk read fits (the runtime
    *  bulk-shape match), with their strides — what the block probe sizes its walk by. Null when the profile has no section
    *  a block may bind to (nothing is read); empty when the read failed or nothing fits. One status + bulk read. */

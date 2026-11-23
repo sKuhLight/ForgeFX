@@ -240,7 +240,9 @@ The keys come in this order; new keys are appended, never inserted (also inside 
 - `walk`: how far a read-only definition walk may query the unit on its running firmware: `extendedIds`
   (ids above 127 of known tables), `above160` (the placeable blocks above effect id 160), `blockProbe` (the
   single-block probe), `farIds` (never enabled). Each is true only on a model and firmware it has been
-  verified on; all false on an unknown firmware. With `extendedIds` or `above160`, a read-only
+  verified on; all false on an unknown firmware (the device diagnostic's optional `extendedWalk`, `above160Walk` and
+  `blockProbe` steps collect the evidence for a model and firmware without storing anything: api-design.md, ADR 0005).
+  With `extendedIds` or `above160`, a read-only
   `POST /device/cache/build` defaults to `scope: "extended"` (a full build only on request): the firmware is
   re-read, the standard walk is stored first, then a bounded read-only extension walk adds to it; the terminal
   `cacheBuild` `done` event says `extension: "done" | "skipped" | "aborted"` (with an `abortReason` code;

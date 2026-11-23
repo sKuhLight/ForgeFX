@@ -1039,11 +1039,13 @@ class Gen3Driver implements DeviceDriver {
   }
   #slotGridInflight = new Map<number, Promise<PresetGridDTO>>();
 
-  async #dumpGrid(): Promise<PresetGridDTO> {
+  /** `silent`: the read does not announce a changed set of unmapped placed blocks (the next grid read or profile swap
+   *  does, since the announced set is left as it was). */
+  async #dumpGrid(opts: { silent?: boolean } = {}): Promise<PresetGridDTO> {
     const dev = await this.#conn();
     const g = await this.#gridFromDump(EDIT_BUFFER);
     this.#lastPlaced = { transport: dev, eids: g.cells.filter((c) => !c.isShunt && c.effectId > 0 && c.effectId < GEN3_SHUNT_BASE).map((c) => c.effectId) };
-    this.#noteUnmappedChange();
+    if (!opts.silent) this.#noteUnmappedChange();
     return g;
   }
 
@@ -1053,6 +1055,16 @@ class Gen3Driver implements DeviceDriver {
   #lastPlaced: { transport: Transport; eids: number[] } | null = null;
   /** The unmapped set the last `definitions`/`unmapped-blocks` event (or the session start) reported, as a key. */
   #unmappedSig = '';
+
+  /** The edit-buffer grid read afresh: one dump read, never the short-TTL cache or a read already in flight. It refreshes
+   *  `placedEffectIds` and, unless a grid-changing write landed meanwhile, the grid cache. `silent`: no `definitions` /
+   *  `unmapped-blocks` event from this read (it is left to the next grid read or profile swap). */
+  async freshGrid(opts: { silent?: boolean } = {}): Promise<PresetGridDTO> {
+    const gen = this.#gridGen;
+    const g = await this.#dumpGrid(opts);
+    if (gen === this.#gridGen) this.#gridCache = { grid: g, at: Date.now(), gen };
+    return g;
+  }
 
   /** Effect ids of the blocks in the edit-buffer grid as last read (shunts and empty cells left out), sorted and
    *  unique; null before the first grid read of the session. No device traffic. */
