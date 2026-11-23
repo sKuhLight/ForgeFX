@@ -171,13 +171,16 @@ const parseSelectorValues = (value: string | null | undefined): number[] =>
 // (see layoutFirmwareLevel; the newest firmware when the connected one is not known):
 //   0. only variants that exist on that firmware take part: the variant's own gate holds, and so does the gate of
 //      at least one of its pages. A variant whose pages are all gated away is a legacy one even when the variant
-//      itself carries no gate (TREMOLO types 0/2/4: their only page is `lt 8,00`, newer firmware draws them from the
-//      value-less default variant). When nothing is left on a known firmware, the newest firmware decides; when
-//      nothing is left at all, every variant takes part (degenerate data);
+//      itself carries no gate (the shipped layouts have none since the codec folds an editor catch-all page into
+//      every type no sibling names — before that, TREMOLO types 0/2/4 had only their `lt 8,00` page). When nothing
+//      is left on a known firmware, the newest firmware decides; when nothing is left at all, every variant takes
+//      part (degenerate data);
 //   1. the key: a variant the generator folded from a page-level selector names that selector
-//      (`selectorParamName`, e.g. DELAY_TYPE: the Delay's routing type, not its model selector DELAY_MODEL), so its
-//      `value` is that selector's CURRENT value (`selectors`); else the block's type value. A caller without a
-//      selector lookup keys by the type value;
+//      (`selectorParamName`, e.g. DELAY_TYPE: the Delay's routing type, not its model selector DELAY_MODEL;
+//      REVERB_BASETYPE, not the reverb's type REVERB_TYPE), so its `value` is that selector's CURRENT ordinal
+//      (`selectors`; see SelectorValues). An unknown selector value keys nothing (→ the folded family's default
+//      variant), never the type value, which is another selector's. A caller without a selector lookup keys by the
+//      type value;
 //   2. variants whose `value` list contains the key win (the normal per-type case);
 //   3. else the unconditional (value === null) variants — the firmware-only-versioned Amp block, whose
 //      variants all carry value:null but differ by `fw`, and a folded family's catch-all default;
@@ -205,9 +208,13 @@ const selectVariant = (
 };
 
 // Lookup from an editor selector parameter symbol (e.g. 'DISTORT_EQTYPE', 'DISTORT_TYPE') to the block's
-// CURRENT numeric value of that param, or undefined when unknown. The driver builds this from the block's
-// live read: the family type selector answers with the type already decoded in blockParams, other
-// selectors (EQ type / drive type / …) with the block's named/enum param values.
+// CURRENT ordinal of that param — the number the editor's variant / page `value` lists name — or undefined when
+// unknown. The driver builds this from the block's live read: the family type selector answers with the type
+// already decoded in blockParams, a selector served as an enum with the ordinal it decoded, any other selector
+// (a dial, or a row the response does not list: REVERB_BASETYPE is a `count` float row) with the ordinal read from
+// its RAW body value (gen3 `selectorOrdinal`: the raw value within the row's top ordinal or too small to be a scaled
+// reading — base types 9 / 10 beyond the row's 0..8 — else unscaled) — never a dial's display value (raw 6 = base
+// type 6 displays as 0.0007).
 export type SelectorValues = (selectorParamName: string) => number | undefined;
 
 // Parse an editor firmware bound ("maj,min", e.g. "6,03" / "12,00") into a comparable integer. Absent → 0.

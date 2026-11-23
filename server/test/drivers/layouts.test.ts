@@ -3,13 +3,20 @@
 //   • variant selection: type-value match, a folded variant's own selector (DELAY_TYPE), amp firmware-pin preference,
 //     null/first fallback;
 //   • firmware gates (variants, pages, controls) on the connected firmware, else the newest (legacy `lt` pages and
-//     variants not served, TREMOLO's legacy-only variant yields to the default, MULTITAP keeps its current variant);
+//     variants not served, TREMOLO 0/2/4 and DELAY get the editor's catch-all page on newer firmware, MULTITAP keeps
+//     its current variant);
+//   • a non-enum selector (REVERB_BASETYPE, also beyond its catalog row's top ordinal; LOOPER_DUB) keys its variant by
+//     the raw body value, not a dial reading;
 //   • v2 passthrough: pages → rows → controls carry widget/rawWidget/placement/crossBlock verbatim;
 //   • AM4 gets a layout for the first time (family mapping via am4LayoutFor).
 import { PROFILES, am4LayoutFor, resolveLayoutPages, type DeviceLayout, type SelectorValues } from '../../src/devices.js';
 import { EDITOR_WIDGET_KINDS, type EditorLayoutPage } from 'forgefx-midi/gen3/fm3';
-import { mockBlockDevice, eidOfSlug } from '../helpers/blockRead.js';
+import { mockBlockDevice, eidOfSlug, blockBulkFrames, compactHex, enc14, sysex } from '../helpers/blockRead.js';
+import { MockTransport, handshakeReply, isIdentifyBroadcast } from '../helpers/mock.js';
 import { SLUG_FAMILY } from '../../src/devices.js';
+import { __createRegistryForTest } from '../../src/drivers/registry.js';
+import type { Gen3Driver } from '../../src/drivers/gen3.js';
+import { createModernFractalCodec } from 'forgefx-midi/gen3/axe-fx-iii';
 import type { BlockParamsV2DTO } from '../../src/drivers/types.js';
 
 const fm3 = PROFILES[0x11]!;
@@ -252,16 +259,43 @@ const checks: Array<{ name: string; ok: () => boolean }> = [
     const newest = fm3.layoutFor('FLANGER')!.pages.map((p) => p.name).join(',');
     const old = fm3.layoutFor('FLANGER', undefined, undefined, { major: 1, minor: 0 })!.pages.map((p) => p.name);
     return newest === 'Basic,Expert 1,Expert 2' && old.includes('Flanger') && old.includes('Tone') && !old.includes('Basic'); } },
-  { name: 'TREMOLO types 0/2/4: their legacy variant (all pages `lt 8,00`) yields to the default variant on newer firmware', ok: () => {
+  { name: "TREMOLO types 0/2/4: their own variant on every firmware — the editor's catch-all Tremolo page on newer firmware, the legacy page on older", ok: () => {
+    // the codec folds the editor's catch-all page (`value=""`, gtet 8,00) into every type no sibling page names, so the
+    // 0,2,4 variant carries its current page next to its `lt 8,00` one (it used to hold only the legacy page and
+    // yield to the default variant on newer firmware)
     const sel = (t: number): SelectorValues => (n) => (n === 'TREMOLO_TYPE' ? t : undefined);
     for (const [p, bound] of [[fm3, 8], [fm9, 6], [axe3, 23]] as const) {
       for (const t of [0, 2, 4]) {
         const cur = p.layoutFor('TREMOLO', t, sel(t));
         const old = p.layoutFor('TREMOLO', t, sel(t), { major: bound - 1, minor: 0 });
-        if (cur?.variantName !== 'Default' || cur.pages.length !== 1 || cur.pages[0]!.fw?.gtet === undefined) return false;
+        if (cur?.variantName !== '0,2,4' || cur.pages.length !== 1 || cur.pages[0]!.name !== 'Tremolo' || cur.pages[0]!.fw?.gtet === undefined) return false;
         if (old?.variantName !== '0,2,4' || old.pages.length !== 1 || old.pages[0]!.fw?.lt === undefined) return false;
       }
-      if (p.layoutFor('TREMOLO', 1, sel(1))?.variantName !== '1') return false; // the Panner keeps its own variant
+      // the Panner keeps its own variant, and the catch-all Tremolo page (same tab position) does not reach it
+      const pan = p.layoutFor('TREMOLO', 1, sel(1));
+      if (pan?.variantName !== '1' || pan.pages.map((pg) => pg.name).join(',') !== 'Panner') return false;
+    }
+    return true; } },
+  { name: "DELAY: every routing type but 6 gets the editor's catch-all Modulation page on current firmware, the legacy one on older", ok: () => {
+    const sel = (t: number): SelectorValues => (n) => (n === 'DELAY_TYPE' ? t : undefined);
+    for (const [p, bound] of [[fm3, 8], [fm9, 6], [axe3, 23]] as const) {
+      for (let t = 0; t <= 7; t++) {
+        const mod = (fw?: { major: number; minor: number }) => (p.layoutFor('DELAY', 0, sel(t), fw)?.pages ?? []).filter((pg) => pg.name === 'Modulation');
+        const cur = mod(); const old = mod({ major: bound - 1, minor: 0 });
+        if (cur.length !== 1 || cur[0]!.fw?.gtet === undefined) return false;
+        if (old.length !== 1 || old[0]!.fw?.lt === undefined) return false;
+      }
+    }
+    return true; } },
+  { name: 'REVERB: the base types the Pitch Shift page names get the full tab set, not the Pitch Shift page alone', ok: () => {
+    for (const p of [fm3, fm9, axe3]) {
+      for (const base of [1, 2, 3, 6, 7, 8]) {
+        const l = p.layoutFor('REVERB', 0, (n) => (n === 'REVERB_BASETYPE' ? base : undefined));
+        if (l?.variantName !== '1,2,3,6,7,8,9,10' || l.pages.map((pg) => pg.name).join(',') !== 'Basic,Advanced,Duck + Mod,EQ,Pitch Shift') return false;
+      }
+      // 0/5 keep their Ducker tab: the catch-all Duck + Mod (same tab position) does not reach them
+      const plate = p.layoutFor('REVERB', 0, (n) => (n === 'REVERB_BASETYPE' ? 5 : undefined));
+      if (plate?.variantName !== '0,5' || plate.pages.map((pg) => pg.name).join(',') !== 'Basic,Advanced,Ducker,EQ') return false;
     }
     return true; } },
   { name: 'MULTITAP: the current-firmware variant of a type wins over its legacy twin (FM3 gtet 9,02, FM9 8,02, III 27,02); an older unit gets the legacy one', ok: () => {
@@ -318,7 +352,7 @@ const checks: Array<{ name: string; ok: () => boolean }> = [
 // layout); one without picks it by its variant selector: the cab by CABINET_MODE (Legacy / DynaCab), the plex by
 // PLEX_BASETYPE. The cab used to follow its preamp type (CABINET_PRETYPE, a param that merely ends in TYPE), so
 // a cab on DynaCab could get the Legacy pages and the other way round.
-const SERVED_VARIANT_CASES = 6;
+const SERVED_VARIANT_CASES = 8;
 
 async function servedVariantChecks(): Promise<void> {
   for (const profile of [fm3, fm9, axe3]) {
@@ -361,23 +395,140 @@ async function servedVariantChecks(): Promise<void> {
       }
     }
     // 6. the driver evaluates the firmware gates against the firmware its context reports: a Tremolo of type 0 is
-    //    served the legacy variant by a unit older than the gate, the default variant by a current one and by a
-    //    driver that does not know the firmware
+    //    served its legacy page by a unit older than the gate, the editor's current (catch-all) page by a current
+    //    one and by a driver that does not know the firmware — both from the type's own variant
     const bound = { fm3: 8, fm9: 6, axe3: 23 }[profile.key]!;
-    for (const [fw, want] of [[{ major: bound - 1, minor: 0 }, '0,2,4'], [{ major: bound, minor: 0 }, 'Default'], [undefined, 'Default']] as const) {
+    for (const [fw, gate] of [[{ major: bound - 1, minor: 0 }, 'lt'], [{ major: bound, minor: 0 }, 'gtet'], [undefined, 'gtet']] as const) {
       for (const r of await served('tremolo', { TREMOLO_TYPE: 0 }, fw)) {
-        if (r.layout?.variantName !== want) throw new Error(`${profile.key}: Tremolo type 0 on firmware ${fw ? `${fw.major}.${fw.minor}` : 'unknown'} is ${r.layout?.variantName}, expected ${want}`);
+        const pages = r.layout?.pages ?? [];
+        if (r.layout?.variantName !== '0,2,4' || pages.length !== 1 || pages[0]!.fw?.[gate] === undefined) {
+          throw new Error(`${profile.key}: Tremolo type 0 on firmware ${fw ? `${fw.major}.${fw.minor}` : 'unknown'} is ${r.layout?.variantName} ${JSON.stringify(pages.map((p) => p.fw))}, expected 0,2,4 with its ${gate} page`);
+        }
       }
     }
+    // 7. the Reverb follows REVERB_BASETYPE as the device stores it — the base type's INDEX in the block body (a
+    //    hardware read gives raw 6 for base type 6, which the dial's continuous reading shows as 0.0007), not the
+    //    reverb type REVERB_TYPE (the type selector), in both responses (the classic one does not list the param at
+    //    all). The catalog row stops at 8, but the current firmware's layouts name base types 9 and 10: raw 9 / 10 are
+    //    those base types, not a scaled base type 0 — a reading above the row's top ordinal is an ordinal while it
+    //    would unscale onto the bottom one (raw 4095 keys base type 4095: no variant names it, the default answers),
+    //    and only a reading large enough to be a 16-bit scaled one is unscaled onto 0..8 (4096 → 1, 32767 → 4,
+    //    49151 → 6, 65534 → 8).
+    for (const [raw, want] of [
+      [6, '1,2,3,6,7,8,9,10'], [1, '1,2,3,6,7,8,9,10'], [4, '4'], [0, '0,5'], [5, '0,5'],
+      [9, '1,2,3,6,7,8,9,10'], [10, '1,2,3,6,7,8,9,10'], [4095, 'Default'],
+      [4096, '1,2,3,6,7,8,9,10'], [32767, '4'], [49151, '1,2,3,6,7,8,9,10'], [65534, '1,2,3,6,7,8,9,10'],
+    ] as const) {
+      for (const r of await served('reverb', { REVERB_BASETYPE: raw, REVERB_TYPE: 4 })) {
+        if (r.layout?.family !== 'REVERB' || r.layout.variantName !== want) throw new Error(`${profile.key}: Reverb variant for REVERB_BASETYPE raw ${raw} (REVERB_TYPE 4) is ${r.layout?.variantName}, expected ${want}`);
+        if (want === '1,2,3,6,7,8,9,10' && r.layout.pages.map((p) => p.name).join(',') !== 'Basic,Advanced,Duck + Mod,EQ,Pitch Shift') {
+          throw new Error(`${profile.key}: Reverb base type raw ${raw} pages ${r.layout.pages.map((p) => p.name).join(',')}`);
+        }
+      }
+    }
+    // 8. the Looper follows LOOPER_DUB keyed by its raw body value in the classic response: the catalog row has no
+    //    usable span (0..0; none at all on the III), so the raw value is the key and the editor's variants '0' / '1'
+    //    answer to raw 0 / 1. How the device stores this selector (an ordinal or a scaled value) is not verified on
+    //    hardware; this pins the keying the data supports. The generic response serves no LOOPER_DUB (a row without
+    //    an informative span is not indexed), so it cannot key by it: it still answers with a Looper layout.
+    for (const raw of [0, 1]) {
+      const [classic, generic] = await served('looper', { LOOPER_DUB: raw });
+      if (classic.layout?.family !== 'LOOPER' || classic.layout.variantName !== String(raw)) throw new Error(`${profile.key}: Looper variant for LOOPER_DUB raw ${raw} is ${classic.layout?.variantName}, expected ${raw}`);
+      if (generic.layout?.family !== 'LOOPER') throw new Error(`${profile.key}: generic Looper layout for LOOPER_DUB raw ${raw} is ${generic.layout?.family}`);
+    }
   }
-  console.log('  drivers/layouts: served variants — cab by CABINET_MODE (not the preamp type), plex by PLEX_BASETYPE, GEQ by its type, Delay by DELAY_TYPE (not its model), firmware gates on the firmware the driver reports; classic and generic, FM3/FM9/III');
+  console.log('  drivers/layouts: served variants — cab by CABINET_MODE (not the preamp type), plex by PLEX_BASETYPE, GEQ by its type, Delay by DELAY_TYPE (not its model), Reverb by REVERB_BASETYPE read raw (not its type; base types 9/10 beyond the row), Looper by LOOPER_DUB raw, firmware gates on the firmware the driver reports; classic and generic, FM3/FM9/III');
 }
 
-export const LAYOUTS_CASE_COUNT = checks.length + SERVED_VARIANT_CASES;
+// ── layout firmware over a session: the registry evaluates the layouts against the firmware the connected unit last
+// reported. Every firmware read clears the running firmware first, and one the unit does not answer (the full-capture
+// gate's refreshFirmware, the diagnostic capture's, a re-detect) leaves it unknown — which used to flip an older unit
+// to the newest firmware's layout for the rest of the session. A disconnect / port change, or another model, forgets
+// it. Driven through the registry over a mocked unit (identify, fn 0x08, status dump, the Tremolo's block read). ──
+const LAYOUT_FIRMWARE_CASES = 1;
+
+async function layoutFirmwareChecks(): Promise<void> {
+  for (const profile of [fm3, fm9, axe3]) {
+    const model = profile.model;
+    const bound = { fm3: 8, fm9: 6, axe3: 23 }[profile.key]!;
+    const older = { major: bound - 1, minor: 0 }; // below the Tremolo page's `gtet` gate: the legacy page is the one shown
+    const codec = createModernFractalCodec(model);
+    const eid = eidOfSlug('tremolo');
+    const values = new Array<number>(profile.rangeSections.TREMOLO!.stride * 4).fill(0); // TREMOLO_TYPE 0, channel A
+    const statusHex = compactHex(codec.buildStatusDump());
+    const pollHex = compactHex(codec.buildBlockBulkReadPoll(eid));
+    let identifyAs = model;
+    let fwAnswers = true;
+    const mock = new MockTransport('serial', `mock-layout-fw-${profile.key}`);
+    mock.reply = (req) => {
+      if (isIdentifyBroadcast(req)) return [handshakeReply(identifyAs)];
+      if (req[0] === 0xf0 && req[5] === 0x08) return fwAnswers ? [[0xf0, 0x00, 0x01, 0x74, model, 0x08, older.major, older.minor, 0x00, 0x00, 0xf7]] : [];
+      const h = compactHex(req);
+      if (h === statusHex) return [sysex(model, 0x13, [...enc14(eid), 0])];
+      if (h === pollHex) return blockBulkFrames(model, eid, values);
+      return [];
+    };
+    const registry = __createRegistryForTest({ resolveConn: async () => ({ transport: 'serial', id: mock.label }), openConn: () => mock });
+    const tag = (what: string) => `${profile.key}: ${what}`;
+    // the gate of the Tremolo page both responses serve ('lt' = the older firmware's page, 'gtet' = the newest's)
+    const served = async (what: string, want: 'lt' | 'gtet') => {
+      const d = (await registry.driver()) as Gen3Driver;
+      for (const r of [await d.blockParams(eid), await d.blockParams(eid, { generic: true })]) {
+        const fw = r.layout?.pages[0]?.fw;
+        const got = fw?.lt ? 'lt' : fw?.gtet ? 'gtet' : String(r.layout?.pages.length);
+        if (r.layout?.variantName !== '0,2,4' || got !== want) throw new Error(tag(`${what}: Tremolo page ${got} (variant ${r.layout?.variantName}), expected ${want}`));
+      }
+    };
+    const fwIs = (what: string, running: number | null, layout: number | null) => {
+      const r = registry.firmwareInfo()?.major ?? null;
+      const l = registry.layoutFirmware()?.major ?? null;
+      if (r !== running || l !== layout) throw new Error(tag(`${what}: running ${r} / layout ${l}, expected ${running} / ${layout}`));
+    };
+
+    await registry.detect();
+    fwIs('detect', older.major, older.major);
+    await served('detect read the older firmware', 'lt');
+
+    fwAnswers = false;
+    if ((await registry.refreshFirmware()) !== null) throw new Error(tag('a silent re-read returns null'));
+    fwIs('silent refreshFirmware', null, older.major);
+    await served('after a silent refreshFirmware (the unit keeps its older firmware)', 'lt');
+    await registry.refreshFirmware({ keepOnSilence: true });
+    fwIs('silent refreshFirmware keepOnSilence', null, older.major);
+    await registry.detect();
+    fwIs('silent re-detect of the same unit', null, older.major);
+    await served('after a silent re-detect of the same unit', 'lt');
+
+    // a re-detect that identifies another model forgets it, also once the original model is back
+    identifyAs = 0x15;
+    await registry.detect();
+    fwIs('re-detect as another model (AM4)', null, null);
+    identifyAs = model;
+    await registry.detect();
+    fwIs('back to the original model, firmware still silent', null, null);
+    await served('another model came in between', 'gtet');
+
+    // a successful read is remembered again; a port change / dropped connection (selectConnection closes the
+    // transport, the next request opens a new one) forgets it
+    fwAnswers = true;
+    await registry.detect();
+    fwIs('re-detect, the read answers again', older.major, older.major);
+    await registry.selectConnection(null);
+    fwIs('right after the port change', null, null);
+    fwAnswers = false;
+    await registry.detect(); // opens a new transport
+    fwIs('after a port change, firmware silent', null, null);
+    await served('after a port change with the firmware unread', 'gtet');
+  }
+  console.log('  drivers/layouts: layout firmware — a silent firmware re-read (refreshFirmware, re-detect) keeps the older unit on its own layout; another model and a port change / dropped connection forget it; classic and generic, FM3/FM9/III');
+}
+
+export const LAYOUTS_CASE_COUNT = checks.length + SERVED_VARIANT_CASES + LAYOUT_FIRMWARE_CASES;
 
 export async function runLayoutsTests(): Promise<void> {
   for (const c of checks) {
     if (!c.ok()) throw new Error(`editor-layout check failed: ${c.name}`);
   }
   await servedVariantChecks();
+  await layoutFirmwareChecks();
 }

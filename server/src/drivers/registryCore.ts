@@ -242,6 +242,12 @@ export class DeviceRegistry {
   // Running firmware, populated best-effort during detect() on gen-3 units (fn 0x08). null until a
   // reply lands (silence/timeout/non-gen-3 keeps it null); surfaced via deviceInfo() + firmwareInfo().
   #firmware: { major: number; minor: number; version: string; build: string } | null = null;
+  // The last firmware a read of the CONNECTED unit answered with, with the model it came from: what the editor layouts
+  // are resolved for while `#firmware` is null again (every read clears it first, and a re-read the unit does not
+  // answer leaves it null), so a silent re-read never flips an older unit to the newest firmware's layout mid-session.
+  // Forgotten only when the unit may have changed: a new transport (disconnect / reconnect, a re-plug or reboot), a
+  // port change (selectConnection), or a read for another model.
+  #lastFirmware: { modelId: number; major: number; minor: number } | null = null;
   // Device-cache key (`deviceCacheKey`) of the runtime profile applyRuntimeCache last layered over the bundled
   // one; null while the bundled profile is live. Only meaningful together with `#prof.profileFacts` (a model
   // switch replaces `#prof` with a static profile, which carries none): capabilities.definitions reads both.
@@ -265,8 +271,18 @@ export class DeviceRegistry {
     emit: (e) => this.#emit(e),
     getCadence: () => this.#cadence(),
     getFirmware: () => this.#firmware, // read at call time: drivers are built before detect() reads it
+    getLayoutFirmware: () => this.layoutFirmware(),
     walkScope: () => this.walkScopeGates()
   };
+
+  /** The firmware the editor layouts are resolved for (DriverCtx.getLayoutFirmware): the running firmware when it is
+   *  known, else the last one the connected unit reported (`#lastFirmware`, only while the identified model is the one
+   *  it came from), else null (the newest firmware). No device traffic. */
+  layoutFirmware(): { major: number; minor: number } | null {
+    if (this.#firmware) return { major: this.#firmware.major, minor: this.#firmware.minor };
+    const last = this.#lastFirmware;
+    return last && last.modelId === this.#modelId ? { major: last.major, minor: last.minor } : null;
+  }
 
   /** The walk-scope gates of the identified model on the running firmware (services/walkScope.ts): the verified
    *  (model, firmware) table plus the Node registry's development override. Every flag false while no model is
@@ -298,7 +314,8 @@ export class DeviceRegistry {
    *  detect() never leaves a stale version behind. Used by the full-capture gate right before it decides.
    *  `keepOnSilence`: when the read gets no version, the previously read value is kept (and null still returned) —
    *  the walk-scope gate of a read-only build uses it: an unreadable version only narrows that build to the standard
-   *  scope, it must not unset the firmware the rest of the session relies on. */
+   *  scope, it must not unset the firmware the rest of the session relies on. Without it the running firmware stays
+   *  unknown after a silent read, but the editor layouts keep the last version this unit reported (layoutFirmware). */
   async refreshFirmware(opts: { keepOnSilence?: boolean } = {}): Promise<{ major: number; minor: number; version: string; build: string } | null> {
     const before = this.#firmware;
     await this.#populateFirmware(this.#modelId);
@@ -464,7 +481,10 @@ export class DeviceRegistry {
         // firmware, and applyRuntimeCache() falls back to the bundled profile (no cache key is built from a stale value).
         // (Today a dropped connection goes through selectConnection(), which clears it too; this keeps the
         // invariant for any other path that ends up opening a new transport.)
+        // The layouts' last known firmware goes too: a new transport is a disconnect, after which the unit may be
+        // another one or the same one with new firmware.
         this.#firmware = null;
+        this.#lastFirmware = null;
         // for the same reason the active driver forgets what it learned over the previous transport (gen-3: dump-header
         // strictness, the known slot, the placed blocks behind the runtime `unmapped-block` gap); a first open has none
         this.#active?.resetSession?.();
@@ -544,6 +564,7 @@ export class DeviceRegistry {
     this.#connecting = null;
     this.#detected = false;
     this.#firmware = null; // re-query firmware against whatever the next detect identifies
+    this.#lastFirmware = null; // a port change may reach another unit: the layouts forget its firmware too
     this.#active = null; // the next detect re-identifies — never poll the new port with the old model
     return { ok: true, chosen: await this.#deps.resolveConn(), profileOverride: this.#deps.getProfileOverride() };
   }
@@ -856,9 +877,12 @@ export class DeviceRegistry {
    *  previous value first, so silence/timeout, a non-gen-3 model, a reply whose model byte is not the
    *  connected model, or a major of 0 all leave `#firmware` null (= unknown) instead of a stale version;
    *  never throws (detection must not depend on it). The store-ack scope and the device-cache key
-   *  both read it; while the read is in flight the value is null, which consumers treat as "unknown". */
+   *  both read it; while the read is in flight the value is null, which consumers treat as "unknown".
+   *  A version read here is also remembered for the editor layouts (`#lastFirmware`, see layoutFirmware), which
+   *  keep it through a later read that gets no answer; a read for another model forgets it (another unit). */
   async #populateFirmware(modelId: number): Promise<void> {
     this.#firmware = null;
+    if (this.#lastFirmware && this.#lastFirmware.modelId !== modelId) this.#lastFirmware = null;
     if (modelId < 0 || DEVICE_MODELS[modelId]?.gen !== 3) return;
     try {
       const dev = await this.transport();
@@ -872,7 +896,10 @@ export class DeviceRegistry {
       // only a reply from the CONNECTED model counts (f[4] = model byte); a major of 0 is no real version
       const f = frames.find((x) => isFractalHeaderFrame(x) && x[5] === FN_FIRMWARE_VERSION && x[4] === modelId);
       const v = f ? parseFirmwareVersionReply(f) : null;
-      if (v && v.major > 0) this.#firmware = { major: v.major, minor: v.minor, version: formatFirmwareVersion(v.major, v.minor), build: v.build ?? '' };
+      if (v && v.major > 0) {
+        this.#firmware = { major: v.major, minor: v.minor, version: formatFirmwareVersion(v.major, v.minor), build: v.build ?? '' };
+        this.#lastFirmware = { modelId, major: v.major, minor: v.minor };
+      }
     } catch {
       /* silence / timeout / dead port → firmware stays null */
     }

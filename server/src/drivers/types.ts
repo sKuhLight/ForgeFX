@@ -522,6 +522,12 @@ export interface DriverCtx {
    *  it was not read / is not known. Resolved AT CALL TIME (the driver is built before detection reads it).
    *  Optional: a ctx without it simply reports no firmware. */
   getFirmware?(): { major: number; minor: number } | null;
+  /** The firmware the editor layouts' firmware gates are evaluated against: the running firmware when it is known,
+   *  else the last one read from the SAME connected unit this session (a re-read that got no answer — silence, a read
+   *  in flight — does not flip an older unit to the newest firmware's layout). It is forgotten on disconnect, a port
+   *  change or a model change. Null when no read of this unit ever answered. Optional: a ctx without it evaluates the
+   *  layouts against `getFirmware`. */
+  getLayoutFirmware?(): { major: number; minor: number } | null;
   /** The walk-scope gates of the running firmware (services/walkScope.ts; the registry's `walkScopeGates`), read at
    *  call time. Optional: a ctx without it has every gate closed. */
   walkScope?(): WalkScopeGates;

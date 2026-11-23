@@ -529,6 +529,32 @@ function decodeSelector(range: Pick<RangeDef, 'kind' | 'displayMin' | 'displayMa
   return { lo, hi, value, inRange: value >= lo && value <= hi };
 }
 
+/** The ordinal an editor layout keys a selector param on (a variant's / page's `value` list), read from the raw wire
+ *  value `raw` in the block body, for a selector that is NOT served as an enum (an enum entry keys by the value it
+ *  decodes). The editor's selector values are ordinals, and the device stores such a selector as one even on a float
+ *  row: REVERB_BASETYPE (a `count` float row 0..8) reads raw 6 for base type 6, which its continuous display reading
+ *  shows as 0.0007. So the rule is decodeSelector's ordinal rule for any row with a usable span: the raw value when it
+ *  lies within the top ordinal, else a 16-bit scaled reading unscaled onto the span — except a reading above the top
+ *  ordinal that would unscale onto the BOTTOM one, which is an ordinal the row does not reach: a scaled reading of the
+ *  bottom ordinal is exactly 0, so 1..(half an ordinal step) is no plausible scaled reading, while the row's span can
+ *  trail the firmware (REVERB_BASETYPE's row ends at 8, the current firmware's Reverb layouts name base types up to
+ *  10: raw 9 / 10 are those base types, not a scaled base type 0). An enum row is decoded exactly as decodeSelector
+ *  does, an out-of-range reading keying nothing; a row without a usable span (LOOPER_DUB's 0..0 — whether the device
+ *  stores that selector as an ordinal or scaled is not verified on hardware), or no row at all, keys by the raw value. A reading that is no wire value (above 65534, not an integer) keys nothing. */
+function selectorOrdinal(range: Pick<RangeDef, 'kind' | 'displayMin' | 'displayMax' | 'scale' | 'enumCount'> | undefined, raw: number): number | undefined {
+  if (!Number.isInteger(raw) || raw < 0 || raw > 65534) return undefined;
+  if (!range) return raw;
+  if (range.kind === 'enum') {
+    const dec = decodeSelector(range, raw);
+    return dec.inRange ? dec.value : undefined;
+  }
+  const lo = Math.round(range.displayMin);
+  const hi = Math.round(range.displayMax);
+  if (!(hi > lo) || raw <= hi) return raw;
+  const scaled = Math.round((raw / 65534) * (hi - lo)) + lo;
+  return scaled === lo ? raw : scaled;
+}
+
 /** One continuous param's reading for display (`#displayRow`). `unitSource` / `taperSource` are set for the generic
  *  response only. */
 interface DisplayReading {
@@ -1723,17 +1749,24 @@ class Gen3Driver implements DeviceDriver {
       for (const p of knobs) named.push({ id: p.paramId, name: paramLabel(p), value: 0, norm: 0, unresolved: 'read-failed' });
     }
     // Current value of any page/control selector param, keyed by its editor symbol: the family type
-    // selector answers with the type just decoded; other selectors (EQ type, drive type, …) with the
-    // block's read enum/knob value. Lets layoutFor filter the served pages down to the ones the editor
-    // would actually show — collapsing e.g. the amp's per-model 'Authentic' pages to the current model.
-    const valueByPid = new Map<number, number>();
-    for (const e of enums) valueByPid.set(e.id, e.value);
-    for (const n of named) if (typeof n.value === 'number') valueByPid.set(n.id, n.value);
+    // selector answers with the type just decoded; a selector listed as an enum with the ordinal it decoded;
+    // every other selector (listed as a dial or not listed at all: REVERB_BASETYPE, a `count` float row this
+    // response never lists) with the ordinal read from its raw body value (selectorOrdinal) — never a dial's
+    // display value, which no editor `value` list names. Lets layoutFor filter the served pages down to the
+    // ones the editor would actually show — collapsing e.g. the amp's per-model 'Authentic' pages to the
+    // current model.
+    const enumValueByPid = new Map<number, number>();
+    for (const e of enums) enumValueByPid.set(e.id, e.value);
+    const selectorAt = (pid: number): number | undefined => {
+      if (enumValueByPid.has(pid)) return enumValueByPid.get(pid);
+      const slot = readSlot(read, hasChannels, pid);
+      return typeof slot === 'number' ? selectorOrdinal(this.#prof.ranges[family]?.[pid], slot) : undefined;
+    };
     const selectors: SelectorValues = (selectorParamName) => {
       const pid = this.#paramId(family, selectorParamName); // a catalog pid
       if (pid == null) return undefined;
       if (pid === catalogTypeId) return type?.value;
-      return valueByPid.get(pid);
+      return selectorAt(pid);
     };
     // Re-resolve the layout to the variant selected by the block's CURRENT type value (EQ band count,
     // amp firmware-pinned variant, etc.) and filter its pages to the current selector/firmware state. A family
@@ -1742,7 +1775,7 @@ class Gen3Driver implements DeviceDriver {
     // selector's value; falls back to the null/first variant when the value is unknown. Firmware gates are
     // evaluated against the connected firmware (the newest when it is not known).
     const variantPid = variantSelectorPid(this.#prof, family);
-    const variantValue = typeId != null ? type?.value : variantPid != null ? valueByPid.get(variantPid) : undefined;
+    const variantValue = typeId != null ? type?.value : variantPid != null ? selectorAt(variantPid) : undefined;
     const layout = this.#prof.layoutFor(family, variantValue, selectors, this.#layoutFirmware());
     // disambiguate repeated labels within a block (e.g. the cab's 4× "Low Cut", amp's two "Depth")
     // so identical names get a 1/2/3 suffix the UI can tell apart.
@@ -1756,7 +1789,7 @@ class Gen3Driver implements DeviceDriver {
     const { family, slug, hasChannels, read } = c;
     const named: NamedParamV2[] = [];
     const enums: EnumParamV2[] = [];
-    const valueByPid = new Map<number, number>();
+    const enumValueByPid = new Map<number, number>();
     const catalogRows = (this.#prof.staticBase ?? this.#prof).ranges[family] ?? {};
     for (const e of index.entries) {
       const slot = readSlot(read, hasChannels, e.pid);
@@ -1777,7 +1810,6 @@ class Gen3Driver implements DeviceDriver {
           ...meta,
           ...(why ? { unresolved: why } : {}),
         });
-        if (!why) valueByPid.set(e.pid, d.value);
       } else {
         const dec = decodeSelector(e.row, typeof slot === 'number' ? slot : 0);
         const why = typeof slot === 'string' ? slot : dec.inRange ? undefined : 'out-of-range';
@@ -1789,7 +1821,7 @@ class Gen3Driver implements DeviceDriver {
           ...(opts.truncated ? { optionsTruncated: true as const } : {}),
           ...(why ? { unresolved: why } : {}),
         });
-        if (!why) valueByPid.set(e.pid, dec.value);
+        if (!why) enumValueByPid.set(e.pid, dec.value);
       }
     }
     // the type selector is hidden from the lists (the header retype palette shows it): read it on its own
@@ -1808,13 +1840,22 @@ class Gen3Driver implements DeviceDriver {
     // that moved with its row follows it (listed or hidden, the type selector too), a name the device no longer
     // has resolves to nothing.
     const served = (catalogPid: number | undefined): number | undefined => (catalogPid === undefined ? undefined : index.namedAt.get(catalogPid));
+    // A selector served as an enum keys by the ordinal it decoded (none when its reading is unresolved); any other
+    // one — a listed dial or a hidden row — by the ordinal read from its raw body value (selectorOrdinal), never by a
+    // dial's display value: the device reads REVERB_BASETYPE raw 6 (base type 6), which the dial shows as 0.0007.
+    const selectorAt = (pid: number): number | undefined => {
+      const entry = index.byPid.get(pid);
+      if (entry?.list === 'enums') return enumValueByPid.get(pid);
+      const slot = readSlot(read, hasChannels, pid);
+      return typeof slot === 'number' ? selectorOrdinal(entry?.row ?? this.#prof.ranges[family]?.[pid], slot) : undefined;
+    };
     const selectors: SelectorValues = (selectorParamName) => {
       const pid = served(this.#paramId(family, selectorParamName));
       if (pid == null) return undefined;
       if (typeId != null && pid === typeId) return type?.value;
-      return valueByPid.get(pid);
+      return selectorAt(pid);
     };
-    const variantValue = typeId != null ? type?.value : index.variantPid != null ? valueByPid.get(index.variantPid) : undefined;
+    const variantValue = typeId != null ? type?.value : index.variantPid != null ? selectorAt(index.variantPid) : undefined;
     let layout = this.#prof.layoutFor(family, variantValue, selectors, this.#layoutFirmware());
     if (layout) layout = this.#servedLayout(layout, family, index);
     dedupeLabels(named);
@@ -1835,10 +1876,12 @@ class Gen3Driver implements DeviceDriver {
     };
   }
 
-  /** The firmware the editor layouts' firmware gates are evaluated against: the one the registry read from the device
-   *  at detect time; null (the newest firmware) when it was not read. */
+  /** The firmware the editor layouts' firmware gates are evaluated against: the registry's layout firmware (the running
+   *  firmware, else the last one this connected unit reported: a later re-read that got no answer does not flip the
+   *  layouts to the newest firmware mid-session), else the running firmware for a ctx without it; null (the newest
+   *  firmware) when none was read. */
   #layoutFirmware(): LayoutFirmware {
-    return this.#ctx.getFirmware?.() ?? null;
+    return this.#ctx.getLayoutFirmware ? this.#ctx.getLayoutFirmware() : this.#ctx.getFirmware?.() ?? null;
   }
 
   /** The generic response's layout: the editor layout with its controls bound to the params the connected device

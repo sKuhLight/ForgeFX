@@ -92,18 +92,25 @@ Variants, pages and single controls can carry **firmware gates**: `gtet` (from t
 same way:
 
 1. **Firmware.** Gates are evaluated against the connected unit's firmware, as the server read it when it
-   detected the unit. When that is not known, against the newest firmware: every `gtet` gate holds and no `lt`
-   gate does, so pages and variants only older firmware shows are not served (a page gated by `lt` alone
-   included).
+   detected the unit — the last version this unit reported in the session: a later firmware read the unit does
+   not answer leaves the running firmware unknown but keeps the layouts on that version (a disconnect, a port
+   change or another model forgets it). When no read ever answered, against the newest firmware: every `gtet`
+   gate holds and no `lt` gate does, so pages and variants only older firmware shows are not served (a page
+   gated by `lt` alone included).
 2. **Eligible variants.** A variant takes part when its own gate holds and the gate of at least one of its
-   pages does. A variant whose pages are all legacy pages is not eligible even without a gate of its own:
-   Tremolo types whose only page is a legacy page fall through to the default variant. When no variant is
-   eligible on a known firmware, the newest firmware decides (for the variant and its pages).
+   pages does. A variant whose pages are all legacy pages is not eligible even without a gate of its own (the
+   shipped layouts have none since the codec gives an editor catch-all page to every type no sibling page
+   names). When no variant is eligible on a known firmware, the newest firmware decides (for the variant and
+   its pages).
 3. **The key.** A variant that names a `selectorParamName` was generated from a page-level selector (the
-   Delay's routing type `DELAY_TYPE`, which is not its model selector `DELAY_MODEL`): such variants are chosen
-   by that selector's current value. Otherwise the key is the block's type value (or, for a family without a
-   type selector, its variant selector, e.g. the cab's mode), as before. The variants whose value list holds the
-   key win; else the unconditional ones (value `null`); else every eligible one.
+   Delay's routing type `DELAY_TYPE`, which is not its model selector `DELAY_MODEL`; the Reverb's
+   `REVERB_BASETYPE`, which is not its type `REVERB_TYPE`): such variants are chosen by that selector's current
+   ordinal — decoded for a selector served as an enum, read from the block body for any other one (the device
+   stores `REVERB_BASETYPE`, a `count` dial, as its index: raw 6 is base type 6, and raw 9 / 10 are base types
+   9 / 10 even though the catalog row stops at 8 — only a reading too large to be an index is unscaled), never a
+   dial's display value; an unknown value picks the default variant. Otherwise the key is the block's type value (or, for a
+   family without a type selector, its variant selector, e.g. the cab's mode), as before. The variants whose
+   value list holds the key win; else the unconditional ones (value `null`); else every eligible one.
 4. **Firmware siblings.** Among the winners, variants that differ only by firmware gate collapse to the one for
    the firmware: on the newest firmware the highest `gtet` (else the ungated ones), on a known firmware the most
    specific gate that holds (the highest `gtet`, then the lowest `lt`). So a family's legacy and current variant

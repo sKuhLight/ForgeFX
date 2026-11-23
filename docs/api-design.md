@@ -185,8 +185,17 @@ Notes for clients (Axis):
   block's own write guards apply, and a write to GLOBAL (effect id 1) or FC (199) changes persistent settings, as
   `definitions.persistentWrites` says of those blocks. `null` means display only. The classic response serves the layout
   unchanged (no `effectId`).
-- **Which layout is served** (both responses): editor firmware gates are evaluated against the connected firmware, and a
-  variant folded from a page-level selector is keyed by that selector; see [LAYOUTS.md](LAYOUTS.md#how-a-layout-is-resolved).
+  **`effectId` is resolved from the device model, not from the current preset:** it may name a block that is not placed
+  in the preset (a Delay page's control on Reverb 2 while the preset holds only Reverb 1; a block the preset does not use
+  at all). Check the grid (`GET /preset/grid`) before writing: when no cell holds that effect id, show the control
+  disabled or display-only rather than writing to a block that is not there. Device-level blocks that are never placed
+  on the grid (GLOBAL 1, FC 199, …) are exempt from that check.
+- **Which layout is served** (both responses): editor firmware gates are evaluated against the connected firmware — the
+  firmware the connected unit last reported this session, so a later firmware read the unit does not answer keeps an
+  older unit on its own layout (it is forgotten on a disconnect, a port change or a model change; the newest firmware
+  when none was ever read) — and a variant folded from a page-level selector is keyed by that selector's current
+  ordinal, read from the block body for a selector that is not an enum (REVERB_BASETYPE); see
+  [LAYOUTS.md](LAYOUTS.md#how-a-layout-is-resolved).
 - Generic ids appear in `param` events like any other; a non-positional block emits none.
 
 ### Write guards (`PUT /preset/blocks/:eid/params/:paramId`)

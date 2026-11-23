@@ -155,6 +155,87 @@
         ]
       },
       {
+        "fw": {"gtet":"8,00"},
+        "name": "Modulation",
+        "pageNum": 2,
+        "rows": [
+          {
+            "controls": [
+              {"label":"LFO1","paramId":null,"paramName":null,"placement":{"positionExact":"305,25"},"rawWidget":"sectionLabel","widget":"label"},
+              {"label":"Type","paramId":24,"paramName":"DELAY_LFO1TYPE","placement":{"positionExact":"305,50"},"rawWidget":"dropdown1LFO","widget":"dropdown"},
+              {"label":"Target","paramId":48,"paramName":"DELAY_LFO1TARGET","placement":{"positionExact":"390,50"},"rawWidget":"dropdown1","widget":"dropdown"},
+              {"label":"Rate","paramId":18,"paramName":"DELAY_RATE1","placement":{"positionExact":"305,192"},"rawWidget":"knobMiniReadout","widget":"knob"},
+              {
+                "label": "Tempo",
+                "paramId": 50,
+                "paramName": "DELAY_LFO1TEMPO",
+                "placement": {"positionExact":"390,192"},
+                "rawWidget": "dropdownMiniReadout",
+                "widget": "dropdown"
+              },
+              {"label":"Depth","paramId":20,"paramName":"DELAY_DEPTH1","placement":{"positionExact":"305,294"},"rawWidget":"knobMiniReadout","widget":"knob"},
+              {"label":"Phase","paramId":36,"paramName":"DELAY_LFO1PHASE","placement":{"positionExact":"390,294"},"rawWidget":"knobMiniReadout","widget":"knob"},
+              {"label":"LFO2","paramId":null,"paramName":null,"placement":{"positionExact":"545,25"},"rawWidget":"sectionLabel","widget":"label"},
+              {"label":"Type","paramId":25,"paramName":"DELAY_LFO2TYPE","placement":{"positionExact":"545,50"},"rawWidget":"dropdown1LFO","widget":"dropdown"},
+              {"label":"Target","paramId":49,"paramName":"DELAY_LFO2TARGET","placement":{"positionExact":"630,50"},"rawWidget":"dropdown1","widget":"dropdown"},
+              {"label":"Rate","paramId":19,"paramName":"DELAY_RATE2","placement":{"positionExact":"545,192"},"rawWidget":"knobMiniReadout","widget":"knob"},
+              {
+                "label": "Tempo",
+                "paramId": 51,
+                "paramName": "DELAY_LFO2TEMPO",
+                "placement": {"positionExact":"630,192"},
+                "rawWidget": "dropdownMiniReadout",
+                "widget": "dropdown"
+              },
+              {"label":"Depth","paramId":21,"paramName":"DELAY_DEPTH2","placement":{"positionExact":"545,294"},"rawWidget":"knobMiniReadout","widget":"knob"},
+              {"label":"Phase","paramId":37,"paramName":"DELAY_LFO2PHASE","placement":{"positionExact":"630,294"},"rawWidget":"knobMiniReadout","widget":"knob"},
+              {"label":"LFO3","paramId":null,"paramName":null,"placement":{"positionExact":"785,25"},"rawWidget":"sectionLabel","widget":"label"},
+              {"label":"Type","paramId":77,"paramName":"DELAY_LFO4TYPE","placement":{"positionExact":"785,50"},"rawWidget":"dropdown1LFO","widget":"dropdown"},
+              {"label":"Target","paramId":82,"paramName":"DELAY_LFO4TARGET","placement":{"positionExact":"870,50"},"rawWidget":"dropdown1","widget":"dropdown"},
+              {"label":"Rate","paramId":78,"paramName":"DELAY_RATE4","placement":{"positionExact":"785,192"},"rawWidget":"knobMiniReadout","widget":"knob"},
+              {
+                "label": "Tempo",
+                "paramId": 79,
+                "paramName": "DELAY_LFO4TEMPO",
+                "placement": {"positionExact":"870,192"},
+                "rawWidget": "dropdownMiniReadout",
+                "widget": "dropdown"
+              },
+              {"label":"Depth","paramId":80,"paramName":"DELAY_DEPTH4","placement":{"positionExact":"785,294"},"rawWidget":"knobMiniReadout","widget":"knob"},
+              {"label":"Phase","paramId":81,"paramName":"DELAY_LFO4PHASE","placement":{"positionExact":"870,294"},"rawWidget":"knobMiniReadout","widget":"knob"}
+            ],
+            "section": "parameters"
+          },
+          {
+            "controls": [
+              {"label":"Input Gain","paramId":23,"paramName":"DELAY_GAIN","placement":{"col":0},"rawWidget":"knobCompact","widget":"knob"},
+              {"label":"Mix","paramId":0,"paramName":"DELAY_MIX","placement":{"col":1},"rawWidget":"knobCompact","widget":"knob"},
+              {"label":"Level","paramId":1,"paramName":"DELAY_LEVEL","placement":{"col":2},"rawWidget":"knobCompact","widget":"knob"}
+            ],
+            "section": "mixer"
+          },
+          {
+            "controls": [
+              {"label":"Balance","paramId":2,"paramName":"DELAY_PAN","placement":{"col":0},"rawWidget":"knobCompact","widget":"knob"},
+              {"label":"Spread","paramId":14,"paramName":"DELAY_SPREAD","placement":{"col":1},"rawWidget":"knobCompact","widget":"knob"}
+            ],
+            "section": "mixer"
+          },
+          {
+            "controls": [{"label":"Bypass\nMode","paramId":3,"paramName":"DELAY_BYPASSMODE","placement":{"col":2},"rawWidget":"dropdown1TightXtra","widget":"dropdown"}],
+            "section": "mixer"
+          },
+          {
+            "controls": [
+              {"fw":{"gtet":"8,00"},"label":"Kill Dry","paramId":86,"paramName":"DELAY_KILLDRY","rawWidget":"btnKillDry","widget":"button"},
+              {"fw":{"gtet":"5,03"},"label":"Scene\nIgnore","paramId":83,"paramName":"DELAY_SCENEIGNORE","rawWidget":"btnIgnoreScene","widget":"button"},
+              {"label":"Bypass","paramId":5,"paramName":"DELAY_BYPASS","rawWidget":"btnBypass","widget":"button"}
+            ],
+            "section": "mixer"
+          }
+        ]
+      },
+      {
         "fw": {"gtet":"4,00"},
         "name": "EQ",
         "pageNum": 3,
