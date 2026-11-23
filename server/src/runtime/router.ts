@@ -23,6 +23,7 @@ import * as cloudProfiles from '../services/cloudProfiles.js';
 import * as diagnostics from '../services/diagnosticCapture.js';
 import * as contribution from '../services/cacheContribution.js';
 import * as definitionsFile from '../services/definitionsFile.js';
+import * as blockProbe from '../services/blockProbe.js';
 import { blockHelpBySlug, helpIndex } from '../help.js';
 import { createUnifiedHandlers, genericFlag } from './handlers.js';
 import { sendErrorStatus } from '../drivers/sendPolicy.js';
@@ -181,6 +182,12 @@ export function createRouter(deps: RuntimeDeps): {
     c.reply.code(r.code);
     return r.body;
   }, { limit: { bytes: definitionsFile.AXISDEFS_MAX_BYTES, tooLarge: definitionsFile.tooLargeBody } });
+  // block probe (services/blockProbe.ts): the same service and answers as the server route
+  on('POST', '/device/definitions/blocks/:eid/probe', async (c) => {
+    const r = await blockProbe.probeBlock(store, registry, c.params.eid);
+    c.reply.code(r.code);
+    return r.body;
+  });
   // ── editor-cache import (SECOND cache source; capability cacheImport). Disk discovery is Node-only,
   //    so the browser twin returns an empty candidate list (discovery:'unavailable') + octet-only import.
   //    No loopback-origin guard here (app.ts has one, FORGEFX-47): the router is an in-page function call

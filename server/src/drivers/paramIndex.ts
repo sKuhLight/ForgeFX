@@ -49,7 +49,10 @@ export type WidgetSource = 'device' | 'catalog' | 'layout';
 /** How a value is written: `norm` = continuous 0..1 over the display range, `ordinal` = the enum ordinal
  *  (a discrete write), `null` = no verified write path (advisory: the server does not refuse it). */
 export type WriteMode = 'norm' | 'ordinal' | null;
-export type ReadOnlyReason = 'unverified-write-path' | 'generic-typecode-f0';
+/** Why a param is served without a write path. `unconfirmed-block` / `live-only-block` are block-level (the block-map
+ *  binding of a block the catalog cannot place, drivers/blockMapState.ts); the response builder sets them, never the
+ *  index. */
+export type ReadOnlyReason = 'unverified-write-path' | 'generic-typecode-f0' | 'unconfirmed-block' | 'live-only-block';
 export type HiddenReason = 'bypass' | 'type' | 'by-design' | 'removed';
 export interface HiddenParam { readonly id: number; readonly reason: HiddenReason }
 /** What backs the family's rows: a byte-exact profile, a live-walk profile, or the catalog alone

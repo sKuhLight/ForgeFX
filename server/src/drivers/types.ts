@@ -8,8 +8,10 @@ import type {
   HiddenParam, NameConfidence, NameSource, ParamKind, ParamSource, ParamWidget, ReadOnlyReason, WidgetSource, WriteMode
 } from './paramIndex.js';
 import type { Transport } from '../transport/types.js';
-import type { CoverageGapKind, ProfileCoverage, RawSourceKind, SectionRole, SourceSummary } from 'forgefx-midi/cache';
+import type { BlockMapEntry, CoverageGapKind, ProfileCoverage, RawSourceKind, SectionRole, SourceSummary } from 'forgefx-midi/cache';
 import type { TelemetryMode, CadenceProfile } from './telemetryProfiles.js';
+import type { WalkScopeGates } from '../services/walkScope.js';
+import type { BlockMapState } from './blockMapState.js';
 
 /** Thrown by a driver's verbatim-dump export when the slot is an unused (empty) preset slot: its dump is
  *  all zeros, not a restorable preset, so there is nothing to export or back up. Routes map it to 422
@@ -131,6 +133,28 @@ export interface BlockDefinitionsMeta {
   persistentWrites: boolean;
   /** Informative rows that are not listed, with the reason. */
   hidden: HiddenParam[];
+  /** A block the catalog cannot place on its own (no catalog family, or a family the model's effect-id table only
+   *  names from the roster): how it is bound to definitions on this device. Absent for every catalog block. */
+  blockMap?: BlockMapMeta;
+}
+
+/** `definitions.blockMap` of the generic block params (see `blockMapState` for the state of a block-map confidence). */
+export interface BlockMapMeta {
+  /** `confirmed`: device records bind the block (generic or named params; writable only when byte-bridged);
+   *  `likely`: a known but unconfirmed binding — an editor-cache section matched by the block's bulk read, or a
+   *  family the effect-id table names from the roster only — served read-only; `candidates`: several sections fit,
+   *  nothing is served; `none`: no information. */
+  state: BlockMapState;
+  /** The family the block is served under: a catalog family, `section:<tag>` or `block:<eid>`; null without one. */
+  key: string | null;
+  sectionTag: number | null;
+  evidence: BlockMapEntry['evidence'];
+  /** Section tags that fit equally (`candidates`). */
+  candidates?: number[];
+  /** Whether `POST /device/definitions/blocks/:eid/probe` would read this block now, and why not:
+   *  `not-verified` = the block probe is not verified on the running firmware, `not-placed` = the block is not in the
+   *  edit-buffer grid as last read. Absent reason with `available: false`: the block has a catalog (roster) family. */
+  probe: { available: boolean; reason?: 'not-verified' | 'not-placed' | 'remote' | 'no-byte-source' };
 }
 
 /** `capabilities.definitions` of `GET /device` and `/device/detect`: what the generic block-params
@@ -248,7 +272,8 @@ export interface UnknownBlockDiff {
   eid: number;
   /** In the edit-buffer grid as last read (false when no grid was read this session). */
   placed: boolean;
-  state: 'confirmed' | 'likely' | 'candidates' | 'none';
+  /** The block-map entry's state (`blockMapState`, the mapping the generic block params use too). */
+  state: BlockMapState;
   key: string | null;
   sectionTag: number | null;
   /** Params a block read serves for it (the param index of `key`), 0 unless confirmed. */
@@ -474,6 +499,9 @@ export interface DriverCtx {
    *  it was not read / is not known. Resolved AT CALL TIME (the driver is built before detection reads it).
    *  Optional: a ctx without it simply reports no firmware. */
   getFirmware?(): { major: number; minor: number } | null;
+  /** The walk-scope gates of the running firmware (services/walkScope.ts; the registry's `walkScopeGates`), read at
+   *  call time. Optional: a ctx without it has every gate closed. */
+  walkScope?(): WalkScopeGates;
 }
 
 /** Why a store was not a plain acknowledged success (gen-3, additive on the store result): 'rejected' = a
@@ -515,6 +543,10 @@ export interface DeviceDriver {
   /** Gen-3 grid drivers: effect ids of the blocks in the edit-buffer grid as last read, sorted and unique (no device
    *  traffic); null before the first grid read of the session. */
   placedEffectIds?(): number[] | null;
+  /** Gen-3 grid drivers: the editor-cache sections of the applied profile a placed block's bulk read fits (the runtime
+   *  bulk-shape match), with their strides — what the block probe sizes its walk by. Null when the profile has no section
+   *  a block may bind to (nothing is read); empty when the read failed or nothing fits. One status + bulk read. */
+  probeShape?(eid: number): Promise<Array<{ tag: number; stride: number }> | null>;
   /** A (re)detect activated this driver: forget what it learned about the previous connection (gen-3: the
    *  dump-header strictness proven on it and the known current slot). Drivers keep no such state otherwise. */
   resetSession?(): void;

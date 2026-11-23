@@ -10,6 +10,7 @@ import * as store from '../store.js';
 import { createRegistry, type DeviceRegistry, type RegistryDeps } from './registryCore.js';
 import type { DeviceDriver } from './types.js';
 import { loadUsableProfile } from '../profileSchema.js';
+import { walkScopeOverrideFromEnv } from '../services/walkScope.js';
 
 export type { DeviceRegistry, RegistryDeps, ConnInfo } from './registryCore.js';
 
@@ -27,7 +28,10 @@ const nodeDeps: RegistryDeps = {
   // On-connect device-cache lookup: the registry swaps in the device-true runtime profile when a
   // build exists for the attached model+firmware. Reads the same fs store the /device/cache routes write;
   // a profile with an outdated/unknown schema is not applied (the bundled profile stays), see profileSchema.ts.
-  loadDeviceCache: (key) => loadUsableProfile(store, key)
+  loadDeviceCache: (key) => loadUsableProfile(store, key),
+  // The walk-scope development override (FORGEFX_WALK_SCOPE_OVERRIDE, services/walkScope.ts): read from the Node
+  // environment at call time, here only — a Browser Direct registry has no such hook. Ignored in production.
+  walkScopeOverride: () => walkScopeOverrideFromEnv(process.env)
 };
 
 export const registry = createRegistry(nodeDeps);

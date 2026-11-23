@@ -39,6 +39,7 @@ import * as cloudProfiles from './services/cloudProfiles.js';
 import * as diagnostics from './services/diagnosticCapture.js';
 import * as contribution from './services/cacheContribution.js';
 import * as definitionsFile from './services/definitionsFile.js';
+import * as blockProbe from './services/blockProbe.js';
 import * as store from './store.js';
 import { createUnifiedHandlers, genericFlag } from './runtime/handlers.js';
 import { putStoreDoc } from './runtime/services.js';
@@ -254,6 +255,15 @@ export async function buildApp(registry: DeviceRegistry, opts: AppOptions = {}):
       return r.body;
     }
   );
+
+  // Block probe (services/blockProbe.ts): one read-only definition walk of a placed block the catalog does not know, so
+  // the block map can bind it (gated per firmware: 501 reason 'firmware' until verified; 400/404/409/503/504 per the
+  // service; every refusal before any device traffic). Not on the Remote allowlist (it walks the device and persists).
+  app.post<{ Params: { eid: string } }>('/device/definitions/blocks/:eid/probe', async (req, reply) => {
+    const r = await blockProbe.probeBlock(store.defaultStore, registry, req.params.eid);
+    reply.code(r.code);
+    return r.body;
+  });
 
   // ── editor-cache import (SECOND cache source: an official-editor effectDefinitions_*.cache file;
   //    capability cacheImport). See services/editorCacheImport.ts + editorCacheDiscovery.ts. ──

@@ -24,7 +24,10 @@ import {
   type ModernFractalCodec
 } from 'forgefx-midi/gen3/axe-fx-iii';
 import { wireToDisplay } from 'forgefx-midi/shared';
-import { enumOrdinalBounds, isInformativeRow, isPlaceholderRow } from 'forgefx-midi/cache';
+import {
+  LIVE_WALK_LIMITS, blockBindableSection, enumOrdinalBounds, isInformativeRow, isPlaceholderRow, isSyntheticFamilyKey, matchBulkShape,
+  type BlockMapEntry, type DerivedSection, type RangeDef as CodecRangeDef
+} from 'forgefx-midi/cache';
 import {
   parsePresetDump, decodeRawPatch, decodeGen3Body,
   readBlockParamsForModel, modelsFromBlocks,
@@ -34,17 +37,18 @@ import {
 } from 'forgefx-midi/devices/gen3';
 import { isTransportTimeout, type Transport } from '../transport/types.js';
 import {
-  SLUG_FAMILY, isEnumOnAnyDevice, paramLabel, typeSelectorPid, variantSelectorPid,
+  SLUG_FAMILY, isEnumOnAnyDevice, paramLabel, typeSelectorPid, unlessHidden, variantSelectorPid,
   type DeviceProfile, type ParamDef, type TypeModel, type DeviceLayout, type DeviceLayoutControl, type RangeDef, type SelectorValues
 } from '../devices.js';
 import { buildParamIndex, MAX_WIRE_PID, type BlockIndex, type ParamEntry } from './paramIndex.js';
-import { deviceCacheKey, staticFamilyForEffectId } from '../profileCatalog.js';
+import { catalogFamilyOfBlock, deviceCacheKey, profileCatalogFor, staticFamilyForEffectId } from '../profileCatalog.js';
+import { blockMapAccess, blockWriteRefusedMessage, type BlockMapAccess } from './blockMapState.js';
 import { EmptyPresetError } from './types.js';
 import type {
   DeviceDriver, DriverCapabilities, DriverCtx, DiagnosticDump, SelectPresetOpts,
   PresetGridDTO, GridCellDTO, PresetBlockDTO, PresetSummary, NamedParam, EnumParam, MeterVal,
   FcSwitchState, FcReadState, StoreReason,
-  BlockParamsDTO, BlockParamsV2DTO, BlockParamsOpts, NamedParamV2, EnumParamV2, ParamMeta, UnresolvedReason
+  BlockParamsDTO, BlockParamsV2DTO, BlockParamsOpts, NamedParamV2, EnumParamV2, ParamMeta, UnresolvedReason, BlockMapMeta
 } from './types.js';
 import { validatedPresetDump } from './sendPolicy.js';
 
@@ -55,6 +59,18 @@ const BLOCK_META: Record<string, { name: string; page: number }> = (() => {
   for (const e of effectRoster()) out[e.slug] = { name: e.name, page: e.page };
   return out;
 })();
+
+/** The catalog family of an audio block by the codec's block roster (`slugForEffectId` → `SLUG_FAMILY`): a block with
+ *  channels A-D. Never the family the development hook hides (devices.ts `hiddenFamily`): such a block is served as a
+ *  block the catalog does not know. */
+const audioFamilyOf = (eid: number): string | undefined => unlessHidden(SLUG_FAMILY[(slugForEffectId(eid) ?? '').toLowerCase()]);
+
+/** Whether a bulk read of `itemCount` items is a block with channels A-D over a section of `stride` slots: one slice
+ *  (`false`) or four (`true`); null when it is neither or the stride is unknown (contract E4). */
+function shapeChannels(itemCount: number, stride: number | undefined): boolean | null {
+  if (!stride || !(stride > 0) || !(itemCount > 0)) return null;
+  return itemCount === stride ? false : itemCount === 4 * stride ? true : null;
+}
 
 const EDIT_BUFFER = 0x3fff; // preset number sentinel = current edit buffer
 /** Gen-3 grid shunt (routing cell) effect-id base: shunt k is `1023 + k`, real blocks sit well below it. */
@@ -712,8 +728,14 @@ class Gen3Driver implements DeviceDriver {
   applyRuntimeProfile(profile: DeviceProfile): void {
     this.#prof = profile;
     this.#nonPositional.clear(); // the new rows may lay a family out differently
+    this.#runtimeLikely.clear(); // a runtime bulk-shape match was made against the old profile's sections
     this.#noteUnmappedChange(); // the new profile may describe a placed block the old one did not (or the reverse)
   }
+
+  /** Effect ids whose last generic block read matched exactly one editor-cache section by its bulk shape (the runtime
+   *  `likely`, never persisted): param writes to them are refused (contract §3.4) without a fresh read. Forgotten on a
+   *  profile swap and a new session. */
+  #runtimeLikely = new Map<number, number>();
 
   #gridCache: { grid: PresetGridDTO; at: number; gen: number } | null = null;
   #gridInflight: Promise<PresetGridDTO> | null = null;
@@ -929,6 +951,7 @@ class Gen3Driver implements DeviceDriver {
     this.#sessionState = null;
     this.#lastPlaced = null;
     this.#unmappedSig = '';
+    this.#runtimeLikely.clear();
   }
   /** How a dump read of `target` judges headers on this connection. Starts from DUMP_HEADER_POLICY; a
    *  'prefer' kind becomes 'strict' once the device has named the requested number in a header (so a late dump
@@ -1009,7 +1032,7 @@ class Gen3Driver implements DeviceDriver {
     const out = new Set<number>();
     for (const eid of this.#lastPlaced.eids) {
       if (confirmed?.has(eid)) continue;
-      const family = SLUG_FAMILY[(slugForEffectId(eid) ?? '').toLowerCase()] ?? this.#prof.familyForEffectId(eid) ?? staticFamilyForEffectId(model, eid);
+      const family = audioFamilyOf(eid) ?? this.#prof.familyForEffectId(eid) ?? staticFamilyForEffectId(model, eid);
       if (family === undefined) out.add(eid);
     }
     return [...out].sort((a, b) => a - b);
@@ -1341,21 +1364,23 @@ class Gen3Driver implements DeviceDriver {
     this.#watchedEid = eid; // this is the block the user has open → the target the FM3 device-edit poll re-reads
     const generic = opts?.generic === true;
     const codecSlug = slugForEffectId(eid) ?? ''; // audio blocks resolve via the codec
-    // virtual effects (GLOBAL=1, Controllers=2, Modifier=3, FC=199) resolve via the profile's effectId map
-    const family = SLUG_FAMILY[codecSlug.toLowerCase()] ?? this.#prof.familyForEffectId(eid);
-    const hasChannels = !!SLUG_FAMILY[codecSlug.toLowerCase()]; // an audio block; the virtual effects have no channels A-D
-    const slug = codecSlug || (family ? family.toLowerCase() : ''); // virtual effects key on the family name
+    // virtual effects (GLOBAL=1, Controllers=2, Modifier=3, FC=199) resolve via the profile's effectId map, and so do a
+    // block the effect-id table names from the roster only and one the applied document's block map binds
+    const { audio, family, mapEntry } = this.#resolveBlock(eid);
+    // a block the catalog cannot place on its own: a roster-only family, a block-map binding, or no family at all
+    if (generic && !audio && (mapEntry !== undefined || family === undefined)) return this.#paramsMapped(eid, family, mapEntry);
+    const hasChannels = !!audio; // an audio block; the virtual effects have no channels A-D
     const meta = BLOCK_META[codecSlug];
     const page = meta?.page ?? -1;
-    if (!family) {
-      // no device-true param family mapped
-      if (!generic) return { block: meta?.name ?? slug, slug, page, named: [], enums: [], type: null, layout: undefined };
-      // the generic response names an unknown block by its effect id alone, even where the codec has a slug for it
-      return {
-        block: `Block ${eid}`, slug: '', page: -1, named: [], enums: [], type: null, unknownBlock: true,
-        definitions: { family: null, profile: 'none', positional: false, channel: null, persistentWrites: false, hidden: [] }
-      };
+    // no device-true param family mapped — and the classic response serves a block the block map binds the same way
+    // (nothing listed, nothing read); a roster-only family (named in the catalog) is served like any family, its
+    // writes are refused (#guardParamWrite). Known follow-up: the classic response reads a roster-only block as one
+    // slice (`hasChannels` false, no audio slug), so for a channel-bearing one it shows channel A's values; the generic
+    // response decides channels from the bulk shape (#paramsMapped).
+    if (!family || (mapEntry !== undefined && mapEntry.confidence !== 'roster')) {
+      return { block: meta?.name ?? codecSlug, slug: codecSlug, page, named: [], enums: [], type: null, layout: undefined };
     }
+    const slug = codecSlug || family.toLowerCase(); // virtual effects key on the family name
     const blockName = meta?.name ?? family;
     const forced = generic ? forcedGenericPids(family) : undefined;
     const index = buildParamIndex(this.#prof, family, forced ? { forceGeneric: forced } : undefined);
@@ -1419,6 +1444,205 @@ class Gen3Driver implements DeviceDriver {
    *  neither. */
   #isPositional(index: BlockIndex, bulk: { itemCount: number }, stride: number, hasChannels: boolean): boolean {
     return index.positional === true || index.maxPid < Math.max(stride, hasChannels ? 0 : bulk.itemCount);
+  }
+
+  // ── blocks the catalog cannot place on its own (contract M3 §3.3/§3.4) ──
+
+  /** How a block address resolves: its audio family (the codec's block roster), else the profile's family (static
+   *  effect-id table, the block-map overlay of a confirmed binding) or the family of a roster-only entry (every reserved
+   *  instance slot of an Axe-Fx III roster family); `mapEntry` = the block-map entry of a block the catalog cannot place
+   *  on its own (`DeviceProfile.blockMapFor`), never for an audio block. */
+  #resolveBlock(eid: number): { audio: string | undefined; family: string | undefined; mapEntry: BlockMapEntry | undefined } {
+    const audio = audioFamilyOf(eid);
+    if (audio !== undefined) return { audio, family: audio, mapEntry: undefined };
+    const mapEntry = this.#prof.blockMapFor?.(eid);
+    const rosterFamily = mapEntry?.confidence === 'roster' && mapEntry.key !== null ? mapEntry.key : undefined;
+    return { audio, family: this.#prof.familyForEffectId(eid) ?? rosterFamily, mapEntry };
+  }
+
+  /**
+   * The generic response of a block the catalog cannot place on its own:
+   *   - a family the model's effect-id table names from the roster only (Axe-Fx III, FORGEFX-45): its named catalog
+   *     params, read-only (`unconfirmed-block`); not an unknown block;
+   *   - a block the applied document's block map binds `confirmed`: the params of the entry's key (generic for a
+   *     `section:<tag>` / `block:<eid>` key, named for a catalog family), writable when byte-bridged, read-only
+   *     (`live-only-block`) when known from a live read only;
+   *   - any other block without a family: matched by its bulk read against the applied document's editor-cache
+   *     sections a block may bind to (`matchBulkShape`): exactly one fits → `likely`, the section's params read-only
+   *     (`unconfirmed-block`); several → `candidates`, nothing listed; none, or no section to match → `none`, nothing
+   *     listed. Without such a section nothing is read at all.
+   * Every one carries `definitions.blockMap` (state per drivers/blockMapState.ts, the probe's availability); every one
+   * but the roster family is an `unknownBlock` named `Block <eid>`. Channels of a non-audio block come from its bulk
+   * shape (one slice or four), else from its status entry; unknown → every value `channel-unknown`.
+   */
+  async #paramsMapped(eid: number, family: string | undefined, entry: BlockMapEntry | undefined): Promise<BlockParamsV2DTO> {
+    const roster = entry?.confidence === 'roster';
+    const probe = this.#probeAvailability(eid);
+    // a known family (roster-only, or a confirmed block-map binding with rows)
+    if (family !== undefined && entry !== undefined && (roster || entry.confidence === 'confirmed')) {
+      const access = blockMapAccess(entry);
+      const forced = forcedGenericPids(family);
+      const index = buildParamIndex(this.#prof, family, forced ? { forceGeneric: forced } : undefined);
+      // a family that lists nothing (the III's IR Capture: no catalog section) has nothing a read could resolve
+      const shaped = index.entries.length === 0
+        ? { read: this.#unreadNonPositional(eid), hasChannels: false }
+        : await (async () => {
+          const raw = await this.#readRaw(eid);
+          return this.#sliceShaped(eid, raw, family, index, 'error' in raw ? null : shapeChannels(raw.bulk.itemCount, this.#prof.rangeSections[family]?.stride) ?? (raw.channel !== null ? true : null));
+        })();
+      const codecSlug = slugForEffectId(eid) ?? '';
+      const meta = BLOCK_META[codecSlug];
+      const ctx: BlockContext = roster
+        ? { family, slug: codecSlug || family.toLowerCase(), blockName: meta?.name ?? family, page: meta?.page ?? -1, hasChannels: shaped.hasChannels, read: shaped.read }
+        : { family, slug: '', blockName: `Block ${eid}`, page: -1, hasChannels: shaped.hasChannels, read: shaped.read };
+      const blockMap: BlockMapMeta = {
+        state: access.state, key: family, sectionTag: entry.sectionTag, evidence: [...entry.evidence],
+        ...(entry.candidates ? { candidates: [...entry.candidates] } : {}), probe
+      };
+      return this.#withBlockMap(this.#paramsGeneric(ctx, index), { unknown: !roster, access, blockMap });
+    }
+    // no family: the runtime bulk-shape match against the applied document's editor-cache sections
+    const sections = this.#bindableSections();
+    const persisted = entry?.confidence === 'candidate' && entry.candidates && entry.candidates.length > 0 ? entry : undefined;
+    const noInfo = (readError?: string): BlockParamsV2DTO => {
+      // a failed read says nothing new: a refusal earned by an earlier read (`likely`) stands until a read settles it
+      if (readError === undefined) this.#runtimeLikely.delete(eid);
+      const blockMap: BlockMapMeta = persisted
+        ? { state: 'candidates', key: null, sectionTag: null, evidence: [...persisted.evidence], candidates: [...persisted.candidates!], probe }
+        : { state: 'none', key: null, sectionTag: null, evidence: [], probe };
+      return this.#unknownBlockResponse(eid, blockMap, readError);
+    };
+    if (sections.length === 0) return noInfo();
+    const raw = await this.#readRaw(eid);
+    if ('error' in raw) return noInfo(raw.error);
+    const shape = this.#matchShape(raw.bulk, sections);
+    if (shape.confidence !== 'likely' || shape.sectionTag === null) {
+      this.#runtimeLikely.delete(eid);
+      const fits = shape.candidates ?? [];
+      if (fits.length === 0) return noInfo();
+      return this.#unknownBlockResponse(eid, { state: 'candidates', key: null, sectionTag: null, evidence: ['bulk-shape'], candidates: [...fits], probe });
+    }
+    const key = sections.find((s) => s.tag === shape.sectionTag)!.key;
+    this.#runtimeLikely.set(eid, shape.sectionTag);
+    const access = blockMapAccess({ confidence: 'likely', evidence: ['bulk-shape'] });
+    const index = buildParamIndex(this.#prof, key);
+    const shaped = this.#sliceShaped(eid, raw, key, index, shape.channels);
+    const ctx: BlockContext = { family: key, slug: '', blockName: `Block ${eid}`, page: -1, hasChannels: shaped.hasChannels, read: shaped.read };
+    const blockMap: BlockMapMeta = { state: access.state, key, sectionTag: shape.sectionTag, evidence: ['bulk-shape'], probe };
+    return this.#withBlockMap(this.#paramsGeneric(ctx, index), { unknown: true, access, blockMap });
+  }
+
+  /** The runtime bulk-shape match of a block's body against editor-cache sections (`matchBulkShape`: a section's rows
+   *  are the applied document's own rows of its key) under the model's catalog. */
+  #matchShape(bulk: { itemCount: number; values: readonly number[] }, sections: readonly DerivedSection[]): ReturnType<typeof matchBulkShape> {
+    const keyOf = new Map(sections.map((s) => [s.tag, s.key] as const));
+    const docRows = this.#prof.profileFacts?.ranges ?? {};
+    const enumRaw = new Map(bulk.values.map((v, i) => [i, v] as const));
+    const rowsOf = (tag: number): ReadonlyMap<number, CodecRangeDef> =>
+      new Map(Object.entries(docRows[keyOf.get(tag) ?? ''] ?? {}).map(([pid, row]) => [Number(pid), row] as const));
+    return matchBulkShape(bulk.itemCount, enumRaw, sections, rowsOf, profileCatalogFor(this.#prof.model));
+  }
+
+  /** The block probe's sizing read (services/blockProbe.ts): the editor-cache sections of the applied document a placed
+   *  block's bulk read fits (`matchBulkShape` — one for `likely`, several for `candidates`, none), with their strides.
+   *  Null when the applied profile has no section a block may bind to (nothing is read then); empty when the read
+   *  failed or nothing fits. One status + bulk read. */
+  async probeShape(eid: number): Promise<Array<{ tag: number; stride: number }> | null> {
+    const sections = this.#bindableSections();
+    if (sections.length === 0) return null;
+    const raw = await this.#readRaw(eid);
+    if ('error' in raw) return [];
+    const shape = this.#matchShape(raw.bulk, sections);
+    const tags = shape.confidence === 'likely' && shape.sectionTag !== null ? [shape.sectionTag] : shape.candidates ?? [];
+    return tags.map((tag) => ({ tag, stride: sections.find((s) => s.tag === tag)!.stride }));
+  }
+
+  /** The generic response of a block that lists nothing (no family, or nothing to bind it to). */
+  #unknownBlockResponse(eid: number, blockMap: BlockMapMeta, readError?: string): BlockParamsV2DTO {
+    return {
+      block: `Block ${eid}`, slug: '', page: -1, named: [], enums: [], type: null, unknownBlock: true,
+      definitions: { family: null, profile: 'none', positional: false, channel: null, persistentWrites: false, hidden: [], blockMap },
+      ...(readError !== undefined ? { readError } : {})
+    };
+  }
+
+  /** A generic response of a block-map block: the block-level write mode (a read-only binding serves every param with
+   *  `write: null` and the block's reason), `unknownBlock` for a block without a catalog family, and
+   *  `definitions.blockMap`. */
+  #withBlockMap(res: BlockParamsV2DTO, o: { unknown: boolean; access: BlockMapAccess; blockMap: BlockMapMeta }): BlockParamsV2DTO {
+    const reason = o.access.writable ? undefined : o.access.readOnlyReason ?? 'unconfirmed-block';
+    const readOnly = <T extends NamedParamV2 | EnumParamV2>(p: T): T => (reason ? { ...p, write: null, readOnlyReason: reason } : p);
+    const { block, slug, page, named, enums, type, layout, definitions, readError } = res;
+    return {
+      block, slug, page, named: named.map(readOnly), enums: enums.map(readOnly), type,
+      ...(o.unknown ? { unknownBlock: true as const } : {}),
+      ...(layout ? { layout } : {}),
+      definitions: { ...definitions, blockMap: o.blockMap },
+      ...(readError !== undefined ? { readError } : {})
+    };
+  }
+
+  /** The applied document's editor-cache sections a block may bind to (`blockBindableSection` under the model's
+   *  catalog: unassigned ones, and those of catalog families without an effect id). Empty without a profile document. */
+  #bindableSections(): DerivedSection[] {
+    const all = this.#prof.profileFacts?.byteSections ?? [];
+    if (all.length === 0) return [];
+    const firstEid = profileCatalogFor(this.#prof.model).familyFirstEid;
+    return all.filter((s) => blockBindableSection(s, firstEid));
+  }
+
+  /** Whether the block probe would read `eid` now (`definitions.blockMap.probe`), by the route's own rules
+   *  (services/blockProbe.ts): never for a block the bundled catalog places (`catalogFamilyOfBlock`: the route's
+   *  409 `known-block`, a roster-only family included; no reason); else the probe gate of the running firmware — and
+   *  above effect id 160 the above-160 gate too — (`not-verified`), then the edit-buffer grid as last read
+   *  (`not-placed`; known follow-up: like the route, it trusts the last read, which a front-panel change can make
+   *  stale). No device traffic. */
+  #probeAvailability(eid: number): BlockMapMeta['probe'] {
+    if (catalogFamilyOfBlock(this.#prof.model, eid) !== undefined) return { available: false };
+    const gates = this.#ctx.walkScope?.();
+    const gated = gates?.blockProbe === true && (eid <= LIVE_WALK_LIMITS.standardMaxBlock || gates.above160 === true);
+    if (!gated) return { available: false, reason: 'not-verified' };
+    if (!(this.placedEffectIds() ?? []).includes(eid)) return { available: false, reason: 'not-placed' };
+    return { available: true };
+  }
+
+  /** One block's status entry (its active channel, null when the status names none) and its fn-0x1F body, unsliced.
+   *  The read the block-map blocks share; a failed bulk read comes back as `error`. */
+  async #readRaw(eid: number): Promise<{ bulk: { itemCount: number; values: number[] }; channel: number | null } | { error: string }> {
+    try {
+      const dev = await this.#conn();
+      const status = (await this.#statusByEffectId()).get(eid);
+      const frames = await this.#bulkRead(dev, eid, dev.slow ? 8000 : 2500, dev.slow ? 600 : 120);
+      const bulk = this.#codec.assembleGen3BlockBulkRead(frames);
+      return { bulk: { itemCount: bulk.itemCount, values: [...bulk.values] }, channel: status ? status.channel : null };
+    } catch (e) {
+      return { error: e instanceof Error ? e.message : String(e) };
+    }
+  }
+
+  /** A raw block read sliced for `family`: `channels` true = four channel slices (the status channel's is served;
+   *  unknown channel → `channel-unknown`), false = one slice, null = unknown (every value `channel-unknown`). Primes the
+   *  device-edit baseline like #readBlock. */
+  #sliceShaped(
+    eid: number,
+    raw: { bulk: { itemCount: number; values: number[] }; channel: number | null } | { error: string },
+    family: string, index: BlockIndex, channels: boolean | null
+  ): { read: BlockRead; hasChannels: boolean } {
+    const hasChannels = channels !== false;
+    if ('error' in raw) return { read: { values: null, readError: raw.error, channel: null, stride: 0, base: 0, positional: index.positional ?? false }, hasChannels };
+    const { bulk } = raw;
+    const activeCh = channels === true ? raw.channel ?? 0 : 0;
+    this.#watchedChannel = activeCh;
+    const { stride, base, channelCount } = this.#channelSlice(family, bulk, activeCh, channels === true);
+    const channel = channels === true && raw.channel !== null ? Math.min(raw.channel, channelCount - 1) : null;
+    const positional = this.#isPositional(index, bulk, stride, hasChannels);
+    if (positional) {
+      this.#editSnapshot.set(eid, bulk.values.slice(base, base + stride));
+      this.#nonPositional.delete(eid);
+    } else {
+      this.#nonPositional.add(eid);
+    }
+    return { read: { values: bulk.values, channel, stride, base, positional }, hasChannels };
   }
 
   /** The classic response (see blockParams). */
@@ -2170,18 +2394,25 @@ class Gen3Driver implements DeviceDriver {
     try { bulk = this.#codec.assembleGen3BlockBulkRead(frames); } catch { return { events: [], reload: false }; }
     const eid = bulk.blockId;
     if (bulk.values.length === 0) return { events: [], reload: false }; // head-only / empty — nothing to read
-    const audioFamily = SLUG_FAMILY[(slugForEffectId(eid) ?? '').toLowerCase()];
-    const family = audioFamily ?? this.#prof.familyForEffectId(eid);
+    const { audio: audioFamily, family } = this.#resolveBlock(eid);
     if (!family) return { events: [], reload: false }; // no param family mapped
     const defs = this.#prof.params[family] ?? [];
     const index = buildParamIndex(this.#prof, family);
     if (defs.length === 0 && index.entries.length === 0) return { events: [], reload: false }; // nothing to report on
+    // A block the catalog cannot place on its own (a roster-only family, a block-map binding) has channels when its body
+    // is four slices of its section; a body that is neither one slice nor four says nothing about any pid.
+    let channelBlocked = !!audioFamily;
+    if (!audioFamily && this.#prof.blockMapFor?.(eid) !== undefined) {
+      const ch = shapeChannels(bulk.itemCount, this.#prof.rangeSections[family]?.stride);
+      if (ch === null) return { events: [], reload: false };
+      channelBlocked = ch;
+    }
     // Slice the block's ACTIVE channel (the one blockParams surfaced) — the body is channel-blocked, so
     // diffing against channel A while the user has B-D open would flag every A/B-different param as "moved".
-    const { stride, base } = this.#channelSlice(family, bulk, eid === this.#watchedEid ? this.#watchedChannel : 0, !!audioFamily);
+    const { stride, base } = this.#channelSlice(family, bulk, eid === this.#watchedEid ? this.#watchedChannel : 0, channelBlocked);
     // A body that is not indexed by param id (GLOBAL: one record per param) says nothing about any pid: no
     // events, and no baseline to prime.
-    if (!this.#isPositional(index, bulk, stride, !!audioFamily)) {
+    if (!this.#isPositional(index, bulk, stride, channelBlocked)) {
       this.#nonPositional.add(eid);
       return { events: [], reload: false };
     }
@@ -2220,14 +2451,34 @@ class Gen3Driver implements DeviceDriver {
    *    the effective row counts there. A catalog param with a placeholder row (`MOD_MIN`/`MOD_MAX`/`MOD_PARAM`,
    *    the `*_GLOBALMIX` toggles) is a real param and stays writable, and so does an id with no row at all (the
    *    FC block, a cross-block write).
+   *  - 409: a block the catalog cannot place on its own whose binding is read-only (see below), and a pid of a
+   *    synthetic family (`section:<tag>` / `block:<eid>`, a block known from its device rows alone) without an
+   *    informative row: no definition says what that pid is.
    *  A param the generic response marks `write: null` is NOT refused: that mark is advice for the UI. */
   #guardParamWrite(eid: number, paramId: number): void {
     const refuse = (statusCode: number, message: string): never => {
       throw Object.assign(new Error(message), { statusCode });
     };
     if (!Number.isInteger(paramId) || paramId < 0 || paramId > MAX_WIRE_PID) refuse(400, `param id ${paramId} is not a wire parameter`);
-    const family = SLUG_FAMILY[(slugForEffectId(eid) ?? '').toLowerCase()] ?? this.#prof.familyForEffectId(eid);
+    const { audio, family, mapEntry } = this.#resolveBlock(eid);
+    if (!audio) {
+      // a block the catalog cannot place on its own: its block-map binding decides (drivers/blockMapState.ts) — a
+      // roster-only family and a live-only binding are read-only, a byte-bridged binding is writable (the guards below
+      // still apply). A block the last generic read served as a runtime bulk-shape match (`likely`) is read-only too,
+      // whatever persisted entry it has, unless that entry itself serves the block with writable params (a confirmed
+      // byte-bridged binding the profile resolves): a `candidate` entry, or a confirmed one whose key the profile does
+      // not serve, never makes a `likely` block writable. Candidates / no binding and no `likely` read: nothing is
+      // known, nothing is refused.
+      const access = mapEntry ? blockMapAccess(mapEntry) : null;
+      const entryRefuses = !!access && access.serves && !access.writable;
+      const entryServesWritable = !!access && access.serves && access.writable && mapEntry!.key !== null && family === mapEntry!.key;
+      if (entryRefuses || (this.#runtimeLikely.has(eid) && !entryServesWritable)) refuse(409, blockWriteRefusedMessage(eid));
+    }
     if (!family) return;
+    if (isSyntheticFamilyKey(family)) {
+      const row = this.#prof.ranges[family]?.[paramId];
+      if (!row || !isInformativeRow(row)) refuse(409, `param ${paramId} of block ${eid} has no definition on this device; write refused`);
+    }
     const catalog = this.#prof.staticBase ?? this.#prof;
     if ((catalog.params[family] ?? []).some((d) => d.paramId === paramId)) return;
     const facts = this.#prof.profileFacts;
@@ -2253,7 +2504,7 @@ class Gen3Driver implements DeviceDriver {
   }
   /** Change a block's model/type (the family TYPE selector ordinal). */
   async setType(eid: number, value: number) {
-    const family = SLUG_FAMILY[(slugForEffectId(eid) ?? '').toLowerCase()];
+    const family = audioFamilyOf(eid);
     // the pid that carries the family's type selector on this device (it follows its name when the row moved);
     // a family without one (CABINET, PLEX, …) has no type to set
     const tid = family ? buildParamIndex(this.#prof, family).typePid : undefined;

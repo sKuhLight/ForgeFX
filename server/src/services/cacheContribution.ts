@@ -27,7 +27,8 @@ import {
 import { VERSION as CODEC_VERSION } from 'forgefx-midi';
 import { deviceCacheKey, type DeviceRegistry } from '../drivers/registryCore.js';
 import type { DefinitionsCaps } from '../drivers/types.js';
-import { PROFILES, runtimeProfileFrom } from '../devices.js';
+import { PROFILES, hiddenFamily, runtimeProfileFrom } from '../devices.js';
+import { devHookActiveBody } from './cloudProfiles.js';
 import { catalogAgreement, compareRows } from '../drivers/profileCompare.js';
 import { buildEditorCache, importBuiltCache, parseEditorCacheFilename, NOT_A_DISCOVERED_CACHE, type EditorCacheFileInfo } from './editorCacheImport.js';
 import { hasLocalByteSource } from './deviceCache.js';
@@ -621,6 +622,9 @@ export async function contribute(
   opts: ContributeOptions = {}
 ): Promise<ContributeResult> {
   const now = (opts.now ?? Date.now)();
+  // the validation summary (unmapped sections, suspects, catalog agreement) would be computed against the development
+  // hook's hidden catalog: no contribution (nor its coupled import or dry run) while the hook is active
+  if (hiddenFamily() !== null) return { code: 409, body: devHookActiveBody() };
   const p = await prepareContribution(registry, source.bytes, source.name, { acceptFirmwareMismatch: flags.acceptFirmwareMismatch });
   if (!p.ok) return { code: p.code, body: p.body };
   const prep = p.prep;

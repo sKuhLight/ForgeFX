@@ -29,6 +29,7 @@ import {
 } from '../profileSchema.js';
 import { ProfileMergeRefused, foreignSources, mergeRefusal, mergeSourcesIntoStored, refusalBody } from './profileMerge.js';
 import { checkRawSources } from './rawValidation.js';
+import { HIDE_FAMILY_ENV, hiddenFamily } from '../devices.js';
 import type { Store } from '../runtime/store.js';
 import type { ImportResult } from './editorCacheImport.js';
 
@@ -105,7 +106,18 @@ export async function cloudCacheCheck(cloud: DeviceProfileCloud | null, store: S
  *  everything derived only for this install's coverage view. */
 const PUBLISH_STRIPPED_KEYS: readonly string[] = ['raw', 'sections', 'blockMap', 'provenance', 'coverage'];
 /** Format-2 `meta` fields stripped with them (the uploaded copy is a plain derived-tables document). */
-const PUBLISH_STRIPPED_META: readonly string[] = ['format', 'sources', 'derivedWith', 'derivedRevision', 'derivedAt'];
+const PUBLISH_STRIPPED_META: readonly string[] = ['format', 'sources', 'derivedWith', 'derivedRevision', 'derivedAt', 'derivedHidden'];
+
+/** The 409 body of a refused share while the development hook hides a catalog family (devices.ts `hiddenFamily`), or
+ *  while the stored document still carries tables derived under it (`meta.derivedHidden`): what would be shared was
+ *  derived from a catalog with a family left out. Shared with the editor-cache contribution (services/cacheContribution.ts). */
+export function devHookActiveBody(): Record<string, unknown> {
+  return {
+    error: 'dev-hook-active',
+    message: `a development hook (${HIDE_FAMILY_ENV}) hides a catalog family in this session or hid one when the stored definitions were derived; nothing is shared — restart without it (the stored definitions re-derive on the next load), then try again`
+  };
+}
+
 
 const isPlainObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
 
@@ -249,11 +261,14 @@ export async function cloudCachePull(cloud: DeviceProfileCloud | null, store: St
  *  ('live'|'bytes'), so the uploaded copy is normalized back to it. */
 export async function cloudCachePublish(cloud: DeviceProfileCloud | null, store: Store, registry: DeviceRegistry): Promise<ImportResult> {
   if (!cloud) return { code: 503, body: { error: 'cloud disabled' } };
+  // the development hook's hidden catalog never reaches the shared store
+  if (hiddenFamily() !== null) return { code: 409, body: devHookActiveBody() };
   const id = await deviceIdentity(store, registry);
   if (!id) return { code: 503, body: { error: 'no device detected' } };
   const doc = store.getDoc('deviceCaches', id.key);
-  const storedData = doc && !doc.deleted ? (doc.data as { meta?: { source?: string }; firmware?: unknown }) : null;
+  const storedData = doc && !doc.deleted ? (doc.data as { meta?: { source?: string; derivedHidden?: unknown }; firmware?: unknown }) : null;
   if (!storedData?.meta) return { code: 404, body: { error: 'no locally persisted profile to publish' } };
+  if (storedData.meta.derivedHidden !== undefined) return { code: 409, body: devHookActiveBody() };
 
   const kind = storedData.meta.source;
   const notPublishable = (why: string): ImportResult => ({ code: 409, body: { error: `profile source '${kind}' is not publishable (${why})` } });

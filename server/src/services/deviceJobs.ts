@@ -1,11 +1,11 @@
-// Exclusive long-running device jobs — at most ONE of the device-cache build and the diagnostic capture
-// runs per registry at a time (both stream thousands of queries over the one shared link). Each service
-// claims the device before it starts and releases it when its job settles; the other answers 409.
+// Exclusive long-running device jobs — at most ONE of the device-cache build, the diagnostic capture and the block
+// probe runs per registry at a time (each streams definition queries over the one shared link). Each service
+// claims the device before it starts and releases it when its job settles; the others answer 409.
 //
 // Browser-safe: the registry is a type-only import.
 import type { DeviceRegistry } from '../drivers/registryCore.js';
 
-export type DeviceJob = 'capture' | 'cache-build';
+export type DeviceJob = 'capture' | 'cache-build' | 'block-probe';
 
 const BUSY = new WeakMap<DeviceRegistry, DeviceJob>();
 

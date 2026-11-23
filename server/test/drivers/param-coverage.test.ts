@@ -188,10 +188,12 @@ async function runCases(): Promise<void> {
     const unreachable: Record<string, string> = {
       FM3: 'PRESET',
       FM9: 'PRESET',
-      // the III resolves audio blocks through the codec block roster and the shared virtual effects only
-      'Axe-Fx III': 'CROSSOVER,DYNDIST,IRCAPTURE,IRPLAYER,PRESET,RTA,TONEMATCH,VOCODER',
+      // the III resolves its blocks through its effect-id table (FORGEFX-45): the six roster ids (IR Capture 36, Vocoder
+      // 134, Crossover 142, Tone Match 170, RTA 174, IR Player 195) are reachable now, served read-only; Dynamic
+      // Distortion has no effect id (only the block map can bind it), PRESET none of its own
+      'Axe-Fx III': 'DYNDIST,PRESET',
     };
-    const unknown: Record<string, string> = { FM3: '', FM9: '', 'Axe-Fx III': '36,134,142,170,174,195' };
+    const unknown: Record<string, string> = { FM3: '', FM9: '', 'Axe-Fx III': '' };
     for (const [name, mid] of DEVICES) {
       for (const mode of ['catalog', 'profile']) {
         const s = S(`${name} ${mode}`);
@@ -210,12 +212,15 @@ async function runCases(): Promise<void> {
     for (const [name] of DEVICES) coverage(S(`${name} profile`), `${name} profile`, 'profile');
     // the families a device serves that its own catalog tables have no section for (the bundled profile adds them)
     const outside = (name: string) => [...S(`${name} profile`).byFamily.keys()].filter((f) => S(`${name} profile`).profile.profileFacts!.ranges[f] === undefined).sort().join(',');
-    assertEqual(DEVICES.map(([name]) => `${name}:${outside(name)}`).join(' '), 'FM3: FM9: Axe-Fx III:FC,MIDIBLOCK', 'families served from the bundled profile alone (no informative row on the III either)');
+    // (the III's IR Capture, reachable through its roster id 36 since FORGEFX-45, has no catalog section either)
+    assertEqual(DEVICES.map(([name]) => `${name}:${outside(name)}`).join(' '), 'FM3: FM9: Axe-Fx III:FC,IRCAPTURE,MIDIBLOCK', 'families served from the bundled profile alone (no informative row on the III either)');
     for (const [name] of DEVICES) assert(responseOf(S(`${name} profile`), 'MOD').definitions.hidden.some((h) => h.reason === 'by-design'), `${name}: the modifier hides its target id by design`);
     let removedIII = 0;
     for (const { r } of S('Axe-Fx III profile').byFamily.values()) removedIII += r.definitions.hidden.filter((h) => h.reason === 'removed').length;
-    assertEqual(removedIII, 10, 'Axe-Fx III: the reachable families hide 10 inline-bound-only rows as removed');
-    console.log('  drivers/param-coverage: byte-exact catalog profile — FM3/FM9/III listed = expected, listed + hidden = informative per family (III: 10 synthetic rows removed)');
+    // 11 = every inline-bound-only row of the III table: the 10 of the families reachable before FORGEFX-45 and RTA's one
+    // (RTA 6 catalog / 5 profile entries, reachable through its roster id 174 now)
+    assertEqual(removedIII, 11, 'Axe-Fx III: the reachable families hide 11 inline-bound-only rows as removed');
+    console.log('  drivers/param-coverage: byte-exact catalog profile — FM3/FM9/III listed = expected, listed + hidden = informative per family (III: 11 synthetic rows removed)');
   }
 
   // ---- 3. no profile: the bundled catalog alone ----------------------------------------------------------------
@@ -258,9 +263,12 @@ async function runCases(): Promise<void> {
 
   // ---- 5. FM9 and Axe-Fx III totals, and the scope they are counted over ---------------------------------------
   {
+    // III since FORGEFX-45: the six roster families are reachable (read-only) — catalog 1824 + VOCODER 66 + CROSSOVER 14 +
+    // TONEMATCH 18 + RTA 6 + IRPLAYER 19 + IRCAPTURE 0 = 1947; profile 1814 + 66 + 14 + 18 + 5 (RTA's inline-bound row
+    // removed) + 19 = 1936; all of them named (generic unchanged)
     const pinned: Record<string, [number, number]> = {
       'FM9 catalog': [1685, 49], 'FM9 profile': [1685, 49],
-      'Axe-Fx III catalog': [1824, 30], 'Axe-Fx III profile': [1814, 30],
+      'Axe-Fx III catalog': [1947, 30], 'Axe-Fx III profile': [1936, 30],
     };
     for (const [key, [n, g]] of Object.entries(pinned)) assertEqual(`${total(S(key))}/${genericTotal(S(key))}`, `${n}/${g}`, `${key}: params / generic over the reachable families`);
     // the index over EVERY family (PRESET aside) counts more: exactly the families without an effect id
@@ -277,7 +285,7 @@ async function runCases(): Promise<void> {
     }
     const iii = (f: string, mode: string) => buildParamIndex(S(`Axe-Fx III ${mode}`).profile, f).entries.length;
     assertEqual(['VOCODER', 'CROSSOVER', 'TONEMATCH', 'RTA', 'IRPLAYER', 'DYNDIST', 'IRCAPTURE'].map((f) => `${f}:${iii(f, 'catalog')}/${iii(f, 'profile')}`).join(' '),
-      'VOCODER:66/66 CROSSOVER:14/14 TONEMATCH:18/18 RTA:6/5 IRPLAYER:19/19 DYNDIST:12/12 IRCAPTURE:0/0', 'Axe-Fx III: the families without an effect id (135 / 134 params)');
+      'VOCODER:66/66 CROSSOVER:14/14 TONEMATCH:18/18 RTA:6/5 IRPLAYER:19/19 DYNDIST:12/12 IRCAPTURE:0/0', 'Axe-Fx III: the roster families (reachable read-only since FORGEFX-45) and DYNDIST (no effect id: 12 params unreached)');
     // a sweep over the codec block roster and the virtual effects alone (the blocks GET /preset/blocks lists) misses
     // the FM9's CROSSOVER: its effect id (142) is in the effect-id table only
     const rosterOnly = await sweep(S('FM9 profile').profile, [...new Set([...VIRTUAL_EIDS, ...ROSTER_EIDS])].sort((a, b) => a - b));
@@ -286,7 +294,17 @@ async function runCases(): Promise<void> {
     const genericByFamily = (s: Sweep) => [...s.byFamily].filter(([, { r }]) => entriesOf(r).some((e) => e.generic)).map(([f, { r }]) => `${f}:${entriesOf(r).filter((e) => e.generic).length}`).sort().join(' ');
     assertEqual(genericByFamily(S('FM9 profile')), 'CHORUS:3 DELAY:3 DISTORT:3 FUZZ:1 GLOBAL:31 MIXER:6 REVERB:2', 'FM9: generic params per family (catalog rows the FM9 tables have no name for)');
     assertEqual(genericByFamily(S('Axe-Fx III profile')), 'GLOBAL:30', 'Axe-Fx III: generic params per family');
-    console.log('  drivers/param-coverage: FM9 1685/49, III 1824 (catalog) / 1814 (profile), 30 generic — index totals minus the families without an effect id; roster-only FM9 sweep 1671');
+    // the III roster families are served read-only, as a likely binding with roster evidence (not an unknown block)
+    for (const mode of ['catalog', 'profile']) {
+      for (const fam of ['VOCODER', 'CROSSOVER', 'TONEMATCH', 'RTA', 'IRPLAYER', 'IRCAPTURE']) {
+        const r = responseOf(S(`Axe-Fx III ${mode}`), fam);
+        const at = `Axe-Fx III ${mode} ${fam}`;
+        assertEqual(`${r.unknownBlock}/${r.definitions.blockMap?.state}/${r.definitions.blockMap?.key}/${r.definitions.blockMap?.evidence.join('+')}/${r.definitions.blockMap?.probe.available}`,
+          `undefined/likely/${fam}/roster/false`, `${at}: a roster binding, not an unknown block, no probe`);
+        assert(entriesOf(r).every((e) => e.write === null && e.readOnlyReason === 'unconfirmed-block'), `${at}: every param read-only (unconfirmed-block)`);
+      }
+    }
+    console.log('  drivers/param-coverage: FM9 1685/49, III 1947 (catalog) / 1936 (profile), 30 generic — index totals minus DYNDIST (no effect id); III roster families read-only; roster-only FM9 sweep 1671');
   }
 
   // ---- 6. invariants on every response ---------------------------------------------------------------------------
@@ -440,9 +458,14 @@ async function runCases(): Promise<void> {
       }
       const { driver } = mockGen3Device(s.profile, []);
       const u = await driver.blockParams(NEWER_FIRMWARE.unknownEid, { generic: true });
+      // M3 §3.3: every unknown block carries `definitions.blockMap` (a legacy profile has no editor-cache section to
+      // match the block against: state none, nothing read; no probe gate on a bare driver: not-verified)
       assertEqual(JSON.stringify(u), JSON.stringify({
         block: `Block ${NEWER_FIRMWARE.unknownEid}`, slug: '', page: -1, named: [], enums: [], type: null, unknownBlock: true,
-        definitions: { family: null, profile: 'none', positional: false, channel: null, persistentWrites: false, hidden: [] },
+        definitions: {
+          family: null, profile: 'none', positional: false, channel: null, persistentWrites: false, hidden: [],
+          blockMap: { state: 'none', key: null, sectionTag: null, evidence: [], probe: { available: false, reason: 'not-verified' } }
+        },
       }), `${label}: a placed block without a family is named by its effect id`);
     }
     console.log('  drivers/param-coverage: next firmware — MIXER/OUTPUT swap: both suspect, catalog rows, profile none; eid 205 answers "Block 205"');

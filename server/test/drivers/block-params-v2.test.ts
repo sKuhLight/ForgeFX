@@ -298,7 +298,12 @@ export async function runBlockParamsV2Tests(): Promise<void> {
     assertEqual(g.unknownBlock, true, 'marked unknown');
     assertEqual(g.named.length + g.enums.length, 0, 'nothing listed');
     assertEqual(g.type, null, 'no type');
-    assertEqual(JSON.stringify(g.definitions), JSON.stringify({ family: null, profile: 'none', positional: false, channel: null, persistentWrites: false, hidden: [] }), 'definitions of an unknown block');
+    // M3 §3.3: an unknown block's definitions carry its block-map state (no profile, no section to match: none; a bare
+    // driver has no probe gate: not-verified)
+    assertEqual(JSON.stringify(g.definitions), JSON.stringify({
+      family: null, profile: 'none', positional: false, channel: null, persistentWrites: false, hidden: [],
+      blockMap: { state: 'none', key: null, sectionTag: null, evidence: [], probe: { available: false, reason: 'not-verified' } }
+    }), 'definitions of an unknown block');
     const c = (await mockBlockDevice(FM3, {}).driver.blockParams(205)) as BlockParamsDTO;
     assertEqual(c.block, '', 'classic: unchanged');
     assertEqual((c as unknown as Record<string, unknown>).unknownBlock, undefined, 'classic: no marker');
@@ -428,16 +433,23 @@ export async function runBlockParamsV2Tests(): Promise<void> {
 
   // ---- 16. an effect id the codec knows but no family maps: the generic response names it by its id ---
   {
-    const prior = SLUG_FAMILY['delay'];
-    delete SLUG_FAMILY['delay']; // the III maps no audio eid through its profile, so eid 70 now has no family
+    // The III maps every audio block through its effect-id table since FORGEFX-45, so dropping the slug mapping no longer
+    // leaves eid 70 without a family: the development hook hides the DELAY family instead (codec slug kept, no family)
+    const prior = process.env.FORGEFX_DEFS_HIDE_FAMILY;
+    const warn = console.warn;
+    console.warn = () => {};
+    process.env.FORGEFX_DEFS_HIDE_FAMILY = 'DELAY';
     try {
+      assertEqual(SLUG_FAMILY['delay'], 'DELAY', 'premise: the codec slug still names the family');
       const g = await v2Of(AXE3, DELAY, {});
       assertEqual(`${g.block}|${g.slug}|${g.page}|${g.unknownBlock}`, `Block ${DELAY}||-1|true`, 'generic: "Block <eid>", no slug, no page, marked unknown');
       assertEqual(g.definitions.family, null, 'generic: no family');
       const c = (await mockBlockDevice(AXE3, {}).driver.blockParams(DELAY)) as BlockParamsDTO;
       assertEqual(`${c.block}|${c.slug}|${c.page}`, `Delay|delay|${DELAY}`, 'classic: unchanged (the codec name, slug and page)');
     } finally {
-      SLUG_FAMILY['delay'] = prior!;
+      if (prior === undefined) delete process.env.FORGEFX_DEFS_HIDE_FAMILY;
+      else process.env.FORGEFX_DEFS_HIDE_FAMILY = prior;
+      console.warn = warn;
     }
     console.log('  drivers/block-params-v2: an unmapped block with a codec slug — generic "Block <eid>" / slug "" / page -1, classic unchanged');
   }

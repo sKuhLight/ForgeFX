@@ -37,6 +37,7 @@ import {
   type BuiltCache, type CoverageInput, type ProfileCoverage, type ProfileDoc, type ProfileRaw, type RawSource, type SourceSummary
 } from 'forgefx-midi/cache';
 import { catalogForModel, deriveOptionsFor, modelOfCacheKey, profileCatalogFor } from './profileCatalog.js';
+import { hiddenFamily } from './devices.js';
 import type { Store } from './runtime/store.js';
 
 /** The schema this build writes and the only one it accepts. */
@@ -132,10 +133,21 @@ export type RederiveReason = 'outdated' | 'newer' | 'revision';
  *  codec derived under the same schema, raw this build cannot read). */
 export function rederiveReasonOf(profile: unknown): RederiveReason | null {
   if (!readableRaw(profile)) return null;
-  if (!needsRederive((profile as { meta?: Parameters<typeof needsRederive>[0] }).meta)) return null;
+  if (!needsRederive((profile as { meta?: Parameters<typeof needsRederive>[0] }).meta)) {
+    // tables derived while the development hook hid another family than it hides now (devices.ts `hiddenFamily`;
+    // `meta.derivedHidden` marks such a derivation) re-derive like an older revision: a session with the hook sees the
+    // stored raw sources through its hidden catalog, a session without it never keeps a hidden derivation
+    return derivedHiddenOf(profile) !== hiddenFamily() ? 'revision' : null;
+  }
   const check = checkProfileSchema(profile);
   if (!check.usable) return check.reason === 'newer' ? 'newer' : 'outdated';
   return 'revision';
+}
+
+/** The family the development hook hid when the doc's tables were derived (`meta.derivedHidden`), null for none. */
+function derivedHiddenOf(profile: unknown): string | null {
+  const v = (profile as { meta?: { derivedHidden?: unknown } } | null)?.meta?.derivedHidden;
+  return typeof v === 'string' ? v : null;
 }
 
 // ── ForgeFX meta on top of the codec's ──
@@ -143,7 +155,8 @@ export function rederiveReasonOf(profile: unknown): RederiveReason | null {
 /** `meta` keys the derivation owns; everything else in a stored doc's meta is ForgeFX bookkeeping
  *  (`builtAt`, `importedAt`, `pulledAt`, `contentHash`, ...) that survives a re-derivation or merge. */
 const DERIVED_META_KEYS: ReadonlySet<string> = new Set([
-  'schema', 'recordCount', 'source', 'origin', 'walk', 'issues', 'format', 'derivedWith', 'derivedRevision', 'derivedAt', 'sources'
+  'schema', 'recordCount', 'source', 'origin', 'walk', 'issues', 'format', 'derivedWith', 'derivedRevision', 'derivedAt', 'sources',
+  'derivedHidden'
 ]);
 
 /** The ForgeFX bookkeeping fields of a stored doc's meta (see DERIVED_META_KEYS). */
@@ -176,7 +189,10 @@ export function withForgefxMeta(doc: ProfileDoc, extras: Record<string, unknown>
  *  codec's derivation errors (`ProfileDerivationError`, `ProfileUserDataError`, a voter seed failure). */
 export function deriveProfileDoc(raw: ProfileRaw, model: number, firmware: string | null | undefined, derivedAt: string, extras: Record<string, unknown> = {}): ProfileDoc {
   const { params, seeds } = catalogForModel(model);
-  return withForgefxMeta(buildProfileDoc(raw, params, seeds, deriveOptionsFor(model, firmware, derivedAt)), extras);
+  const doc = withForgefxMeta(buildProfileDoc(raw, params, seeds, deriveOptionsFor(model, firmware, derivedAt)), extras);
+  // a derivation under the development hook's hidden catalog is marked, so a session without the hook re-derives it
+  const hidden = hiddenFamily();
+  return hidden === null ? doc : { ...doc, meta: { ...doc.meta, derivedHidden: hidden } as ProfileDoc['meta'] };
 }
 
 /** Re-derive a format-2 doc from its raw sources (raw kept, derived tables + schema/derivedWith/derivedAt
@@ -201,15 +217,17 @@ export type StoredProfile =
     }
   | { state: 'stale'; profile: BuiltCache; check: Extract<ProfileSchemaCheck, { usable: false }>; format: ProfileFormat };
 
-/** Classification per stored `data` object, so repeated lookups of the same doc re-derive once. */
-const CLASSIFIED = new WeakMap<object, StoredProfile>();
+/** Classification per stored `data` object (and the development hook's hidden family it was made under), so repeated
+ *  lookups of the same doc re-derive once. */
+const CLASSIFIED = new WeakMap<object, { hidden: string | null; out: StoredProfile }>();
 
 /** Classify a stored profile `data` of the device-cache `key` (the key names the model a re-derivation
  *  derives for; the doc's own `model` is the fallback). */
 export function classifyProfile(data: unknown, key: string | null): StoredProfile {
+  const hidden = hiddenFamily();
   if (isObj(data)) {
     const hit = CLASSIFIED.get(data);
-    if (hit) return hit;
+    if (hit && hit.hidden === hidden) return hit.out;
   }
   const profile = data as BuiltCache;
   const format = profileFormatOf(data);
@@ -229,7 +247,7 @@ export function classifyProfile(data: unknown, key: string | null): StoredProfil
       out = { state: 'stale', profile, check: { usable: false, reason: 'derivation-failed', schema: check.schema, current: CURRENT_CACHE_SCHEMA }, format: 2 };
     }
   }
-  if (isObj(data)) CLASSIFIED.set(data, out);
+  if (isObj(data)) CLASSIFIED.set(data, { hidden, out });
   return out;
 }
 

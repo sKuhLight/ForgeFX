@@ -57,6 +57,7 @@ import type { DeviceDriver, DeviceEvent, DriverCtx, DriverCapabilities, Definiti
 import { definitionsDrift, type AppliedDefinitions } from './definitionsDiff.js';
 import { assertRawProbeAllowed } from './sendPolicy.js';
 import { cadenceFor, isTelemetryMode, TELEMETRY_MODES, type TelemetryMode, type CadenceProfile } from './telemetryProfiles.js';
+import { walkScopeGates, type WalkScopeGates, type WalkScopeOverride } from '../services/walkScope.js';
 
 /** Device-cache doc key for the deviceCaches store collection (`<model-hex>_<major>p<minor>`): defined in
  *  profileCatalog.ts (the gen-3 driver keys its `definitions` events by it too), re-exported here for its callers. */
@@ -191,6 +192,9 @@ export interface RegistryDeps {
    *  should return only profiles this build may use (`loadUsableProfile`); applyRuntimeCache re-checks
    *  the schema anyway, so a hook that forgets cannot make a stale profile live. */
   loadDeviceCache?(key: string): BuiltCache | null | Promise<BuiltCache | null>;
+  /** The walk-scope development override (services/walkScope.ts), read at call time. Only the Node registry supplies it
+   *  (from its environment, ignored in production); absent → no override (Browser Direct, the fail-closed default). */
+  walkScopeOverride?(): WalkScopeOverride;
 }
 
 const NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
@@ -259,8 +263,18 @@ export class DeviceRegistry {
     transport: () => this.transport(),
     emit: (e) => this.#emit(e),
     getCadence: () => this.#cadence(),
-    getFirmware: () => this.#firmware // read at call time: drivers are built before detect() reads it
+    getFirmware: () => this.#firmware, // read at call time: drivers are built before detect() reads it
+    walkScope: () => this.walkScopeGates()
   };
+
+  /** The walk-scope gates of the identified model on the running firmware (services/walkScope.ts): the verified
+   *  (model, firmware) table plus the Node registry's development override. Every flag false while no model is
+   *  identified or the firmware is unknown (fail closed). No device traffic. */
+  walkScopeGates(): WalkScopeGates {
+    let override: WalkScopeOverride | undefined;
+    try { override = this.#deps.walkScopeOverride?.(); } catch { override = undefined; }
+    return walkScopeGates(this.#modelId, this.#modelId >= 0 ? this.#firmware : null, override);
+  }
 
   get profile() { return this.#prof; }
 

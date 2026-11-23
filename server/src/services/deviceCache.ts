@@ -224,7 +224,9 @@ export function walkBlockLimits(model: number, mode: BuildMode, stored?: BuiltCa
   const roster = staticRoster(model);
   for (let block = 0; block <= WALK_BOUND_MAX_BLOCK; block++) {
     const ref = roster.get(block);
-    const family = ref?.family;
+    // a block the effect-id table names from the roster only (`roster`, FORGEFX-45) is no known table: no known size,
+    // no bound derived from a family it is not proven to be — treated like an unknown block
+    const family = ref?.roster ? undefined : ref?.family;
     const stride = family ? strides[family] : undefined;
     if (family === undefined || stride === undefined) {
       if (mode === 'full') limits.bound[block] = WALK_MAX_PARAM_ID; // unknown block: the HW-proven envelope
@@ -303,6 +305,16 @@ export const ENUM_HINTS_VERIFIED_FW: Readonly<Record<number, ReadonlyArray<{ rea
   0x11: [{ major: 13, minor: 0 }] // FM3
 };
 
+/** The walk-scope gates per (model, firmware) — extended ids, roster blocks above 160, the block probe, far ids — with
+ *  their verified-firmware table (`WALK_SCOPE_VERIFIED_FW`, empty in this build: every gate fails closed) and the
+ *  Node-only development override. They live in the import-free leaf services/walkScope.ts so the registry core and
+ *  the gen-3 driver can read them without an import cycle through this module; re-exported here, their home for the
+ *  walk's callers. The registry applies them to the running firmware (`DeviceRegistry.walkScopeGates`). */
+export {
+  WALK_SCOPE_VERIFIED_FW, WALK_SCOPE_OVERRIDE_ENV, parseWalkScopeOverride, walkScopeGates, walkScopeOverrideFromEnv,
+  type FwList, type WalkScopeFlag, type WalkScopeGates, type WalkScopeOverride, type WalkScopeOverrideToken
+} from './walkScope.js';
+
 /** Whether the live walk may get enum hints for `model` on firmware `fw`: an exact match in
  *  {@link ENUM_HINTS_VERIFIED_FW}. Unknown or malformed firmware and unlisted models: no (fail closed). */
 export function enumHintsVerifiedOn(model: number, fw: { major: number; minor: number } | null | undefined): boolean {
@@ -341,6 +353,7 @@ export function walkEnumHints(model: number, stored?: BuiltCache | null): Record
     return h;
   };
   for (const [block, ref] of staticRoster(model)) {
+    if (ref.roster) continue; // named from the roster only (FORGEFX-45): never walk-hinted
     const h = hintsOf(ref.family);
     if (Object.keys(h).length > 0) hints[block] = h;
   }
@@ -648,7 +661,8 @@ export async function startCacheBuild(store: Store, registry: DeviceRegistry, op
   // The device is exclusive between this build and the diagnostic capture: claim it before the first await
   // (a running capture answers 409 busy, a concurrent build start the usual 'building').
   if (!claimDevice(registry, 'cache-build')) {
-    return deviceBusy(registry) === 'capture' ? { code: 409, body: { error: 'busy', what: 'capture' } } : { code: 409, body: { error: 'building' } };
+    const busy = deviceBusy(registry);
+    return busy !== null && busy !== 'cache-build' ? { code: 409, body: { error: 'busy', what: busy } } : { code: 409, body: { error: 'building' } };
   }
   let started = false;
   try {

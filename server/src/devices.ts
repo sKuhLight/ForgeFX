@@ -2,7 +2,7 @@
 // catalog, ranges, rosters, enum labels). The gen-3 effect codec itself is shared — only the data
 // changes — so the device client picks a profile by the detected model and is otherwise generic.
 import { familyAssignmentSuspects, isSyntheticFamilyKey } from 'forgefx-midi/cache';
-import type { BuiltCache, RangeDef as CodecRangeDef } from 'forgefx-midi/cache';
+import type { BlockMapEntry, BuiltCache, DerivedSection, RangeDef as CodecRangeDef } from 'forgefx-midi/cache';
 import {
   FM3_RANGES,
   FM3_PARAMS_BY_FAMILY,
@@ -51,6 +51,9 @@ import {
   AXE3_MOD_EFFECT_ID, AXE3_MOD_SLOT_COUNT, AXE3_MOD_FIELDS, AXE3_MOD_SOURCES_STATUS,
   AXE3_RANGE_SECTIONS,
   AXE3_CATALOG_BASELINE,
+  AXE3_CATALOG_SECTIONS,
+  AXE3_FAMILY_BY_EFFECT_ID,
+  axe3EffectIdEntry,
 } from 'forgefx-midi/gen3/axe-fx-iii';
 import type {
   DeviceEditorLayouts, EditorBlockLayout, EditorLayoutVariant, EditorLayoutPage,
@@ -93,10 +96,67 @@ export type DeviceLayout = {
   /** All pages of the chosen variant ONLY (editor display order); rows → controls verbatim from the codec. */
   pages: DeviceLayoutPage[];
 };
-// gen-3 shared virtual-effect effectIds (capture-confirmed on FM3; III reuses them since its package
-// ships layouts but no effectId table). Audio-block eids resolve via the codec (slugForEffectId).
+// ── development hook: hide one catalog family ─────────────────────────────────────────────────────────────────────
+/** Name of the leave-one-out development hook's environment variable. */
+export const HIDE_FAMILY_ENV = 'FORGEFX_DEFS_HIDE_FAMILY';
+/** The last hook value seen (re-checked and re-announced only when it changes). */
+let hideState: { key: string; family: string | null } | undefined;
+
+/**
+ * Development hook, off by default: `FORGEFX_DEFS_HIDE_FAMILY=<FAMILY>` (a catalog family symbol, upper case) hides that
+ * family from the bundled catalog for the session, so a block of it is served the way a block a newer firmware added
+ * is (unknown block → block map → probe): it leaves the static effect-id table (`familyForEffectId`, the codec slug
+ * resolution of the gen-3 driver), the static roster (walk bounds and hints, `staticFamilyForEffectId`), the
+ * derivation catalog (voter params and seeds, `familyFirstEid`, instance counts, rosters, reference rows and the
+ * section inventory — so its editor-cache section stays `section:<tag>`), see profileCatalog.ts. The bundled display
+ * tables (params, ranges, labels) are left alone. Read through a guarded process access (M2's diagnostic-hook
+ * pattern): a browser runtime has none and never hides anything. Ignored when `NODE_ENV=production`. One warning line
+ * per distinct value. A malformed value (not an upper-case symbol) is ignored.
+ */
+export function hiddenFamily(): string | null {
+  const env = typeof process !== 'undefined' ? process.env : undefined;
+  const raw = env?.[HIDE_FAMILY_ENV]?.trim();
+  if (!raw) return null;
+  const production = env?.NODE_ENV === 'production';
+  const key = `${production ? 'p' : 'd'}|${raw}`;
+  if (hideState?.key === key) return hideState.family;
+  let family: string | null = null;
+  if (production) console.warn(`[forgefx] ${HIDE_FAMILY_ENV} is ignored in production`);
+  else if (!/^[A-Z][A-Z0-9_]*$/.test(raw)) console.warn(`[forgefx] ${HIDE_FAMILY_ENV}: ignored malformed value ${JSON.stringify(raw)} (expected a catalog family symbol, e.g. RESONATOR)`);
+  else {
+    family = raw;
+    console.warn(`[forgefx] ${HIDE_FAMILY_ENV}: the ${raw} family is hidden from the bundled catalog for this session (development hook)`);
+  }
+  hideState = { key, family };
+  return family;
+}
+
+/** `family` unless it is the hidden one (`hiddenFamily`). */
+export const unlessHidden = (family: string | undefined): string | undefined =>
+  family !== undefined && family === hiddenFamily() ? undefined : family;
+
+// gen-3 shared virtual-effect effectIds (capture-confirmed on FM3; the III's effect-id table carries them too).
+// Audio-block eids resolve via the codec (slugForEffectId).
 const VIRTUAL_EID_FAMILY: Record<number, string> = { 1: 'GLOBAL', 2: 'CONTROLLERS', 3: 'MOD', 190: 'MIDIBLOCK', 199: 'FC' };
-const eidFamily = (map?: Record<number, string>) => (eid: number): string | undefined => map?.[eid] ?? VIRTUAL_EID_FAMILY[eid];
+const eidFamily = (map?: Record<number, string>) => (eid: number): string | undefined => unlessHidden(map?.[eid] ?? VIRTUAL_EID_FAMILY[eid]);
+
+/** The catalog section tag of `family` in an inventory (its first tag), null when it has none. */
+const inventoryTag = (inventory: ReadonlyArray<{ tag: number; family: string | null }>, family: string): number | null =>
+  inventory.find((s) => s.family === family)?.tag ?? null;
+
+/** The Axe-Fx III block-map entry of an effect id a family reserves that the III effect-id table names from the roster
+ *  only (`confidence: 'roster'`, FORGEFX-45: IR Capture 36, Vocoder 134-137, Crossover 142-145, Tone Match 170-173,
+ *  RTA 174-177, IR Player 195-198 — every reserved instance slot, as the static roster maps them): the family is known,
+ *  no device read has bound it, so it is served read-only (drivers/blockMapState.ts). `sectionTag` is the family's tag
+ *  in the III section inventory (a hint, null for IR Capture). Undefined for any other id and for the hidden family. */
+function axe3RosterEntry(eid: number): BlockMapEntry | undefined {
+  const hit = axe3EffectIdEntry(eid);
+  if (!hit || hit.entry.confidence !== 'roster' || unlessHidden(hit.entry.family) === undefined) return undefined;
+  return {
+    eid, key: hit.entry.family, sectionTag: inventoryTag(AXE3_CATALOG_SECTIONS, hit.entry.family),
+    confidence: 'roster', evidence: ['roster'], channels: null
+  };
+}
 
 // Parse a variant/page selector `value` ("10,11,12") into the numeric block-type values it activates.
 // Blank segments are dropped, so an EMPTY value ("") parses to NO values rather than to [0]: the editor
@@ -431,6 +491,10 @@ export interface ProfileFacts {
   /** Effect ids the document's persisted block map binds with confidence `confirmed` (a block the catalog does not
    *  place, matched to a section or walked live). Empty for a legacy document. */
   confirmedBlocks: ReadonlySet<number>;
+  /** The document's editor-cache sections (`sections` with `space: 'section'`): what a placed block the catalog
+   *  cannot place is matched against by its bulk read (the runtime `likely`, `matchBulkShape`). Empty for a legacy
+   *  document and for one without an editor-cache source. */
+  byteSections: readonly DerivedSection[];
   /** `built.firmware`, when the doc carries one. */
   firmware: string | null;
   /** `built.ranges` verbatim (placeholder rows included). */
@@ -467,8 +531,15 @@ export interface DeviceProfile {
   enumLabelsFor(family: string, paramId: number): string[] | undefined;
   /** Cab IR names per bank (Factory 1/2, Legacy, Scratchpad) — for the cab IR picker. {} if the device has none. */
   cabIrs(): Record<string, string[]>;
-  /** effectId → catalog family, incl. virtual effects (GLOBAL=1, Controllers=2, Modifier=3, FC=199). */
+  /** effectId → catalog family, incl. virtual effects (GLOBAL=1, Controllers=2, Modifier=3, FC=199). A runtime profile
+   *  adds the block-map overlay: an effect id the applied document's block map binds `confirmed` resolves to the
+   *  entry's key (a catalog family, `section:<tag>` or `block:<eid>`). */
   familyForEffectId(eid: number): string | undefined;
+  /** The block-map entry of an effect id the catalog cannot place on its own: the static effect-id table's `roster`
+   *  entries (Axe-Fx III, FORGEFX-45), else (runtime profile) the applied document's persisted entry for an effect id
+   *  the static tables do not place. Undefined for every catalog block and every unknown one without an entry. How a
+   *  block is served per entry: drivers/blockMapState.ts. */
+  blockMapFor?(eid: number): BlockMapEntry | undefined;
   /** Editor-authentic UI layout for a family, resolved to the block-type/firmware variant selected by
    *  the block's CURRENT type value (`typeValue`); the variant's pages are further filtered to the
    *  block's current selector/firmware state via `selectors` (see resolveLayoutPages). Undefined if none. */
@@ -620,7 +691,9 @@ export const PROFILES: Record<number, DeviceProfile> = {
     rosterFor: axe3RosterFor,
     enumLabelsFor: axe3EnumLabels,
     cabIrs: () => AXE3_CAB_IRS as unknown as Record<string, string[]>, // factory banks bundled (III editor cache, fw 32.6 era); USER banks read live
-    familyForEffectId: eidFamily(), // III ships no effectId table → shared gen-3 virtual eids only
+    // the III effect-id table (FORGEFX-45): every family's first effect id, the six `roster` ids served read-only
+    familyForEffectId: eidFamily(AXE3_FAMILY_BY_EFFECT_ID as Record<number, string>),
+    blockMapFor: axe3RosterEntry,
     layoutFor: layoutFrom(AXE3_LAYOUTS as unknown as DeviceEditorLayouts),
     editorLayouts: AXE3_LAYOUTS as unknown as DeviceEditorLayouts,
     catalogFirmware: AXE3_CATALOG_BASELINE.firmware,
@@ -789,10 +862,41 @@ export function familyByteExactness(built: BuiltCache): (family: string) => bool
 /** Effect ids of a profile document's persisted block-map entries with confidence `confirmed` (empty when it has
  *  none, or no block map at all — a legacy document). Never throws. */
 function confirmedBlocksOf(built: BuiltCache): ReadonlySet<number> {
-  const map = (built as unknown as { blockMap?: unknown }).blockMap;
   const out = new Set<number>();
-  if (Array.isArray(map)) for (const e of map) if (isRecord(e) && e.confidence === 'confirmed' && Number.isInteger(e.eid)) out.add(e.eid as number);
+  for (const e of blockMapOf(built)) if (e.confidence === 'confirmed') out.add(e.eid);
   return out;
+}
+
+/** A profile document's persisted block-map entries that are well-formed (integer eid, string confidence, key a
+ *  string or null, evidence an array), first entry per eid. Empty for a legacy document. Never throws. */
+function blockMapOf(built: BuiltCache): BlockMapEntry[] {
+  const map = (built as unknown as { blockMap?: unknown }).blockMap;
+  const out: BlockMapEntry[] = [];
+  const seen = new Set<number>();
+  if (!Array.isArray(map)) return out;
+  for (const e of map) {
+    if (!isRecord(e) || !Number.isInteger(e.eid) || typeof e.confidence !== 'string' || seen.has(e.eid as number)) continue;
+    if (!(e.key === null || typeof e.key === 'string') || !Array.isArray(e.evidence)) continue;
+    seen.add(e.eid as number);
+    out.push({
+      eid: e.eid as number, key: e.key as string | null, sectionTag: Number.isInteger(e.sectionTag) ? (e.sectionTag as number) : null,
+      confidence: e.confidence as BlockMapEntry['confidence'], evidence: (e.evidence as unknown[]).filter((x): x is BlockMapEntry['evidence'][number] => typeof x === 'string'),
+      ...(isRecord(e.compared) ? { compared: e.compared as BlockMapEntry['compared'] } : {}),
+      ...(Array.isArray(e.candidates) ? { candidates: (e.candidates as unknown[]).filter((t): t is number => Number.isInteger(t)) } : {}),
+      channels: typeof e.channels === 'boolean' ? e.channels : null
+    });
+  }
+  return out;
+}
+
+/** A profile document's editor-cache sections (`sections` entries with `space: 'section'` and the fields the runtime
+ *  shape match reads). Empty for a legacy document. Never throws. */
+function byteSectionsOf(built: BuiltCache): DerivedSection[] {
+  const list = (built as unknown as { sections?: unknown }).sections;
+  if (!Array.isArray(list)) return [];
+  return list.filter((s): s is DerivedSection =>
+    isRecord(s) && s.space === 'section' && Number.isInteger(s.tag) && typeof s.key === 'string' && (s.family === null || typeof s.family === 'string')
+    && typeof s.role === 'string' && typeof s.stride === 'number');
 }
 
 /**
@@ -812,6 +916,10 @@ function confirmedBlocksOf(built: BuiltCache): ReadonlySet<number> {
  *   • a family whose cache rows match another family's catalog rows clearly better than their own (a
  *     section assigned to the wrong family, see `familyAssignmentSuspects`) is left out of the merge
  *     altogether: ranges, labels, section and roster stay static. It is listed in `profileFacts`.
+ *   • familyForEffectId / blockMapFor — the block-map overlay of a profile document: an effect id the static tables
+ *     do not place and the document's block map binds `confirmed` resolves to the entry's key (when the merged rows
+ *     carry it); `blockMapFor` hands out the static roster-only entries first, then the document's entry of such an
+ *     effect id. How each is served (read-only or writable): drivers/blockMapState.ts.
  * The model byte, grid dims, instanceLimits, params, layouts, FC/Mod/monitor models, and write mode
  * all stay from the static profile (the walk doesn't recover them). `profileFacts` records the
  * provenance and which rows the merge took; `staticBase` the profile this one was layered over.
@@ -884,11 +992,23 @@ export function runtimeProfileFrom(built: BuiltCache, staticProfile: DeviceProfi
     mergedSections[fam] = !byteFamily(fam) && stat ? { ...cached, stride: Math.max(stat.stride, cached.stride) } : cached;
   }
 
+  // Block-map overlay: an effect id the static tables do not place and the document's block map binds `confirmed`
+  // resolves to the entry's key — when the merged rows have that key (a key without rows describes nothing). The
+  // static tables win for every effect id they place (the codec never maps one of those); the hidden family of the
+  // development hook is never a key.
+  const mapEntries = blockMapOf(built);
+  const mapByEid = new Map(mapEntries.map((e) => [e.eid, e] as const));
+  const overlay = new Map<number, string>();
+  for (const e of mapEntries) {
+    if (e.confidence === 'confirmed' && e.key !== null && mergedRanges[e.key] !== undefined && unlessHidden(e.key) !== undefined) overlay.set(e.eid, e.key);
+  }
+
   const profileFacts: ProfileFacts = {
     source: profileSourceOf(built.meta?.source),
     byteExact: docByteExact,
     isByteExactFamily: byteFamily,
     confirmedBlocks: confirmedBlocksOf(built),
+    byteSections: byteSectionsOf(built),
     firmware: typeof built.firmware === 'string' ? built.firmware : null,
     ranges: built.ranges ?? {},
     enumLabels: builtEnums,
@@ -902,6 +1022,14 @@ export function runtimeProfileFrom(built: BuiltCache, staticProfile: DeviceProfi
     rangeSections: mergedSections,
     profileFacts,
     staticBase: staticProfile.staticBase ?? staticProfile,
+    familyForEffectId(eid: number): string | undefined {
+      return staticProfile.familyForEffectId(eid) ?? overlay.get(eid);
+    },
+    blockMapFor(eid: number): BlockMapEntry | undefined {
+      const fixed = staticProfile.blockMapFor?.(eid);
+      if (fixed) return fixed;
+      return staticProfile.familyForEffectId(eid) === undefined ? mapByEid.get(eid) : undefined;
+    },
     rosterFor(slug: string): TypeModel[] {
       const fam = SLUG_FAMILY[slug.toLowerCase()];
       const cacheRoster = fam && !suspects.has(fam) ? builtRosters[fam] : undefined;

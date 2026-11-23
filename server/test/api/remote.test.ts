@@ -82,6 +82,9 @@ const REJECTED: [string, string][] = [
   ['POST', '/device/definitions/import'],
   ['POST', '/device/definitions/import?force=1'],
   ['POST', '/device/definitions/import?replace=1'],
+  // block probe: a definition walk of the unit that also rewrites the stored definitions — never relayed
+  ['POST', '/device/definitions/blocks/203/probe'],
+  ['POST', '/device/definitions/blocks/162/probe'],
 ];
 
 // Requests relayed end to end, with the status the remote must receive.

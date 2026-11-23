@@ -20,6 +20,7 @@ import { profileCatalogFor, rosterSelectorPid } from '../profileCatalog.js';
 import { profileSummaryOf } from '../profileSchema.js';
 import { buildParamIndex, MAX_WIRE_PID, type BlockIndex } from './paramIndex.js';
 import { classifyProfileRows, type ClassifiedFamily } from './profileCompare.js';
+import { blockMapState } from './blockMapState.js';
 import type {
   DefinitionsCaps, DefinitionsDiffDTO, DefinitionsDiffPart, FamilyDiff, ParamDelta, RosterDelta, SectionDiff, UnknownBlockDiff
 } from './types.js';
@@ -151,11 +152,10 @@ function delta(id: number, row: RangeDef, labels: readonly string[] | undefined,
   return d;
 }
 
-/** The `UnknownBlockDiff.state` of a block-map entry's confidence (`confirmed`, `likely`; `candidate` and anything
- *  else — a `roster` entry included — `candidates`). */
-export function blockMapState(confidence: string): UnknownBlockDiff['state'] {
-  return confidence === 'confirmed' ? 'confirmed' : confidence === 'likely' ? 'likely' : 'candidates';
-}
+/** The `UnknownBlockDiff.state` of a block-map entry's confidence: the one mapping the generic block params use too
+ *  (drivers/blockMapState.ts — `confirmed`; `likely` and `roster` → `likely`; `candidate` → `candidates`; anything else
+ *  `none`). Re-exported here, where the diff's callers have always found it. */
+export { blockMapState };
 
 /**
  * Build the definitions diff. Families: every catalog family and every other family the profile has (synthetic
