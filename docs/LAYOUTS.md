@@ -37,6 +37,33 @@ type DeviceLayout = {
 This is the same shape for every gen-3 device; only the data differs per unit. The profile
 exposes it via `layoutFor(family)` (see [`server/src/devices.ts`](../server/src/devices.ts)).
 
+### Page-level controls
+
+The editor places most controls in rows, and some directly on the page: section titles and separators,
+but also parameters that appear nowhere else (the Synth's tracking mode, the Graphic EQ's master Q, the
+amp's EQ type and location, the Looper's trims). A page carries those in an optional `pageControls` array,
+next to its `rows`:
+
+```jsonc
+{
+  "name": "Voice 1",
+  "rows": [ /* … */ ],
+  "pageControls": [                           // absent when the page has none
+    { "label": "Tracking\nMode", "paramName": "SYNTH_PD_RANGE", "paramId": 41,
+      "widget": "dropdown", "rawWidget": "dropdown1Tight",
+      "placement": { "positionExact": "196,230" }, "fw": { "gtet": "11,01" } }
+  ]
+}
+```
+
+The entries have the shape of a row control, in editor order, and get the same treatment: a control an
+`lt` firmware bound hides on the newest firmware is not served, a `gtet`-gated one is, with its gate in
+`fw`. Titles, separators and other decorative entries (`paramName: null`) are included as the editor has
+them; a client may ignore them, or the whole array. A page can have `pageControls` and empty `rows`.
+`paramId` is also `null` for a parameter that belongs to another block's family: `paramName` still names
+it, but it is not addressable on this block. A few entries are editor actions whose `paramId` is a pseudo
+id without a live value (the EQ's "Zero All" button), as some row buttons are.
+
 ## Layouts on the parameter response
 
 `GET /preset/blocks/:eid/params` returns the block's live, named parameter values and now also

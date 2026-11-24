@@ -59,7 +59,9 @@ import { AM4_LAYOUTS } from 'forgefx-midi/am4';
 // layout: the block's editorName + family, plus which variant was chosen, plus ALL of that variant's
 // pages (tabs → rows → controls) passed through VERBATIM from the codec's *_LAYOUTS (widget / rawWidget /
 // placement / crossBlock / per-control fw preserved). No unioning across variants; the client renders
-// exactly the pages the editor would show for the current block type.
+// exactly the pages the editor would show for the current block type. A page's controls come in two places:
+// its `rows`, and (optional, absent when there are none) `pageControls`: the controls the editor places
+// directly on the page, e.g. the Synth's tracking mode. Both get the same per-control treatment.
 export type DeviceLayout = {
   editorName: string;
   family: string;
@@ -167,18 +169,24 @@ const filterPagesBySelector = (
 
 // Drop controls that the newest firmware would hide: a control gated with an `lt` (only firmware < X)
 // bound never applies to the newest firmware (whether it also carries a `gtet` — a closed range — or not).
-// Controls with a `gtet`-only gate or no gate always apply and pass through untouched.
+// Controls with a `gtet`-only gate or no gate always apply and pass through untouched. One rule for row
+// controls and page-level ones (`pageControls`; the key goes with the last control it held).
 const pruneControlsByFw = (page: EditorLayoutPage): EditorLayoutPage => {
   let touched = false;
+  const prune = (controls: EditorLayoutRow['controls']): EditorLayoutRow['controls'] => {
+    const kept = controls.filter((c) => c.fw?.lt == null);
+    if (kept.length === controls.length) return controls;
+    touched = true;
+    return kept;
+  };
   const rows: EditorLayoutRow[] = page.rows.map((row) => {
-    const controls = row.controls.filter((c) => {
-      const drop = c.fw?.lt != null;
-      if (drop) touched = true;
-      return !drop;
-    });
-    return controls.length === row.controls.length ? row : { ...row, controls };
+    const controls = prune(row.controls);
+    return controls === row.controls ? row : { ...row, controls };
   });
-  return touched ? { ...page, rows } : page;
+  const { pageControls, ...rest } = page;
+  const kept = pageControls && prune(pageControls);
+  if (!touched) return page;
+  return { ...rest, rows, ...(kept?.length ? { pageControls: kept } : {}) };
 };
 
 // Filter a variant's pages down to what the editor actually shows for the block's current state: pages
