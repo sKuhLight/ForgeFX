@@ -17,6 +17,10 @@ import {
   isLooperWaveformResponse,
   parseLooperWaveform,
   buildLooperControl,
+  GRAPH_CURVE_SLOTS,
+  buildGraphCurvePoll,
+  isGraphCurveResponse,
+  parseGraphCurve,
   isMultipurposeResponse,
   parseMultipurposeResponse,
   describeMultipurposeResultCode,
@@ -734,7 +738,9 @@ class Gen3Driver implements DeviceDriver {
       presetDump: true,
       presetConvert: true, // full gen-3 lift (routing grid + per-scene block state + amp knobs)
       blockParamDecode: profile.model === 0x11, // per-block body decode is FM3-only today
-      telemetry: { tuner: true, outputMeters: true, cpu: true },
+      // FM3 only: the `sub 0x23` graph-curve reply was observed on the FM3; the FM9 / Axe-Fx III share
+      // the codec but no reply was captured from either, so the route stays 501 there until one is.
+      telemetry: { tuner: true, outputMeters: true, cpu: true, graphCurves: profile.model === 0x11 },
       fcModel: !!profile.fcModel,
       fcLiveRead: !!profile.fcModel?.liveState,
       modBind: !!profile.modModel,
@@ -2402,10 +2408,12 @@ class Gen3Driver implements DeviceDriver {
     return out;
   }
 
-  /** Looper page telemetry: the live waveform envelope + playhead position + level (FM3 capture 2026-07-04;
-   *  gen-3 shared). Waveform = fn 0x01 sub 0x23 (~595 raw 7-bit magnitudes → 0..1); position = sub 0x19
-   *  pid 14 (0..1 across the loop); level = sub 0x19 pid 22. Returns empty with NO device I/O when the
-   *  block isn't a looper, so Axis can poll it for whatever block is open without cost. */
+  /** Looper page telemetry: the live waveform envelope + playhead position + level (gen-3 shared).
+   *  Waveform = fn 0x01 sub 0x23 at curve slot 0: the same 609-byte container as the block graph curves,
+   *  decoded to 128 envelope magnitudes. Those are device values whose envelope can exceed 1 (observed
+   *  up to ~2.17), so each is clamped to 0..1 for this method's HTTP contract. Position = sub 0x19 pid 14
+   *  (0..1 across the loop); level = sub 0x19 pid 22. Returns empty with NO device I/O when the block
+   *  isn't a looper, so Axis can poll it for whatever block is open without cost. */
   async looperTelemetry(eid: number): Promise<{ wave: number[]; position: number | null; level: number | null }> {
     if (slugForEffectId(eid) !== 'looper') return { wave: [], position: null, level: null };
     const dev = await this.#conn();
@@ -2416,7 +2424,7 @@ class Gen3Driver implements DeviceDriver {
     try {
       const wf = await dev.request(buildLooperWaveformPoll(eid, model), { timeoutMs: 900, quietMs: 60, routine: true, match: (fs) => fs.some((f) => isLooperWaveformResponse(f, eid)) });
       const r = wf.find((f) => isLooperWaveformResponse(f, eid));
-      if (r) wave = parseLooperWaveform(r);
+      if (r) wave = parseLooperWaveform(r).map((v) => Math.max(0, Math.min(1, v)));
     } catch { /* no waveform this tick */ }
     for (const [pid, isPos] of [[14, true], [22, false]] as const) {
       try {
@@ -2444,6 +2452,24 @@ class Gen3Driver implements DeviceDriver {
     const dev = await this.#conn();
     await dev.sendQueued(buildLooperControl(eid, pid, on, this.#prof.model));
     return { ok: true };
+  }
+
+  /** One page's device-rendered graph curve (fn 0x01 sub 0x23): the block page asks for it on a state
+   *  change (page open, parameter echo, type/zoom), NOT on a timer. The reply is a fixed container whose
+   *  declared byte count sizes it (a full-size curve is 609 bytes = 128 float32 magnitudes). Null when no
+   *  reply matched; a frame for another block/slot is ignored by the matcher. */
+  async blockCurve(eid: number, slot: number): Promise<{ eid: number; slot: number; values: number[] } | null> {
+    if (!Number.isInteger(slot) || slot < 0 || slot >= GRAPH_CURVE_SLOTS) {
+      throw new Error(`curve slot ${slot} out of range 0..${GRAPH_CURVE_SLOTS - 1}`);
+    }
+    const dev = await this.#conn();
+    const frames = await dev.request(buildGraphCurvePoll(eid, slot, this.#prof.model), {
+      timeoutMs: 900, quietMs: 60, routine: true,
+      match: (fs) => fs.some((f) => isGraphCurveResponse(f, eid, slot))
+    });
+    const r = frames.find((f) => isGraphCurveResponse(f, eid, slot));
+    if (!r) return null;
+    return { eid, slot, values: parseGraphCurve(r) };
   }
 
   /** Build dropdown options for the enum param over the ordinals `min..max`. A label is the device's own list

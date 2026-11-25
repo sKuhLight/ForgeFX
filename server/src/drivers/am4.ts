@@ -246,7 +246,7 @@ class Am4Driver implements DeviceDriver {
     presetDump: false, // AM4 backups run their own verbatim dump path (/am4/preset/backup), not the gen-3 one
     presetConvert: true, // partial lift (name + scenes + amp block per-channel params) via the AM4 dump decode
     blockParamDecode: false,
-    telemetry: { tuner: true, outputMeters: false, cpu: false }, // tuner via block-0x0023 live-poll (readTuner); no gen-3 meter/CPU frames
+    telemetry: { tuner: true, outputMeters: false, cpu: false, graphCurves: false }, // tuner via block-0x0023 live-poll (readTuner); no gen-3 meter/CPU frames
     fcModel: false,
     fcLiveRead: false,
     modBind: false, // modifier model is data-only (see modifierModel); the wire binding is not captured

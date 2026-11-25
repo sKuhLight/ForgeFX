@@ -523,8 +523,9 @@ export interface DriverCapabilities {
   presetConvert: boolean;
   /** Full per-block param decode from the preset body (FM3 only today). */
   blockParamDecode: boolean;
-  /** Gen-3 live telemetry polls the supervisor may run against this device. */
-  telemetry: { tuner: boolean; outputMeters: boolean; cpu: boolean };
+  /** Gen-3 live telemetry polls the supervisor may run against this device. `graphCurves` gates the
+   *  block graph-curve read (GET /preset/blocks/:eid/curve), not a supervisor poll. */
+  telemetry: { tuner: boolean; outputMeters: boolean; cpu: boolean; graphCurves: boolean };
   /** Foot Controller address model available. */
   fcModel: boolean;
   /** Live FC per-switch state read (FM3 only today). */
@@ -690,6 +691,10 @@ export interface DeviceDriver {
   /** Toggle a looper transport control (POST /preset/looper/control). `action` ∈ record|play|stop|
    *  overdub|undo|once|reverse|half; `on` = 1.0/0.0. gen-3. */
   looperControl?(eid: number, action: string, on: boolean): Promise<{ ok: boolean }>;
+  /** Device-rendered block graph curve for one page slot (GET /preset/blocks/:eid/curve): the
+   *  `sub 0x23` reply decoded to `count/4` float32 magnitudes (128 for a full-size curve). Null when
+   *  no reply matched. gen-3 (capability telemetry.graphCurves). */
+  blockCurve?(eid: number, slot: number): Promise<{ eid: number; slot: number; values: number[] } | null>;
 
   // ── FC / modifier ──
   fcReadSwitch?(layout: number, view: number, sw: number): Promise<FcSwitchState>;

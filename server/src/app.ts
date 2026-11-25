@@ -28,6 +28,7 @@ import { parseHexBytes, sendErrorStatus } from './drivers/sendPolicy.js';
 import * as backups from './services/backups.js';
 import * as convert from './services/convert.js';
 import type { ConverterPreset } from 'forgefx-midi/convert';
+import { GRAPH_CURVE_SLOTS } from 'forgefx-midi/gen3/axe-fx-iii';
 import * as deviceCache from './services/deviceCache.js';
 import * as editorCacheImport from './services/editorCacheImport.js';
 import * as editorCacheDiscovery from './services/editorCacheDiscovery.js';
@@ -776,6 +777,22 @@ export async function buildApp(registry: DeviceRegistry, opts: AppOptions = {}):
       if (!d.looperControl) return unsupported(reply, 'looperControl');
       if (!Number.isFinite(eid as number) || !action) { reply.code(400); return { error: 'eid + action required' }; }
       return await d.looperControl(eid as number, action, on !== false);
+    } catch (e) { reply.code(503); return { error: (e as Error).message }; }
+  });
+  // Device-rendered block graph curve for one page slot (EQ/PEQ/filter/comp/LFO/ADSR/modifier/cab/RTA).
+  // `slot` is the page's graph index (default 0); the driver answers null when no reply matched.
+  app.get<{ Params: { eid: string }; Querystring: { slot?: string } }>('/preset/blocks/:eid/curve', async (req, reply) => {
+    const eid = Number(req.params.eid);
+    const raw = req.query.slot;
+    const slot = raw != null && raw !== '' ? Number(raw) : 0;
+    try {
+      const d = await driver();
+      if (!d.capabilities.telemetry.graphCurves || !d.blockCurve) return unsupported(reply, 'graphCurves');
+      if (!Number.isFinite(eid)) { reply.code(400); return { error: 'eid must be a number' }; }
+      if (!Number.isInteger(slot) || slot < 0 || slot >= GRAPH_CURVE_SLOTS) {
+        reply.code(400); return { error: `slot must be an integer 0..${GRAPH_CURVE_SLOTS - 1}` };
+      }
+      return await d.blockCurve(eid, slot);
     } catch (e) { reply.code(503); return { error: (e as Error).message }; }
   });
   // FC current switch state via the sub-0x01 structured config-selector read (the read FM3-Edit uses on

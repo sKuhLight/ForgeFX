@@ -26,6 +26,7 @@ import * as contribution from '../services/cacheContribution.js';
 import * as definitionsFile from '../services/definitionsFile.js';
 import * as blockProbe from '../services/blockProbe.js';
 import { blockHelpBySlug, helpIndex } from '../help.js';
+import { GRAPH_CURVE_SLOTS } from 'forgefx-midi/gen3/axe-fx-iii';
 import { createUnifiedHandlers, genericFlag } from './handlers.js';
 import { sendErrorStatus } from '../drivers/sendPolicy.js';
 import { putStoreDoc } from './services.js';
@@ -530,6 +531,22 @@ export function createRouter(deps: RuntimeDeps): {
       if (!d.looperControl) return unsupported(c.reply, 'looperControl');
       if (!Number.isFinite(eid as number) || !action) { c.reply.code(400); return { error: 'eid + action required' }; }
       return await d.looperControl(eid as number, action, onv !== false);
+    } catch (e) { c.reply.code(503); return { error: (e as Error).message }; }
+  });
+  // Device-rendered block graph curve for one page slot (see app.ts): `slot` default 0, 400 on a
+  // non-finite eid / out-of-range slot, 501 where telemetry.graphCurves is false, 503 on a driver error.
+  on('GET', '/preset/blocks/:eid/curve', async (c) => {
+    const eid = Number(c.params.eid);
+    const raw = c.query.get('slot');
+    const slot = raw != null && raw !== '' ? Number(raw) : 0;
+    try {
+      const d = await driver();
+      if (!d.capabilities.telemetry.graphCurves || !d.blockCurve) return unsupported(c.reply, 'graphCurves');
+      if (!Number.isFinite(eid)) { c.reply.code(400); return { error: 'eid must be a number' }; }
+      if (!Number.isInteger(slot) || slot < 0 || slot >= GRAPH_CURVE_SLOTS) {
+        c.reply.code(400); return { error: `slot must be an integer 0..${GRAPH_CURVE_SLOTS - 1}` };
+      }
+      return await d.blockCurve(eid, slot);
     } catch (e) { c.reply.code(503); return { error: (e as Error).message }; }
   });
   // FC current switch state via the sub-0x01 structured config-selector read (see app.ts).
