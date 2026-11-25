@@ -84,15 +84,15 @@ function checkGen3Common(caps: Caps, label: string, fullCapture = true): void {
   assertEqual(caps.telemetryControl, true, `${label} telemetryControl (registry-level cadence-mode control)`);
 }
 
-/** The blockState flag is the LAST key of the extended matrix (additive-only ordering): it sits right after
- *  virtualEffects and before the registry-level telemetryControl / supportsSave. */
+/** New capabilities append to the extended matrix, ahead of the registry-only control and supportsSave. */
 function checkBlockStateOrdering(caps: Caps, label: string): void {
   const keys = Object.keys(caps);
   const at = keys.indexOf('blockState');
   assert(at > 0, `${label} blockState key present`);
   assertEqual(keys[at - 1], 'virtualEffects', `${label} blockState follows virtualEffects`);
   assertEqual(keys[at + 1], 'blockVisuals', `${label} blockState precedes blockVisuals`);
-  assertEqual(keys[at + 2], 'telemetryControl', `${label} blockVisuals precedes telemetryControl`);
+  assertEqual(keys[at + 2], 'looperTelemetry', `${label} blockVisuals precedes looperTelemetry`);
+  assertEqual(keys[at + 3], 'telemetryControl', `${label} looperTelemetry precedes telemetryControl`);
 }
 
 async function fm3(): Promise<void> {

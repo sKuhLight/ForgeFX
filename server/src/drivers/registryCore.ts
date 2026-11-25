@@ -102,7 +102,7 @@ export function diagnosticCaptureSupported(modelId: number, caps: Pick<DriverCap
 
 /** The /telemetry/config DTO both surfaces serve: the current mode, its resolved cadence, and the
  *  full mode list. Cumulative-counter-free — traffic rides the SSE `traffic` event + /diag. */
-export interface TelemetryConfigDto { mode: TelemetryMode; effective: CadenceProfile; modes: readonly TelemetryMode[]; }
+export interface TelemetryConfigDto { mode: TelemetryMode; effective: CadenceProfile; modes: readonly TelemetryMode[]; meters: boolean; }
 
 const DESCRIPTOR_BY_MODEL: Record<number, { capabilities: Record<string, unknown> }> = {
   0x01: AXEFXGEN1_DESCRIPTOR as never,
@@ -265,6 +265,7 @@ export class DeviceRegistry {
 
   // ── telemetry cadence mode (in-memory; resets to the balanced default on restart) ──
   #telemetryMode: TelemetryMode = 'balanced';
+  #meterDemand = false;
   /** The cadence bundle for the CURRENT mode + the ACTIVE driver's model family (falls back to the
    *  detected/provisional model, then generic). Resolved AT CALL TIME so a mode switch applies on the
    *  next reschedule of every loop without touching timers directly. */
@@ -274,7 +275,7 @@ export class DeviceRegistry {
   }
   /** GET /telemetry/config payload. */
   getTelemetryConfig(): TelemetryConfigDto {
-    return { mode: this.#telemetryMode, effective: this.#cadence(), modes: TELEMETRY_MODES };
+    return { mode: this.#telemetryMode, effective: this.#cadence(), modes: TELEMETRY_MODES, meters: this.#meterDemand };
   }
   /** Set the cadence mode (PUT /telemetry/config). Validates, stores in-memory, and emits a
    *  `telemetryConfig` event so every live UI reflects it. Throws on an unknown mode (the route maps
@@ -283,6 +284,13 @@ export class DeviceRegistry {
     if (!isTelemetryMode(mode)) throw new Error(`unknown telemetry mode '${mode}'`);
     this.#telemetryMode = mode;
     this.#emit({ type: 'telemetryConfig', mode });
+    return this.getTelemetryConfig();
+  }
+  /** Turn the server's meter round-robin on or off. Off by default: it runs only while a client has its meters on. */
+  setMeterDemand(on: boolean): TelemetryConfigDto {
+    this.#meterDemand = on;
+    if (on) this.#startMeters();
+    else this.#stopMeters();
     return this.getTelemetryConfig();
   }
   /** The accepted mode set — the route uses it to 400 an unknown value before calling the setter. */
@@ -567,8 +575,9 @@ export class DeviceRegistry {
       blockState: !!c.blockState,
       // Read-only block visuals: `visuals` on GET /preset/blocks/:eid/params + `graphKey` on the served
       // layout's graph slots. Derived from the driver cap AND the route method so the DTO can't drift.
-      // Appended last (additive-only ordering — see #capabilitiesDto).
-      blockVisuals: !!c.blockVisuals && !!d.blockParams
+      blockVisuals: !!c.blockVisuals && !!d.blockParams,
+      // The waveform is an editor visual with its own demand, independent of live block meters.
+      looperTelemetry: !!d.looperTelemetry
     };
   }
 
@@ -931,6 +940,7 @@ export class DeviceRegistry {
   //     590-byte frame, so we read it only once per round-robin cycle (meters are tiny 23-byte reads).
   // Runs while ≥1 SSE client is subscribed AND the active driver's telemetry capability allows it.
   #startMeters() {
+    if (!this.#meterDemand) return; // the meter round-robin runs only while a client has its meters on (METER toggle)
     if (this.#metersTimer || this.#telemetryHolds > 0) return; // held by an exclusive operation (pauseTelemetry)
     if (this.#active && !this.#active.capabilities.telemetry.outputMeters) return; // no gen-3 meter frames on this device
     this.#metersTimer = setTimeout(() => this.#pollMeters(), this.#cadence().meterTickMs); // primer at the mode's meter tick

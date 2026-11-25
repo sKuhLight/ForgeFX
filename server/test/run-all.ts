@@ -68,7 +68,7 @@ const tests: Array<{ name: string; run: () => void | Promise<void> }> = [
   { name: `drivers/block-state (${BLOCK_STATE_CASE_COUNT} cases, Scene Ignore + Bypass Mode tagged per model: ids FM3 137 / FM9 6 / III 135, values per active channel, write frames, firmware gate, a failed read flagged, caps)`, run: runBlockStateTests },
   { name: `drivers/tables (${TABLES_CASE_COUNT} identity checks, paramId cross-contamination guard)`, run: runTablesTests },
   { name: `drivers/layouts (${LAYOUTS_CASE_COUNT} editor-layout v2 variant-selection + passthrough)`, run: runLayoutsTests },
-  { name: `drivers/block-visuals (${BLOCK_VISUALS_CASE_COUNT} cases, caps flag per model, blockParams visuals narrowed to the current variant with device-own ids, DELAY without layout, CONTROLLERS instances, stamped layout graph slots, route passthrough; mocked)`, run: runBlockVisualsTests },
+  { name: `drivers/block-visuals (${BLOCK_VISUALS_CASE_COUNT} cases, caps flag per model, blockParams visuals narrowed to the current variant with device-own ids, DELAY without layout, CONTROLLERS instances, AMP Input/Output EQ, stamped layout graph slots, route passthrough; mocked)`, run: runBlockVisualsTests },
   { name: `drivers/telemetry (${TELEMETRY_CASE_COUNT} cadence/traffic/echo-guard/yield cases)`, run: runTelemetryTests },
   { name: `drivers/reflection (${REFLECTION_CASE_COUNT} slow-link/scene-state/blockState/scene cases)`, run: runReflectionTests },
   { name: `api/alias-parity (${ALIAS_PARITY_CASE_COUNT} alias↔unified twins, mocked AM4)`, run: runAliasParityTests },

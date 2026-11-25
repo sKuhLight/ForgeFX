@@ -322,7 +322,7 @@ export interface DeviceDriver {
   blockTypes?(slug: string): TypeModel[];
 
   // ── live block params ──
-  blockParams?(eid: number): Promise<{ block: string; slug: string; page: number; named: NamedParam[]; enums: EnumParam[]; type: { value: number; name: string } | null; layout?: DeviceLayout; blockState?: BlockStateDTO; visuals?: BlockVisualDTO[] }>;
+  blockParams?(eid: number, opts?: { observe?: boolean }): Promise<{ block: string; slug: string; page: number; named: NamedParam[]; enums: EnumParam[]; type: { value: number; name: string } | null; layout?: DeviceLayout; blockState?: BlockStateDTO; visuals?: BlockVisualDTO[] }>;
   readParams?(eid: number, pids: number[]): Promise<Record<number, number>>;
   readRange?(eid: number, pids: number[]): Promise<Record<number, number>>;
   rawBlock?(eid: number): Promise<{ eid: number; values: Record<number, number> }>;
@@ -333,7 +333,7 @@ export interface DeviceDriver {
   >;
   liveMonitors?(onlyEid?: number): Promise<{ effectId: number; family: string; paramName: string; role: string; norm: number; db: number | null; minDb?: number; maxDb?: number }[]>;
   /** Looper page telemetry (GET /preset/looper): live waveform envelope (0..1 magnitudes) + playhead
-   *  position (0..1) + level (0..1). Empty when the block isn't a looper. gen-3 (capability liveMonitors). */
+   *  position (0..1) + level (0..1). Empty when the block isn't a looper. */
   looperTelemetry?(eid: number): Promise<{ wave: number[]; position: number | null; level: number | null }>;
   /** Toggle a looper transport control (POST /preset/looper/control). `action` ∈ record|play|stop|
    *  overdub|undo|once|reverse|half; `on` = 1.0/0.0. gen-3. */

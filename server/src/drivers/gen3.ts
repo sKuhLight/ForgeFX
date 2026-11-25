@@ -264,13 +264,14 @@ interface DecodedDump {
  *  (beacons, other replies) that the strict frame-walking parser would reject; the old decoder
  *  skipped them the same way. */
 function dumpBytesFromFrames(frames: readonly (readonly number[])[]): Uint8Array {
-  const keep: number[] = [];
-  for (const f of frames) {
-    if (f.length < 8 || f[0] !== 0xf0 || f[1] !== 0x00 || f[2] !== 0x01 || f[3] !== 0x74) continue;
-    const fn = f[5];
-    if (fn === 0x77 || fn === 0x78 || fn === 0x79) keep.push(...f);
+  const kept = frames.filter((f) => f.length >= 8 && f[0] === 0xf0 && f[1] === 0x00 && f[2] === 0x01 && f[3] === 0x74 && (f[5] === 0x77 || f[5] === 0x78 || f[5] === 0x79));
+  const out = new Uint8Array(kept.reduce((n, f) => n + f.length, 0));
+  let at = 0;
+  for (const f of kept) {
+    out.set(f, at);
+    at += f.length;
   }
-  return Uint8Array.from(keep);
+  return out;
 }
 
 /** Full dump decode via the package pipeline (parse → raw_patch/CRC/Huffman → structured body),
@@ -390,6 +391,18 @@ function looksDiscrete(range: { displayMin: number; displayMax: number; step?: n
 
 type FamilyParam = DeviceProfile['params'][string][number];
 
+/** Unit code by paramId for one family's param list, built once per list (a block read asks per param). */
+const unitIndexes = new WeakMap<readonly FamilyParam[], Map<number, string | undefined>>();
+function unitOfParam(defs: readonly FamilyParam[], paramId: number): string | undefined {
+  let index = unitIndexes.get(defs);
+  if (!index) {
+    index = new Map();
+    for (const p of defs) if (!index.has(p.paramId)) index.set(p.paramId, p.unit);
+    unitIndexes.set(defs, index);
+  }
+  return index.get(paramId);
+}
+
 /** Is this catalog param a knob: a float-kind range with a usable span (min !== max), a continuous
  *  catalog unit (KNOB_UNITS), not the bypass flag and not a known non-dial (NOT_A_KNOB). A param on one
  *  of the provisional units ('unverified' / 'count' / 'pf') must also not be a selector on another
@@ -491,14 +504,14 @@ export function blockVisualsFor(
   const params = profile.params[family];
   if (!layout) return resolveBlockVisuals(params, family, served);
   const selectedIds = layoutParamIds(layout.pages);
-  const strict = resolveBlockVisuals(params, family, served, { layoutParamIds: selectedIds });
+  const strict = resolveBlockVisuals(params, family, served, { layoutParamIds: selectedIds, pages: layout.pages });
   if (layout.variantValue === null) return strict; // the selected variant IS a Default variant
   const dflt = profile.layoutFor(family); // no type value → the value-less Default variant, if the family has one
   if (!dflt || dflt.variantValue !== null) return strict;
   const selectedNames = new Set(layout.pages.map((p) => p.name));
   if (dflt.pages.some((p) => selectedNames.has(p.name))) return strict;
   const union = new Set([...selectedIds, ...layoutParamIds(dflt.pages)]);
-  const relaxed = resolveBlockVisuals(params, family, served, { layoutParamIds: union });
+  const relaxed = resolveBlockVisuals(params, family, served, { layoutParamIds: union, pages: [...layout.pages, ...dflt.pages] });
   const strictKeys = new Set(strict.map((v) => v.key));
   // keep the family's visual order: a strict visual where it exists, else the relaxed one
   return relaxed.flatMap((v) => (strictKeys.has(v.key) ? strict.filter((s) => s.key === v.key) : [v]))
@@ -763,7 +776,12 @@ class Gen3Driver implements DeviceDriver {
     const what = target === EDIT_BUFFER ? 'edit buffer' : `slot ${target}`;
     let partial: number[][] = [];
     for (let attempt = 1; attempt <= 3; attempt++) {
+
       const plan = this.#dumpHeaderPlan(dev, target);
+      // The FM3 can pause for several hundred ms between the 0x77 header and its first 0x78 chunk (and
+      // needs ~5 s before it starts at all when its queue is busy). A 180 ms quiet gap aborted such a
+      // dump mid-read, retried, and piled another transfer onto the device's queue - which then starved
+      // every later slot. The 0x79 `settles` still ends a whole dump immediately.
       const frames = await dev.request(this.#codec.buildRequestPresetDump(target), presetDumpOpts(model, plan, slow ? 25000 : 5000, slow ? 1500 : 180));
       let whole = wholeDumps(frames, model, plan.named)[0];
       if (whole && headerNamesRequest(dumpHeaderNumber(whole[0]!), target)) this.#session(dev).learned.add(target === EDIT_BUFFER ? 'edit' : 'stored');
@@ -1113,8 +1131,10 @@ class Gen3Driver implements DeviceDriver {
    * (knob position); `value`/`unit` are the device-true DISPLAY reading via this.#prof.ranges
    * (e.g. 1.2k Hz, -12 dB) where the cache has a range, else the 0..10 position.
    */
-  async blockParams(eid: number): Promise<{ block: string; slug: string; page: number; named: NamedParam[]; enums: EnumParam[]; type: { value: number; name: string } | null; layout?: DeviceLayout; blockState: BlockStateDTO; visuals: BlockVisual[] }> {
-    this.#watchedEid = eid; // this is the block the user has open → the target the FM3 device-edit poll re-reads
+  async blockParams(eid: number, opts: { observe?: boolean } = {}): Promise<{ block: string; slug: string; page: number; named: NamedParam[]; enums: EnumParam[]; type: { value: number; name: string } | null; layout?: DeviceLayout; blockState: BlockStateDTO; visuals: BlockVisual[] }> {
+    // A background read (observe === false) must not retarget the device-edit watch: only the block the user has open is watched.
+    const observe = opts.observe !== false;
+    if (observe) this.#watchedEid = eid; // this is the block the user has open → the target the FM3 device-edit poll re-reads
     const codecSlug = slugForEffectId(eid) ?? ''; // audio blocks resolve via the codec
     // virtual effects (GLOBAL=1, Controllers=2, Modifier=3, FC=199) resolve via the profile's effectId map
     const family = SLUG_FAMILY[codecSlug.toLowerCase()] ?? this.#prof.familyForEffectId(eid);
@@ -1158,7 +1178,7 @@ class Gen3Driver implements DeviceDriver {
         // params/type: the fn-0x1F body is channel-blocked and holds ALL channels, so we must slice the
         // active one, not always channel A. Costs one status round-trip per open — worth it for correctness.
         const activeCh = (await this.#statusByEffectId()).get(eid)?.channel ?? 0;
-        this.#watchedChannel = activeCh; // keep the device-edit-burst diff on the same channel (see decodeEditBurst)
+        if (observe) this.#watchedChannel = activeCh; // keep the device-edit-burst diff on the same channel (see decodeEditBurst)
         const frames = await this.#bulkRead(dev, eid, dev.slow ? 8000 : 2500, dev.slow ? 600 : 120);
         const bulk = this.#codec.assembleGen3BlockBulkRead(frames);
         const { stride, base } = this.#channelSlice(family, bulk, activeCh, hasChannels);
@@ -1750,7 +1770,7 @@ class Gen3Driver implements DeviceDriver {
         // Prefer the DEVICE-TRUE unit captured by the live-walk (RangeDef.unit, view 0x00)
         // over the AM4-name-overlay catalog code; fall back to the overlay when absent
         // (byte-source/.cache profiles carry no device-true unit).
-        const unitCode = family ? this.#prof.params[family]?.find((x) => x.paramId === paramId)?.unit : undefined;
+        const unitCode = family && this.#prof.params[family] ? unitOfParam(this.#prof.params[family], paramId) : undefined;
         return { value: round3(v), norm, unit: range.unit ?? ((unitCode && UNIT_LABEL[unitCode]) || undefined), min: range.displayMin, max: range.displayMax, log: log || undefined };
       } catch {
         /* fall through to 0..10 position */

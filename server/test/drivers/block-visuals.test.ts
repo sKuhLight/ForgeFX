@@ -24,7 +24,7 @@ import { createModernFractalCodec, packValue16 } from 'forgefx-midi/gen3/axe-fx-
 import { buildTestApp } from '../helpers/api.js';
 import { MockTransport, assert, assertEqual } from '../helpers/mock.js';
 
-export const BLOCK_VISUALS_CASE_COUNT = 13;
+export const BLOCK_VISUALS_CASE_COUNT = 14;
 
 const AXE3 = 0x10;
 const FM3 = 0x11;
@@ -100,10 +100,12 @@ function checkServed(r: ParamsResult, profile: DeviceProfile, family: string, la
   }
 }
 
-/** Graph keys stamped on a layout's graph slots, as `page:key` (in page order). */
+/** Graph keys stamped on a layout's graph slots, as `page:key` (in page order; page-level slots too). */
 function stampedKeys(layout: DeviceLayout | undefined): string[] {
   const out: string[] = [];
-  for (const p of layout?.pages ?? []) for (const r of p.rows) for (const c of r.controls) if (c.graphKey) out.push(`${p.name}:${c.graphKey}`);
+  for (const p of layout?.pages ?? []) {
+    for (const c of [...p.rows.flatMap((r) => r.controls), ...(p.pageControls ?? [])]) if (c.graphKey) out.push(`${p.name}:${c.graphKey}`);
+  }
   return out;
 }
 
@@ -115,6 +117,7 @@ export async function runBlockVisualsTests(): Promise<void> {
       const res = await app.inject({ method: 'GET', url: '/device' });
       const caps = (res.json() as { capabilities: Record<string, unknown> }).capabilities;
       assertEqual(caps.blockVisuals, want, `0x${model.toString(16)} capabilities.blockVisuals`);
+      assertEqual(caps.looperTelemetry, want, `0x${model.toString(16)} capabilities.looperTelemetry`);
       const keys = Object.keys(caps);
       assertEqual(keys[keys.indexOf('blockState') + 1], 'blockVisuals', `0x${model.toString(16)} blockVisuals directly after blockState (end of the extended matrix)`);
     } finally {
@@ -142,7 +145,8 @@ export async function runBlockVisualsTests(): Promise<void> {
     assertEqual(v.roles.threshold2, undefined, 'type 0 variant shows no THRESH2 → role dropped');
     assertEqual(v.roles.sustain, undefined, 'type 0 variant shows no SUSTAIN → role dropped');
     checkServed(r, fm3, 'COMP', 'FM3 COMP type 0');
-    assertEqual(stampedKeys(r.layout).join(','), 'Basic:dynamics', 'FM3 COMP type 0: the Basic graph slot is stamped (sidechain EQ slot is not)');
+    assertEqual(stampedKeys(r.layout).join(','), 'Basic:dynamics,Sidechain:sidechainEq', 'FM3 COMP type 0: dynamics and Sidechain EQ slots');
+    assertEqual(visual(r, 'sidechainEq')?.roles.filterType, pidOf(fm3, 'COMP', 'COMP_EQTYPE'), 'FM3 Sidechain EQ selector');
   }
   console.log('  drivers/block-visuals: FM3 COMP full curve, device ids, variant-narrowed roles, stamped slot');
 
@@ -158,12 +162,14 @@ export async function runBlockVisualsTests(): Promise<void> {
     assertEqual(v.roles.threshold, undefined, 'type 3: no threshold role');
     assertEqual(v.roles.ratio, undefined, 'type 3: no ratio role');
     assertEqual(v.roles.threshold2, pidOf(fm3, 'COMP', 'COMP_THRESH2'), 'type 3: threshold2 role');
+    assert(stampedKeys(dyn.layout).includes('Basic:dynamics'), 'type 3: gain reduction anchored on Basic');
     checkServed(dyn, fm3, 'COMP', 'FM3 COMP type 3');
     const sus = await readBlock(FM3, compEid, 'COMP', { [compTypePid]: 15 });
     const s = visual(sus, 'dynamics');
     assert(s, 'FM3 COMP type 15: dynamics visual served (gain reduction)');
     assertEqual(s.title, 'Gain reduction', 'FM3 COMP type 15 (SUSTAIN-only) title');
     assertEqual(s.roles.sustain, pidOf(fm3, 'COMP', 'COMP_SUSTAIN'), 'type 15: sustain role');
+    assert(stampedKeys(sus.layout).includes('Basic:dynamics'), 'type 15: gain reduction anchored on Basic');
     assert(s.roles.threshold == null && s.roles.ratio == null, 'type 15: the layout shows SUSTAIN, not THRESH/RATIO → narrowed to GR-only');
     checkServed(sus, fm3, 'COMP', 'FM3 COMP type 15');
     const compander = await readBlock(FM3, compEid, 'COMP', { [compTypePid]: 12 });
@@ -293,7 +299,46 @@ export async function runBlockVisualsTests(): Promise<void> {
   }
   console.log('  drivers/block-visuals: FM3/FM9 lfo1 shape; MULTITAP / PLEX variants follow <FAM>_BASETYPE');
 
-  // ---- Case 7: served layouts — gen-3 stamped, AM4 untouched -----------------------------------
+  // ---- Case 6c: AMP Input / Output EQ - bands from the served catalog + fixed-frequency pages ------
+  for (const model of [FM3, FM9, AXE3]) {
+    const prof = profileForModel(model);
+    const amp = await readBlock(model, eidOf('amp'), 'DISTORT', {}, 4);
+    const served = new Set([...amp.named.map((n) => n.id), ...amp.enums.map((e) => e.id)]);
+    const input = visual(amp, 'inputEq');
+    assert(input, `${prof.key} AMP: inputEq served`);
+    assertEqual(input.kind, 'eq', `${prof.key} AMP inputEq kind`);
+    assertEqual(input.mode, 'parametric', `${prof.key} AMP inputEq mode`);
+    const ib = input.bands ?? [];
+    assertEqual(ib.map((b) => b.key).join(','), 'peak,lowCut,highCut', `${prof.key} AMP inputEq bands`);
+    assertEqual(ib[0]!.freq, pidOf(prof, 'DISTORT', 'DISTORT_INEQFREQ'), `${prof.key} AMP inputEq freq`);
+    assertEqual(ib[0]!.gain, pidOf(prof, 'DISTORT', 'DISTORT_INEQGAIN'), `${prof.key} AMP inputEq gain`);
+    assertEqual(ib[0]!.q, pidOf(prof, 'DISTORT', 'DISTORT_INEQQ'), `${prof.key} AMP inputEq q`);
+    assertEqual(ib[0]!.type, pidOf(prof, 'DISTORT', 'DISTORT_INEQTYPE'), `${prof.key} AMP inputEq type`);
+    assertEqual(ib[1]!.shape, 'lowcut', `${prof.key} AMP inputEq low cut`);
+    assertEqual(ib[2]!.shape, 'highcut', `${prof.key} AMP inputEq high cut`);
+
+    const output = visual(amp, 'outputEq');
+    assert(output, `${prof.key} AMP: outputEq served`);
+    assertEqual(output.kind, 'eq', `${prof.key} AMP outputEq kind`);
+    assertEqual(output.mode, 'graphic', `${prof.key} AMP outputEq mode`);
+    const ob = output.bands ?? [];
+    assertEqual(ob.map((b) => b.centerHz).join(','), '62,125,250,500,1000,2000,4000,8000', `${prof.key} AMP outputEq centers`);
+    for (const b of ob) {
+      assertEqual(b.shape, 'bell', `${prof.key} AMP outputEq ${b.key} shape`);
+      assertEqual(b.gain, pidOf(prof, 'DISTORT', b.key), `${prof.key} AMP outputEq ${b.key} gain`);
+      assert(served.has(b.gain!), `${prof.key} AMP outputEq ${b.key} gain is served`);
+    }
+
+    const keys = stampedKeys(amp.layout);
+    assertEqual(keys.join(','), 'Input EQ:inputEq,Output EQ:outputEq', `${prof.key} AMP graph slots (EQ graph on the Input EQ page, graphic Output EQ page-level)`);
+    const outPage = amp.layout?.pages.find((p) => p.name === 'Output EQ');
+    const slot = outPage?.pageControls?.find((c) => c.graphKey === 'outputEq');
+    assert(slot, `${prof.key} AMP: the Output EQ page carries the graphic slot`);
+    assertEqual(slot!.paramId, null, `${prof.key} AMP outputEq slot has no parameter`);
+  }
+  console.log('  drivers/block-visuals: AMP Input EQ (parametric) and Output EQ (8-band graphic) per device');
+
+  // ---- Case 7: served layouts - gen-3 stamped, AM4 untouched -----------------------------------
   {
     const filter = fm3.layoutFor('FILTER', 0);
     const keys = stampedKeys(filter);
@@ -347,7 +392,7 @@ export async function runBlockVisualsTests(): Promise<void> {
       assertEqual(res.statusCode, 200, 'GET /preset/blocks/:eid/params');
       const body = res.json() as { visuals?: BlockVisualDTO[]; layout?: DeviceLayout };
       assertEqual(body.visuals?.[0]?.key, 'dynamics', 'route serves visuals');
-      assertEqual(stampedKeys(body.layout).join(','), 'Basic:dynamics', 'route serves the stamped layout');
+      assertEqual(stampedKeys(body.layout).join(','), 'Basic:dynamics,Sidechain:sidechainEq', 'route serves the stamped layout');
     } finally {
       await app.close();
     }

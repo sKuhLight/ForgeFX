@@ -382,7 +382,8 @@ export async function buildApp(registry: DeviceRegistry): Promise<FastifyInstanc
 
   // ── live block params (addressed by the placed block's canonical address `addr`: gen-3 = the
   //    effect id, AM4 = the block's pidLow — exactly what each device's grid/blocks report) ──
-  app.get<{ Params: { eid: string } }>('/preset/blocks/:eid/params', async (req, reply) => blockParamsH(reply, Number(req.params.eid)));
+  app.get<{ Params: { eid: string }; Querystring: { observe?: string } }>('/preset/blocks/:eid/params', async (req, reply) =>
+    blockParamsH(reply, Number(req.params.eid), { observe: req.query.observe !== '0' }));
   app.put<{ Params: { eid: string; paramId: string }; Body: { value: number; continuous?: boolean } }>(
     '/preset/blocks/:eid/params/:paramId',
     async (req, reply) => setParamH(reply, Number(req.params.eid), Number(req.params.paramId), req.body.value, req.body.continuous ?? true)
@@ -418,7 +419,7 @@ export async function buildApp(registry: DeviceRegistry): Promise<FastifyInstanc
 
   // ── telemetry cadence-mode control (GET/PUT /telemetry/config) ──
   app.get('/telemetry/config', () => telemetryConfigH());
-  app.put<{ Body: { mode?: string } }>('/telemetry/config', (req, reply) => telemetrySetH(reply, req.body?.mode));
+  app.put<{ Body: { mode?: string; meters?: boolean } }>('/telemetry/config', (req, reply) => telemetrySetH(reply, req.body?.mode, req.body?.meters));
 
   // ── telemetry: tuner · tempo · scene ──
   app.post<{ Body: { on: boolean } }>('/tuner', (req) => registry.setTuner(!!req.body?.on));
@@ -627,6 +628,16 @@ export async function buildApp(registry: DeviceRegistry): Promise<FastifyInstanc
   app.post<{ Body: { bytes?: number[] } }>('/am4/firmware/validate', async (req, reply) => { deprecated(req, reply); return fwValidateH(reply, req.body?.bytes); });
 
   // ── live event stream (SSE): tuner / tempo / scene / cpu pushes ──
+  // Every SSE client gets the same event object: serialise it once, not once per connected client.
+  const encodedEvents = new WeakMap<object, string>();
+  const encodedEvent = (e: object): string => {
+    let s = encodedEvents.get(e);
+    if (s === undefined) {
+      s = JSON.stringify(e);
+      encodedEvents.set(e, s);
+    }
+    return s;
+  };
   app.get('/events', (req, reply) => {
     reply.hijack();
     const raw = reply.raw;
@@ -637,7 +648,7 @@ export async function buildApp(registry: DeviceRegistry): Promise<FastifyInstanc
       'access-control-allow-origin': '*'
     });
     raw.write(': connected\n\n');
-    const unsub = registry.subscribe((e) => raw.write(`data: ${JSON.stringify(e)}\n\n`));
+    const unsub = registry.subscribe((e) => raw.write(`data: ${encodedEvent(e)}\n\n`));
     const hb = setInterval(() => raw.write(': hb\n\n'), 15000);
     req.raw.on('close', () => {
       clearInterval(hb);

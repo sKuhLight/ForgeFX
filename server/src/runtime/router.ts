@@ -290,7 +290,7 @@ export function createRouter(deps: RuntimeDeps): {
   });
 
   // ── live block params (addressed by the placed block's canonical address `addr`) ──
-  on('GET', '/preset/blocks/:eid/params', (c) => h.blockParamsH(c.reply, Number(c.params.eid)));
+  on('GET', '/preset/blocks/:eid/params', (c) => h.blockParamsH(c.reply, Number(c.params.eid), { observe: c.query.get('observe') !== '0' }));
   on('PUT', '/preset/blocks/:eid/params/:paramId', (c) => {
     const b = c.body as { value: number; continuous?: boolean };
     return h.setParamH(c.reply, Number(c.params.eid), Number(c.params.paramId), b.value, b.continuous ?? true);
@@ -368,7 +368,7 @@ export function createRouter(deps: RuntimeDeps): {
 
   // ── telemetry cadence-mode control (GET/PUT /telemetry/config) ──
   on('GET', '/telemetry/config', () => h.telemetryConfigH());
-  on('PUT', '/telemetry/config', (c) => h.telemetrySetH(c.reply, (c.body as { mode?: string } | undefined)?.mode));
+  on('PUT', '/telemetry/config', (c) => { const b = c.body as { mode?: string; meters?: boolean } | undefined; return h.telemetrySetH(c.reply, b?.mode, b?.meters); });
 
   // ── telemetry: tuner · tempo · scene ──
   on('POST', '/tuner', (c) => registry.setTuner(!!(c.body as { on?: boolean } | undefined)?.on));

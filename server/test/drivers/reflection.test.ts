@@ -69,6 +69,7 @@ async function slowLinkReflection(): Promise<void> {
   reg.__seedDriver(0x11, fake);
   await reg.detect();
   const events: DeviceEvent[] = [];
+  reg.setMeterDemand(true);
   const unsub = reg.subscribe((e) => events.push(e));
   await sleep(2600); // slow tick = 2000 ms; need prime + one change tick
   unsub();
@@ -140,6 +141,7 @@ async function noDuplicateBlockState(): Promise<void> {
   reg.__seedDriver(0x11, fake);
   await reg.detect();
   const events: DeviceEvent[] = [];
+  reg.setMeterDemand(true);
   const unsub = reg.subscribe((e) => events.push(e));
   reg.setTelemetryMode('performance'); // 60 ms tick → fast
   await waitFor(() => chanCalls >= 1, 3000, 'channel-watch primer');
@@ -190,6 +192,7 @@ async function slowLinkYieldBackoff(): Promise<void> {
   reg.setTelemetryMode('performance'); // 60 ms primer tick, so a fast-tick back-off would force a read by ~240 ms
   const t = await reg.transport();
   const held = t.request([0x11, 0x22, 0x33]);
+  reg.setMeterDemand(true);
   const unsub = reg.subscribe(() => {});
   await sleep(700);
   unsub();
@@ -220,6 +223,7 @@ async function slowLinkEditWatch(): Promise<void> {
   const reg = makeReg(serial(mock), mock);
   reg.__seedDriver(0x11, fake);
   await reg.detect();
+  reg.setMeterDemand(true);
   const unsub = reg.subscribe(() => {});
   await sleep(2600); // primer at editWatchMs (2000 ms), then the slow reschedule (4000 ms)
   unsub();
