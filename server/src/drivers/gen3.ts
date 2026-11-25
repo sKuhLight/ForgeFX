@@ -1889,7 +1889,7 @@ class Gen3Driver implements DeviceDriver {
         paramId: si.paramId,
         value: siEnum.value,
         supported,
-        ...(supported || !si.minFw ? {} : { reason: `Needs firmware = ${formatBlockStateFirmware(si.minFw)}` })
+        ...(supported || !si.minFw ? {} : { reason: `Needs firmware ≥ ${formatBlockStateFirmware(si.minFw)}` })
       };
     }
     let bypassMode: BlockStateDTO['bypassMode'] = null;

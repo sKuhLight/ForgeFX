@@ -1130,7 +1130,8 @@ export class DeviceRegistry {
   //     round-robin cycle (meters are tiny 23-byte reads).
   // Runs while ≥1 SSE client is subscribed AND the active driver's telemetry capability allows it.
   #startMeters() {
-    if (!this.#meterDemand) return; // the meter round-robin runs only while a client has its meters on (METER toggle)
+    // The loop runs while a listener is present (the CPU read and the scene/channel reflection want it);
+    // the four METER reads inside it run only while a client has its meters on (METER toggle).
     if (this.#metersTimer || this.#telemetryHolds > 0) return; // held by an exclusive operation (pauseTelemetry)
     if (this.#active && !this.#active.capabilities.telemetry.outputMeters) return; // no gen-3 meter frames on this device
     this.#metersTimer = setTimeout(() => this.#pollMeters(), this.#cadence().meterTickMs); // primer at the mode's meter tick
@@ -1179,21 +1180,24 @@ export class DeviceRegistry {
         this.#lastMeterTs = now;
         const aUp = DeviceRegistry.#meterFactor(DeviceRegistry.METER_ATTACK, dt);
         const aDn = DeviceRegistry.#meterFactor(DeviceRegistry.METER_RELEASE, dt);
-        // Read ALL 4 output meters back-to-back each tick (tiny 23-byte reads — this is exactly what
+        // Read ALL 4 output meters back-to-back each tick (tiny 23-byte reads - this is exactly what
         // FM3-Edit's leveling page does; NOT the many-block sweep that stutters audio) so every bar
-        // refreshes every tick, not once per round-robin → smooth, not choppy.
-        for (let i = 0; i < 4; i++) {
-          const meter = GEN3_OUTPUT_METERS[i]!;
-          const frames = await dev.request(buildOutputMeterPoll(meter, d.modelId), { timeoutMs: 200, quietMs: 12, routine: true, match: (fs) => fs.some((f) => isOutputMeterResponse(f, meter)) });
-          const f = frames.find((x) => isOutputMeterResponse(x, meter));
-          if (f) {
-            const raw = meterRmsToDb(parseOutputMeterRms(f), DeviceRegistry.METER_FLOOR, DeviceRegistry.METER_CEIL);
-            const prev = this.#mDb[i]!;
-            const a = raw > prev ? aUp : aDn;
-            this.#mDb[i] = prev + a * (raw - prev);
+        // refreshes every tick, not once per round-robin → smooth, not choppy. Skipped while no client
+        // asks for meters (METER off) - the loop itself keeps running for CPU + the reflection watches.
+        if (this.#meterDemand) {
+          for (let i = 0; i < 4; i++) {
+            const meter = GEN3_OUTPUT_METERS[i]!;
+            const frames = await dev.request(buildOutputMeterPoll(meter, d.modelId), { timeoutMs: 200, quietMs: 12, routine: true, match: (fs) => fs.some((f) => isOutputMeterResponse(f, meter)) });
+            const f = frames.find((x) => isOutputMeterResponse(x, meter));
+            if (f) {
+              const raw = meterRmsToDb(parseOutputMeterRms(f), DeviceRegistry.METER_FLOOR, DeviceRegistry.METER_CEIL);
+              const prev = this.#mDb[i]!;
+              const a = raw > prev ? aUp : aDn;
+              this.#mDb[i] = prev + a * (raw - prev);
+            }
           }
+          this.#emit({ type: 'meters', out1L: this.#mDb[0]!, out1R: this.#mDb[1]!, out2L: this.#mDb[2]!, out2R: this.#mDb[3]! });
         }
-        this.#emit({ type: 'meters', out1L: this.#mDb[0]!, out1R: this.#mDb[1]!, out2L: this.#mDb[2]!, out2R: this.#mDb[3]! });
         // CPU is a heavy status-block read → poll it only occasionally (every Nth tick), off the meter path.
         if (step % cad.cpuEveryNTicks === 0) {
           const frames = await dev.request(buildCpuPoll(d.modelId), { timeoutMs: 400, quietMs: 25, routine: true, match: (fs) => fs.some((f) => isCpuResponse(f)) });
