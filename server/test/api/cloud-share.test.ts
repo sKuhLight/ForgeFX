@@ -904,6 +904,11 @@ async function twins(): Promise<void> {
       return { status: res.status, text: res.body as string };
     };
     const stripTimes = (t: string) => t.replace(/"consentAt":"[^"]+"/g, '"consentAt":"T"').replace(/"at":"[^"]+"/g, '"at":"T"');
+    /** The stored doc with its share records in a stable order, for twins that may process the kinds differently. */
+    const sortedShapes = (t: string): string => {
+      const v = JSON.parse(t) as { shares?: Json[] } | null;
+      return v ? json([...v.shares!].map((x) => json(x)).sort()) : 'null';
+    };
     const reset = async () => { clearDocs(); await storeAll(); f.state.anonSession = false; forgetAnonymousSharePolicy(f.cloud); forgetDefinitionSources(reg); };
     for (const [label, method, url, body, expect] of [
       ['status', 'GET', '/device/cache/cloud/share', undefined, 200],
@@ -927,7 +932,9 @@ async function twins(): Promise<void> {
       assertEqual(a.status, expect, `[twins] ${label}: app status (${a.text.slice(0, 200)})`);
       assertEqual(b.status, a.status, `[twins] ${label}: router status = app status`);
       assertEqual(stripTimes(b.text), stripTimes(a.text), `[twins] ${label}: router body = app body`);
-      assertEqual(stripTimes(json(sharesDoc())), stripTimes(appRecords), `[twins] ${label}: the same records`);
+      // The stored array order follows the order the kinds were processed, which is not part of the contract
+      // (the status lists them newest first; ties are incidental) — compare the records themselves.
+      assertEqual(sortedShapes(stripTimes(json(sharesDoc()))), sortedShapes(stripTimes(appRecords)), `[twins] ${label}: the same records`);
       assertEqual(json(f.calls.contribute.splice(0).map((e) => ({ ...e, consentAt: 'T' }))), appCalls, `[twins] ${label}: the same requests`);
     }
     // withdraw after a share, both twins
