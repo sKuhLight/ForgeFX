@@ -42,7 +42,8 @@
             "placement": {"positionExact":"196,230"},
             "rawWidget": "dropdown1Tight",
             "widget": "dropdown"
-          }
+          },
+          {"graphKey":"dynaCab","label":"DynaCab mic","paramId":null,"paramName":null,"rawWidget":"graph_cab","widget":"graph"}
         ],
         "pageNum": 0,
         "rows": [
