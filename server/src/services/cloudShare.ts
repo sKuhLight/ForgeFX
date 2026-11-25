@@ -289,10 +289,16 @@ function readShares(store: Pick<Store, 'getDoc'>, key: string): ShareRecord[] {
   return out;
 }
 
-/** Store the records of a key (the newest `DEFINITION_SHARES_MAX`; an empty list deletes the doc). */
+/** Store the records of a key (the newest `DEFINITION_SHARES_MAX`; an empty list deletes the doc). Newest first,
+ *  and a stable kind/source tie-break so two writers of the same moment store the same array — the order must not
+ *  depend on which request happened to finish first. */
 function writeShares(store: Pick<Store, 'putDoc' | 'delDoc'>, key: string, records: ShareRecord[]): void {
   if (records.length === 0) { store.delDoc(DEFINITION_SHARES_COLLECTION, key); return; }
-  const kept = [...records].sort((a, b) => (a.at < b.at ? 1 : a.at > b.at ? -1 : 0)).slice(0, DEFINITION_SHARES_MAX);
+  const kept = [...records]
+    .sort((a, b) => (a.at < b.at ? 1 : a.at > b.at ? -1
+      : a.kind < b.kind ? -1 : a.kind > b.kind ? 1
+        : a.sourceId < b.sourceId ? -1 : a.sourceId > b.sourceId ? 1 : 0))
+    .slice(0, DEFINITION_SHARES_MAX);
   store.putDoc(DEFINITION_SHARES_COLLECTION, key, { shares: kept });
 }
 
