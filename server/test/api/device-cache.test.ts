@@ -10,11 +10,12 @@ import * as store from '../../src/store.js';
 import type { BuiltCache, CacheRecord, LiveWalkOptions } from 'forgefx-midi/cache';
 import { buildDefQuery, enumHintsFromRanges, VIEW_DEFINITION, CACHE_SCHEMA } from 'forgefx-midi/cache';
 import { PROFILES } from '../../src/devices.js';
-import { FM3_PARAMS_BY_FAMILY } from 'forgefx-midi/gen3/fm3';
+import { editorCacheSource, familyRecords, liveSeedRecords, liveSource, profileDoc, widenTable } from '../helpers/profileDocs.js';
+import { seedRecords as cacheSeedRecords } from '../helpers/cacheBytes.js';
 import type { DeviceEvent, DeviceDriver, DriverCapabilities } from '../../src/drivers/types.js';
 import { MockTransport, handshakeReply, isIdentifyBroadcast, assert, assertEqual, sleep } from '../helpers/mock.js';
 
-export const DEVICE_CACHE_CASE_COUNT = 17;
+export const DEVICE_CACHE_CASE_COUNT = 18;
 
 const FM3 = 0x11;
 const KEY = '11_12p0'; // FM3 fw 12.0
@@ -49,30 +50,14 @@ async function makeApp(model: number, opts?: { fw?: [number, number, string?]; l
   return { app, registry, mock };
 }
 
-// The 5 HW-seed families and their section tags. buildCache asserts EVERY seed anchors to its section
-// (a real device always reports all five), so the canned walk must reproduce that: per family we emit
-// a handful of that family's range-bearing FLOAT params at its seed section, each with the param's
-// device-true display range so the section→family voter scores its own section decisively. Preferring
-// the LEAST-shared param ids (gen-3 families share a big common vocabulary — MIX/LEVEL/…) keeps
-// cross-family scoring low so each seed wins its own section.
-const SEED_TAGS: Record<string, number> = { DISTORT: 10, CABINET: 11, REVERB: 12, DELAY: 13, FUZZ: 25 };
-
+// The canned live walk: the 5 HW-seed families at their BLOCK ADDRESSES (effect ids), where a live walk reports
+// a record. The derivation asserts EVERY seeded family is found (a real device always reports all five) and, in
+// block space, lets a block take only the family whose effect-id span holds it. Per family a handful of its most
+// distinctive range-bearing FLOAT params with the device-true display range, so the section→family voter scores
+// its own block decisively (test/helpers/profileDocs.ts; the editor-cache fixture keys the same records by
+// section tag: test/helpers/cacheBytes.ts).
 export function seedRecords(): CacheRecord[] {
-  const byFam = FM3_PARAMS_BY_FAMILY as unknown as Record<string, { paramId: number; unit?: string; displayMin?: number; displayMax?: number }[]>;
-  const fams = Object.keys(SEED_TAGS);
-  // how many seed families use each paramId (lower = more distinctive)
-  const shareCount = new Map<number, number>();
-  for (const f of fams) { const seen = new Set<number>(); for (const p of byFam[f] ?? []) if (!seen.has(p.paramId)) { seen.add(p.paramId); shareCount.set(p.paramId, (shareCount.get(p.paramId) ?? 0) + 1); } }
-  const recs: CacheRecord[] = [];
-  for (const fam of fams) {
-    const cands = (byFam[fam] ?? [])
-      .filter((p) => p.paramId < 0xff00 && p.unit !== 'enum' && p.displayMin != null && p.displayMax != null && p.displayMin !== p.displayMax)
-      .sort((a, b) => (shareCount.get(a.paramId)! - shareCount.get(b.paramId)!) || a.paramId - b.paramId)
-      .slice(0, 6);
-    assert(cands.length > 0, `seed family ${fam} has a range-bearing float param for the fixture`);
-    for (const p of cands) recs.push({ kind: 'float', section: SEED_TAGS[fam]!, offset: 0, id: p.paramId, tc: 0, min: p.displayMin!, max: p.displayMax!, def: 1, step: 0, t1: 0, t2: 0 });
-  }
-  return recs;
+  return liveSeedRecords();
 }
 
 /** A build doc with a distinctive DISTORT (amp) roster — proves the runtime profile serves it. Stamped
@@ -240,21 +225,32 @@ async function cancelBuild(): Promise<void> {
 }
 
 // ── 4. cache-hit short-circuit + runtime profile ──
+// Profile v2: `already` only when the stored doc holds a complete local live source of the requested kind. A legacy
+// (format-1) doc holds no raw source: the build walks once and writes a format-2 doc in its place.
 async function cacheHitAndRuntimeProfile(): Promise<void> {
   store.defaultStore.delDoc('deviceCaches', KEY);
-  store.defaultStore.putDoc('deviceCaches', KEY, fakeCacheDoc()); // pre-existing build
+  store.defaultStore.putDoc('deviceCaches', KEY, fakeCacheDoc()); // pre-existing legacy (format-1) build
   const { app, registry } = await makeApp(FM3, { fw: [12, 0], loadCache: (k) => (k === KEY ? fakeCacheDoc() : null) });
   try {
-    // build with a spy walk → must NOT be invoked (doc already present, no force)
-    let walked = false;
-    const spyWalk = async (): Promise<CacheRecord[]> => { walked = true; return []; };
-    const r = await deviceCache.startCacheBuild(store.defaultStore, registry, { walkImpl: spyWalk });
-    assertEqual((r.body as { already?: boolean }).already, true, 'already-built short-circuit');
-    assertEqual(walked, false, 'walk not invoked on a cache hit');
-
     // the runtime profile serves the device-true roster (swapped in during detect via loadDeviceCache)
     const types = (await app.inject({ method: 'GET', url: '/blocks/amp/types' })).json() as { name: string }[];
     assert(types.some((t) => t.name === 'FAKE CACHE AMP'), `runtime roster served (got ${types.map((t) => t.name).slice(0, 3).join(',')})`);
+
+    let walks = 0;
+    const spyWalk = async (): Promise<CacheRecord[]> => { walks++; return seedRecords(); };
+    // a legacy doc: the build walks (no `already`) and migrates it to format 2
+    let r = await deviceCache.startCacheBuild(store.defaultStore, registry, { walkImpl: spyWalk });
+    assertEqual((r.body as { started?: boolean }).started, true, 'a legacy doc is no cache hit: the build walks');
+    await deviceCache.cacheBuildPromise(registry);
+    assertEqual(walks, 1, 'walked once');
+    const doc = store.defaultStore.getDoc('deviceCaches', KEY)!.data as { meta: { format?: number; sources?: Array<{ kind: string; origin: string }> } };
+    assertEqual(doc.meta.format, 2, 'the legacy doc was replaced by a format-2 doc');
+    assertEqual(JSON.stringify(doc.meta.sources?.map((s) => `${s.kind}/${s.origin}`)), JSON.stringify(['live-readonly/local']), 'holding the walk as its one raw source');
+
+    // now the doc holds a complete local read-only source: the next build short-circuits, the walk is not invoked
+    r = await deviceCache.startCacheBuild(store.defaultStore, registry, { walkImpl: spyWalk });
+    assertEqual((r.body as { already?: boolean }).already, true, 'already-built short-circuit');
+    assertEqual(walks, 1, 'walk not invoked on a cache hit');
   } finally {
     store.defaultStore.delDoc('deviceCaches', KEY);
     await app.close();
@@ -321,14 +317,15 @@ function gen3FakeCaps(over: Partial<DriverCapabilities>): DriverCapabilities {
 /** A minimal gen-3-shaped fake driver. `selectCalls` records reloadPreset's re-select target so the
  *  full-mode test can assert the current preset was reloaded, without real preset-switch bytes. */
 function makeGen3Fake(caps: DriverCapabilities, selectCalls: number[]): DeviceDriver {
-  const fake = {
+  const presetRef = async () => ({ number: 7, name: 'Cur' });
+  const selectPreset = async (n: number) => { selectCalls.push(n); return { ok: true }; };
+  return {
     modelId: FM3, key: 'fm3', name: 'FM3', capabilities: caps,
     grid: async () => ({ model: 'fm3', name: 'F', crcValid: true, rows: 4, cols: 12, scenes: [], cells: [], source: 'dump' as const }),
-    presetRef: async () => ({ number: 7, name: 'Cur' }),
-    selectPreset: async (n: number) => { selectCalls.push(n); return { ok: true }; },
-    reloadPreset: async () => { const { number } = await fake.presetRef(); if (number >= 0) await fake.selectPreset(number); }
+    presetRef,
+    selectPreset,
+    reloadPreset: async () => { const { number } = await presetRef(); if (number >= 0) await selectPreset(number); }
   } as unknown as DeviceDriver;
-  return fake;
 }
 
 async function makeAppWithFake(model: number, fake: DeviceDriver, fw?: [number, number, string?]) {
@@ -507,8 +504,14 @@ async function walkBoundDerivation(): Promise<void> {
   // an exact cache without rows for the family is judged by the catalog's ids (CHORUS ids reach 28)
   const noRows = sectionsDoc({ CHORUS: 20 }, { source: 'editor-cache' });
   assertEqual(deviceCache.walkBlockLimits(FM3, 'full', noRows).knownSize[78], undefined, 'catalog ids beyond an exact stride: no known size');
-  const cloudBytes = sectionsDoc({ DISTORT: 150 }, { source: 'cloud', origin: 'bytes' }, { DISTORT: 150 });
-  assertEqual(deviceCache.walkBlockLimits(FM3, 'full', cloudBytes).knownSize[58], 150, 'a cloud profile of byte origin is exact');
+  // bounds and known sizes come ONLY from a local editor-cache source (profile v2, contract D-M3-7): a cloud (or
+  // definitions-file) profile never widens a bound, not even one published from an editor cache
+  for (const meta of [{ source: 'cloud', origin: 'bytes' }, { source: 'axisdefs', origin: 'bytes' }]) {
+    const foreign = sectionsDoc({ DISTORT: 150 }, meta, { DISTORT: 150 });
+    const l = deviceCache.walkBlockLimits(FM3, 'full', foreign);
+    assertEqual(l.knownSize[58], 144, `${JSON.stringify(meta)}: the catalog DISTORT size stays (not 150)`);
+    assertEqual(l.bound[58], 175, `${JSON.stringify(meta)}: the catalog DISTORT ceiling stays`);
+  }
   // (5) an UNUSABLE exact stride falls back to the catalog's stride; the family is not dropped
   for (const bad of [0, -3, Number.NaN, Number.POSITIVE_INFINITY]) {
     const doc = sectionsDoc({ DISTORT: bad, CHORUS: 20 }, { source: 'editor-cache' }, { CHORUS: 20 });
@@ -528,16 +531,18 @@ async function walkBoundDerivation(): Promise<void> {
   }
 }
 
-// ── 9. a force-rebuild over a byte-exact stored cache walks with ITS sizes (store to walk options) ──
+// ── 9. a rebuild over a byte-exact stored cache walks with ITS sizes (store to walk options). The stored cache is a
+//    legacy (format-1) editor-cache import: a walk cannot merge into it, so only `replace` walks over it (`force`
+//    answers 409 local-profile-better, profile-merge.test.ts). ──
 async function walkBoundFromStoredCache(): Promise<void> {
   store.defaultStore.delDoc('deviceCaches', KEY);
   store.defaultStore.putDoc('deviceCaches', KEY, sectionsDoc({ CHORUS: 40 }, { source: 'editor-cache' }, { CHORUS: 40 }));
   const { app, registry } = await makeApp(FM3, { fw: [12, 0] });
   try {
-    let seen: LiveWalkOptions | null = null;
+    let seen = null as LiveWalkOptions | null;
     const spyWalk = async (_t: unknown, opts: LiveWalkOptions): Promise<CacheRecord[]> => { seen = opts; return seedRecords(); };
-    const r = await deviceCache.startCacheBuild(store.defaultStore, registry, { force: true, walkImpl: spyWalk });
-    assertEqual((r.body as { started?: boolean }).started, true, 'forced rebuild started');
+    const r = await deviceCache.startCacheBuild(store.defaultStore, registry, { replace: true, walkImpl: spyWalk });
+    assertEqual((r.body as { started?: boolean }).started, true, 'replacing rebuild started');
     await deviceCache.cacheBuildPromise(registry);
     assert(seen != null, 'walk invoked');
     assertEqual(sizeOf(seen!, 78), 40, 'stored byte-exact CHORUS (40 slots) is the known size, not the catalog 29');
@@ -551,11 +556,11 @@ async function walkBoundFromStoredCache(): Promise<void> {
   }
 }
 
-// ── 6b. FULL-mode firmware gate: full capture is allowed only on a firmware the model's full capture is
-//    verified on (FM3 <= 13.0 here), and refused above it and on unknown firmware (a firmware can move the
-//    table ends the walk relies on); read-only mode is never
-//    gated. Service-level, via the walkImpl seam. ──
-type GateOutcome = { code: number; body: Record<string, unknown>; walkCalls: number; walkModes: Array<string | undefined>; setFrames: number };
+// ── 6b. FULL-mode firmware gate: full capture is allowed only on a firmware inside the range the model's full
+//    capture is verified on (FM3 12.0 to 13.0 here), and refused below and above it and on unknown firmware (a
+//    firmware can move the table ends the walk relies on; an older one was never exercised); read-only mode is
+//    never gated. Service-level, via the walkImpl seam. ──
+type GateOutcome = { code: number; body: Record<string, unknown>; walkCalls: number; walkModes: Array<string | undefined>; setFrames: number; docStored: boolean };
 
 async function runGateScenario(fw: [number, number] | undefined, mode: 'full' | 'read-only'): Promise<GateOutcome> {
   const key = fw ? `11_${fw[0]}p${fw[1]}` : null;
@@ -573,7 +578,8 @@ async function runGateScenario(fw: [number, number] | undefined, mode: 'full' | 
     const r = await deviceCache.startCacheBuild(store.defaultStore, registry, { mode, walkImpl: walk });
     await deviceCache.cacheBuildPromise(registry);
     const k = (f: readonly number[]) => f.join(',');
-    return { code: r.code, body: r.body as Record<string, unknown>, walkCalls: walkModes.length, walkModes, setFrames: mock.sent.filter((f) => k(f) === k([...SET_FRAME])).length };
+    const docStored = key ? store.defaultStore.getDoc('deviceCaches', key) != null : false;
+    return { code: r.code, body: r.body as Record<string, unknown>, walkCalls: walkModes.length, walkModes, setFrames: mock.sent.filter((f) => k(f) === k([...SET_FRAME])).length, docStored };
   } finally {
     if (key) store.defaultStore.delDoc('deviceCaches', key);
     await app.close();
@@ -592,6 +598,30 @@ async function fullFirmwareGate(): Promise<void> {
   const ok13 = await runGateScenario([13, 0], 'full');
   assertEqual(ok13.code, 200, 'full on fw 13.0 → 200');
   assertEqual(ok13.walkModes.join(','), 'full', 'fw 13.0 walk runs in full mode');
+
+  // fw 11.99 (just below the FM3's verified range, which starts at 12.0) → refused: a range with a floor, not just a ceiling
+  const justBelow = await runGateScenario([11, 99], 'full');
+  assertEqual(justBelow.code, 501, 'full on fw 11.99 → 501');
+  assertEqual(justBelow.body.error, 'unsupported', 'fw 11.99 501 keeps the unsupported error code');
+  assertEqual(justBelow.body.capability, 'fullCapture', 'fw 11.99 501 names the fullCapture capability');
+  assertEqual(justBelow.body.reason, 'firmware', 'fw 11.99 refusal reason: firmware');
+  assertEqual(justBelow.body.firmware, '11.99', 'fw 11.99 501 reports the detected firmware');
+  assertEqual(justBelow.walkCalls, 0, 'fw 11.99 never walks');
+  assertEqual(justBelow.setFrames, 0, 'fw 11.99 writes nothing');
+
+  // fw 5.3 (a real tester firmware far below anything a full capture ran on) → refused the same way
+  const old = await runGateScenario([5, 3], 'full');
+  assertEqual(old.code, 501, 'full on fw 5.3 → 501');
+  assertEqual(old.body.error, 'unsupported', 'fw 5.3 501 keeps the unsupported error code');
+  assertEqual(old.body.capability, 'fullCapture', 'fw 5.3 501 names the fullCapture capability');
+  assertEqual(old.body.reason, 'firmware', 'fw 5.3 refusal reason: firmware');
+  assertEqual(old.body.firmware, '5.3', 'fw 5.3 501 reports the detected firmware');
+  const oldMsg = String(old.body.message);
+  assert(/verified/.test(oldMsg) && oldMsg.includes('5.3') && /use read-only/.test(oldMsg), 'fw 5.3 501 message names the firmware, says verified-only, and points at read-only');
+  assertEqual(old.walkCalls, 0, 'fw 5.3 never walks');
+  assertEqual(old.setFrames, 0, 'fw 5.3 writes nothing');
+  assertEqual(old.docStored, false, 'fw 5.3 refusal stored no device cache');
+  assertEqual(justBelow.docStored, false, 'fw 11.99 refusal stored no device cache');
 
   // fw 13.1 (just above the FM3's verified 13.0) → refused: allowlist, not "major < 14"
   const justAbove = await runGateScenario([13, 1], 'full');
@@ -636,6 +666,15 @@ async function fullFirmwareGate(): Promise<void> {
   assertEqual(ro.walkModes.length, 1, 'read-only walk ran once');
   assertEqual(ro.walkModes[0], undefined, 'read-only walk passes no mode');
   assertEqual(ro.setFrames, 0, 'read-only walk writes nothing');
+
+  // read-only on a below-range fw 5.3 stays allowed too: the range only governs the writing full mode
+  const roOld = await runGateScenario([5, 3], 'read-only');
+  assertEqual(roOld.code, 200, 'read-only on fw 5.3 → 200');
+  assertEqual(roOld.body.started, true, 'read-only on fw 5.3 starts the build');
+  assertEqual(roOld.walkModes.length, 1, 'fw 5.3 read-only walk ran once');
+  assertEqual(roOld.walkModes[0], undefined, 'fw 5.3 read-only walk passes no mode');
+  assertEqual(roOld.setFrames, 0, 'fw 5.3 read-only walk writes nothing');
+  assertEqual(roOld.docStored, true, 'fw 5.3 read-only build stored its device cache');
 }
 
 // Stale / unusable firmware: the full-capture gate never judges a version it did not just read.
@@ -858,6 +897,74 @@ async function enumHintDerivation(): Promise<void> {
   assertEqual(deviceCache.staticRoster(0x10).get(41)?.instance, 5, 'Axe-Fx III: five Inputs (37..41)');
 }
 
+// ── 10b. profile v2: walk bounds and hints come only from the doc's LOCAL editor-cache source (localByteSource) ──
+// A merged doc's `meta.source: 'editor-cache'` names its best source, not every table: a family only a merged live
+// walk provides (here a CHORUS table of 40 slots) must neither size nor hint the next walk; a cloud editor-cache
+// source never does either.
+async function profileV2LocalByteSource(): Promise<void> {
+  const catalogLimits = deviceCache.walkBlockLimits(FM3, 'full');
+  const catalogHints = deviceCache.walkEnumHints(FM3);
+  const wide = widenTable(cacheSeedRecords(), 10, 150, 'DISTORT'); // DISTORT section (tag 10) with 150 slots
+  const local150 = await editorCacheSource(wide);
+  const cloud150 = await editorCacheSource(wide, { origin: 'cloud', capturedAt: '2026-11-21T10:00:00.000Z' });
+  const chorus40 = widenTable(familyRecords('CHORUS', 78), 78, 40);
+  const live = liveSource([...liveSeedRecords(), ...chorus40]);
+
+  // the positive case: a format-2 doc with a local editor-cache source sizes the walk from it
+  const v2Local = profileDoc([local150]);
+  assertEqual((v2Local.meta as { format?: number }).format, 2, 'fixture: a format-2 doc');
+  let l = deviceCache.walkBlockLimits(FM3, 'full', v2Local);
+  assertEqual(l.knownSize[58], 150, 'format 2, local editor-cache source: DISTORT 150 slots is the known size');
+  assertEqual(l.bound[58], 181, 'format 2, local editor-cache source: DISTORT ceiling 150 - 1 + 32');
+  assertEqual(deviceCache.localByteSource(v2Local, FM3)?.rangeSections.DISTORT?.stride, 150, 'localByteSource derives the editor-cache source');
+
+  // merged with a local live walk: still the editor-cache data only (the live CHORUS table moves nothing)
+  const merged = profileDoc([local150, live]);
+  assertEqual((merged.meta as { source?: string }).source, 'editor-cache', 'fixture: the merged doc names the editor cache as its source');
+  assertEqual(merged.rangeSections.CHORUS?.stride, 40, 'fixture: the merged tables carry the live CHORUS table');
+  l = deviceCache.walkBlockLimits(FM3, 'full', merged);
+  assertEqual(l.knownSize[58], 150, 'merged doc: DISTORT from the local editor-cache source');
+  assertEqual(l.knownSize[78], catalogLimits.knownSize[78], 'merged doc: the live-only CHORUS table does not size the walk (catalog 29)');
+  assertEqual(l.bound[78], catalogLimits.bound[78], 'merged doc: nor move its ceiling');
+  const h = deviceCache.walkEnumHints(FM3, merged);
+  assert(sameJson(h[78], catalogHints[78]), 'merged doc: the live-only CHORUS rows create no hints (catalog hints stay)');
+  assert(Object.keys(catalogHints[78] ?? {}).length > 0, 'fixture: the catalog has CHORUS hints to lose');
+
+  // no local editor-cache source at all: the catalog, whatever the doc's tables or meta say
+  for (const [label, doc] of [
+    ['a live-only doc', profileDoc([live])],
+    ['a cloud editor-cache source', profileDoc([cloud150])],
+    ['a cloud editor-cache source merged with a local walk', profileDoc([cloud150, live])]
+  ] as const) {
+    assertEqual(deviceCache.localByteSource(doc, FM3), null, `${label}: no local editor-cache data`);
+    l = deviceCache.walkBlockLimits(FM3, 'full', doc);
+    assertEqual(l.knownSize[58], 144, `${label}: the catalog DISTORT size stays`);
+    assertEqual(l.knownSize[78], catalogLimits.knownSize[78], `${label}: the catalog CHORUS size stays`);
+    assert(sameJson(deviceCache.walkEnumHints(FM3, doc), catalogHints), `${label}: the catalog hints stay`);
+  }
+  assertEqual(deviceCache.hasLocalByteSource(merged), true, 'hasLocalByteSource: a merged doc with a local editor cache');
+  assertEqual(deviceCache.hasLocalByteSource(profileDoc([cloud150, live])), false, 'hasLocalByteSource: a cloud editor cache is not local');
+  // memoised per doc: the same stored object derives once
+  assert(deviceCache.localByteSource(merged, FM3) === deviceCache.localByteSource(merged, FM3), 'localByteSource is memoised per doc');
+
+  // store → walk: a force rebuild over a stored merged doc walks with the editor-cache sizes only
+  store.defaultStore.delDoc('deviceCaches', KEY);
+  store.defaultStore.putDoc('deviceCaches', KEY, merged);
+  const { app, registry } = await makeApp(FM3, { fw: [12, 0] });
+  try {
+    let seen: LiveWalkOptions | null = null;
+    const spy = async (_t: unknown, o: LiveWalkOptions): Promise<CacheRecord[]> => { seen = o; return seedRecords(); };
+    await deviceCache.startCacheBuild(store.defaultStore, registry, { force: true, walkImpl: spy });
+    await deviceCache.cacheBuildPromise(registry);
+    assert(seen != null, 'walk invoked');
+    assertEqual(sizeOf(seen!, 58), 150, 'stored merged doc: DISTORT known size from the local editor cache');
+    assertEqual(sizeOf(seen!, 78), 29, 'stored merged doc: CHORUS keeps the catalog stride, not the walked 40');
+  } finally {
+    store.defaultStore.delDoc('deviceCaches', KEY);
+    await app.close();
+  }
+}
+
 // ── 11. the hints reach the walk options (store → walk): verified firmware only, both modes ──
 async function enumHintsInWalkOptions(): Promise<void> {
   // the verified table: exact major.minor, fail closed
@@ -867,7 +974,7 @@ async function enumHintsInWalkOptions(): Promise<void> {
   }
   const catalog = deviceCache.walkEnumHints(FM3);
   const KEY13 = '11_13p0';
-  const spyBuild = async (fw: [number, number], opts: { force?: boolean } = {}): Promise<LiveWalkOptions> => {
+  const spyBuild = async (fw: [number, number], opts: { force?: boolean; replace?: boolean } = {}): Promise<LiveWalkOptions> => {
     const { app, registry } = await makeApp(FM3, { fw });
     try {
       let seen: LiveWalkOptions | null = null;
@@ -900,7 +1007,8 @@ async function enumHintsInWalkOptions(): Promise<void> {
       store.defaultStore.delDoc('deviceCaches', key);
     }
   }
-  // force-rebuild over a stored local import: its rows; over a byte-origin CLOUD profile or a LIVE profile: the catalog
+  // a rebuild over a stored local import: its rows; over a byte-origin CLOUD profile or a LIVE profile: the catalog
+  // (legacy docs: `replace`, the only build that walks over a raw-less byte profile)
   for (const [meta, want] of [
     [{ source: 'editor-cache' }, { 70: { count: 26, typecode: 16 } }],
     [{ source: 'cloud', origin: 'bytes' }, catalog[58]],
@@ -908,7 +1016,7 @@ async function enumHintsInWalkOptions(): Promise<void> {
   ] as const) {
     store.defaultStore.putDoc('deviceCaches', KEY13, enumRowsDoc(meta, 'DISTORT', { 70: { enumCount: 26, typecode: 16 } }));
     try {
-      const o = await spyBuild([13, 0], { force: true });
+      const o = await spyBuild([13, 0], { replace: true });
       assert(sameJson(o.enumHintByBlock?.[58], want), `stored ${JSON.stringify(meta)} profile: eid 58 hints ${JSON.stringify(o.enumHintByBlock?.[58])}`);
       assert(sameJson(o.enumHintByBlock?.[66], catalog[66]), `stored ${JSON.stringify(meta)} profile: other families keep the catalog hints`);
     } finally {
@@ -947,6 +1055,7 @@ export async function runDeviceCacheTests(): Promise<void> {
   await walkBoundDerivation();
   await walkBoundFromStoredCache();
   await enumHintDerivation();
+  await profileV2LocalByteSource();
   await enumHintsInWalkOptions();
   await fullFirmwareGate();
   await fullFirmwareFreshness();

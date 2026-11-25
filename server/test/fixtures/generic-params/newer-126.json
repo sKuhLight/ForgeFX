@@ -1,0 +1,66 @@
+{
+  "block": "Mixer",
+  "definitions": {"channel":0,"family":"MIXER","hidden":[{"id":16,"reason":"bypass"}],"persistentWrites":false,"positional":true,"profile":"none","suspect":true},
+  "enums": [
+    {"fp":"1:62f9a26e","generic":false,"id":14,"kind":"enum","name":"Mono/Stereo","nameConfidence":"high","nameSource":"catalog","options":"#0","source":"catalog","value":0,"widget":"toggle","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:fc7179d3","generic":false,"id":15,"kind":"enum","name":"BYPASSMODE","nameConfidence":"high","nameSource":"catalog","options":"#0","source":"catalog","value":1,"widget":"toggle","widgetSource":"device","write":"ordinal"}
+  ],
+  "layout": {
+    "editorName": "Mixer",
+    "family": "MIXER",
+    "pages": [
+      {
+        "name": "Mixer",
+        "rows": [
+          {
+            "controls": [
+              {"label":"Row 1\nGain","paramId":0,"paramName":"MIXER_GAIN1","rawWidget":"knob","widget":"knob"},
+              {"label":"Row 2\nGain","paramId":1,"paramName":"MIXER_GAIN2","rawWidget":"knob","widget":"knob"},
+              {"label":"Row 3\nGain","paramId":2,"paramName":"MIXER_GAIN3","rawWidget":"knob","widget":"knob"},
+              {"label":"Row 4\nGain","paramId":3,"paramName":"MIXER_GAIN4","rawWidget":"knob","widget":"knob"},
+              {"label":"","paramId":null,"paramName":null,"rawWidget":"spacer","widget":"spacer"},
+              {"label":"","paramId":null,"paramName":null,"rawWidget":"spacer","widget":"spacer"},
+              {"label":"Mono/Stereo","paramId":14,"paramName":"MIXER_MODE","rawWidget":"dropdown1","widget":"dropdown"}
+            ],
+            "section": "parameters"
+          },
+          {
+            "controls": [
+              {"label":"Row 1\nBalance","paramId":6,"paramName":"MIXER_PAN1","rawWidget":"knob","widget":"knob"},
+              {"label":"Row 2\nBalance","paramId":7,"paramName":"MIXER_PAN2","rawWidget":"knob","widget":"knob"},
+              {"label":"Row 3\nBalance","paramId":8,"paramName":"MIXER_PAN3","rawWidget":"knob","widget":"knob"},
+              {"label":"Row 4\nBalance","paramId":9,"paramName":"MIXER_PAN4","rawWidget":"knob","widget":"knob"}
+            ],
+            "section": "parameters"
+          },
+          {"controls":[{"label":"Level","paramId":12,"paramName":"MIXER_MASTER","rawWidget":"knob","widget":"knob"}],"section":"mixer"},
+          {"controls":[{"label":"Balance","paramId":13,"paramName":"MIXER_PAN","rawWidget":"knob","widget":"knob"}],"section":"mixer"}
+        ]
+      }
+    ],
+    "variantName": "Mixer",
+    "variantValue": null
+  },
+  "named": [
+    {"fp":"1:318ec60c","generic":false,"id":0,"kind":"float","max":100,"min":0,"name":"Row 1 Gain","nameConfidence":"high","nameSource":"catalog","norm":0,"source":"catalog","step":0.1,"taperSource":"typecode","value":0,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:318ec60c","generic":false,"id":1,"kind":"float","max":100,"min":0,"name":"Row 2 Gain","nameConfidence":"high","nameSource":"catalog","norm":0.0152134769737846,"source":"catalog","step":0.1,"taperSource":"typecode","value":1.521,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:318ec60c","generic":false,"id":2,"kind":"float","max":100,"min":0,"name":"Row 3 Gain","nameConfidence":"high","nameSource":"catalog","norm":0.0304269539475692,"source":"catalog","step":0.1,"taperSource":"typecode","value":3.043,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:318ec60c","generic":false,"id":3,"kind":"float","max":100,"min":0,"name":"Row 4 Gain","nameConfidence":"high","nameSource":"catalog","norm":0.0456404309213538,"source":"catalog","step":0.1,"taperSource":"typecode","value":4.564,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:318ec60c","generic":false,"id":4,"kind":"float","max":100,"min":0,"name":"Row 5 Gain","nameConfidence":"high","nameSource":"catalog","norm":0.0608539078951384,"source":"catalog","step":0.1,"taperSource":"typecode","value":6.085,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:318ec60c","generic":false,"id":5,"kind":"float","max":100,"min":0,"name":"Row 6 Gain","nameConfidence":"high","nameSource":"catalog","norm":0.076067384868923,"source":"catalog","step":0.1,"taperSource":"typecode","value":7.607,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:0538b5c7","generic":false,"id":6,"kind":"float","max":100,"min":-100,"name":"Row 1 Balance","nameConfidence":"high","nameSource":"catalog","norm":0.0912808618427076,"source":"catalog","step":0.2,"taperSource":"typecode","unit":"%","unitSource":"catalog","value":-81.744,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:0538b5c7","generic":false,"id":7,"kind":"float","max":100,"min":-100,"name":"Row 2 Balance","nameConfidence":"high","nameSource":"catalog","norm":0.1064943388164922,"source":"catalog","step":0.2,"taperSource":"typecode","unit":"%","unitSource":"catalog","value":-78.701,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:0538b5c7","generic":false,"id":8,"kind":"float","max":100,"min":-100,"name":"Row 3 Balance","nameConfidence":"high","nameSource":"catalog","norm":0.1217078157902768,"source":"catalog","step":0.2,"taperSource":"typecode","unit":"%","unitSource":"catalog","value":-75.658,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:0538b5c7","generic":false,"id":9,"kind":"float","max":100,"min":-100,"name":"Row 4 Balance","nameConfidence":"high","nameSource":"catalog","norm":0.1369212927640614,"source":"catalog","step":0.2,"taperSource":"typecode","unit":"%","unitSource":"catalog","value":-72.616,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:0538b5c7","generic":false,"id":10,"kind":"float","max":100,"min":-100,"name":"Row 5 Balance","nameConfidence":"high","nameSource":"catalog","norm":0.152134769737846,"source":"catalog","step":0.2,"taperSource":"typecode","unit":"%","unitSource":"catalog","value":-69.573,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:0538b5c7","generic":false,"id":11,"kind":"float","max":100,"min":-100,"name":"Row 6 Balance","nameConfidence":"high","nameSource":"catalog","norm":0.1673482467116306,"source":"catalog","step":0.2,"taperSource":"typecode","unit":"%","unitSource":"catalog","value":-66.53,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:d25ebf43","generic":false,"id":12,"kind":"float","max":20,"min":-80,"name":"Level","nameConfidence":"high","nameSource":"catalog","norm":0.1825617236854152,"source":"catalog","step":0.1,"taperSource":"typecode","value":-61.744,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:63434cb2","generic":false,"id":13,"kind":"float","max":100,"min":-100,"name":"Balance","nameConfidence":"high","nameSource":"catalog","norm":0.19777520065919982,"source":"catalog","step":0.2,"taperSource":"typecode","unit":"%","unitSource":"catalog","value":-60.445,"widget":"knob","widgetSource":"device","write":"norm"}
+  ],
+  "page": 126,
+  "slug": "mixer",
+  "type": null,
+  "optionLists": [
+    [{"label":"0","value":0},{"label":"1","value":1}]
+  ]
+}

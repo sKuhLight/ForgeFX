@@ -10,10 +10,8 @@ import { __createRegistryForTest } from '../../src/drivers/registry.js';
 import * as store from '../../src/store.js';
 import { parseEditorCacheFilename } from '../../src/services/editorCacheImport.js';
 import { discoverEditorCaches, type DiscoveryFs } from '../../src/services/editorCacheDiscovery.js';
-import type { CacheRecord } from 'forgefx-midi/cache';
 import { loadUsableProfile } from '../../src/profileSchema.js';
-import { FM3_PARAMS_BY_FAMILY } from 'forgefx-midi/gen3/fm3';
-import { AM4_CACHE_PARAMS, AM4_SEEDS } from 'forgefx-midi/am4';
+import { am4SeedRecords, encodeCache, seedRecords } from '../helpers/cacheBytes.js';
 import { MockTransport, handshakeReply, isIdentifyBroadcast, assert, assertEqual } from '../helpers/mock.js';
 
 export const EDITOR_CACHE_IMPORT_CASE_COUNT = 7;
@@ -50,52 +48,10 @@ async function makeApp(model: number, fw?: [number, number]) {
 }
 
 // ── synthetic .cache buffer ──────────────────────────────────────────────────────────────────────
-// Same 5 HW-seed families/tags buildCache asserts (a real device reports all five), each carrying a
-// handful of its most-distinctive range-bearing FLOAT params so the section→family voter wins its own
-// section. Lifted from device-cache.test.ts's seedRecords, then serialised with the codec's inverse
-// cache encoder (from forgefx-midi/test/cache/buildprofile.test.ts) so the real byte walker runs.
-const SEED_TAGS: Record<string, number> = { DISTORT: 10, CABINET: 11, REVERB: 12, DELAY: 13, FUZZ: 25 };
-
-function seedRecords(): CacheRecord[] {
-  const byFam = FM3_PARAMS_BY_FAMILY as unknown as Record<string, { paramId: number; unit?: string; displayMin?: number; displayMax?: number }[]>;
-  const fams = Object.keys(SEED_TAGS);
-  const shareCount = new Map<number, number>();
-  for (const f of fams) { const seen = new Set<number>(); for (const p of byFam[f] ?? []) if (!seen.has(p.paramId)) { seen.add(p.paramId); shareCount.set(p.paramId, (shareCount.get(p.paramId) ?? 0) + 1); } }
-  const recs: CacheRecord[] = [];
-  for (const fam of fams) {
-    const cands = (byFam[fam] ?? [])
-      .filter((p) => p.paramId < 0xff00 && p.unit !== 'enum' && p.displayMin != null && p.displayMax != null && p.displayMin !== p.displayMax)
-      .sort((a, b) => (shareCount.get(a.paramId)! - shareCount.get(b.paramId)!) || a.paramId - b.paramId)
-      .slice(0, 6);
-    assert(cands.length > 0, `seed family ${fam} has a range-bearing float param for the fixture`);
-    for (const p of cands) recs.push({ kind: 'float', section: SEED_TAGS[fam]!, offset: 0, id: p.paramId, tc: 0, min: p.displayMin!, max: p.displayMax!, def: 1, step: 0, t1: 0, t2: 0 });
-  }
-  return recs;
-}
-
-/** Minimal little-endian cache encoder (inverse of parseCacheRecords), matching the codec's own test. */
-export function encodeCache(records: readonly CacheRecord[]): Uint8Array {
-  const bytes: number[] = [];
-  const u16 = (v: number) => bytes.push(v & 0xff, (v >>> 8) & 0xff);
-  const u32 = (v: number) => bytes.push(v & 0xff, (v >>> 8) & 0xff, (v >>> 16) & 0xff, (v >>> 24) & 0xff);
-  const f32 = (v: number) => { const b = new Uint8Array(4); new DataView(b.buffer).setFloat32(0, v, true); bytes.push(b[0]!, b[1]!, b[2]!, b[3]!); };
-  for (let i = 0; i < 0x2e; i++) bytes.push(0); // preamble filler → first section header at 0x2e
-  const order: number[] = [];
-  const bySection = new Map<number, CacheRecord[]>();
-  for (const r of records) { let g = bySection.get(r.section); if (!g) { g = []; bySection.set(r.section, g); order.push(r.section); } g.push(r); }
-  for (const tag of order) {
-    const recs = bySection.get(tag)!;
-    u32(tag); u32(recs.length);
-    for (const r of recs) {
-      u16(r.id); u16(r.tc); u16(0); f32(r.min); f32(r.max); f32(r.def); f32(r.step);
-      // seedRecords only emits floats; the enum arm mirrors the codec encoder for completeness.
-      if (r.kind === 'enum') { u32(r.values.length); for (const v of r.values) { u32(v.length); for (let i = 0; i < v.length; i++) bytes.push(v.charCodeAt(i)); } u32(r.x); u16(0); }
-      else { u32(r.t1); u32(r.t2); u16(0); }
-    }
-  }
-  return new Uint8Array(bytes);
-}
-
+// The 5 HW-seed families, each with a handful of its most-distinctive range-bearing FLOAT params, serialised
+// with the inverse cache encoder so the real byte walker runs (test/helpers/cacheBytes.ts, shared with the
+// contribution suites).
+export { encodeCache };
 export const CACHE_BYTES = encodeCache(seedRecords());
 
 function importReq(app: Awaited<ReturnType<typeof makeApp>>['app'], name: string, force = false, bytes: Uint8Array = CACHE_BYTES) {
@@ -209,16 +165,7 @@ async function noCacheImport(): Promise<void> {
 function am4CacheBytes(): Uint8Array {
   // One distinctive range-bearing float per seed family (amp/drive/reverb/delay), straight from
   // AM4_CACHE_PARAMS so the vote anchors every AM4 seed. Same inverse encoder as the gen-3 fixture.
-  const seeds = Object.entries(AM4_SEEDS) as Array<[string, number]>;
-  const recs: CacheRecord[] = [];
-  for (const [fam, section] of seeds) {
-    const cands = (AM4_CACHE_PARAMS as unknown as { family: string; paramId: number; unit?: string; displayMin?: number; displayMax?: number }[])
-      .filter((p) => p.family === fam && p.unit !== 'enum' && p.displayMin != null && p.displayMax != null && p.displayMin !== p.displayMax)
-      .slice(0, 6);
-    assert(cands.length > 0, `AM4 seed family ${fam} has range-bearing params`);
-    for (const p of cands) recs.push({ kind: 'float', section, offset: 0, id: p.paramId, tc: 0, min: p.displayMin!, max: p.displayMax!, def: 1, step: 0, t1: 0, t2: 0 });
-  }
-  return encodeCache(recs);
+  return encodeCache(am4SeedRecords());
 }
 
 async function am4Import(): Promise<void> {

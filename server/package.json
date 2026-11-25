@@ -25,6 +25,7 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "check:browser": "tsx scripts/check-browser-safe.ts",
+    "profile-check": "tsx scripts/profile-check.ts",
     "test": "tsx test/run-all.ts && tsx scripts/check-browser-safe.ts",
     "probe:grid": "tsx src/probes/grid-read.ts",
     "probe:grid2e": "tsx src/probes/grid-2e.ts",

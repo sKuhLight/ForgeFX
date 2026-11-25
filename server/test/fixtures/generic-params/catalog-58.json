@@ -1,0 +1,785 @@
+{
+  "block": "Amp",
+  "definitions": {
+    "channel": 0,
+    "family": "DISTORT",
+    "hidden": [{"id":5,"reason":"bypass"},{"id":6,"reason":"type"}],
+    "persistentWrites": false,
+    "positional": true,
+    "profile": "byte-exact"
+  },
+  "enums": [
+    {"fp":"1:e87bd748","generic":false,"id":3,"kind":"enum","name":"Bypass Mode","nameConfidence":"high","nameSource":"catalog","options":"#0","source":"profile","value":1,"widget":"toggle","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:35b1c93b","generic":false,"id":20,"kind":"enum","name":"Tonestack Location","nameConfidence":"high","nameSource":"catalog","options":"#1","source":"profile","value":0,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:fe4f9081","generic":false,"id":21,"kind":"enum","name":"Input Select","nameConfidence":"high","nameSource":"catalog","options":"#2","source":"profile","value":0,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:df007c25","generic":false,"id":24,"kind":"enum","name":"CLIPTYPE2","nameConfidence":"high","nameSource":"catalog","options":"#3","source":"profile","value":11,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:dcb68b92","generic":false,"id":32,"kind":"enum","name":"DRIVETYPE","nameConfidence":"high","nameSource":"catalog","options":"#4","source":"profile","value":0,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:022142ae","generic":false,"id":36,"kind":"enum","name":"Tonestack Type","nameConfidence":"high","nameSource":"catalog","options":"#5","source":"profile","value":36,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:41c6b918","generic":false,"id":39,"kind":"enum","name":"FBTYPE","nameConfidence":"high","nameSource":"catalog","options":"#6","source":"profile","value":39,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:02a8ec0b","generic":false,"id":41,"kind":"enum","name":"Bright","nameConfidence":"high","nameSource":"catalog","options":"#7","source":"profile","value":1,"widget":"toggle","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:02a8ec0b","generic":false,"id":42,"kind":"enum","name":"Boost","nameConfidence":"high","nameSource":"catalog","options":"#7","source":"profile","value":0,"widget":"toggle","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:02a8ec0b","generic":false,"id":47,"kind":"enum","name":"Cut","nameConfidence":"high","nameSource":"catalog","options":"#7","source":"profile","value":1,"widget":"toggle","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:b2b92f63","generic":false,"id":51,"kind":"enum","name":"Master Vol Location","nameConfidence":"high","nameSource":"catalog","options":"#8","source":"profile","value":0,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:f108d8bd","generic":false,"id":56,"kind":"enum","name":"Saturation Switch","nameConfidence":"high","nameSource":"catalog","options":"#9","source":"profile","value":2,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:8790af11","generic":false,"id":70,"kind":"enum","name":"Power Tube Type","nameConfidence":"high","nameSource":"catalog","options":"#10","source":"profile","value":20,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:a0136dd3","generic":false,"id":71,"kind":"enum","name":"Preamp Tube Type","nameConfidence":"high","nameSource":"catalog","options":"#11","source":"profile","value":8,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:02a8ec0b","generic":false,"id":80,"kind":"enum","name":"Fat","nameConfidence":"high","nameSource":"catalog","options":"#7","source":"profile","value":0,"widget":"toggle","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:ce7e83c3","generic":false,"id":88,"kind":"enum","name":"Power Type","nameConfidence":"high","nameSource":"catalog","options":"#12","source":"profile","value":0,"widget":"toggle","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:c4cc7976","generic":false,"id":93,"kind":"enum","name":"Ratio","nameConfidence":"high","nameSource":"catalog","options":"#13","source":"profile","value":0,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:33435c07","generic":false,"id":94,"kind":"enum","name":"Type 1","nameConfidence":"high","nameSource":"catalog","options":"#14","source":"profile","value":6,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:02a8ec0b","generic":false,"id":98,"kind":"enum","name":"Preamp Sag","nameConfidence":"high","nameSource":"catalog","options":"#7","source":"profile","value":0,"widget":"toggle","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:3965ecdd","generic":false,"id":104,"kind":"enum","name":"Type 2","nameConfidence":"high","nameSource":"catalog","options":"#15","source":"profile","value":0,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:02a8ec0b","generic":false,"id":106,"kind":"enum","name":"Pres. Shift","nameConfidence":"high","nameSource":"catalog","options":"#7","source":"profile","value":0,"widget":"toggle","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:35512e30","generic":false,"id":111,"kind":"enum","name":"Out Comp Type","nameConfidence":"high","nameSource":"catalog","options":"#16","source":"profile","value":0,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:b44c4e6e","generic":false,"id":112,"kind":"enum","name":"Location","nameConfidence":"high","nameSource":"catalog","options":"#17","source":"profile","value":1,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:d7f02ccf","generic":false,"id":113,"kind":"enum","name":"Type 3","nameConfidence":"high","nameSource":"catalog","options":"#18","source":"profile","value":1,"widget":"toggle","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:e84488aa","generic":false,"id":125,"kind":"enum","name":"Boost Type","nameConfidence":"high","nameSource":"catalog","options":"#19","source":"profile","value":5,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:ed64f0c6","generic":false,"id":126,"kind":"enum","name":"Output Mode","nameConfidence":"high","nameSource":"catalog","options":"#20","source":"profile","value":0,"widget":"toggle","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:02a8ec0b","generic":false,"id":128,"kind":"enum","name":"Off / On","nameConfidence":"high","nameSource":"catalog","options":"#7","source":"profile","value":0,"widget":"toggle","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:dbfc1c34","generic":false,"id":130,"kind":"enum","name":"Speaker Imp. Curve","nameConfidence":"high","nameSource":"catalog","options":"#21","source":"profile","value":37,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:02a8ec0b","generic":false,"id":136,"kind":"enum","name":"Power Amp Modeling","nameConfidence":"high","nameSource":"catalog","options":"#7","source":"profile","value":0,"widget":"toggle","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:02a8ec0b","generic":false,"id":137,"kind":"enum","name":"Scene Ignore","nameConfidence":"high","nameSource":"catalog","options":"#7","source":"profile","value":1,"widget":"toggle","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:aaddd9fb","generic":false,"id":138,"kind":"enum","name":"Speaker Breakup","nameConfidence":"high","nameSource":"catalog","options":"#22","source":"profile","value":0,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:02a8ec0b","generic":false,"id":140,"kind":"enum","name":"Plate Suppr. Diodes","nameConfidence":"high","nameSource":"catalog","options":"#7","source":"profile","value":0,"widget":"toggle","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:02a8ec0b","generic":false,"id":142,"kind":"enum","name":"Auto Dyna-Cab Imp.","nameConfidence":"high","nameSource":"catalog","options":"#7","source":"profile","value":0,"widget":"toggle","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:02a8ec0b","generic":false,"id":143,"kind":"enum","name":"NFB Compensation","nameConfidence":"high","nameSource":"catalog","options":"#7","source":"profile","value":1,"widget":"toggle","widgetSource":"device","write":"ordinal"}
+  ],
+  "layout": {
+    "editorName": "Amp",
+    "family": "DISTORT",
+    "fw": {"gtet":"8,00"},
+    "pages": [
+      {
+        "name": "Authentic",
+        "pageNum": 0,
+        "rows": [
+          {
+            "controls": [
+              {"label":"Gain","paramId":7,"paramName":"DISTORT_DRIVE","placement":{"col":0},"rawWidget":"knob","widget":"knob"},
+              {"label":"Bass","paramId":8,"paramName":"DISTORT_BASS","placement":{"col":2},"rawWidget":"knob","widget":"knob"},
+              {"label":"Treble","paramId":10,"paramName":"DISTORT_TREBLE","placement":{"col":4},"rawWidget":"knob","widget":"knob"},
+              {"label":"High\nCut","paramId":135,"paramName":"DISTORT_PAHICUT","placement":{"col":5},"rawWidget":"knob","widget":"knob"},
+              {
+                "label": "HEADROOM",
+                "paramId": 132,
+                "paramName": "DISTORT_VPLATEMON",
+                "placement": {"positionExact":"465,370"},
+                "rawWidget": "meterGainHeadroom",
+                "widget": "meter"
+              }
+            ],
+            "section": "parameters"
+          },
+          {"controls":[{"label":"Input\nTrim","paramId":49,"paramName":"DISTORT_TRIM","rawWidget":"knob","widget":"knob"}],"section":"parameters"},
+          {
+            "controls": [
+              {"label":"Level","paramId":1,"paramName":"DISTORT_LEVEL","rawWidget":"knob","widget":"knob"},
+              {"label":"Balance","paramId":2,"paramName":"DISTORT_PAN","rawWidget":"knob","widget":"knob"}
+            ],
+            "section": "mixer"
+          },
+          {
+            "controls": [
+              {"label":"Input\nSelect","paramId":21,"paramName":"DISTORT_INPUTSELECT","rawWidget":"dropdown1Tight","widget":"dropdown"},
+              {"label":"Bypass\nMode","paramId":3,"paramName":"DISTORT_BYPASSMODE","rawWidget":"dropdown1Tight","widget":"dropdown"},
+              {"label":"Bypass","paramId":5,"paramName":"DISTORT_BYPASS","rawWidget":"btnBypass","widget":"button"},
+              {"label":"Scene\nIgnore","paramId":137,"paramName":"DISTORT_SCENEIGNORE","rawWidget":"btnIgnoreScene","widget":"button"}
+            ],
+            "section": "mixer"
+          }
+        ],
+        "selectorParamName": "DISTORT_TYPE",
+        "value": "6,8,43,128,236,326"
+      },
+      {
+        "name": "Ideal",
+        "pageNum": 1,
+        "rows": [
+          {
+            "controls": [
+              {"label":"Gain","paramId":7,"paramName":"DISTORT_DRIVE","placement":{"col":0},"rawWidget":"knob","widget":"knob"},
+              {"label":"","paramId":null,"paramName":null,"placement":{"col":1},"rawWidget":"spacer","widget":"spacer"},
+              {"label":"Bass","paramId":8,"paramName":"DISTORT_BASS","placement":{"col":2},"rawWidget":"knob","widget":"knob"},
+              {"label":"Mid","paramId":9,"paramName":"DISTORT_MID","placement":{"col":3},"rawWidget":"knob","widget":"knob"},
+              {"label":"Treble","paramId":10,"paramName":"DISTORT_TREBLE","placement":{"col":4},"rawWidget":"knob","widget":"knob"},
+              {"label":"High\nCut","paramId":135,"paramName":"DISTORT_PAHICUT","placement":{"col":5},"rawWidget":"knob","widget":"knob"},
+              {"label":"Depth","paramId":22,"paramName":"DISTORT_DEPTH","placement":{"col":6},"rawWidget":"knob","widget":"knob"},
+              {"label":"","paramId":null,"paramName":null,"placement":{"col":7},"rawWidget":"spacer","widget":"spacer"},
+              {"label":"Master Volume","paramId":11,"paramName":"DISTORT_MASTER","placement":{"col":8},"rawWidget":"knob","widget":"knob"}
+            ],
+            "section": "parameters"
+          },
+          {
+            "controls": [
+              {"label":"Boost","paramId":42,"paramName":"DISTORT_BOOST","placement":{"col":0,"offsetY":-70},"rawWidget":"toggleHorz","widget":"toggle"},
+              {"label":"Cut","paramId":47,"paramName":"DISTORT_CUT","placement":{"col":2,"offsetY":-70},"rawWidget":"toggleHorz","widget":"toggle"},
+              {"label":"Fat","paramId":80,"paramName":"DISTORT_FAT","placement":{"col":3,"offsetY":-70},"rawWidget":"toggleHorz","widget":"toggle"},
+              {"label":"Bright","paramId":41,"paramName":"DISTORT_BRIGHT","placement":{"col":4,"offsetY":-70},"rawWidget":"toggleHorz","widget":"toggle"},
+              {
+                "label": "Pres. Shift",
+                "paramId": 106,
+                "paramName": "DISTORT_PRESSHIFT",
+                "placement": {"col":5,"offsetY":-70},
+                "rawWidget": "toggleHorz",
+                "widget": "toggle"
+              },
+              {"label":"Input\nTrim","paramId":49,"paramName":"DISTORT_TRIM","placement":{"col":0},"rawWidget":"knob","widget":"knob"},
+              {"label":"","paramId":null,"paramName":null,"placement":{"col":1},"rawWidget":"spacer","widget":"spacer"},
+              {"label":"","paramId":null,"paramName":null,"placement":{"col":2},"rawWidget":"spacer","widget":"spacer"},
+              {"label":"High\nTreble","paramId":99,"paramName":"DISTORT_HITREBLE","placement":{"col":3},"rawWidget":"knob","widget":"knob"},
+              {"label":"Bright\nCap","paramId":16,"paramName":"DISTORT_BRIGHTCAP","placement":{"col":4},"rawWidget":"knob","widget":"knob"},
+              {"label":"","paramId":null,"paramName":null,"placement":{"col":5},"rawWidget":"spacer","widget":"spacer"},
+              {"label":"","paramId":null,"paramName":null,"placement":{"col":6},"rawWidget":"spacer","widget":"spacer"},
+              {"label":"","paramId":null,"paramName":null,"placement":{"col":7},"rawWidget":"spacer","widget":"spacer"},
+              {"label":"Master Vol Trim","paramId":79,"paramName":"DISTORT_MVTRIM","placement":{"col":8},"rawWidget":"knob","widget":"knob"},
+              {
+                "label": "HEADROOM",
+                "paramId": 132,
+                "paramName": "DISTORT_VPLATEMON",
+                "placement": {"positionExact":"465,370"},
+                "rawWidget": "meterGainHeadroom",
+                "widget": "meter"
+              }
+            ],
+            "section": "parameters"
+          },
+          {
+            "controls": [
+              {"label":"Level","paramId":1,"paramName":"DISTORT_LEVEL","rawWidget":"knob","widget":"knob"},
+              {"label":"Balance","paramId":2,"paramName":"DISTORT_PAN","rawWidget":"knob","widget":"knob"}
+            ],
+            "section": "mixer"
+          },
+          {
+            "controls": [
+              {"label":"Input\nSelect","paramId":21,"paramName":"DISTORT_INPUTSELECT","rawWidget":"dropdown1Tight","widget":"dropdown"},
+              {"label":"Bypass\nMode","paramId":3,"paramName":"DISTORT_BYPASSMODE","rawWidget":"dropdown1Tight","widget":"dropdown"},
+              {"label":"Bypass","paramId":5,"paramName":"DISTORT_BYPASS","rawWidget":"btnBypass","widget":"button"},
+              {"label":"Scene\nIgnore","paramId":137,"paramName":"DISTORT_SCENEIGNORE","rawWidget":"btnIgnoreScene","widget":"button"}
+            ],
+            "section": "mixer"
+          }
+        ],
+        "selectorParamName": "DISTORT_TYPE",
+        "value": "6,7,8,40,61,62,66,79,80,85,93,94,96,112,123,128,129,137,142,157,158,161,162,163,164,165,166,167,180,188,201,214,233,236,237,271,283,289,297,326,329,330"
+      },
+      {
+        "name": "Preamp",
+        "pageNum": 2,
+        "rows": [
+          {
+            "controls": [
+              {"label":"INPUT BOOST","paramId":null,"paramName":null,"placement":{"positionExact":"307,29"},"rawWidget":"sectionLabel","widget":"label"},
+              {"label":"Boost","paramId":42,"paramName":"DISTORT_BOOST","placement":{"col":0},"rawWidget":"toggle","widget":"toggle"},
+              {"label":"Boost\nType","paramId":125,"paramName":"DISTORT_BOOSTTYPE","placement":{"col":1},"rawWidget":"dropdown1","widget":"dropdown"},
+              {"label":"Boost\nLevel","paramId":124,"paramName":"DISTORT_BOOSTLVL","placement":{"col":2},"rawWidget":"knob","widget":"knob"},
+              {"label":"SATURATION","paramId":null,"paramName":null,"placement":{"positionExact":"562,29"},"rawWidget":"sectionLabel","widget":"label"},
+              {"label":"Saturation\nSwitch","paramId":56,"paramName":"DISTORT_SATSWITCH","placement":{"col":3},"rawWidget":"dropdown1","widget":"dropdown"},
+              {"label":"Saturation\nDrive","paramId":107,"paramName":"DISTORT_SATDRIVE","placement":{"col":4},"rawWidget":"knob","widget":"knob"},
+              {"label":"Preamp Tube Type","paramId":71,"paramName":"DISTORT_PRETUBETYPE","placement":{"col":5},"rawWidget":"dropdown1","widget":"dropdown"},
+              {"label":"","paramId":null,"paramName":null,"placement":{"col":6},"rawWidget":"spacer","widget":"spacer"},
+              {"label":"Low Cut\nFrequency","paramId":12,"paramName":"DISTORT_HPFREQ","placement":{"col":7},"rawWidget":"knob","widget":"knob"},
+              {"label":"High Cut\nFrequency","paramId":13,"paramName":"DISTORT_LPFREQ","placement":{"col":8},"rawWidget":"knob","widget":"knob"}
+            ],
+            "section": "parameters"
+          },
+          {
+            "controls": [
+              {"label":"Preamp\nSag","paramId":98,"paramName":"DISTORT_PRESAG","placement":{"col":0},"rawWidget":"toggle","widget":"toggle"},
+              {"label":"Tube\nHardness","paramId":50,"paramName":"DISTORT_HARDNESS2","placement":{"col":1},"rawWidget":"knob","widget":"knob"},
+              {"label":"Triode 1\nPlate Freq","paramId":69,"paramName":"DISTORT_FEEDFWDFREQ1","placement":{"col":2},"rawWidget":"knob","widget":"knob"},
+              {"label":"Triode 2\nPlate Freq","paramId":68,"paramName":"DISTORT_FEEDFWDFREQ2","placement":{"col":3},"rawWidget":"knob","widget":"knob"},
+              {"label":"Preamp\nBias","paramId":44,"paramName":"DISTORT_OFFSET2","placement":{"col":4},"rawWidget":"knob","widget":"knob"},
+              {"label":"Preamp Bias\nExcursion","paramId":108,"paramName":"DISTORT_TRIODE2RATIO","placement":{"col":5},"rawWidget":"knob","widget":"knob"},
+              {"label":"TONESTACK","paramId":null,"paramName":null,"placement":{"positionExact":"817,209"},"rawWidget":"sectionLabel","widget":"label"},
+              {"label":"Tonestack\nType","paramId":36,"paramName":"DISTORT_TONETYPE","placement":{"col":6},"rawWidget":"dropdown1","widget":"dropdown"},
+              {"label":"Tonestack\nFreq","paramId":14,"paramName":"DISTORT_TONEFREQ","placement":{"col":7},"rawWidget":"knob","widget":"knob"},
+              {"label":"Tonestack\nLocation","paramId":20,"paramName":"DISTORT_TONELOC","placement":{"col":8},"rawWidget":"dropdown1","widget":"dropdown"}
+            ],
+            "section": "parameters"
+          },
+          {
+            "controls": [
+              {"label":"Level","paramId":1,"paramName":"DISTORT_LEVEL","rawWidget":"knob","widget":"knob"},
+              {"label":"Balance","paramId":2,"paramName":"DISTORT_PAN","rawWidget":"knob","widget":"knob"}
+            ],
+            "section": "mixer"
+          },
+          {
+            "controls": [
+              {"label":"Input\nSelect","paramId":21,"paramName":"DISTORT_INPUTSELECT","rawWidget":"dropdown1Tight","widget":"dropdown"},
+              {"label":"Bypass\nMode","paramId":3,"paramName":"DISTORT_BYPASSMODE","rawWidget":"dropdown1Tight","widget":"dropdown"},
+              {"label":"Bypass","paramId":5,"paramName":"DISTORT_BYPASS","rawWidget":"btnBypass","widget":"button"},
+              {"label":"Scene\nIgnore","paramId":137,"paramName":"DISTORT_SCENEIGNORE","rawWidget":"btnIgnoreScene","widget":"button"}
+            ],
+            "section": "mixer"
+          }
+        ]
+      },
+      {
+        "name": "Power Amp",
+        "pageNum": 3,
+        "rows": [
+          {
+            "controls": [
+              {"label":"Power Amp Modeling","paramId":136,"paramName":"DISTORT_PAONOFF","placement":{"col":0},"rawWidget":"toggle","widget":"toggle"},
+              {"label":"Negative Feedback","paramId":27,"paramName":"DISTORT_BETA","placement":{"col":1},"rawWidget":"knob","widget":"knob"},
+              {"label":"NFB Compensation","paramId":143,"paramName":"DISTORT_NFBCOMP","placement":{"col":2},"rawWidget":"toggle","widget":"toggle"},
+              {"label":"Pres. Shift","paramId":106,"paramName":"DISTORT_PRESSHIFT","placement":{"col":3},"rawWidget":"toggle","widget":"toggle"},
+              {"label":"Presence Frequency","paramId":28,"paramName":"DISTORT_PRESFREQ","placement":{"col":4},"rawWidget":"knob","widget":"knob"},
+              {"label":"Depth Frequency","paramId":31,"paramName":"DISTORT_DEPTHFREQ","placement":{"col":5},"rawWidget":"knob","widget":"knob"},
+              {"label":"","paramId":null,"paramName":null,"placement":{"col":6},"rawWidget":"spacer","widget":"spacer"},
+              {"label":"Master Vol\nCap","paramId":33,"paramName":"DISTORT_MVCAP","placement":{"col":7},"rawWidget":"knob","widget":"knob"},
+              {"label":"Master Vol\nLocation","paramId":51,"paramName":"DISTORT_MVPOSITION","placement":{"col":8},"rawWidget":"dropdown1","widget":"dropdown"}
+            ],
+            "section": "parameters"
+          },
+          {
+            "controls": [
+              {"label":"TRANSFORMER","paramId":null,"paramName":null,"placement":{"positionExact":"305,209"},"rawWidget":"sectionLabel","widget":"label"},
+              {"label":"XFormer\nDrive","paramId":48,"paramName":"DISTORT_XDRIVE","placement":{"col":0},"rawWidget":"knob","widget":"knob"},
+              {"label":"XFormer\nMatching","paramId":53,"paramName":"DISTORT_XFMATCH","placement":{"col":1},"rawWidget":"knob","widget":"knob"},
+              {"label":"","paramId":null,"paramName":null,"placement":{"col":2},"rawWidget":"spacer","widget":"spacer"},
+              {"label":"Speaker Impedance","paramId":129,"paramName":"DISTORT_SPKRDCR","placement":{"col":3},"rawWidget":"knob","widget":"knob"},
+              {"label":"","paramId":null,"paramName":null,"placement":{"col":4},"rawWidget":"spacer","widget":"spacer"},
+              {"label":"PI Bias Excursion","paramId":116,"paramName":"DISTORT_PIEXCURSION","placement":{"col":5},"rawWidget":"knob","widget":"knob"},
+              {"label":"","paramId":null,"paramName":null,"placement":{"col":6},"rawWidget":"spacer","widget":"spacer"},
+              {"label":"Cathode Resistance","paramId":95,"paramName":"DISTORT_CBRATIO","placement":{"col":7},"rawWidget":"knob","widget":"knob"},
+              {"label":"Cathode Time Const","paramId":96,"paramName":"DISTORT_CBTIME","placement":{"col":8},"rawWidget":"knob","widget":"knob"}
+            ],
+            "section": "parameters"
+          },
+          {
+            "controls": [
+              {"label":"Level","paramId":1,"paramName":"DISTORT_LEVEL","rawWidget":"knob","widget":"knob"},
+              {"label":"Balance","paramId":2,"paramName":"DISTORT_PAN","rawWidget":"knob","widget":"knob"}
+            ],
+            "section": "mixer"
+          },
+          {
+            "controls": [
+              {"label":"Input\nSelect","paramId":21,"paramName":"DISTORT_INPUTSELECT","rawWidget":"dropdown1Tight","widget":"dropdown"},
+              {"label":"Bypass\nMode","paramId":3,"paramName":"DISTORT_BYPASSMODE","rawWidget":"dropdown1Tight","widget":"dropdown"},
+              {"label":"Bypass","paramId":5,"paramName":"DISTORT_BYPASS","rawWidget":"btnBypass","widget":"button"},
+              {"label":"Scene\nIgnore","paramId":137,"paramName":"DISTORT_SCENEIGNORE","rawWidget":"btnIgnoreScene","widget":"button"}
+            ],
+            "section": "mixer"
+          }
+        ]
+      },
+      {
+        "name": "Pwr Tubes + CF",
+        "pageNum": 4,
+        "rows": [
+          {
+            "controls": [
+              {"label":"POWER TUBES","paramId":null,"paramName":null,"placement":{"positionExact":"305,29"},"rawWidget":"sectionLabel","widget":"label"},
+              {"label":"Power Tube Type","paramId":70,"paramName":"DISTORT_TUBETYPE","placement":{"col":0},"rawWidget":"dropdown1","widget":"dropdown"},
+              {"label":"Grid\nBias","paramId":38,"paramName":"DISTORT_BIAS","placement":{"col":1},"rawWidget":"knob","widget":"knob"},
+              {"label":"Hardness","paramId":90,"paramName":"DISTORT_PAHARDNESS","placement":{"col":2},"rawWidget":"knob","widget":"knob"},
+              {"label":"Mismatch","paramId":100,"paramName":"DISTORT_PAOFFSET","placement":{"col":3},"rawWidget":"knob","widget":"knob"},
+              {"label":"Bias\nExcursion","paramId":65,"paramName":"DISTORT_BIASEXCURSION","placement":{"col":4},"rawWidget":"knob","widget":"knob"},
+              {"label":"Plate Suppr.\nDiodes","paramId":140,"paramName":"DISTORT_PLATEDIODE","placement":{"col":5},"rawWidget":"dropdown1","widget":"dropdown"}
+            ],
+            "section": "parameters"
+          },
+          {
+            "controls": [
+              {
+                "fw": {"gtet":"9"},
+                "label": "CATHODE FOLLOWER",
+                "paramId": null,
+                "paramName": null,
+                "placement": {"positionExact":"560,209"},
+                "rawWidget": "sectionLabel",
+                "widget": "label"
+              },
+              {"fw":{"gtet":"9"},"label":"Compression","paramId":82,"paramName":"DISTORT_CFTHRESH","placement":{"col":3},"rawWidget":"knob","widget":"knob"},
+              {"fw":{"gtet":"9"},"label":"Harmonics","paramId":35,"paramName":"DISTORT_CFCLIP","placement":{"col":4},"rawWidget":"knob","widget":"knob"}
+            ],
+            "section": "parameters"
+          },
+          {
+            "controls": [
+              {"label":"Level","paramId":1,"paramName":"DISTORT_LEVEL","rawWidget":"knob","widget":"knob"},
+              {"label":"Balance","paramId":2,"paramName":"DISTORT_PAN","rawWidget":"knob","widget":"knob"}
+            ],
+            "section": "mixer"
+          },
+          {
+            "controls": [
+              {"label":"Input\nSelect","paramId":21,"paramName":"DISTORT_INPUTSELECT","rawWidget":"dropdown1Tight","widget":"dropdown"},
+              {"label":"Bypass\nMode","paramId":3,"paramName":"DISTORT_BYPASSMODE","rawWidget":"dropdown1Tight","widget":"dropdown"},
+              {"label":"Bypass","paramId":5,"paramName":"DISTORT_BYPASS","rawWidget":"btnBypass","widget":"button"},
+              {"label":"Scene\nIgnore","paramId":137,"paramName":"DISTORT_SCENEIGNORE","rawWidget":"btnIgnoreScene","widget":"button"}
+            ],
+            "section": "mixer"
+          }
+        ]
+      },
+      {
+        "name": "Power Supply",
+        "pageNum": 5,
+        "rows": [
+          {
+            "controls": [
+              {"label":"Supply Sag","paramId":25,"paramName":"DISTORT_SUPPLYSAG","placement":{"col":0},"rawWidget":"knob","widget":"knob"},
+              {"label":"B+","paramId":120,"paramName":"DISTORT_VCCMON","placement":{"col":1},"rawWidget":"meterGainVert","widget":"meter"},
+              {"label":"","paramId":null,"paramName":null,"placement":{"col":2},"rawWidget":"spacer","widget":"spacer"},
+              {"label":"Power\nType","paramId":88,"paramName":"DISTORT_SUPPLYTYPE","placement":{"col":3},"rawWidget":"dropdown1","widget":"dropdown"},
+              {"label":"AC Line\nFrequency","paramId":89,"paramName":"DISTORT_LINEFREQ","placement":{"col":4},"rawWidget":"knob","widget":"knob"},
+              {"label":"Variac","paramId":103,"paramName":"DISTORT_VARIAC","placement":{"col":5},"rawWidget":"knob","widget":"knob"}
+            ],
+            "section": "parameters"
+          },
+          {
+            "controls": [
+              {"label":"B+ Time Constant","paramId":37,"paramName":"DISTORT_TIMECONST","placement":{"col":0},"rawWidget":"knob","widget":"knob"},
+              {"label":"","paramId":null,"paramName":null,"placement":{"col":1},"rawWidget":"spacer","widget":"spacer"},
+              {"label":"","paramId":null,"paramName":null,"placement":{"col":2},"rawWidget":"spacer","widget":"spacer"},
+              {"label":"Screen Frequency","paramId":54,"paramName":"DISTORT_SCREENFREQ","placement":{"col":3},"rawWidget":"knob","widget":"knob"},
+              {"label":"Screen Q","paramId":55,"paramName":"DISTORT_SCREENQ","placement":{"col":4},"rawWidget":"knob","widget":"knob"}
+            ],
+            "section": "parameters"
+          },
+          {
+            "controls": [
+              {"label":"Level","paramId":1,"paramName":"DISTORT_LEVEL","rawWidget":"knob","widget":"knob"},
+              {"label":"Balance","paramId":2,"paramName":"DISTORT_PAN","rawWidget":"knob","widget":"knob"}
+            ],
+            "section": "mixer"
+          },
+          {
+            "controls": [
+              {"label":"Input\nSelect","paramId":21,"paramName":"DISTORT_INPUTSELECT","rawWidget":"dropdown1Tight","widget":"dropdown"},
+              {"label":"Bypass\nMode","paramId":3,"paramName":"DISTORT_BYPASSMODE","rawWidget":"dropdown1Tight","widget":"dropdown"},
+              {"label":"Bypass","paramId":5,"paramName":"DISTORT_BYPASS","rawWidget":"btnBypass","widget":"button"},
+              {"label":"Scene\nIgnore","paramId":137,"paramName":"DISTORT_SCENEIGNORE","rawWidget":"btnIgnoreScene","widget":"button"}
+            ],
+            "section": "mixer"
+          }
+        ]
+      },
+      {
+        "name": "Speaker",
+        "pageNum": 6,
+        "rows": [
+          {
+            "controls": [
+              {
+                "label": "Low Freq",
+                "paramId": 29,
+                "paramName": "DISTORT_SPKRLFREQ",
+                "placement": {"positionExact":"305,30"},
+                "rawWidget": "knobMiniReadout",
+                "widget": "knob"
+              },
+              {"label":"LF Reso","paramId":30,"paramName":"DISTORT_SPKRLFGAIN","placement":{"positionExact":"305,128"},"rawWidget":"knobMini","widget":"knob"},
+              {"label":"LF Q","paramId":43,"paramName":"DISTORT_SPKRLFQ","placement":{"positionExact":"305,206"},"rawWidget":"knobMini","widget":"knob"},
+              {
+                "label": "XFormer Low Freq",
+                "paramId": 18,
+                "paramName": "DISTORT_XFHPF",
+                "placement": {"positionExact":"305,284"},
+                "rawWidget": "knobMiniReadout2",
+                "widget": "knob"
+              },
+              {"label":"Graph","paramId":null,"paramName":null,"placement":{"positionExact":"395,24"},"rawWidget":"graph4","widget":"graph"},
+              {
+                "label": "Speaker Imp. Curve",
+                "paramId": 130,
+                "paramName": "DISTORT_SPKRMODEL",
+                "placement": {"positionExact":"405,284"},
+                "rawWidget": "dropdown1p5ThinTight1Line",
+                "widget": "dropdown"
+              },
+              {
+                "label": "Auto Dyna-Cab Imp.",
+                "paramId": 142,
+                "paramName": "DISTORT_AUTO_SPKR_Z",
+                "placement": {"positionExact":"405,345"},
+                "rawWidget": "dropdown1p5ThinTight1Line",
+                "widget": "dropdown"
+              },
+              {
+                "label": "Cab Resonance",
+                "paramId": 131,
+                "paramName": "DISTORT_CABRESONANCE",
+                "placement": {"positionExact":"542,284"},
+                "rawWidget": "knobMiniReadout2",
+                "widget": "knob"
+              },
+              {
+                "label": "Speaker Breakup",
+                "paramId": 138,
+                "paramName": "DISTORT_SPKRBREAKUP",
+                "placement": {"positionExact":"640,284"},
+                "rawWidget": "dropdown1Tight",
+                "widget": "dropdown"
+              },
+              {
+                "label": "High Freq",
+                "paramId": 45,
+                "paramName": "DISTORT_SPKRHFREQ",
+                "placement": {"positionExact":"745,30"},
+                "rawWidget": "knobMiniReadout",
+                "widget": "knob"
+              },
+              {"label":"HF Reso","paramId":46,"paramName":"DISTORT_SPKRHFGAIN","placement":{"positionExact":"745,128"},"rawWidget":"knobMini","widget":"knob"},
+              {"label":"HF Slope","paramId":102,"paramName":"DISTORT_SPKRHFQ","placement":{"positionExact":"745,206"},"rawWidget":"knobMini","widget":"knob"},
+              {
+                "label": "XFormer Hi Freq",
+                "paramId": 19,
+                "paramName": "DISTORT_XFLPF",
+                "placement": {"positionExact":"745,284"},
+                "rawWidget": "knobMiniReadout2",
+                "widget": "knob"
+              }
+            ],
+            "section": "parameters"
+          },
+          {
+            "controls": [
+              {"label":"Seperator","paramId":null,"paramName":null,"placement":{"positionExact":"860,25"},"rawWidget":"labelSeperator","widget":"label"},
+              {
+                "label": "Speaker\nDrive",
+                "paramId": 52,
+                "paramName": "DISTORT_SPKRDRIVE",
+                "placement": {"positionExact":"900,30"},
+                "rawWidget": "knobMiniReadout2",
+                "widget": "knob"
+              },
+              {
+                "label": "Speaker\nCompress.",
+                "paramId": 117,
+                "paramName": "DISTORT_MOTORDRIVE",
+                "placement": {"positionExact":"985,30"},
+                "rawWidget": "knobMiniReadout2",
+                "widget": "knob"
+              },
+              {
+                "label": "Speaker\nCompliance",
+                "paramId": 127,
+                "paramName": "DISTORT_SPKRDYNAMICS",
+                "placement": {"positionExact":"900,157"},
+                "rawWidget": "knobMiniReadout2",
+                "widget": "knob"
+              },
+              {
+                "label": "Speaker\nTime Const",
+                "paramId": 118,
+                "paramName": "DISTORT_MDTIME",
+                "placement": {"positionExact":"985,157"},
+                "rawWidget": "knobMiniReadout2",
+                "widget": "knob"
+              },
+              {
+                "label": "Speaker\nThump",
+                "paramId": 139,
+                "paramName": "DISTORT_SPKRTHUMP",
+                "placement": {"positionExact":"900,284"},
+                "rawWidget": "knobMiniReadout2",
+                "widget": "knob"
+              },
+              {
+                "label": "Output Mode",
+                "paramId": 126,
+                "paramName": "DISTORT_OUTPUTTYPE",
+                "placement": {"positionExact":"1025,294"},
+                "rawWidget": "dropdown1p5Mini",
+                "widget": "dropdown"
+              },
+              {
+                "label": "Gain",
+                "paramId": 122,
+                "paramName": "DISTORT_MDMON",
+                "placement": {"positionExact":"1071,25"},
+                "rawWidget": "meterGainVertShort",
+                "widget": "meter"
+              }
+            ],
+            "section": "parameters"
+          },
+          {"controls":[{"label":"Level","paramId":1,"paramName":"DISTORT_LEVEL","rawWidget":"knobCompact","widget":"knob"}],"section":"mixer"},
+          {
+            "controls": [
+              {"label":"Balance","paramId":2,"paramName":"DISTORT_PAN","placement":{"positionExact":"1179,185"},"rawWidget":"knobCompact","widget":"knob"},
+              {"label":"Bypass","paramId":5,"paramName":"DISTORT_BYPASS","rawWidget":"btnBypass","widget":"button"},
+              {"label":"Scene\nIgnore","paramId":137,"paramName":"DISTORT_SCENEIGNORE","rawWidget":"btnIgnoreScene","widget":"button"}
+            ],
+            "section": "mixer"
+          }
+        ]
+      },
+      {
+        "name": "Input EQ",
+        "pageNum": 7,
+        "rows": [
+          {
+            "controls": [
+              {"label":"Type","paramId":104,"paramName":"DISTORT_INEQTYPE","rawWidget":"dropdown1","widget":"dropdown"},
+              {"label":"Frequency","paramId":74,"paramName":"DISTORT_INEQFREQ","rawWidget":"knob","widget":"knob"},
+              {"label":"Q","paramId":73,"paramName":"DISTORT_INEQQ","rawWidget":"knob","widget":"knob"},
+              {"label":"Gain","paramId":75,"paramName":"DISTORT_INEQGAIN","rawWidget":"knob","widget":"knob"},
+              {"label":"","paramId":null,"paramName":null,"rawWidget":"spacer","widget":"spacer"},
+              {"label":"Graph","paramId":null,"paramName":null,"rawWidget":"graph4","widget":"graph"}
+            ],
+            "section": "parameters"
+          },
+          {
+            "controls": [
+              {"label":"","paramId":null,"paramName":null,"rawWidget":"spacer","widget":"spacer"},
+              {"label":"Low Cut","paramId":12,"paramName":"DISTORT_HPFREQ","rawWidget":"knob","widget":"knob"},
+              {"label":"High Cut","paramId":85,"paramName":"DISTORT_HICUT","rawWidget":"knob","widget":"knob"},
+              {"label":"Definition","paramId":81,"paramName":"DISTORT_DEFINITION","rawWidget":"knob","widget":"knob"}
+            ],
+            "section": "parameters"
+          },
+          {
+            "controls": [
+              {"label":"Level","paramId":1,"paramName":"DISTORT_LEVEL","rawWidget":"knob","widget":"knob"},
+              {"label":"Balance","paramId":2,"paramName":"DISTORT_PAN","rawWidget":"knob","widget":"knob"}
+            ],
+            "section": "mixer"
+          },
+          {
+            "controls": [
+              {"label":"Input\nSelect","paramId":21,"paramName":"DISTORT_INPUTSELECT","rawWidget":"dropdown1Tight","widget":"dropdown"},
+              {"label":"Bypass\nMode","paramId":3,"paramName":"DISTORT_BYPASSMODE","rawWidget":"dropdown1Tight","widget":"dropdown"},
+              {"label":"Bypass","paramId":5,"paramName":"DISTORT_BYPASS","rawWidget":"btnBypass","widget":"button"},
+              {"label":"Scene\nIgnore","paramId":137,"paramName":"DISTORT_SCENEIGNORE","rawWidget":"btnIgnoreScene","widget":"button"}
+            ],
+            "section": "mixer"
+          }
+        ]
+      },
+      {
+        "name": "Output EQ",
+        "pageNum": 8,
+        "rows": [
+          {
+            "controls": [
+              {"label":"","paramId":null,"paramName":null,"rawWidget":"spacer","widget":"spacer"},
+              {"label":"Low","paramId":57,"paramName":"DISTORT_EQ1","placement":{"offsetX":52},"rawWidget":"slider","widget":"slider"},
+              {"label":"Low Mid","paramId":58,"paramName":"DISTORT_EQ2","rawWidget":"slider","widget":"slider"},
+              {"label":"Mid","paramId":59,"paramName":"DISTORT_EQ3","rawWidget":"slider","widget":"slider"},
+              {"label":"High Mid","paramId":60,"paramName":"DISTORT_EQ4","rawWidget":"slider","widget":"slider"},
+              {"label":"High","paramId":61,"paramName":"DISTORT_EQ5","rawWidget":"slider","widget":"slider"}
+            ],
+            "section": "parameters"
+          },
+          {
+            "controls": [
+              {"label":"Level","paramId":1,"paramName":"DISTORT_LEVEL","rawWidget":"knob","widget":"knob"},
+              {"label":"Balance","paramId":2,"paramName":"DISTORT_PAN","rawWidget":"knob","widget":"knob"}
+            ],
+            "section": "mixer"
+          },
+          {
+            "controls": [
+              {"label":"Input\nSelect","paramId":21,"paramName":"DISTORT_INPUTSELECT","rawWidget":"dropdown1Tight","widget":"dropdown"},
+              {"label":"Bypass\nMode","paramId":3,"paramName":"DISTORT_BYPASSMODE","rawWidget":"dropdown1Tight","widget":"dropdown"},
+              {"label":"Bypass","paramId":5,"paramName":"DISTORT_BYPASS","rawWidget":"btnBypass","widget":"button"},
+              {"label":"Scene\nIgnore","paramId":137,"paramName":"DISTORT_SCENEIGNORE","rawWidget":"btnIgnoreScene","widget":"button"}
+            ],
+            "section": "mixer"
+          }
+        ],
+        "selectorParamName": "DISTORT_EQTYPE",
+        "value": "6"
+      },
+      {
+        "name": "Dynamics",
+        "pageNum": 9,
+        "rows": [
+          {
+            "controls": [
+              {"label":"OUTPUT COMPRESSOR","paramId":null,"paramName":null,"placement":{"positionExact":"305,29"},"rawWidget":"sectionLabel","widget":"label"},
+              {"label":"Out Compression","paramId":77,"paramName":"DISTORT_COMPRESSION","placement":{"col":0},"rawWidget":"knob","widget":"knob"},
+              {"label":"Out Comp\nThreshold","paramId":78,"paramName":"DISTORT_THRESHOLD","placement":{"col":1},"rawWidget":"knob","widget":"knob"},
+              {"label":"Out Comp\nClarity","paramId":72,"paramName":"DISTORT_CLARITY","placement":{"col":2},"rawWidget":"knob","widget":"knob"},
+              {"label":"Gain","paramId":121,"paramName":"DISTORT_GAINMON","placement":{"col":3},"rawWidget":"meterGainVert","widget":"meter"},
+              {
+                "fw": {"gtet":"4,2"},
+                "label": "Master Bias\nExcursion",
+                "paramId": 134,
+                "paramName": "DISTORT_BIASX",
+                "placement": {"col":5},
+                "rawWidget": "knob",
+                "widget": "knob"
+              }
+            ],
+            "section": "parameters"
+          },
+          {
+            "controls": [
+              {
+                "label": "Out Comp\nType",
+                "paramId": 111,
+                "paramName": "DISTORT_COMPTYPE",
+                "placement": {"col":0,"offsetX":40},
+                "rawWidget": "dropdown1p5",
+                "widget": "dropdown"
+              }
+            ],
+            "section": "parameters"
+          },
+          {
+            "controls": [
+              {"label":"Level","paramId":1,"paramName":"DISTORT_LEVEL","rawWidget":"knob","widget":"knob"},
+              {"label":"Balance","paramId":2,"paramName":"DISTORT_PAN","rawWidget":"knob","widget":"knob"}
+            ],
+            "section": "mixer"
+          },
+          {
+            "controls": [
+              {"label":"Input\nSelect","paramId":21,"paramName":"DISTORT_INPUTSELECT","rawWidget":"dropdown1Tight","widget":"dropdown"},
+              {"label":"Bypass\nMode","paramId":3,"paramName":"DISTORT_BYPASSMODE","rawWidget":"dropdown1Tight","widget":"dropdown"},
+              {"label":"Bypass","paramId":5,"paramName":"DISTORT_BYPASS","rawWidget":"btnBypass","widget":"button"},
+              {"label":"Scene\nIgnore","paramId":137,"paramName":"DISTORT_SCENEIGNORE","rawWidget":"btnIgnoreScene","widget":"button"}
+            ],
+            "section": "mixer"
+          }
+        ]
+      }
+    ],
+    "pinned": true,
+    "variantName": "Amp GTE 8.00",
+    "variantValue": null
+  },
+  "named": [
+    {"fp":"1:70f92dab","generic":false,"id":1,"kind":"float","max":20,"min":-80,"name":"Amp1 Level","nameConfidence":"high","nameSource":"catalog","norm":0.0152134769737846,"source":"profile","step":0.1,"taperSource":"typecode","unit":"dB","unitSource":"catalog","value":-78.479,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:63434cb2","generic":false,"id":2,"kind":"float","max":100,"min":-100,"name":"Balance","nameConfidence":"high","nameSource":"catalog","norm":0.0304269539475692,"source":"profile","step":0.2,"taperSource":"typecode","unit":"%","unitSource":"catalog","value":-93.915,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:b8c6bac6","generic":false,"id":7,"kind":"float","max":10,"min":0,"name":"Gain 1","nameConfidence":"high","nameSource":"catalog","norm":0.1064943388164922,"source":"profile","step":0.01,"taperSource":"typecode","value":1.065,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:b8c6bac6","generic":false,"id":8,"kind":"float","max":10,"min":0,"name":"Bass 1","nameConfidence":"high","nameSource":"catalog","norm":0.1217078157902768,"source":"profile","step":0.01,"taperSource":"typecode","value":1.217,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:b8c6bac6","generic":false,"id":9,"kind":"float","max":10,"min":0,"name":"Mid 1","nameConfidence":"high","nameSource":"catalog","norm":0.1369212927640614,"source":"profile","step":0.01,"taperSource":"typecode","value":1.369,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:b8c6bac6","generic":false,"id":10,"kind":"float","max":10,"min":0,"name":"Treble 1","nameConfidence":"high","nameSource":"catalog","norm":0.152134769737846,"source":"profile","step":0.01,"taperSource":"typecode","value":1.521,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:b8c6bac6","generic":false,"id":11,"kind":"float","max":10,"min":0,"name":"Master Volume","nameConfidence":"high","nameSource":"catalog","norm":0.1673482467116306,"source":"profile","step":0.01,"taperSource":"typecode","value":1.673,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:e4500c0e","generic":false,"id":12,"kind":"float","log":true,"max":1000,"min":10,"name":"Low Cut Frequency","nameConfidence":"high","nameSource":"catalog","norm":0.1825617236854152,"source":"profile","taperSource":"typecode","unit":"Hz","unitSource":"typecode","value":23.181,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:ed8db58f","generic":false,"id":13,"kind":"float","log":true,"max":40000,"min":400,"name":"High Cut Frequency","nameConfidence":"high","nameSource":"catalog","norm":0.19777520065919982,"source":"profile","taperSource":"typecode","unit":"Hz","unitSource":"typecode","value":994.513,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:bc80fc7c","generic":false,"id":14,"kind":"float","log":true,"max":2000,"min":200,"name":"Tonestack Freq","nameConfidence":"high","nameSource":"catalog","norm":0.2129886776329844,"source":"profile","taperSource":"typecode","unit":"Hz","unitSource":"typecode","value":326.602,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:2a314fd2","generic":false,"id":15,"kind":"float","max":1,"min":0,"name":"XFLEAKAGE","nameConfidence":"high","nameSource":"catalog","norm":0.22820215460676901,"source":"profile","value":0.228,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:2972d498","generic":false,"id":16,"kind":"float","log":true,"max":10000,"min":10,"name":"Bright Cap","nameConfidence":"high","nameSource":"catalog","norm":0.2434156315805536,"source":"profile","taperSource":"typecode","unit":"pF","unitSource":"catalog","value":53.734,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:ed8db58f","generic":false,"id":17,"kind":"float","log":true,"max":40000,"min":400,"name":"WSLPF","nameConfidence":"high","nameSource":"catalog","norm":0.2586291085543382,"source":"profile","taperSource":"typecode","unit":"Hz","unitSource":"typecode","value":1316.189,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:98023a5c","generic":false,"id":18,"kind":"float","log":true,"max":500,"min":5,"name":"XFormer Low Freq","nameConfidence":"high","nameSource":"catalog","norm":0.2738425855281228,"source":"profile","taperSource":"typecode","unit":"Hz","unitSource":"typecode","value":17.646,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:fad3f0f5","generic":false,"id":19,"kind":"float","log":true,"max":40000,"min":4000,"name":"XFormer Hi Freq","nameConfidence":"high","nameSource":"catalog","norm":0.2890560625019074,"source":"profile","taperSource":"typecode","unit":"Hz","unitSource":"typecode","value":7782.445,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:b8c6bac6","generic":false,"id":22,"kind":"float","max":10,"min":0,"name":"Depth 1","nameConfidence":"high","nameSource":"catalog","norm":0.3346964934232612,"source":"profile","step":0.01,"taperSource":"typecode","value":3.347,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:3ab4c21a","generic":false,"id":23,"kind":"float","max":1,"min":-1,"name":"OFFSET1","nameConfidence":"high","nameSource":"catalog","norm":0.3499099703970458,"source":"profile","step":0.002,"taperSource":"typecode","value":-0.3,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:b8c6bac6","generic":false,"id":25,"kind":"float","max":10,"min":0,"name":"Supply Sag","nameConfidence":"high","nameSource":"catalog","norm":0.380336924344615,"source":"profile","step":0.01,"taperSource":"typecode","value":3.803,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:b8c6bac6","generic":false,"id":26,"kind":"float","max":10,"min":0,"name":"Presence 1","nameConfidence":"high","nameSource":"catalog","norm":0.39555040131839964,"source":"profile","step":0.01,"taperSource":"typecode","value":3.956,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:cdbcb920","generic":false,"id":27,"kind":"float","max":10,"min":0,"name":"Negative Feedback","nameConfidence":"high","nameSource":"catalog","norm":0.4107638782921842,"source":"profile","step":0.01,"taperSource":"typecode","value":4.108,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:8f98e036","generic":false,"id":28,"kind":"float","log":true,"max":10,"min":0.1,"name":"Presence Frequency","nameConfidence":"high","nameSource":"catalog","norm":0.4259773552659688,"source":"profile","taperSource":"typecode","unit":"Hz","unitSource":"catalog","value":0.711,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:98eddd84","generic":false,"id":29,"kind":"float","log":true,"max":400,"min":40,"name":"Low Freq","nameConfidence":"high","nameSource":"catalog","norm":0.4411908322397534,"source":"profile","taperSource":"typecode","unit":"Hz","unitSource":"typecode","value":110.472,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:859c0327","generic":false,"id":30,"kind":"float","max":10,"min":0,"name":"LF Reso","nameConfidence":"high","nameSource":"catalog","norm":0.45640430921353803,"source":"profile","step":0.01,"taperSource":"typecode","value":4.564,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:e37beabd","generic":false,"id":31,"kind":"float","log":true,"max":500,"min":50,"name":"Depth Frequency","nameConfidence":"high","nameSource":"catalog","norm":0.4716177861873226,"source":"profile","taperSource":"typecode","unit":"Hz","unitSource":"catalog","value":148.111,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:27bc31d2","generic":false,"id":33,"kind":"float","log":true,"max":1000,"min":1,"name":"Master Vol Cap","nameConfidence":"high","nameSource":"catalog","norm":0.5020447401348919,"source":"profile","taperSource":"typecode","value":32.073,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:4592ab4b","generic":false,"id":34,"kind":"float","log":true,"max":2000,"min":2,"name":"WSHPF","nameConfidence":"high","nameSource":"catalog","norm":0.5172582171086764,"source":"profile","taperSource":"typecode","value":71.253,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:b6b9fd3f","generic":false,"id":35,"kind":"float","max":1,"min":0,"name":"Harmonics","nameConfidence":"high","nameSource":"catalog","norm":0.532471694082461,"source":"profile","step":0.001,"taperSource":"typecode","value":0.532,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:61177e4f","generic":false,"id":37,"kind":"float","log":true,"max":100,"min":1,"name":"B+ Time Constant","nameConfidence":"high","nameSource":"catalog","norm":0.5628986480300302,"source":"profile","taperSource":"typecode","value":13.36,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:318ec60c","generic":false,"id":38,"kind":"float","max":100,"min":0,"name":"Grid Bias","nameConfidence":"high","nameSource":"catalog","norm":0.5781121250038148,"source":"profile","step":0.1,"taperSource":"typecode","unit":"%","unitSource":"catalog","value":57.811,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:b6b9fd3f","generic":false,"id":40,"kind":"float","max":1,"min":0,"name":"PI RATIO","nameConfidence":"high","nameSource":"catalog","norm":0.608539078951384,"source":"profile","step":0.001,"taperSource":"typecode","value":0.609,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:8f98e036","generic":false,"id":43,"kind":"float","log":true,"max":10,"min":0.1,"name":"LF Q","nameConfidence":"high","nameSource":"catalog","norm":0.6541795098727378,"source":"profile","taperSource":"typecode","value":2.034,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:3ab4c21a","generic":false,"id":44,"kind":"float","max":1,"min":-1,"name":"Preamp Bias","nameConfidence":"high","nameSource":"catalog","norm":0.6693929868465224,"source":"profile","step":0.002,"taperSource":"typecode","value":0.339,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:40209c64","generic":false,"id":45,"kind":"float","log":true,"max":4000,"min":400,"name":"High Freq","nameConfidence":"high","nameSource":"catalog","norm":0.684606463820307,"source":"profile","taperSource":"typecode","unit":"Hz","unitSource":"typecode","value":1934.935,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:859c0327","generic":false,"id":46,"kind":"float","max":10,"min":0,"name":"HF Reso","nameConfidence":"high","nameSource":"catalog","norm":0.6998199407940916,"source":"profile","step":0.01,"taperSource":"typecode","value":6.998,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:617752f9","generic":false,"id":48,"kind":"float","log":true,"max":10,"min":0.01,"name":"XFormer Drive","nameConfidence":"high","nameSource":"catalog","norm":0.7302468947416608,"source":"profile","taperSource":"typecode","value":1.551,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:8f98e036","generic":false,"id":49,"kind":"float","log":true,"max":10,"min":0.1,"name":"Input Trim","nameConfidence":"high","nameSource":"catalog","norm":0.7454603717154454,"source":"profile","taperSource":"typecode","value":3.097,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:b8c6bac6","generic":false,"id":50,"kind":"float","max":10,"min":0,"name":"Tube Hardness","nameConfidence":"high","nameSource":"catalog","norm":0.76067384868923,"source":"profile","step":0.01,"taperSource":"typecode","value":7.607,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:b8c6bac6","generic":false,"id":52,"kind":"float","max":10,"min":0,"name":"Speaker Drive","nameConfidence":"high","nameSource":"catalog","norm":0.7911008026367993,"source":"profile","step":0.002,"taperSource":"typecode","value":7.911,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:82b5730a","generic":false,"id":53,"kind":"float","log":true,"max":2,"min":0.5,"name":"XFormer Matching","nameConfidence":"high","nameSource":"catalog","norm":0.8063142796105838,"source":"profile","step":0.001,"taperSource":"typecode","value":1.529,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:781b91d6","generic":false,"id":54,"kind":"float","log":true,"max":100,"min":1,"name":"Screen Frequency","nameConfidence":"high","nameSource":"catalog","norm":0.8215277565843684,"source":"profile","step":0.001,"taperSource":"typecode","value":43.96,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:75961c6b","generic":false,"id":55,"kind":"float","log":true,"max":10,"min":0.1,"name":"Screen Q","nameConfidence":"high","nameSource":"catalog","norm":0.836741233558153,"source":"profile","step":0.001,"taperSource":"typecode","value":4.715,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:78d7dbed","generic":false,"id":57,"kind":"float","max":12,"min":-12,"name":"Bass 2","nameConfidence":"high","nameSource":"catalog","norm":0.8671681875057222,"source":"profile","step":0.024,"taperSource":"typecode","value":8.812,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:78d7dbed","generic":false,"id":58,"kind":"float","max":12,"min":-12,"name":"Mid 2","nameConfidence":"high","nameSource":"catalog","norm":0.8823816644795068,"source":"profile","step":0.024,"taperSource":"typecode","value":9.177,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:78d7dbed","generic":false,"id":59,"kind":"float","max":12,"min":-12,"name":"Treble 2","nameConfidence":"high","nameSource":"catalog","norm":0.8975951414532914,"source":"profile","step":0.024,"taperSource":"typecode","value":9.542,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:78d7dbed","generic":false,"id":60,"kind":"float","max":12,"min":-12,"name":"Presence 2","nameConfidence":"high","nameSource":"catalog","norm":0.9128086184270761,"source":"profile","step":0.024,"taperSource":"typecode","value":9.907,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:78d7dbed","generic":false,"id":61,"kind":"float","max":12,"min":-12,"name":"1600","nameConfidence":"high","nameSource":"catalog","norm":0.9280220954008607,"source":"profile","step":0.024,"taperSource":"typecode","value":10.273,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:78d7dbed","generic":false,"id":62,"kind":"float","max":12,"min":-12,"name":"2K","nameConfidence":"high","nameSource":"catalog","norm":0.9432355723746452,"source":"profile","step":0.024,"taperSource":"typecode","value":10.638,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:78d7dbed","generic":false,"id":63,"kind":"float","max":12,"min":-12,"name":"4K","nameConfidence":"high","nameSource":"catalog","norm":0.9584490493484298,"source":"profile","step":0.024,"taperSource":"typecode","value":11.003,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:78d7dbed","generic":false,"id":64,"kind":"float","max":12,"min":-12,"name":"8K","nameConfidence":"high","nameSource":"catalog","norm":0.9736625263222144,"source":"profile","step":0.024,"taperSource":"typecode","value":11.368,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:0a2f8bb0","generic":false,"id":65,"kind":"float","max":200,"min":0,"name":"Bias Excursion","nameConfidence":"high","nameSource":"catalog","norm":0.988876003295999,"source":"profile","step":0.2,"taperSource":"typecode","value":197.775,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:2c81011c","generic":false,"id":66,"kind":"float","log":true,"max":25,"min":0.25,"name":"Excursion Time","nameConfidence":"high","nameSource":"catalog","norm":0.004074221015045626,"source":"profile","taperSource":"typecode","value":0.255,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:382d5403","generic":false,"id":67,"kind":"float","log":true,"max":50,"min":0.5,"name":"Recovery Time","nameConfidence":"high","nameSource":"catalog","norm":0.019287697988830226,"source":"profile","taperSource":"typecode","value":0.546,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:03697a74","generic":false,"id":68,"kind":"float","log":true,"max":40000,"min":400,"name":"Triode 2 Plate Freq","nameConfidence":"high","nameSource":"catalog","norm":0.034501174962614824,"source":"profile","taperSource":"typecode","unit":"Hz","unitSource":"typecode","value":468.881,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:03697a74","generic":false,"id":69,"kind":"float","log":true,"max":40000,"min":400,"name":"Triode 1 Plate Freq","nameConfidence":"high","nameSource":"catalog","norm":0.04971465193639943,"source":"profile","taperSource":"typecode","unit":"Hz","unitSource":"typecode","value":502.909,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:b606079b","generic":false,"id":72,"kind":"float","max":10,"min":0,"name":"Out Comp Clarity","nameConfidence":"high","nameSource":"catalog","norm":0.09535508285775322,"source":"profile","taperSource":"device","value":0.954,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:75961c6b","generic":false,"id":73,"kind":"float","log":true,"max":10,"min":0.1,"name":"Q","nameConfidence":"high","nameSource":"catalog","norm":0.11056855983153782,"source":"profile","step":0.001,"taperSource":"typecode","value":0.166,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:ed0f7c99","generic":false,"id":74,"kind":"float","log":true,"max":10000,"min":100,"name":"Frequency 1","nameConfidence":"high","nameSource":"catalog","norm":0.12578203680532243,"source":"profile","taperSource":"typecode","value":178.47,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:784933cc","generic":false,"id":75,"kind":"float","max":20,"min":-20,"name":"Gain 2","nameConfidence":"high","nameSource":"catalog","norm":0.14099551377910702,"source":"profile","step":0.05,"taperSource":"typecode","value":-14.36,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:b8c6bac6","generic":false,"id":76,"kind":"float","max":10,"min":0,"name":"Overdrive","nameConfidence":"high","nameSource":"catalog","norm":0.15620899075289163,"source":"profile","step":0.01,"taperSource":"typecode","value":1.562,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:b8c6bac6","generic":false,"id":77,"kind":"float","max":10,"min":0,"name":"Out Compression","nameConfidence":"high","nameSource":"catalog","norm":0.17142246772667624,"source":"profile","step":0.01,"taperSource":"typecode","value":1.714,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:5113f6ef","generic":false,"id":78,"kind":"float","max":0,"min":-60,"name":"Out Comp Threshold","nameConfidence":"high","nameSource":"catalog","norm":0.18663594470046083,"source":"profile","step":0.1,"taperSource":"typecode","unit":"dB","unitSource":"catalog","value":-48.802,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:8f98e036","generic":false,"id":79,"kind":"float","log":true,"max":10,"min":0.1,"name":"Master Vol Trim","nameConfidence":"high","nameSource":"catalog","norm":0.20184942167424544,"source":"profile","taperSource":"typecode","value":0.253,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:35fc2b95","generic":false,"id":81,"kind":"float","max":10.00014,"min":-10.00014,"name":"Definition","nameConfidence":"high","nameSource":"catalog","norm":0.23227637562181463,"source":"profile","step":0.00999287,"taperSource":"typecode","value":-5.355,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:318ec60c","generic":false,"id":82,"kind":"float","max":100,"min":0,"name":"Compression","nameConfidence":"high","nameSource":"catalog","norm":0.24748985259559922,"source":"profile","step":0.1,"taperSource":"typecode","value":24.749,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:318ec60c","generic":false,"id":83,"kind":"float","max":100,"min":0,"name":"Grid Clipping","nameConfidence":"high","nameSource":"catalog","norm":0.26270332956938386,"source":"profile","step":0.1,"taperSource":"typecode","unit":"%","unitSource":"catalog","value":26.27,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:ffbaba1c","generic":false,"id":85,"kind":"float","log":true,"max":20000,"min":200,"name":"High Cut 1","nameConfidence":"high","nameSource":"catalog","norm":0.293130283516953,"source":"profile","taperSource":"typecode","unit":"Hz","unitSource":"catalog","value":771.419,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:1eb4e31d","generic":false,"id":86,"kind":"float","max":10,"min":-10,"name":"Dynamic Presence","nameConfidence":"high","nameSource":"catalog","norm":0.30834376049073764,"source":"profile","step":0.02,"taperSource":"typecode","value":-3.833,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:b8c6bac6","generic":false,"id":87,"kind":"float","max":10,"min":0,"name":"Dynamic Depth","nameConfidence":"high","nameSource":"catalog","norm":0.32355723746452225,"source":"profile","step":0.01,"taperSource":"typecode","value":3.236,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:f43cf2ff","generic":false,"id":89,"kind":"float","max":100,"min":30,"name":"AC Line Frequency","nameConfidence":"high","nameSource":"catalog","norm":0.3539841914120914,"source":"profile","step":5,"taperSource":"typecode","value":54.779,"widget":"stepper","widgetSource":"device","write":"norm"},
+    {"fp":"1:b606079b","generic":false,"id":90,"kind":"float","max":10,"min":0,"name":"Hardness 1","nameConfidence":"high","nameSource":"catalog","norm":0.36919766838587603,"source":"profile","taperSource":"device","value":3.692,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:ed8f4000","generic":false,"id":91,"kind":"float","log":true,"max":20,"min":0.2,"name":"Frequency 2","nameConfidence":"high","nameSource":"catalog","norm":0.38441114535966064,"source":"profile","taperSource":"typecode","unit":"dB","unitSource":"catalog","value":1.174,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:318ec60c","generic":false,"id":92,"kind":"float","max":100,"min":0,"name":"Depth 2","nameConfidence":"high","nameSource":"catalog","norm":0.39962462233344526,"source":"profile","step":0.1,"taperSource":"typecode","unit":"%","unitSource":"catalog","value":39.962,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:318ec60c","generic":false,"id":95,"kind":"float","max":100,"min":0,"name":"Cathode Resistance","nameConfidence":"high","nameSource":"catalog","norm":0.44526505325479904,"source":"profile","step":0.1,"taperSource":"typecode","value":44.527,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:61177e4f","generic":false,"id":96,"kind":"float","log":true,"max":100,"min":1,"name":"Cathode Time Const","nameConfidence":"high","nameSource":"catalog","norm":0.46047853022858365,"source":"profile","taperSource":"typecode","value":8.336,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:b8c6bac6","generic":false,"id":97,"kind":"float","max":10,"min":0,"name":"DYNIMP","nameConfidence":"high","nameSource":"catalog","norm":0.47569200720236826,"source":"profile","step":0.01,"taperSource":"typecode","value":4.757,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:fe5b32cd","generic":false,"id":99,"kind":"float","max":12,"min":-12,"name":"High Treble","nameConfidence":"high","nameSource":"catalog","norm":0.5061189611499375,"source":"profile","step":0.024,"taperSource":"typecode","value":0.147,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:3ab4c21a","generic":false,"id":100,"kind":"float","max":1,"min":-1,"name":"Mismatch","nameConfidence":"high","nameSource":"catalog","norm":0.521332438123722,"source":"profile","step":0.002,"taperSource":"typecode","value":0.043,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:1eb4e31d","generic":false,"id":101,"kind":"float","max":10,"min":-10,"name":"Input Dynamics","nameConfidence":"high","nameSource":"catalog","norm":0.5365459150975066,"source":"profile","step":0.02,"taperSource":"typecode","value":0.731,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:8859108c","generic":false,"id":102,"kind":"float","log":true,"max":10,"min":1,"name":"HF Slope","nameConfidence":"high","nameSource":"catalog","norm":0.5517593920712912,"source":"profile","taperSource":"typecode","value":3.563,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:546c813c","generic":false,"id":103,"kind":"float","max":150,"min":50,"name":"Variac","nameConfidence":"high","nameSource":"catalog","norm":0.5669728690450758,"source":"profile","step":0.1,"taperSource":"typecode","unit":"%","unitSource":"catalog","value":106.697,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:e8f52df9","generic":false,"id":105,"kind":"float","max":100,"min":10,"name":"GRIDHARDNESS","nameConfidence":"high","nameSource":"catalog","norm":0.597399822992645,"source":"profile","step":0.1,"taperSource":"typecode","unit":"%","unitSource":"catalog","value":63.766,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:9bda7e78","generic":false,"id":107,"kind":"float","max":10,"min":1,"name":"Saturation Drive","nameConfidence":"high","nameSource":"catalog","norm":0.6278267769402143,"source":"profile","step":0.01,"taperSource":"typecode","value":6.65,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:0a2f8bb0","generic":false,"id":108,"kind":"float","max":200,"min":0,"name":"Preamp Bias Excursion","nameConfidence":"high","nameSource":"catalog","norm":0.6430402539139989,"source":"profile","step":0.2,"taperSource":"typecode","value":128.608,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:f65191a1","generic":false,"id":109,"kind":"float","log":true,"max":100,"min":0.1,"name":"TRIODE2EXTIME","nameConfidence":"high","nameSource":"catalog","norm":0.6582537308877835,"source":"profile","taperSource":"typecode","unit":"ms","unitSource":"catalog","value":9.435,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:a99144f1","generic":false,"id":110,"kind":"float","log":true,"max":200,"min":0.2,"name":"TRIODE2RECTIME","nameConfidence":"high","nameSource":"catalog","norm":0.673467207861568,"source":"profile","taperSource":"typecode","unit":"ms","unitSource":"catalog","value":20.962,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:8597876b","generic":false,"id":114,"kind":"float","max":200,"min":-200,"name":"TRIODE1RATIO","nameConfidence":"high","nameSource":"catalog","norm":0.7343211157567064,"source":"profile","step":0.2,"taperSource":"typecode","unit":"%","unitSource":"catalog","value":93.728,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:b8c6bac6","generic":false,"id":115,"kind":"float","max":10,"min":0,"name":"Hardness 2","nameConfidence":"high","nameSource":"catalog","norm":0.7495345927304911,"source":"profile","step":0.01,"taperSource":"typecode","value":7.495,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:0a2f8bb0","generic":false,"id":116,"kind":"float","max":200,"min":0,"name":"PI Bias Excursion","nameConfidence":"high","nameSource":"catalog","norm":0.7647480697042757,"source":"profile","step":0.2,"taperSource":"typecode","value":152.95,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:b8c6bac6","generic":false,"id":117,"kind":"float","max":10,"min":0,"name":"Speaker Compress.","nameConfidence":"high","nameSource":"catalog","norm":0.7799615466780603,"source":"profile","step":0.01,"taperSource":"typecode","value":7.8,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:8a32bb77","generic":false,"id":118,"kind":"float","log":true,"max":10000,"min":100,"name":"Speaker Time Const","nameConfidence":"high","nameSource":"catalog","norm":0.7951750236518449,"source":"profile","taperSource":"typecode","value":3893.588,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:2a314fd2","generic":false,"id":119,"kind":"float","max":1,"min":0,"name":"RESOLUTION","nameConfidence":"high","nameSource":"catalog","norm":0.8103885006256294,"source":"profile","unit":"dB","unitSource":"catalog","value":0.81,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:2a314fd2","generic":false,"id":120,"kind":"float","max":1,"min":0,"name":"B+","nameConfidence":"high","nameSource":"catalog","norm":0.825601977599414,"source":"profile","unit":"dB","unitSource":"catalog","value":0.826,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:2a314fd2","generic":false,"id":121,"kind":"float","max":1,"min":0,"name":"Gain 3","nameConfidence":"high","nameSource":"catalog","norm":0.8408154545731986,"source":"profile","unit":"dB","unitSource":"catalog","value":0.841,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:2a314fd2","generic":false,"id":122,"kind":"float","max":1,"min":0,"name":"Gain 4","nameConfidence":"high","nameSource":"catalog","norm":0.8560289315469832,"source":"profile","unit":"dB","unitSource":"catalog","value":0.856,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:2a314fd2","generic":false,"id":123,"kind":"float","max":1,"min":0,"name":"Gain 5","nameConfidence":"high","nameSource":"catalog","norm":0.8712424085207678,"source":"profile","unit":"dB","unitSource":"catalog","value":0.871,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:03bf4d65","generic":false,"id":124,"kind":"float","max":24,"min":0,"name":"Boost Level","nameConfidence":"high","nameSource":"catalog","norm":0.8864558854945525,"source":"profile","step":0.05,"taperSource":"typecode","value":21.275,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:318ec60c","generic":false,"id":127,"kind":"float","max":100,"min":0,"name":"Speaker Compliance","nameConfidence":"high","nameSource":"catalog","norm":0.9320963164159063,"source":"profile","step":0.1,"taperSource":"typecode","value":93.21,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:82b5730a","generic":false,"id":129,"kind":"float","log":true,"max":2,"min":0.5,"name":"Speaker Impedance","nameConfidence":"high","nameSource":"catalog","norm":0.9625232703634754,"source":"profile","step":0.001,"taperSource":"typecode","value":1.899,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:55ce6331","generic":false,"id":131,"kind":"float","max":200,"min":0,"name":"Cab Resonance","nameConfidence":"high","nameSource":"catalog","norm":0.9929502243110446,"source":"profile","step":0.1,"taperSource":"typecode","value":198.59,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:2a314fd2","generic":false,"id":132,"kind":"float","max":1,"min":0,"name":"HEADROOM","nameConfidence":"high","nameSource":"catalog","norm":0.008148442030091251,"source":"profile","unit":"dB","unitSource":"catalog","value":0.008,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:b8c6bac6","generic":false,"id":133,"kind":"float","max":10,"min":0,"name":"Preamp Presence","nameConfidence":"high","nameSource":"catalog","norm":0.02336191900387585,"source":"profile","step":0.01,"taperSource":"typecode","value":0.234,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:318ec60c","generic":false,"id":134,"kind":"float","max":100,"min":0,"name":"Master Bias Excursion","nameConfidence":"high","nameSource":"catalog","norm":0.03857539597766045,"source":"profile","step":0.1,"taperSource":"typecode","value":3.858,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:b8c6bac6","generic":false,"id":135,"kind":"float","max":10,"min":0,"name":"High Cut 2","nameConfidence":"high","nameSource":"catalog","norm":0.05378887295144505,"source":"profile","step":0.01,"taperSource":"typecode","value":0.538,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:b8c6bac6","generic":false,"id":139,"kind":"float","max":10,"min":0,"name":"Speaker Thump","nameConfidence":"high","nameSource":"catalog","norm":0.11464278084658346,"source":"profile","step":0.01,"taperSource":"typecode","value":1.146,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:b8c6bac6","generic":false,"id":141,"kind":"float","max":10,"min":0,"name":"Global MV","nameConfidence":"high","nameSource":"catalog","norm":0.14506973479415267,"source":"profile","step":0.01,"taperSource":"typecode","value":1.451,"widget":"knob","widgetSource":"device","write":"norm"}
+  ],
+  "page": 58,
+  "slug": "amp",
+  "type": {"name":"Class-A 15W TB","value":6},
+  "optionLists": [
+    [{"label":"THRU","value":0},{"label":"MUTE","value":1}],
+    [{"label":"PRE","value":0},{"label":"POST","value":1},{"label":"MID","value":2},{"label":"END","value":3},{"label":"PRE-MID","value":4}],
+    [{"label":"LEFT","value":0},{"label":"RIGHT","value":1},{"label":"SUM L+R","value":2}],
+    [{"label":"SOFT","value":0},{"label":"HARD","value":1},{"label":"SQUARE","value":2},{"label":"CUBIC","value":3},{"label":"ABS","value":4},{"label":"TUBE","value":5},{"label":"QUARTIC","value":6},{"label":"PUSH-PULL","value":7},{"label":"3/2 HARD","value":8},{"label":"3/2 SOFT","value":9},{"label":"TRIODE","value":10},{"label":"TRIODE+SAT","value":11},{"label":"TRIODE+SAT1","value":12}],
+    [{"label":"NORMAL","value":0},{"label":"DUAL","value":1},{"label":"JUMPED HIWATT","value":2},{"label":"JUMPED BASSMAN","value":3},{"label":"JUMPED TWEED","value":4},{"label":"TWEED","value":5},{"label":"GANGED","value":6},{"label":"JUMPED PLEXI","value":7}],
+    [{"label":"ACTIVE","value":0},{"label":"DEFAULT","value":1},{"label":"BROWNFACE","value":2},{"label":"BLACKFACE","value":3},{"label":"BASSGUY","value":4},{"label":"TOP BOOST","value":5},{"label":"PLEXI","value":6},{"label":"BOUTIQUE","value":7},{"label":"HI POWER","value":8},{"label":"USA NORMAL","value":9},{"label":"USA FAT","value":10},{"label":"RECTO1 ORG","value":11},{"label":"RECTO1 RED","value":12},{"label":"SKYLINE","value":13},{"label":"GERMAN","value":14},{"label":"JR BLUES","value":15},{"label":"WRECKER 1","value":16},{"label":"NEUTRAL","value":17},{"label":"CA3+SE","value":18},{"label":"FREYER D60","value":19},{"label":"MR Z 38 SR","value":20},{"label":"EURO UBER","value":21},{"label":"PVH 6160","value":22},{"label":"SOLO 100","value":23},{"label":"CORNCOB","value":24},{"label":"XTC","value":25},{"label":"CAROLANN","value":26},{"label":"CITRUS","value":27},{"label":"BRIT JM45","value":28},{"label":"USA RHY","value":29},{"label":"RECTO2 ORG","value":30},{"label":"RECTO2 RED VNTG","value":31},{"label":"SHIVER CLN","value":32},{"label":"CAMERON","value":33},{"label":"BRIT JVM 0D1","value":34},{"label":"BRIT JVM 0D2","value":35},{"label":"5153 GREEN","value":36},{"label":"5153 BLUE","value":37},{"label":"5153 RED","value":38},{"label":"BRIT SUPER","value":39},{"label":"DIV13 CJ","value":40},{"label":"BADGER 18","value":41},{"label":"ATOMICA","value":42},{"label":"SPAWN ROD","value":43},{"label":"BADGER 30","value":44},{"label":"BRIT SILVER","value":45},{"label":"SUPER VERB","value":46},{"label":"HOT KITTY","value":47},{"label":"VIBRATO-KING","value":48},{"label":"GIBTONE SCOUT","value":49},{"label":"CA3+SE CLEAN","value":50},{"label":"BF FIXED MID","value":51},{"label":"GERMAN V4","value":52},{"label":"VIBRATO-LUX","value":53},{"label":"DIRTY SHIRLEY","value":54},{"label":"PLEXI 100W","value":55},{"label":"RUBY ROCKET BRT","value":56},{"label":"CONCOURSE","value":57},{"label":"TRIPTIK LD","value":58},{"label":"TRIPTIK CLN","value":59},{"label":"JAZZ 120","value":60},{"label":"BOGFISH","value":61},{"label":"WRECKER 2","value":62},{"label":"SKYLINE DEEP","value":63},{"label":"USA SUB BLUES","value":64},{"label":"WRECKER LVRPOOL","value":65},{"label":"CITRUS A30 CLN","value":66},{"label":"CITRUS A30 DRT","value":67},{"label":"CAR ROAMER","value":68},{"label":"USA BASS","value":69},{"label":"CITRUS BASS","value":70},{"label":"STUDIO","value":71},{"label":"BRIT 800","value":72},{"label":"RECTO1 ORG MDRN","value":73},{"label":"ANGLE SEVERE 1","value":74},{"label":"ANGLE SEVERE 2","value":75},{"label":"USA PRE LD1 RED","value":76},{"label":"RECTO ORG BRT","value":77},{"label":"RECTO RED BRT","value":78},{"label":"VIBROVERB AA","value":79},{"label":"PVH 6160+ LEAD","value":80},{"label":"RUMBLE HRM","value":81},{"label":"MR Z HWY 66","value":82},{"label":"SUPER 6G4","value":83},{"label":"65 BASSMAN BASS","value":84},{"label":"FRIEDMAN","value":85},{"label":"BAND-COMMANDER","value":86},{"label":"USA PRE CLEAN","value":87},{"label":"TUCANA CLEAN","value":88},{"label":"FRIEDMAN SM BOX","value":89},{"label":"TX STAR","value":90},{"label":"USA IIC+","value":91},{"label":"THORDENDAL","value":92},{"label":"SOLO 99","value":93},{"label":"BLUDOJAI","value":94},{"label":"HERBIE","value":95},{"label":"PVH 6160+ CRUNCH","value":96},{"label":"SOLO 88 CLEAN","value":97},{"label":"JS410","value":98},{"label":"JS410 MIDSHIFT","value":99},{"label":"RUBY ROCKET","value":100},{"label":"USA IIC++","value":101},{"label":"LEGATO 100","value":102},{"label":"HOOK EDGE","value":103},{"label":"HOOK NO EDGE","value":104},{"label":"HOOK CLEAN 1","value":105},{"label":"HOOK CLEAN 2","value":106},{"label":"SOLO 88","value":107},{"label":"SPAWN NITROUS","value":108},{"label":"SV BASS","value":109},{"label":"RECTO2 RED MDRN","value":110},{"label":"JP IIC+ YEL/RED","value":111},{"label":"JP IIC+ GREEN","value":112},{"label":"MR Z GHIA","value":113},{"label":"MATCHBOX D-30 EF86","value":114},{"label":"TRES CORONA","value":115},{"label":"PVH 6160+ CLEAN","value":116},{"label":"ARCHEAN","value":117},{"label":"ARCHEAN BRIGHT","value":118},{"label":"ARCHEAN CLEAN","value":119},{"label":"BUDDAH DUOMASTER","value":120},{"label":"NULL","value":121},{"label":"JMPRE-1 CLN","value":122},{"label":"JMPRE-1 CLN BASS","value":123},{"label":"JMPRE-1 OD1","value":124},{"label":"BRIT STUDIO 20","value":125},{"label":"BRIT AFS100","value":126},{"label":"MATCHBOX D-30","value":127},{"label":"HERBIE MK3","value":128},{"label":"BASSGUY REISSUE","value":129},{"label":"REVV PURPLE","value":130},{"label":"REVV RED","value":131},{"label":"REVV GREEN","value":132},{"label":"5153 RED STEALTH","value":133},{"label":"USA CLEAN","value":134},{"label":"CLASS-A BRILLIANT","value":135},{"label":"PLEXI BROWN","value":136},{"label":"SUPRO 1695T","value":137}],
+    [{"label":"BASSGUY","value":0},{"label":"PLEXI","value":1},{"label":"BRIT 800","value":2},{"label":"BRIT 1987x","value":3},{"label":"SOLO 100","value":4},{"label":"RUMBLE","value":5},{"label":"XTC","value":6},{"label":"JR BLUES","value":7},{"label":"RECTO ORG","value":8},{"label":"FRYETTE","value":9},{"label":"6160","value":10},{"label":"IDEAL","value":11},{"label":"AC-30","value":12},{"label":"SHIVER OLD","value":13},{"label":"CAMERON","value":14},{"label":"BRIT JVM","value":15},{"label":"TRIPTIK","value":16},{"label":"CALI","value":17},{"label":"GERMAN V4","value":18},{"label":"TRIP-TIK","value":19},{"label":"WRECKER","value":20},{"label":"RECTO RED","value":21},{"label":"DEUTSCH WILDE","value":22},{"label":"FRIEDMAN","value":23},{"label":"TUCANA","value":24},{"label":"5153 100W","value":25},{"label":"TERRIER","value":26},{"label":"MARK IIC","value":27},{"label":"MARK IV RHY","value":28},{"label":"MATCHBOX","value":29},{"label":"SUPER 6G4","value":30},{"label":"CONCERT 6G12","value":31},{"label":"NULL","value":32},{"label":"PLEXI 50W","value":33},{"label":"SHIVER NEW","value":34},{"label":"UBER","value":35},{"label":"DIZZY","value":36},{"label":"ATOMICA","value":37},{"label":"FASTROD","value":38},{"label":"TX STAR","value":39},{"label":"CORNFORD","value":40},{"label":"CAPT HOOK","value":41},{"label":"AFS100","value":42},{"label":"SPAWN NITROUS","value":43},{"label":"USA JP IIC+","value":44},{"label":"SUPREMO TREM","value":45},{"label":"BRIT JM45","value":46},{"label":"MATCHBOX D-30","value":47},{"label":"ARCHEAN","value":48},{"label":"DELUXE VERB","value":49},{"label":"DOUBLE VERB","value":50},{"label":"VIBRATO LUX","value":51},{"label":"TREMOLO LUX","value":52},{"label":"FAS CLASSIC","value":53},{"label":"KOMET","value":54},{"label":"HIPOWER","value":55},{"label":"USA SUB BLUES","value":56},{"label":"FAS BROOTALZ","value":57},{"label":"ENERGYBALL","value":58},{"label":"CITRUS RV50","value":59},{"label":"BASSGUY RI","value":60},{"label":"REVV GENERATOR","value":61},{"label":"5153 50W","value":62},{"label":"5153 STEALTH","value":63},{"label":"JS410","value":64},{"label":"MARK V","value":65},{"label":"BRIT SILVER","value":66},{"label":"PLEXI 2204","value":67},{"label":"BRIT 6100","value":68}],
+    [{"label":"OFF","value":0},{"label":"ON","value":1}],
+    [{"label":"PRE-PI","value":0},{"label":"POST-PI","value":1},{"label":"PRE-TRIODE","value":2}],
+    [{"label":"OFF","value":0},{"label":"ON","value":1},{"label":"ON (IDEAL)","value":2}],
+    [{"label":"5881","value":0},{"label":"6L6GB","value":1},{"label":"EL34 MULL","value":2},{"label":"EL84/6BQ5","value":3},{"label":"6L6GC GE","value":4},{"label":"6V6GT GE","value":5},{"label":"KT66 GEN","value":6},{"label":"KT88 GEN","value":7},{"label":"6550 SVET","value":8},{"label":"6973","value":9},{"label":"6AQ5","value":10},{"label":"300B","value":11},{"label":"KT77 JJ","value":12},{"label":"6CA7 JJ","value":13},{"label":"6L6GC JJ","value":14},{"label":"EL34 JJ","value":15},{"label":"EL84 JJ","value":16},{"label":"KT66 JJ","value":17},{"label":"KT88 JJ","value":18},{"label":"6CA7 AMP","value":19},{"label":"EL34 SVET","value":20},{"label":"6L6GC SVET","value":21},{"label":"6V6GT TUNG","value":22},{"label":"EL84 MULL","value":23},{"label":"6550 TUNG","value":24}],
+    [{"label":"12AX7A SYL","value":0},{"label":"ECC83","value":1},{"label":"7025","value":2},{"label":"12AX7A JJ","value":3},{"label":"ECC803S","value":4},{"label":"EF86","value":5},{"label":"12AX7A RCA","value":6},{"label":"12AX7A","value":7},{"label":"12AX7B","value":8}],
+    [{"label":"AC","value":0},{"label":"DC","value":1}],
+    [{"label":"FIXED","value":0},{"label":"SHARED CATHODE","value":1},{"label":"SPLIT CATHODE","value":2}],
+    [{"label":"8 BAND VAR Q","value":0},{"label":"7 BAND VAR Q","value":1},{"label":"5 BAND (MARK)","value":2},{"label":"8 BAND CONST Q","value":3},{"label":"7 BAND CONST Q","value":4},{"label":"5 BAND CONST Q","value":5},{"label":"5 BAND PASSIVE","value":6},{"label":"4 BAND PASSIVE","value":7},{"label":"3 BAND PASSIVE","value":8},{"label":"3 BAND CONSOLE","value":9},{"label":"JMPRE-1","value":10}],
+    [{"label":"LOWSHELF","value":0},{"label":"PEAKING","value":1},{"label":"HIGHSHELF","value":2},{"label":"TILT EQ","value":3}],
+    [{"label":"OUTPUT","value":0},{"label":"FEEDBACK","value":1},{"label":"GAIN ENHANCER","value":2}],
+    [{"label":"OUTPUT","value":0},{"label":"PRE P.A.","value":1},{"label":"INPUT","value":2}],
+    [{"label":"AUTHENTIC","value":0},{"label":"IDEAL","value":1}],
+    [{"label":"NEUTRAL","value":0},{"label":"T808","value":1},{"label":"T808 MOD","value":2},{"label":"SUPER OD","value":3},{"label":"FULL OD","value":4},{"label":"AC BOOST","value":5},{"label":"SHIMMER","value":6},{"label":"FAS BOOST","value":7},{"label":"GRINDER","value":8},{"label":"TREBLE BOOST","value":9},{"label":"MID BOOST","value":10},{"label":"CC BOOST","value":11},{"label":"SHRED BOOST","value":12},{"label":"RCB BOOST","value":13},{"label":"JP IIC+ SHRED","value":14}],
+    [{"label":"FRFR","value":0},{"label":"SS PWR AMP + CAB","value":1}],
+    [{"label":"Resistive Load","value":0},{"label":"1x8 5F1 Tweed","value":1},{"label":"1x10 Princetone NR","value":2},{"label":"1x10 BF Princetone","value":3},{"label":"1x10 SF Princetone","value":4},{"label":"1x12 Tweed Emmi","value":5},{"label":"1x12 Vibrato Lux","value":6},{"label":"1x12 Deluxe Verb","value":7},{"label":"1x12 Deluxe Verb RI","value":8},{"label":"1x12 JR Blues","value":9},{"label":"1x12 Brit G12H55","value":10},{"label":"1x12 Brit G12H75","value":11},{"label":"1x12 Div13 CJ11","value":12},{"label":"1x12 Brit G12T","value":13},{"label":"1x12 V30","value":14},{"label":"1x12 AC-20 DLX","value":15},{"label":"1x12 Car Ambler","value":16},{"label":"1x12 AST BV25","value":17},{"label":"1x15 Vibrato Verb","value":18},{"label":"1x15 Portabass","value":19},{"label":"2x10 Super","value":20},{"label":"2x10 Vibrato Lux","value":21},{"label":"2x12 Bassguy","value":22},{"label":"2x12 Double Verb","value":23},{"label":"2x12 Double Verb SF","value":24},{"label":"1x12 Class-A 15W","value":25},{"label":"2x12 Class-A 30W","value":26},{"label":"2x12 TX Star","value":27},{"label":"2x12 Match Chief","value":28},{"label":"1x12 Hot Kitty","value":29},{"label":"2x12 Jazz 120","value":30},{"label":"4x10 Bassguy","value":31},{"label":"4x10 Brit JM45","value":32},{"label":"4x10 Super Verb","value":33},{"label":"4x10 SV Bass","value":34},{"label":"4x12 Brit TV","value":35},{"label":"4x12 Brit Greenback","value":36},{"label":"4x12 Basketweave","value":37},{"label":"4x12 Brit 800","value":38},{"label":"4x12 Brit AX","value":39},{"label":"4x12 Hipower","value":40},{"label":"4x12 USA MC90","value":41},{"label":"4x12 Recto Large","value":42},{"label":"4x12 Recto Small","value":43},{"label":"4x12 Recto Slant","value":44},{"label":"4x12 Recto Straight","value":45},{"label":"4x12 5153","value":46},{"label":"4x12 Citrus","value":47},{"label":"4x12 Rumble","value":48},{"label":"2x12 Lead 80","value":49},{"label":"4x12 Solo 100","value":50},{"label":"Load Box LB-2 UK","value":51},{"label":"Load Box LB-2 US","value":52},{"label":"4x12 Friedman","value":53},{"label":"2x12 Bassbuster","value":54},{"label":"1x12 Tweed Alnico Blue","value":55},{"label":"4x12 PVH 6160","value":56},{"label":"4x12 Euro","value":57},{"label":"2x12 Recto","value":58},{"label":"2x12 Godzilla","value":59},{"label":"1x12 Tweed C12Q","value":60},{"label":"1x12 Dirty Shirley EV12L","value":61},{"label":"1x12 USA Ext EV12L","value":62},{"label":"2x12 Band Commander SRO","value":63},{"label":"2x12 Guy Tron Alnico Blue","value":64},{"label":"1x12 G12T-75","value":65},{"label":"2x12 Class-A Greenback","value":66},{"label":"2x12 Two Stone 1265","value":67},{"label":"4x12 Lerxst Omega","value":68},{"label":"1x12 Deluxe Oxford","value":69},{"label":"4x12 Hipower Pete T","value":70},{"label":"4x12 USA Semi-Open","value":71},{"label":"2x12 Dizzy RV","value":72},{"label":"4x12 Hipower Lindsey B","value":73},{"label":"4x12 London Town Tall","value":74},{"label":"Oxbow Loadbox","value":75},{"label":"Double Notes Loadbox","value":76},{"label":"1x10 Metro Blues","value":77},{"label":"4x10 Bassguy RI","value":78},{"label":"2x12 Class-A 30W Silver","value":79},{"label":"2x10 Heart Key","value":80},{"label":"4x12 1960BV","value":81},{"label":"1x12 Deluxe Tweed","value":82},{"label":"1x15 Heart Key","value":83},{"label":"2x12 USA C90 Open Back","value":84},{"label":"1x12 Friedman","value":85},{"label":"2x12 5153 Stealth","value":86},{"label":"4x12 5153 Stealth","value":87},{"label":"1x12 Scholz","value":88},{"label":"1x8 Princetone","value":89},{"label":"1x12 Black Magick","value":90},{"label":"8x10 SV Bass","value":91},{"label":"Suhr Reactive Load","value":92}],
+    [{"label":"SOFT","value":0},{"label":"MEDIUM","value":1},{"label":"HARD","value":2}]
+  ]
+}

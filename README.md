@@ -64,6 +64,23 @@ The image is multi-arch (amd64 + arm64), so it builds natively on a Pi. The FM3 
 through in [`docker-compose.yml`](./docker-compose.yml): the host's stable `by-id` symlink is
 mapped to a fixed path inside the container so the device name stays put across re-enumeration.
 
+The server refuses browser requests from other sites and requests whose `Host` is a name it does
+not know (DNS rebinding). By IP address everything works out of the box. Otherwise
+(commented examples in `docker-compose.yml`):
+
+- reached by a hostname (`raspberrypi.local`): list that name in `FORGEFX_ALLOWED_HOSTS`;
+- behind a reverse proxy that keeps `Host` (Traefik, Caddy): list the public name in
+  `FORGEFX_ALLOWED_HOSTS`;
+- behind a proxy that rewrites `Host` to its upstream (nginx's default): the upstream name, unless
+  it is an IP, goes into `FORGEFX_ALLOWED_HOSTS` and the public origin into `FORGEFX_ALLOWED_ORIGINS`;
+- testing the dev UI from another device (`vite --host`): put that page's origin
+  (`http://<lan-ip>:5173`) into `FORGEFX_ALLOWED_ORIGINS`.
+
+On a `0.0.0.0` bind (Docker, headless) non-browser clients on the LAN can call the API without any
+credentials, as before; only the routes that read local editor files require a connection from the
+machine itself. Set `FORGEFX_HOST=127.0.0.1` or firewall the port if the network is not trusted.
+See ADR 0004 in [`docs/api-design.md`](./docs/api-design.md).
+
 ## The API
 
 Resource-oriented and named. The shape:

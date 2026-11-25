@@ -58,7 +58,7 @@ class Vp4Driver implements DeviceDriver {
     presetDump: false,
     presetConvert: true, // skeleton lift (name + scenes + 4-slot chain identity) via readStructure()
     blockParamDecode: false,
-    telemetry: { tuner: false, outputMeters: false, cpu: false },
+    telemetry: { tuner: false, outputMeters: false, cpu: false, graphCurves: false },
     fcModel: false,
     fcLiveRead: false,
     modBind: false,

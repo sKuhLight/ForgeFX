@@ -7,12 +7,20 @@
 // the router uses a tiny status recorder), so the exact same code produces the exact same
 // status+body on both surfaces. NO node:/fastify imports — this module must load in a browser.
 import type { DeviceRegistry } from '../drivers/registryCore.js';
-import { EmptyPresetError } from '../drivers/types.js';
+import { EmptyPresetError, type BlockParamsOpts } from '../drivers/types.js';
 import { presetDumpFramesViolation } from '../drivers/sendPolicy.js';
+import { definitionsDiff, parseDefinitionsDiffQuery } from '../drivers/definitionsDiff.js';
 
 /** The one reply capability the shared handlers need: set the response status. FastifyReply's
  *  `code()` matches; the runtime router records the status into its RouterResponse. */
 export interface StatusSink { code(statusCode: number): unknown }
+
+/** The `?generic=1` opt-in of GET /preset/blocks/:eid/params, parsed the same way on both surfaces: on iff
+ *  the FIRST value is `'1'`. Fastify hands a repeated key over as an array (`?generic=1&generic=0` →
+ *  `['1', '0']`), URLSearchParams.get returns its first value. */
+export function genericFlag(raw: unknown): boolean {
+  return (Array.isArray(raw) ? raw[0] : raw) === '1';
+}
 
 export function createUnifiedHandlers(registry: DeviceRegistry) {
   const driver = () => registry.driver();
@@ -102,11 +110,13 @@ export function createUnifiedHandlers(registry: DeviceRegistry) {
       return await d.sceneState();
     } catch (e) { return decodeFail(reply, 'scene-state', e); }
   };
-  const blockParamsH = async (reply: StatusSink, addr: number) => {
+  // `opts.generic` (the `?generic=1` query on both surfaces) asks for the generic response; a driver without
+  // it ignores the flag and answers the classic shape.
+  const blockParamsH = async (reply: StatusSink, addr: number, opts?: BlockParamsOpts) => {
     try {
       const d = await driver();
       if (!d.blockParams) return unsupported(reply, 'blockParams');
-      return await d.blockParams(addr);
+      return await d.blockParams(addr, opts);
     } catch (e) { reply.code(404); return { error: (e as Error).message }; }
   };
   // Unified param write: {value, continuous}. continuous:true → the driver's normalized write
@@ -229,12 +239,31 @@ export function createUnifiedHandlers(registry: DeviceRegistry) {
     return d.decodePresetBytes(bytes) as Record<string, unknown>;
   };
 
+  // GET /device/definitions/diff — the bundled catalog against the applied profile (drivers/definitionsDiff.ts), from
+  // state the registry already holds: never a detection, a store read or a device frame. 503 `no-device` before a unit
+  // was identified; 501 unsupported(genericParams) on a driver without the generic params (not a gen-3 grid unit); 503
+  // `firmware-unknown` while the firmware was not read; 404 `unknown-family` for a `family` neither the catalog nor
+  // the profile has. `query` holds the raw `family` / `include` values as the surface parsed them.
+  const definitionsDiffH = (reply: StatusSink, query: { family?: unknown; include?: unknown }) => {
+    if (registry.detectedModelId < 0) { reply.code(503); return { error: 'no-device' }; }
+    const ctx = registry.definitionsDiffContext();
+    if (!ctx || !ctx.caps.genericParams) return unsupported(reply, 'genericParams');
+    if (ctx.firmware === null) { reply.code(503); return { error: 'firmware-unknown' }; }
+    const r = definitionsDiff({
+      model: ctx.model, firmware: ctx.firmware, state: ctx.caps.drift, staticProfile: ctx.staticProfile, applied: ctx.applied,
+      placedEids: ctx.placedEids, unmappedEids: ctx.unmappedEids
+    }, parseDefinitionsDiffQuery(query.family, query.include));
+    if (!r.ok) { reply.code(404); return { error: r.error, family: r.family }; }
+    return r.diff;
+  };
+
   return {
     driver, unsupported, decodeFail,
     gridH, presetGridH, presetSummaryH, presetParamsH, blocksH, sceneStateH, blockParamsH, setParamH, bypassH, sceneSetH,
     presetSelectH, presetStoreH, presetNameH, locationsH,
     backupH, restoreH, fwValidateH, deviceParamH, modModelH,
     telemetryConfigH, telemetrySetH,
-    decodeH, decodeBytes
+    decodeH, decodeBytes,
+    definitionsDiffH
   };
 }
