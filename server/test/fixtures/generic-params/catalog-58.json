@@ -522,7 +522,7 @@
               {"label":"Q","paramId":73,"paramName":"DISTORT_INEQQ","rawWidget":"knob","widget":"knob"},
               {"label":"Gain","paramId":75,"paramName":"DISTORT_INEQGAIN","rawWidget":"knob","widget":"knob"},
               {"label":"","paramId":null,"paramName":null,"rawWidget":"spacer","widget":"spacer"},
-              {"label":"Graph","paramId":null,"paramName":null,"rawWidget":"graph4","widget":"graph"}
+              {"graphKey":"inputEq","label":"Graph","paramId":null,"paramName":null,"rawWidget":"graph4","widget":"graph"}
             ],
             "section": "parameters"
           },
@@ -555,6 +555,27 @@
       },
       {
         "name": "Output EQ",
+        "pageControls": [
+          {
+            "label": "Type",
+            "paramId": 94,
+            "paramName": "DISTORT_EQTYPE",
+            "placement": {"positionExact":"305,50"},
+            "rawWidget": "dropdown1p5Tight1Line",
+            "widget": "dropdown"
+          },
+          {
+            "label": "Location",
+            "paramId": 112,
+            "paramName": "DISTORT_EQPOSITION",
+            "placement": {"positionExact":"305,125"},
+            "rawWidget": "dropdown1p5Tight1Line",
+            "widget": "dropdown"
+          },
+          {"label":"Zero All","paramId":65520,"paramName":"DISTORT_ZEROEQ","placement":{"positionExact":"331,225"},"rawWidget":"btnRectangle","widget":"button"},
+          {"label":"Off / On","paramId":128,"paramName":"DISTORT_EQONOFF","placement":{"positionExact":"325,275"},"rawWidget":"toggleCompact","widget":"toggle"},
+          {"graphKey":"outputEq","label":"Output EQ","paramId":null,"paramName":null,"rawWidget":"graph_eq","widget":"graph"}
+        ],
         "pageNum": 8,
         "rows": [
           {

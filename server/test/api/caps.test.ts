@@ -106,7 +106,8 @@ function checkBlockStateOrdering(caps: Caps, label: string): void {
   assertEqual(keys[at - 1], 'virtualEffects', `${label} blockState follows virtualEffects`);
   assertEqual(keys[at + 1], 'blockVisuals', `${label} blockState precedes blockVisuals`);
   assertEqual(keys[at + 2], 'looperTelemetry', `${label} blockVisuals precedes looperTelemetry`);
-  assertEqual(keys[at + 3], 'telemetryControl', `${label} looperTelemetry precedes telemetryControl`);
+  assertEqual(keys[at + 3], 'definitions', `${label} looperTelemetry precedes definitions`);
+  assertEqual(keys[at + 4], 'telemetryControl', `${label} definitions precede telemetryControl`);
 }
 
 async function fm3(): Promise<void> {
@@ -334,6 +335,9 @@ async function vp4(): Promise<void> {
     checkBlockStateOrdering(caps, 'VP4');
   } finally {
     await app.close();
+  }
+}
+
 // ── capabilities.definitions ──────────────────────────────────────────────────────────────────────
 // A mocked unit whose firmware reply and stored device-cache docs the test controls. `docs` is read by the
 // registry's loadDeviceCache hook at every apply, so a test can add/remove a profile and re-apply.
@@ -591,9 +595,14 @@ async function definitionsKeyOrder(): Promise<void> {
       const keys = Object.keys(caps);
       // slotCount (grid models) and grid (linear ones) are undefined, hence absent from the JSON; every other key is always there
       const previous = PREVIOUS_GRID_CAPS_KEYS.filter((k) => keys.includes(k) || (k !== 'slotCount' && k !== 'grid'));
-      assertEqual(keys.filter((k) => k !== 'definitions').join(','), previous.join(','), `${name}: every previous key keeps its place, none is added or dropped`);
-      assertEqual(keys[keys.indexOf('virtualEffects') + 1], 'definitions', `${name}: definitions follows virtualEffects`);
-      assertEqual(keys[keys.indexOf('definitions') + 1], 'telemetryControl', `${name}: definitions comes before telemetryControl`);
+      // the block-editor additions are appended after virtualEffects (additive-only, in this order)
+      const ADDED = ['blockState', 'blockVisuals', 'looperTelemetry', 'definitions'];
+      assertEqual(keys.filter((k) => !ADDED.includes(k)).join(','), previous.join(','), `${name}: every previous key keeps its place, none is added or dropped`);
+      assertEqual(
+        keys.slice(keys.indexOf('virtualEffects') + 1).join(','),
+        'blockState,blockVisuals,looperTelemetry,definitions,telemetryControl,supportsSave',
+        `${name}: the block-editor keys follow virtualEffects, definitions before telemetryControl`
+      );
       // spotCheck (M4) is appended after portable: additive-only
       assertEqual(Object.keys(caps.definitions as object).join(','), 'genericParams,catalogFirmware,profile,drift,contribute,walk,portable,spotCheck', `${name}: definitions key order`);
       const profile = (caps.definitions as { profile: Record<string, unknown> | null }).profile;

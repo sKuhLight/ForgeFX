@@ -24,6 +24,7 @@
     "pages": [
       {
         "name": "Basic",
+        "pageControls": [{"graphKey":"lfo","label":"Chorus LFO","paramId":null,"paramName":null,"rawWidget":"graph_lfo","widget":"graph"}],
         "pageNum": 0,
         "rows": [
           {

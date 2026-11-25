@@ -34,6 +34,16 @@
       {
         "fw": {"gtet":"6,03"},
         "name": "Cab",
+        "pageControls": [
+          {
+            "label": "Input\nMode",
+            "paramId": 42,
+            "paramName": "CABINET_INPUTSEL",
+            "placement": {"positionExact":"196,230"},
+            "rawWidget": "dropdown1Tight",
+            "widget": "dropdown"
+          }
+        ],
         "pageNum": 0,
         "rows": [
           {
@@ -227,6 +237,18 @@
       },
       {
         "name": "Preamp",
+        "pageControls": [
+          {"label":"TONE","paramId":null,"paramName":null,"placement":{"positionExact":"305,209"},"rawWidget":"sectionLabel","widget":"label"},
+          {
+            "fw": {"gtet":"4"},
+            "label": "FILTERS",
+            "paramId": null,
+            "paramName": null,
+            "placement": {"positionExact":"647,209"},
+            "rawWidget": "sectionLabel",
+            "widget": "label"
+          }
+        ],
         "pageNum": 1,
         "rows": [
           {
@@ -299,6 +321,10 @@
       },
       {
         "name": "Room/Air",
+        "pageControls": [
+          {"label":"ROOM","paramId":null,"paramName":null,"placement":{"positionExact":"305,29"},"rawWidget":"sectionLabel","widget":"label"},
+          {"label":"AIR","paramId":null,"paramName":null,"placement":{"positionExact":"305,209"},"rawWidget":"sectionLabel","widget":"label"}
+        ],
         "pageNum": 2,
         "rows": [
           {
@@ -351,6 +377,7 @@
               {"label":"Zoom","paramId":40,"paramName":"CABINET_ZOOM","placement":{"positionExact":"196,230"},"rawWidget":"toggle","widget":"toggle"},
               {
                 "fw": {"gtet":"12,00"},
+                "graphKey": "cabAlign",
                 "label": "Graph",
                 "paramId": null,
                 "paramName": null,
@@ -360,6 +387,7 @@
               },
               {
                 "fw": {"gtet":"12,00"},
+                "graphKey": "cabAlign",
                 "label": "Graph",
                 "paramId": null,
                 "paramName": null,

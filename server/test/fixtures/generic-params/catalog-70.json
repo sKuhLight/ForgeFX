@@ -42,6 +42,16 @@
     "pages": [
       {
         "name": "Time/FB",
+        "pageControls": [
+          {
+            "label": "Repeat Stack/Hold",
+            "paramId": 27,
+            "paramName": "DELAY_HOLD",
+            "placement": {"positionExact":"196,281"},
+            "rawWidget": "dropdown1Tight",
+            "widget": "dropdown"
+          }
+        ],
         "pageNum": 0,
         "rows": [
           {
@@ -156,6 +166,16 @@
       {
         "fw": {"gtet":"8,00"},
         "name": "Modulation",
+        "pageControls": [
+          {
+            "label": "LFO Depth Range",
+            "paramId": 67,
+            "paramName": "DELAY_MAXDEPTH",
+            "placement": {"positionExact":"196,281"},
+            "rawWidget": "dropdown1Tight",
+            "widget": "dropdown"
+          }
+        ],
         "pageNum": 2,
         "rows": [
           {

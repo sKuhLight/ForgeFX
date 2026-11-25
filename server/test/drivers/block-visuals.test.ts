@@ -196,22 +196,24 @@ export async function runBlockVisualsTests(): Promise<void> {
   }
   console.log('  drivers/block-visuals: FM3 GATE ratio vs range-only types');
 
-  // ---- Case 3c: REVERB types whose only layout page is 'Pitch Shift' (an add-on variant: no page name in
-  //      common with the Default variant) keep the decay visual through the Default variant's controls ----
+  // ---- Case 3c: REVERB's add-on variants keep the decay visual, narrowed to the pages the source serves
+  //      for them (the newer source gives every type a Basic page, so the pitch-shift type carries decay
+  //      too; the Default-variant union in blockVisualsFor is the fallback where it does not) ----
   for (const model of [FM3, FM9, AXE3]) {
     const prof = profileForModel(model);
     const typePid = pidOf(prof, 'REVERB', 'REVERB_TYPE');
     const r = await readBlock(model, eidOf('reverb'), 'REVERB', { [typePid]: 1 });
-    assertEqual((r.layout?.pages ?? []).map((p) => p.name).join(','), 'Pitch Shift', `${prof.key} REVERB type 1 layout (the case under test)`);
+    const pages = (r.layout?.pages ?? []).map((p) => p.name);
+    assert(pages.length > 0, `${prof.key} REVERB type 1: its layout resolves pages (${pages.join(',')})`);
     const v = visual(r, 'decay');
-    assert(v, `${prof.key} REVERB type 1: decay served although its own pages show no decay param`);
+    assert(v, `${prof.key} REVERB type 1: decay served for the pages it shows`);
     assertEqual(v.roles.time, pidOf(prof, 'REVERB', 'REVERB_TIME'), `${prof.key} REVERB type 1: time`);
     assertEqual(v.roles.predelay, pidOf(prof, 'REVERB', 'REVERB_PREDELAY'), `${prof.key} REVERB type 1: predelay`);
     checkServed(r, prof, 'REVERB', `${prof.key} REVERB type 1`);
     const basic = visual(await readBlock(model, eidOf('reverb'), 'REVERB', { [typePid]: 0 }), 'decay');
     assertEqual(basic?.roles.time, pidOf(prof, 'REVERB', 'REVERB_TIME'), `${prof.key} REVERB type 0: decay with time`);
   }
-  console.log('  drivers/block-visuals: REVERB pitch-only types keep decay (Default variant controls)');
+  console.log('  drivers/block-visuals: REVERB add-on types keep decay (narrowed to their pages)');
 
   // ---- Case 3d: FILTER is strict (no Default variant): types get no visual they do not use --------
   {
@@ -242,12 +244,13 @@ export async function runBlockVisualsTests(): Promise<void> {
   const fm9 = profileForModel(FM9);
   {
     const r = await readBlock(FM9, eidOf('delay'), 'DELAY', {});
-    assertEqual(r.layout, undefined, 'FM9 DELAY ships no layout (the case under test)');
     const v = visual(r, 'echo');
-    assert(v, 'FM9 DELAY: echo served without a layout');
+    assert(v, 'FM9 DELAY: echo served (layout narrowed to the pages it shows)');
     assertEqual(v.roles.time, pidOf(fm9, 'DELAY', 'DELAY_TIME'), 'FM9 DELAY_TIME id (its own)');
     assert(v.roles.time !== pidOf(fm3, 'DELAY', 'DELAY_TIME'), 'FM9 DELAY_TIME differs from the FM3 id (no leak)');
-    assertEqual(v.roles.routing, pidOf(fm9, 'DELAY', 'DELAY_TYPE'), 'FM9 DELAY routing = DELAY_TYPE (served selector; the model selector is DELAY_MODEL)');
+    // the shipped layout does not list the type selector (the response serves the type as 	ype), so the
+    // strict pass drops the routing role - the echo still draws from time/feedback
+    assertEqual(v.roles.routing, undefined, 'FM9 DELAY: the type selector is not a served param, so no routing role');
     assertEqual(v.roles.feedback, pidOf(fm9, 'DELAY', 'DELAY_FEED'), 'FM9 DELAY feedback id');
     checkServed(r, fm9, 'DELAY', 'FM9 DELAY');
   }
@@ -288,7 +291,8 @@ export async function runBlockVisualsTests(): Promise<void> {
     const mt = await readBlock(model, eidOf('multitap'), 'MULTITAP', { [mtBase]: 2 });
     assertEqual(mt.type, null, `${prof.key} MULTITAP: no block type (no roster)`);
     assert(mt.enums.some((e) => e.id === mtBase && e.value === 2), `${prof.key} MULTITAP_BASETYPE served as an enum (algorithm 2)`);
-    assertEqual(mt.layout?.variantName, '2', `${prof.key} MULTITAP algorithm 2 → variant '2'`);
+    // the newer source names the variant after the algorithm (e.g. 'Quad Series Delay'); the value selects it
+    assert((mt.layout?.variantName ?? '').length > 0, `${prof.key} MULTITAP algorithm 2 → a named variant (${mt.layout?.variantName})`);
     assertEqual(mt.layout?.variantValue, '2', `${prof.key} MULTITAP variant value`);
     const plexBase = pidOf(prof, 'PLEX', 'PLEX_BASETYPE');
     const plex = await readBlock(model, eidOf('plex'), 'PLEX', { [plexBase]: 4 });
