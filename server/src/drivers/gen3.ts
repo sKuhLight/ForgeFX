@@ -17,6 +17,10 @@ import {
   isLooperWaveformResponse,
   parseLooperWaveform,
   buildLooperControl,
+  GRAPH_CURVE_SLOTS,
+  buildGraphCurvePoll,
+  isGraphCurveResponse,
+  parseGraphCurve,
   isMultipurposeResponse,
   parseMultipurposeResponse,
   describeMultipurposeResultCode,
@@ -24,6 +28,12 @@ import {
   type ModernFractalCodec
 } from 'forgefx-midi/gen3/axe-fx-iii';
 import { wireToDisplay } from 'forgefx-midi/shared';
+import {
+  LIVE_WALK_LIMITS, blockBindableSection, enumOrdinalBounds, isInformativeRow, isPlaceholderRow, isSyntheticFamilyKey, matchBulkShape,
+  typecodeTaper, typecodeUnit,
+  type BlockMapEntry, type DerivedSection, type RangeDef as CodecRangeDef
+} from 'forgefx-midi/cache';
+import { crossBlockEffectId, gen3RosterSpan, type CrossBlockRefKey } from 'forgefx-midi/gen3/fm3';
 import {
   parsePresetDump, decodeRawPatch, decodeGen3Body,
   readBlockParamsForModel, modelsFromBlocks,
@@ -35,14 +45,24 @@ import {
   type BlockVisual
 } from 'forgefx-midi/devices/gen3';
 import { isTransportTimeout, type Transport } from '../transport/types.js';
-import { SLUG_FAMILY, PROFILES, type DeviceProfile, type TypeModel, type DeviceLayout, type SelectorValues } from '../devices.js';
+import {
+  SLUG_FAMILY, isEnumOnAnyDevice, paramLabel, typeSelectorPid, unlessHidden, variantSelectorPid,
+  type DeviceProfile, type ParamDef, type TypeModel, type DeviceLayout, type DeviceLayoutControl, type LayoutFirmware, type RangeDef,
+  type SelectorValues
+} from '../devices.js';
+import { buildParamIndex, MAX_WIRE_PID, type BlockIndex, type ParamEntry } from './paramIndex.js';
+import { catalogFamilyOfBlock, deviceCacheKey, profileCatalogFor, staticFamilyForEffectId } from '../profileCatalog.js';
+import { blockMapAccess, blockWriteRefusedMessage, type BlockMapAccess } from './blockMapState.js';
 import { EmptyPresetError } from './types.js';
 import type {
   DeviceDriver, DriverCapabilities, DriverCtx, DiagnosticDump, SelectPresetOpts,
   PresetGridDTO, GridCellDTO, PresetBlockDTO, PresetSummary, NamedParam, EnumParam, MeterVal,
-  FcSwitchState, FcReadState, StoreReason, BlockStateDTO
+  FcSwitchState, FcReadState, StoreReason, BlockStateDTO,
+  BlockParamsDTO, BlockParamsV2DTO, BlockParamsOpts, NamedParamV2, EnumParamV2, ParamMeta, UnresolvedReason, BlockMapMeta,
+  ValueSource
 } from './types.js';
 import { validatedPresetDump } from './sendPolicy.js';
+import { devHookValue, processEnv } from '../devHooks.js';
 
 // slug → { name, page=base effect id } from the authoritative codec base table (replaces the old
 // defs.js pack lookup; block names + base ids are codec facts, not editor-cache definitions).
@@ -51,6 +71,18 @@ const BLOCK_META: Record<string, { name: string; page: number }> = (() => {
   for (const e of effectRoster()) out[e.slug] = { name: e.name, page: e.page };
   return out;
 })();
+
+/** The catalog family of an audio block by the codec's block roster (`slugForEffectId` → `SLUG_FAMILY`): a block with
+ *  channels A-D. Never the family the development hook hides (devices.ts `hiddenFamily`): such a block is served as a
+ *  block the catalog does not know. */
+const audioFamilyOf = (eid: number): string | undefined => unlessHidden(SLUG_FAMILY[(slugForEffectId(eid) ?? '').toLowerCase()]);
+
+/** Whether a bulk read of `itemCount` items is a block with channels A-D over a section of `stride` slots: one slice
+ *  (`false`) or four (`true`); null when it is neither or the stride is unknown (contract E4). */
+function shapeChannels(itemCount: number, stride: number | undefined): boolean | null {
+  if (!stride || !(stride > 0) || !(itemCount > 0)) return null;
+  return itemCount === stride ? false : itemCount === 4 * stride ? true : null;
+}
 
 const EDIT_BUFFER = 0x3fff; // preset number sentinel = current edit buffer
 /** Gen-3 grid shunt (routing cell) effect-id base: shunt k is `1023 + k`, real blocks sit well below it. */
@@ -364,21 +396,6 @@ const NOT_A_KNOB = new Set([
   'GLOBAL_CS_CHAN_BEGIN', // its paramId lies outside the fn-0x1F body, so the read-back is always the minimum
 ]);
 
-/** `FAMILY.NAME` of every param that is a selector ('enum' unit) on ANY gen-3 device's static catalog.
- *  The same param can carry a confirmed unit on one device and 'unverified' on another (TENTAP_DECAYSTYLE
- *  is a 2-way selector on the Axe-Fx III). Consulted only for the provisional units, whose catalog unit
- *  proves nothing on this device. */
-let enumElsewhere: Set<string> | undefined;
-function isEnumOnAnyDevice(family: string, name: string): boolean {
-  if (!enumElsewhere) {
-    enumElsewhere = new Set();
-    for (const prof of Object.values(PROFILES)) {
-      for (const [fam, list] of Object.entries(prof.params)) for (const q of list) if (q.unit === 'enum') enumElsewhere.add(`${fam}.${q.name}`);
-    }
-  }
-  return enumElsewhere.has(`${family}.${name}`);
-}
-
 /** A range that reads like a stepper or selector rather than a dial: integral bounds with either an
  *  integer step, or no step and a small span (<= 64 values). Deliberately conservative (it also hides
  *  a plain 0..1 range): used only to vet the provisional units, whose catalog unit proves nothing. */
@@ -532,10 +549,223 @@ function dedupeLabels(items: { name: string }[]): void {
     }
   }
 }
-/** Friendly param label: the catalog displayLabel, else tidy the raw NAME (strip family prefix, _→space). */
-function paramLabel(p: { displayLabel?: string; name: string }): string {
-  return p.displayLabel ?? p.name.replace(/^[A-Z0-9]+_/, '').replace(/_/g, ' ');
+
+// ── reading a block: geometry and value decoding shared by the classic and the generic response ──
+
+/** Most options one selector lists. The longest real list (a CC list of GLOBAL) has 162 entries; the cap only
+ *  keeps a corrupt row from producing an unbounded list. */
+export const MAX_ENUM_OPTIONS = 4096;
+
+type EnumOption = { value: number; label: string };
+
+/** The options of a selector over the ordinals `lo..hi`. A label is the device's own list at `v - lo` (a list
+ *  starts at the row's first ordinal, not at 0), else the model overlay at `v`, else the bare ordinal. Cut at
+ *  MAX_ENUM_OPTIONS (`truncated`). */
+function buildEnumOptions(
+  lo: number, hi: number, labels: readonly string[] | undefined, overlay: Readonly<Record<number, string>> | undefined
+): { options: EnumOption[]; truncated: boolean } {
+  const options: EnumOption[] = [];
+  let v = lo;
+  for (; v <= hi && options.length < MAX_ENUM_OPTIONS; v++) options.push({ value: v, label: labels?.[v - lo] ?? overlay?.[v] ?? String(v) });
+  return { options, truncated: v <= hi };
 }
+
+/** A selector row read as the wire value `raw`: the ordinal range its options cover, the decoded ordinal, and
+ *  whether the reading lies inside the range. An enum-KIND row stores the ordinal; a value above the top ordinal
+ *  looks 16-bit scaled and is unscaled onto the ordinal range. A FLOAT row (a float-row selector) always
+ *  carries the normalised raw/65534 value, so it is always scaled onto its label range: guessing "ordinal or
+ *  scaled" there would read raw 1 (~0.0) as ON. The midpoint raw 32767 (exactly 0.5) rounds up, like Math.round
+ *  does for the rest of the decode. */
+function decodeSelector(range: Pick<RangeDef, 'kind' | 'displayMin' | 'displayMax' | 'scale' | 'enumCount'>, raw: number): { lo: number; hi: number; value: number; inRange: boolean } {
+  if (range.kind === 'float') {
+    const lo = Math.round(range.displayMin);
+    const hi = Math.round(range.displayMax);
+    const value = Math.min(hi, Math.max(lo, Math.round((raw / 65534) * (hi - lo)) + lo));
+    return { lo, hi, value, inRange: raw <= 65534 };
+  }
+  const { lo, hi } = enumOrdinalBounds(range);
+  const value = raw > hi ? Math.round((raw / 65534) * (hi - lo)) + lo : raw;
+  return { lo, hi, value, inRange: value >= lo && value <= hi };
+}
+
+/** The ordinal an editor layout keys a selector param on (a variant's / page's `value` list), read from the raw wire
+ *  value `raw` in the block body, for a selector that is NOT served as an enum (an enum entry keys by the value it
+ *  decodes). The editor's selector values are ordinals, and the device stores such a selector as one even on a float
+ *  row: REVERB_BASETYPE (a `count` float row 0..8) reads raw 6 for base type 6, which its continuous display reading
+ *  shows as 0.0007. So the rule is decodeSelector's ordinal rule for any row with a usable span: the raw value when it
+ *  lies within the top ordinal, else a 16-bit scaled reading unscaled onto the span — except a reading above the top
+ *  ordinal that would unscale onto the BOTTOM one, which is an ordinal the row does not reach: a scaled reading of the
+ *  bottom ordinal is exactly 0, so 1..(half an ordinal step) is no plausible scaled reading, while the row's span can
+ *  trail the firmware (REVERB_BASETYPE's row ends at 8, the current firmware's Reverb layouts name base types up to
+ *  10: raw 9 / 10 are those base types, not a scaled base type 0). An enum row is decoded exactly as decodeSelector
+ *  does, an out-of-range reading keying nothing; a row without a usable span (LOOPER_DUB's 0..0 — whether the device
+ *  stores that selector as an ordinal or scaled is not verified on hardware), or no row at all, keys by the raw value. A reading that is no wire value (above 65534, not an integer) keys nothing. */
+function selectorOrdinal(range: Pick<RangeDef, 'kind' | 'displayMin' | 'displayMax' | 'scale' | 'enumCount'> | undefined, raw: number): number | undefined {
+  if (!Number.isInteger(raw) || raw < 0 || raw > 65534) return undefined;
+  if (!range) return raw;
+  if (range.kind === 'enum') {
+    const dec = decodeSelector(range, raw);
+    return dec.inRange ? dec.value : undefined;
+  }
+  const lo = Math.round(range.displayMin);
+  const hi = Math.round(range.displayMax);
+  if (!(hi > lo) || raw <= hi) return raw;
+  const scaled = Math.round((raw / 65534) * (hi - lo)) + lo;
+  return scaled === lo ? raw : scaled;
+}
+
+/** One continuous param's reading for display (`#displayRow`). `unitSource` / `taperSource` are set for the generic
+ *  response only. */
+interface DisplayReading {
+  value: number; norm: number; unit?: string; min?: number; max?: number; log?: boolean;
+  unitSource?: ValueSource; taperSource?: ValueSource;
+}
+
+/** Where the row a generic reading is taken from comes from: the applied profile (`fromProfile`, the index entry's
+ *  `source`), and the bundled catalog's own row of the param (to tell a field the device supplied from the
+ *  catalog's). */
+interface RowProvenance { fromProfile: boolean; catalogRow: Readonly<RangeDef> | undefined }
+
+/** What one fn-0x1F read of a block gave, and how its body is laid out. */
+interface BlockRead {
+  /** The body (one wire value per record, all channels back to back); null when it was not read or failed. */
+  values: readonly number[] | null;
+  /** The read threw or timed out: `values` is null and this says why. */
+  readError?: string;
+  /** Active channel (0-3) of a channel-bearing block, as served: the one the status read reported, clamped onto
+   *  the channels the body carries. Null when the status read did not report the block, and for a block without
+   *  channels. */
+  channel: number | null;
+  /** One channel slice's width and where the active channel's slice starts. */
+  stride: number;
+  base: number;
+  /** The body is indexed by param id: every informative row of the family lies inside one slice. */
+  positional: boolean;
+}
+
+/** What the two response builders share about the block they serve. */
+interface BlockContext {
+  family: string;
+  slug: string;
+  blockName: string;
+  page: number;
+  hasChannels: boolean;
+  read: BlockRead;
+}
+
+/** What a param's slot of the read holds (a wire value), or the reason it holds nothing usable. */
+function readSlot(read: BlockRead, hasChannels: boolean, pid: number): number | UnresolvedReason {
+  if (!read.values) return 'read-failed';
+  if (!read.positional) return 'non-positional';
+  if (hasChannels && read.channel === null) return 'channel-unknown';
+  const at = read.base + pid;
+  return pid >= read.stride || at >= read.values.length ? 'not-in-body' : read.values[at]!;
+}
+
+/** The value of the `FORGEFX_DEFS_FORCE_GENERIC` hook, parsed: family → pids, plus the entries that did not
+ *  parse. Entries are comma-separated. `FAMILY:pid` names a family (upper case, as the catalogs spell it) and a
+ *  pid; a bare `pid` adds one more pid to the family named just before it (`DELAY:3,5, CHORUS:8`). Anything
+ *  else is malformed and ignored: `CHORUS:8:9`, a lower-case family, a pid that is not a wire parameter, a
+ *  bare pid with no family before it, or one right after a malformed entry. */
+export function parseForcedGeneric(raw: string): { pids: ReadonlyMap<string, ReadonlySet<number>>; malformed: string[] } {
+  const pids = new Map<string, Set<number>>();
+  const malformed: string[] = [];
+  let family: string | undefined;
+  for (const token of raw.split(',')) {
+    const entry = token.trim();
+    if (entry === '') continue;
+    const m = /^(?:([A-Z][A-Z0-9_]*):)?(\d{1,5})$/.exec(entry);
+    const fam = m ? m[1] ?? family : undefined;
+    const pid = m ? Number(m[2]) : NaN;
+    if (fam === undefined || !(pid <= MAX_WIRE_PID)) {
+      malformed.push(entry);
+      family = undefined; // a bare pid after a malformed entry has no family to join
+      continue;
+    }
+    family = fam;
+    let set = pids.get(fam);
+    if (!set) pids.set(fam, (set = new Set()));
+    set.add(pid);
+  }
+  return { pids, malformed };
+}
+
+/** The last hook value parsed (re-parsed only when the variable changes, so a malformed value warns once). */
+let forcedGeneric: { raw: string; pids: ReadonlyMap<string, ReadonlySet<number>> } | undefined;
+
+/** Name of the diagnostic hook's environment variable. */
+export const FORCE_GENERIC_ENV = 'FORGEFX_DEFS_FORCE_GENERIC';
+
+/** Diagnostic hook, off by default: pids to serve as generic params whatever the catalog names them, from
+ *  `FORGEFX_DEFS_FORCE_GENERIC` (see parseForcedGeneric; for testing only). Read through a guarded process
+ *  access: a browser runtime has none and never forces anything. Like every development hook it needs the explicit
+ *  opt-in `FORGEFX_DEV_HOOKS=1` and is ignored when `NODE_ENV=production` (devHooks.ts `devHookValue`). */
+function forcedGenericPids(family: string): ReadonlySet<number> | undefined {
+  const raw = devHookValue(processEnv(), FORCE_GENERIC_ENV);
+  if (!raw) return undefined;
+  if (forcedGeneric?.raw !== raw) {
+    const parsed = parseForcedGeneric(raw);
+    if (parsed.malformed.length > 0) {
+      console.warn(`[forgefx] ${FORCE_GENERIC_ENV}: ignored malformed ${parsed.malformed.length === 1 ? 'entry' : 'entries'} ${parsed.malformed.map((e) => JSON.stringify(e)).join(', ')} (expected FAMILY:pid[,pid...])`);
+    }
+    forcedGeneric = { raw, pids: parsed.pids };
+  }
+  return forcedGeneric.pids.get(family);
+}
+
+/** The meta every generic param carries besides its value (the `unresolved` reason is added by the caller). */
+function paramMetaOf(e: ParamEntry): ParamMeta {
+  return {
+    kind: e.kind,
+    source: e.source,
+    generic: e.generic,
+    ...(e.isNew ? { isNew: true as const } : {}),
+    ...(e.pageHint ? { pageHint: e.pageHint } : {}),
+    nameSource: e.nameSource,
+    ...(e.nameConfidence ? { nameConfidence: e.nameConfidence } : {}),
+    ...(e.movedFrom !== undefined ? { movedFrom: e.movedFrom } : {}),
+    fp: e.fp,
+    widget: e.widget,
+    widgetSource: e.widgetSource,
+    write: e.write,
+    ...(e.readOnlyReason ? { readOnlyReason: e.readOnlyReason } : {}),
+    ...(e.step !== undefined ? { step: e.step } : {}),
+  };
+}
+
+/** A layout button symbol `<F>_BTN_<X><n>` and the served param `<F>_<X><n>` it presses (`CABINET_BTN_MUTE1` →
+ *  `CABINET_MUTE1`). The button's own `paramId` is an editor pseudo id and stays as it is. */
+const BUTTON_SYMBOL = /^([A-Z0-9]+)_BTN_([A-Z]+\d*)$/;
+
+/** Layout widgets that only display a value (a button is excluded: a scene-ignore button writes its param). */
+const DISPLAY_ONLY_WIDGETS: ReadonlySet<string> = new Set(['meter', 'readout', 'label', 'graph', 'spacer']);
+
+/** A copy of `layout` with every control passed through `fn`. A control `fn` returns as it is stays shared, and
+ *  so does every row, page and layout in which nothing changed. */
+function mapLayoutControls(layout: DeviceLayout, fn: (c: DeviceLayoutControl) => DeviceLayoutControl): DeviceLayout {
+  let touched = false;
+  const pages = layout.pages.map((page) => {
+    let pageTouched = false;
+    const rows = page.rows.map((row) => {
+      let rowTouched = false;
+      const controls = row.controls.map((c): DeviceLayoutControl => {
+        const out = fn(c);
+        if (out !== c) rowTouched = true;
+        return out;
+      });
+      if (!rowTouched) return row;
+      pageTouched = true;
+      return { ...row, controls };
+    });
+    if (!pageTouched) return page;
+    touched = true;
+    return { ...page, rows };
+  });
+  return touched ? { ...layout, pages } : layout;
+}
+
+/** The fn 0x13 status dump read: effect id → bypass flag and active channel (0-3). */
+type StatusMap = Map<number, { bypassed: boolean; channel: number }>;
 
 class Gen3Driver implements DeviceDriver {
   #prof: DeviceProfile;
@@ -563,7 +793,9 @@ class Gen3Driver implements DeviceDriver {
       presetDump: true,
       presetConvert: true, // full gen-3 lift (routing grid + per-scene block state + amp knobs)
       blockParamDecode: profile.model === 0x11, // per-block body decode is FM3-only today
-      telemetry: { tuner: true, outputMeters: true, cpu: true },
+      // FM3 only: the `sub 0x23` graph-curve reply was observed on the FM3; the FM9 / Axe-Fx III share
+      // the codec but no reply was captured from either, so the route stays 501 there until one is.
+      telemetry: { tuner: true, outputMeters: true, cpu: true, graphCurves: profile.model === 0x11 },
       fcModel: !!profile.fcModel,
       fcLiveRead: !!profile.fcModel?.liveState,
       modBind: !!profile.modModel,
@@ -606,7 +838,17 @@ class Gen3Driver implements DeviceDriver {
   /** Adopt a device-cache-derived runtime profile (device-true rosters / enum labels / ranges). The
    *  model byte is unchanged so the codec bound at construction stays valid; only the data the reads
    *  resolve through (#prof) is swapped. Idempotent — re-applying a fresh profile just replaces it. */
-  applyRuntimeProfile(profile: DeviceProfile): void { this.#prof = profile; }
+  applyRuntimeProfile(profile: DeviceProfile): void {
+    this.#prof = profile;
+    this.#nonPositional.clear(); // the new rows may lay a family out differently
+    this.#runtimeLikely.clear(); // a runtime bulk-shape match was made against the old profile's sections
+    this.#noteUnmappedChange(); // the new profile may describe a placed block the old one did not (or the reverse)
+  }
+
+  /** Effect ids whose last generic block read matched exactly one editor-cache section by its bulk shape (the runtime
+   *  `likely`, never persisted): param writes to them are refused (contract §3.4) without a fresh read. Forgotten on a
+   *  profile swap and a new session. */
+  #runtimeLikely = new Map<number, number>();
 
   #gridCache: { grid: PresetGridDTO; at: number; gen: number } | null = null;
   #gridInflight: Promise<PresetGridDTO> | null = null;
@@ -814,12 +1056,20 @@ class Gen3Driver implements DeviceDriver {
    *  header, and the current slot when the driver knows it (set by presetRef / selectPreset). */
   #sessionState: { transport: Transport; learned: Set<'stored' | 'edit'>; currentSlot: number | null } | null = null;
   #session(dev: Transport) {
-    if (this.#sessionState?.transport !== dev) this.#sessionState = { transport: dev, learned: new Set(), currentSlot: null };
+    if (this.#sessionState?.transport !== dev) {
+      this.#sessionState = { transport: dev, learned: new Set(), currentSlot: null };
+      // a new connection: the placed blocks read on the old one say nothing about this one
+      if (this.#lastPlaced && this.#lastPlaced.transport !== dev) { this.#lastPlaced = null; this.#unmappedSig = ''; }
+    }
     return this.#sessionState;
   }
-  /** A fresh detect: forget what was learned about the connection. */
+  /** A fresh detect (a reconnect, a port or model switch): forget what was learned about the connection, including
+   *  the placed blocks of the last grid read. */
   resetSession(): void {
     this.#sessionState = null;
+    this.#lastPlaced = null;
+    this.#unmappedSig = '';
+    this.#runtimeLikely.clear();
   }
   /** How a dump read of `target` judges headers on this connection. Starts from DUMP_HEADER_POLICY; a
    *  'prefer' kind becomes 'strict' once the device has named the requested number in a header (so a late dump
@@ -860,8 +1110,73 @@ class Gen3Driver implements DeviceDriver {
   }
   #slotGridInflight = new Map<number, Promise<PresetGridDTO>>();
 
-  async #dumpGrid(): Promise<PresetGridDTO> {
-    return this.#gridFromDump(EDIT_BUFFER);
+  /** `silent`: the read does not announce a changed set of unmapped placed blocks (the next grid read or profile swap
+   *  does, since the announced set is left as it was). */
+  async #dumpGrid(opts: { silent?: boolean } = {}): Promise<PresetGridDTO> {
+    const dev = await this.#conn();
+    const g = await this.#gridFromDump(EDIT_BUFFER);
+    this.#lastPlaced = { transport: dev, eids: g.cells.filter((c) => !c.isShunt && c.effectId > 0 && c.effectId < GEN3_SHUNT_BASE).map((c) => c.effectId) };
+    if (!opts.silent) this.#noteUnmappedChange();
+    return g;
+  }
+
+  /** Effect ids of the blocks in the edit-buffer grid as last read on `transport` (shunts and empty cells left out),
+   *  null before the first read of this session. Forgotten on a (re)detect (`resetSession`: a reconnect, a port or
+   *  model switch) and when the connection's transport changes (`#session`). */
+  #lastPlaced: { transport: Transport; eids: number[] } | null = null;
+  /** The unmapped set the last `definitions`/`unmapped-blocks` event (or the session start) reported, as a key. */
+  #unmappedSig = '';
+
+  /** The edit-buffer grid read afresh: one dump read, never the short-TTL cache or a read already in flight. It refreshes
+   *  `placedEffectIds` and, unless a grid-changing write landed meanwhile, the grid cache. `silent`: no `definitions` /
+   *  `unmapped-blocks` event from this read (it is left to the next grid read or profile swap). */
+  async freshGrid(opts: { silent?: boolean } = {}): Promise<PresetGridDTO> {
+    const gen = this.#gridGen;
+    const g = await this.#dumpGrid(opts);
+    if (gen === this.#gridGen) this.#gridCache = { grid: g, at: Date.now(), gen };
+    return g;
+  }
+
+  /** Effect ids of the blocks in the edit-buffer grid as last read (shunts and empty cells left out), sorted and
+   *  unique; null before the first grid read of the session. No device traffic. */
+  placedEffectIds(): number[] | null {
+    if (!this.#lastPlaced) return null;
+    return [...new Set(this.#lastPlaced.eids)].sort((a, b) => a - b);
+  }
+
+  /** Effect ids of the last read edit-buffer grid that no param family describes, sorted and unique; null before
+   *  the first grid read of the session. No device traffic: the capabilities report the runtime coverage gap
+   *  `unmapped-block` from it. A block counts as described when:
+   *   - the CURRENT profile resolves it like `blockParams` (the codec's audio-block slug, then the profile's own
+   *     effect-id map), or
+   *   - the model's STATIC tables place it (`staticFamilyForEffectId`: the static roster's instance slots and
+   *     virtual blocks, the catalog's effect-id spans — e.g. an Axe-Fx III fifth Input, or a III roster block such
+   *     as Vocoder that gets read-only service, WP-F5), or
+   *   - the applied profile document's persisted block map binds it with confidence `confirmed`
+   *     (`ProfileFacts.confirmedBlocks`).
+   *  Only a block none of these knows (a block a newer firmware added, no confirmed map) is unmapped. */
+  unmappedPlacedEffectIds(): number[] | null {
+    if (!this.#lastPlaced) return null;
+    const model = this.#prof.model;
+    const confirmed = this.#prof.profileFacts?.confirmedBlocks;
+    const out = new Set<number>();
+    for (const eid of this.#lastPlaced.eids) {
+      if (confirmed?.has(eid)) continue;
+      const family = audioFamilyOf(eid) ?? this.#prof.familyForEffectId(eid) ?? staticFamilyForEffectId(model, eid);
+      if (family === undefined) out.add(eid);
+    }
+    return [...out].sort((a, b) => a - b);
+  }
+
+  /** After a grid read or a profile swap: when the unmapped set changed, tell live UIs to re-read the capabilities
+   *  (SSE `definitions`, reason `unmapped-blocks`, keyed by the running firmware's profile key). Without a known
+   *  firmware there is no profile key and no applied profile, so the set cannot change the drift: nothing is sent. */
+  #noteUnmappedChange(): void {
+    const sig = (this.unmappedPlacedEffectIds() ?? []).join(',');
+    if (sig === this.#unmappedSig) return;
+    this.#unmappedSig = sig;
+    const fw = this.#ctx.getFirmware?.() ?? null;
+    if (fw) this.#emit({ type: 'definitions', reason: 'unmapped-blocks', key: deviceCacheKey(this.#prof.model, fw.major, fw.minor) });
   }
 
   /** Decode a preset dump (the edit buffer or a stored slot) into the routing-grid DTO. */
@@ -1023,14 +1338,51 @@ class Gen3Driver implements DeviceDriver {
     return { len: body.length, hex: Buffer.from(body).toString('hex') };
   }
 
-  async #statusByEffectId(): Promise<Map<number, { bypassed: boolean; channel: number }>> {
+  /** Active channel and bypass per placed block, from the fn 0x13 status dump. An EMPTY map means the read
+   *  failed: no reply in time, or a reply that lists no block, which a real preset never gives (it always has
+   *  its Output blocks). Such a read is re-issued once, shortly after, before giving up: a scene switch leaves
+   *  the unit busy for a moment, and a slow link can miss one reply window. The first request waits longer on
+   *  a slow link, the retry the normal 1.5 s, so a lost reply costs at most ~5.7 s there before the caller's
+   *  next request (the queue is serialised, and Axis gives a request 12 s). The routine channel-watch poll
+   *  passes `retry: false`: one request with the fixed 1.5 s it always had (its next tick is the retry). */
+  async #statusByEffectId(opts: { retry?: boolean } = {}): Promise<StatusMap> {
     const dev = await this.#conn();
-    const map = new Map<number, { bypassed: boolean; channel: number }>();
+    const retry = opts.retry !== false;
+    let map = await this.#readStatusDump(dev, retry && dev.slow ? 4000 : 1500);
+    if (map.size === 0 && retry) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 200));
+      map = await this.#readStatusDump(dev, 1500);
+    }
+    return map;
+  }
+
+  /** The status-dump request in flight, if any, and how long it waits for its reply: a caller that needs the
+   *  status while one is pending awaits that request instead of queueing another, as long as it would not wait
+   *  longer itself (each caller still decides on its own retry). */
+  #statusInflight: { promise: Promise<StatusMap>; timeoutMs: number } | null = null;
+
+  /** One fn 0x13 status-dump request; an empty map when it failed or timed out. A request already in flight is
+   *  joined when its timeout is at least `timeoutMs`. A caller that waits longer (the first request of a block
+   *  read on a slow link, 4 s, while the channel-watch poll's 1.5 s request is pending) issues its own, which the
+   *  serialised queue sends after the pending one: joining would cut its wait short exactly when the unit is
+   *  busy (after a scene switch). Later callers then join the longer request. */
+  #readStatusDump(dev: Transport, timeoutMs: number): Promise<StatusMap> {
+    const pending = this.#statusInflight;
+    if (pending && pending.timeoutMs >= timeoutMs) return pending.promise;
+    const p: Promise<StatusMap> = this.#requestStatusDump(dev, timeoutMs).finally(() => {
+      if (this.#statusInflight?.promise === p) this.#statusInflight = null;
+    });
+    this.#statusInflight = { promise: p, timeoutMs };
+    return p;
+  }
+
+  async #requestStatusDump(dev: Transport, timeoutMs: number): Promise<StatusMap> {
+    const map: StatusMap = new Map();
     try {
       // fractal-midi's isStatusDumpResponse is locked to model 0x10 (III), so match the
       // 0x13 frame ourselves (any model) and parse the id-id-dd triples inline.
       // fn-only matcher: the status dump carries no request id (polled by the channel watch)
-      const frames = await dev.request(this.#codec.buildStatusDump(), { timeoutMs: 1500, routine: true, match: (fs) => fs.some((f) => f[5] === 0x13) });
+      const frames = await dev.request(this.#codec.buildStatusDump(), { timeoutMs, routine: true, match: (fs) => fs.some((f) => f[5] === 0x13) });
       const f = frames.find((x) => x[5] === 0x13);
       if (f) {
         const payload = f.slice(6, f.length - 2);
@@ -1047,9 +1399,10 @@ class Gen3Driver implements DeviceDriver {
   }
 
   /** Live active-channel per placed block (effectId → channel 0-3), from the fn 0x13 status dump.
-   *  Feeds the registry's front-panel channel-change watch. One small round-trip. */
+   *  Feeds the registry's front-panel channel-change watch. One small round-trip (a failed one is not
+   *  repeated: the watch skips an empty answer and asks again on its next tick). */
   async getActiveChannels(): Promise<Map<number, number>> {
-    const status = await this.#statusByEffectId();
+    const status = await this.#statusByEffectId({ retry: false });
     const out = new Map<number, number>();
     for (const [eid, st] of status) out.set(eid, st.channel);
     return out;
@@ -1084,14 +1437,11 @@ class Gen3Driver implements DeviceDriver {
    *  and re-apply just this. One small round-trip; keeps scene changes snappy and OFF the heavy,
    *  crash-prone dump path (a full dump right after a scene switch hits the device mid-rebuild). */
   async sceneState(): Promise<{ effectId: number; bypassed: boolean; channel: string | null }[]> {
-    let status = await this.#statusByEffectId();
     // A scene switch leaves the unit busy rebuilding for a moment, so the first status read can come back
-    // empty even though the device is fine. Retry once shortly after before treating it as a failure — the
-    // alternative (503 → the client's full preset dump) lands on the device exactly while it is rebuilding.
-    if (status.size === 0) {
-      await new Promise<void>((resolve) => setTimeout(resolve, 200));
-      status = await this.#statusByEffectId();
-    }
+    // empty even though the device is fine. #statusByEffectId retries once shortly after before treating it
+    // as a failure — the alternative (503 → the client's full preset dump) lands on the device exactly while
+    // it is rebuilding.
+    const status = await this.#statusByEffectId();
     // An EMPTY status map means the fn-0x13 read failed/timed out (#statusByEffectId swallows the
     // error). A real preset always has ≥ Output blocks, so `[]` can never be a legitimate scene state —
     // returning it made the route answer 200 `[]` and Axis kept the previous scene's bypass/channel
@@ -1130,27 +1480,306 @@ class Gen3Driver implements DeviceDriver {
    * channelCount = values.length/stride (per-block, NOT always 4). `norm` = raw/65534
    * (knob position); `value`/`unit` are the device-true DISPLAY reading via this.#prof.ranges
    * (e.g. 1.2k Hz, -12 dB) where the cache has a range, else the 0..10 position.
+   *
+   * Two responses share one read. The classic one (default) lists the catalog's dials and selectors and always
+   * carries numbers; a value that had to be invented (a zero for a position the read did not cover, a guessed
+   * channel, a family whose body is not indexed by param id) keeps its number and gains `unresolved`. The generic
+   * one (`opts.generic`) lists every param the block has on the connected device (see buildParamIndex), serves
+   * `null` plus the `unresolved` reason where no value could be resolved, and adds a `definitions` block.
    */
-  async blockParams(eid: number, opts: { observe?: boolean } = {}): Promise<{ block: string; slug: string; page: number; named: NamedParam[]; enums: EnumParam[]; type: { value: number; name: string } | null; layout?: DeviceLayout; blockState: BlockStateDTO; visuals: BlockVisual[] }> {
+  blockParams(eid: number): Promise<BlockParamsDTO>;
+  blockParams(eid: number, opts: BlockParamsOpts & { generic: true }): Promise<BlockParamsV2DTO>;
+  blockParams(eid: number, opts?: BlockParamsOpts): Promise<BlockParamsDTO | BlockParamsV2DTO>;
+  async blockParams(eid: number, opts?: BlockParamsOpts): Promise<BlockParamsDTO | BlockParamsV2DTO> {
     // A background read (observe === false) must not retarget the device-edit watch: only the block the user has open is watched.
-    const observe = opts.observe !== false;
+    const observe = opts?.observe !== false;
     if (observe) this.#watchedEid = eid; // this is the block the user has open → the target the FM3 device-edit poll re-reads
+    const generic = opts?.generic === true;
     const codecSlug = slugForEffectId(eid) ?? ''; // audio blocks resolve via the codec
-    // virtual effects (GLOBAL=1, Controllers=2, Modifier=3, FC=199) resolve via the profile's effectId map
-    const family = SLUG_FAMILY[codecSlug.toLowerCase()] ?? this.#prof.familyForEffectId(eid);
-    const hasChannels = !!SLUG_FAMILY[codecSlug.toLowerCase()]; // an audio block; the virtual effects have no channels A-D
-    const slug = codecSlug || (family ? family.toLowerCase() : ''); // virtual effects key on the family name
+    // virtual effects (GLOBAL=1, Controllers=2, Modifier=3, FC=199) resolve via the profile's effectId map, and so do a
+    // block the effect-id table names from the roster only and one the applied document's block map binds
+    const { audio, family, mapEntry } = this.#resolveBlock(eid);
+    // a block the catalog cannot place on its own: a roster-only family, a block-map binding, or no family at all
+    if (generic && !audio && (mapEntry !== undefined || family === undefined)) return this.#paramsMapped(eid, family, mapEntry);
+    const hasChannels = !!audio; // an audio block; the virtual effects have no channels A-D
     const meta = BLOCK_META[codecSlug];
-    const blockName = meta?.name ?? family ?? slug;
     const page = meta?.page ?? -1;
-    // Seed the editor-authentic layout with the family's fallback variant; once the block's CURRENT
-    // type is read below we re-resolve to the type-matched (or firmware-pinned) variant.
-    let layout = family ? this.#prof.layoutFor(family) : undefined;
-    if (!family) {
-      // no device-true param family mapped
-      return { block: blockName, slug, page, named: [], enums: [], type: null, layout, blockState: { sceneIgnore: null, bypassMode: null }, visuals: [] };
+    // no device-true param family mapped — and the classic response serves a block the block map binds the same way
+    // (nothing listed, nothing read); a roster-only family (named in the catalog) is served like any family, its
+    // writes are refused (#guardParamWrite). Known follow-up: the classic response reads a roster-only block as one
+    // slice (`hasChannels` false, no audio slug), so for a channel-bearing one it shows channel A's values; the generic
+    // response decides channels from the bulk shape (#paramsMapped).
+    if (!family || (mapEntry !== undefined && mapEntry.confidence !== 'roster')) {
+      return { block: meta?.name ?? codecSlug, slug: codecSlug, page, named: [], enums: [], type: null, layout: undefined };
     }
-    const defs = this.#prof.params[family] ?? [];
+    const slug = codecSlug || family.toLowerCase(); // virtual effects key on the family name
+    const blockName = meta?.name ?? family;
+    const forced = generic ? forcedGenericPids(family) : undefined;
+    const index = buildParamIndex(this.#prof, family, forced ? { forceGeneric: forced } : undefined);
+    // GLOBAL's body holds one record per param, not one per pid: the generic response can resolve no value from
+    // it (every one is `non-positional`), so it is not read at all. The classic response still reads it.
+    const read = generic && family === 'GLOBAL' && !hasChannels && index.positional === false
+      ? this.#unreadNonPositional(eid)
+      : await this.#readBlock(eid, family, hasChannels, index, observe);
+    const shared = { family, slug, blockName, page, hasChannels, read };
+    return generic ? this.#paramsGeneric(shared, index) : this.#paramsClassic(shared, index);
+  }
+
+  /** A block read that was skipped because its body says nothing about any pid: no values to resolve, and none
+   *  to watch for device edits. */
+  #unreadNonPositional(eid: number): BlockRead {
+    this.#nonPositional.add(eid);
+    return { values: [], channel: null, stride: 0, base: 0, positional: false };
+  }
+
+  /** The block's status (active channel) and its fn-0x1F body, sliced to the active channel. Primes the
+   *  device-edit baseline of a block whose body is indexed by param id; a family whose body is not (GLOBAL: one
+   *  record per param, in id order) has no per-param information to diff and is never watched. */
+  async #readBlock(eid: number, family: string, hasChannels: boolean, index: BlockIndex, observe = true): Promise<BlockRead> {
+    const dev = await this.#conn();
+    let channel: number | null = null;
+    try {
+      // Read the block's CURRENT channel (A-D) so a channel switch actually reloads that channel's
+      // params/type: the fn-0x1F body is channel-blocked and holds ALL channels, so we must slice the
+      // active one, not always channel A. Costs one status round-trip per open — worth it for correctness.
+      // A block without channels (the virtual effects: GLOBAL, CONTROLLERS, MODIFIER, MIDI block, FC) is one
+      // slice: its status says nothing the read needs, so it is not asked for.
+      const status = hasChannels ? (await this.#statusByEffectId()).get(eid) : undefined;
+      channel = status ? status.channel : null;
+      const activeCh = status?.channel ?? 0;
+      if (observe) this.#watchedChannel = activeCh; // keep the device-edit-burst diff on the same channel (see decodeEditBurst)
+      const frames = await this.#bulkRead(dev, eid, dev.slow ? 8000 : 2500, dev.slow ? 600 : 120);
+      const bulk = this.#codec.assembleGen3BlockBulkRead(frames);
+      const { stride, base, channelCount } = this.#channelSlice(family, bulk, activeCh, hasChannels);
+      // the channel whose values are served: the reported one, clamped onto the channels the body carries
+      if (channel !== null) channel = Math.min(channel, channelCount - 1);
+      const positional = this.#isPositional(index, bulk, stride, hasChannels);
+      if (positional) {
+        // Prime the device-edit-push baseline with the OPEN channel's values so a later front-panel
+        // edit's burst diffs cleanly to the moved param (no first-sight reload — see decodeEditBurst).
+        this.#editSnapshot.set(eid, bulk.values.slice(base, base + stride));
+        this.#nonPositional.delete(eid);
+      } else {
+        this.#nonPositional.add(eid);
+      }
+      return { values: bulk.values, channel, stride, base, positional };
+    } catch (e) {
+      return { values: null, readError: e instanceof Error ? e.message : String(e), channel, stride: 0, base: 0, positional: index.positional ?? false };
+    }
+  }
+
+  /** Is a family's body indexed by param id, i.e. does one channel slice hold every informative row? Either the
+   *  section stride the profile carries says so (the index's own answer) or the slice the reply actually shows
+   *  does: a table stride is only a hint (see #channelSlice) and may be too short for the connected firmware, and
+   *  a short body leaves the high pids `not-in-body`, not the family unreadable. A block without channels is one
+   *  slice, as wide as the body the device advertised. GLOBAL (pids up to 14879 over a 136-record body) is
+   *  neither. */
+  #isPositional(index: BlockIndex, bulk: { itemCount: number }, stride: number, hasChannels: boolean): boolean {
+    return index.positional === true || index.maxPid < Math.max(stride, hasChannels ? 0 : bulk.itemCount);
+  }
+
+  // ── blocks the catalog cannot place on its own (contract M3 §3.3/§3.4) ──
+
+  /** How a block address resolves: its audio family (the codec's block roster), else the profile's family (static
+   *  effect-id table, the block-map overlay of a confirmed binding) or the family of a roster-only entry (every reserved
+   *  instance slot of an Axe-Fx III roster family); `mapEntry` = the block-map entry of a block the catalog cannot place
+   *  on its own (`DeviceProfile.blockMapFor`), never for an audio block. */
+  #resolveBlock(eid: number): { audio: string | undefined; family: string | undefined; mapEntry: BlockMapEntry | undefined } {
+    const audio = audioFamilyOf(eid);
+    if (audio !== undefined) return { audio, family: audio, mapEntry: undefined };
+    const mapEntry = this.#prof.blockMapFor?.(eid);
+    const rosterFamily = mapEntry?.confidence === 'roster' && mapEntry.key !== null ? mapEntry.key : undefined;
+    return { audio, family: this.#prof.familyForEffectId(eid) ?? rosterFamily, mapEntry };
+  }
+
+  /**
+   * The generic response of a block the catalog cannot place on its own:
+   *   - a family the model's effect-id table names from the roster only (Axe-Fx III, FORGEFX-45): its named catalog
+   *     params, read-only (`unconfirmed-block`); not an unknown block;
+   *   - a block the applied document's block map binds `confirmed`: the params of the entry's key (generic for a
+   *     `section:<tag>` / `block:<eid>` key, named for a catalog family), writable when byte-bridged, read-only
+   *     (`live-only-block`) when known from a live read only;
+   *   - any other block without a family: matched by its bulk read against the applied document's editor-cache
+   *     sections a block may bind to (`matchBulkShape`): exactly one fits → `likely`, the section's params read-only
+   *     (`unconfirmed-block`); several → `candidates`, nothing listed; none, or no section to match → `none`, nothing
+   *     listed. Without such a section nothing is read at all.
+   * Every one carries `definitions.blockMap` (state per drivers/blockMapState.ts, the probe's availability); every one
+   * but the roster family is an `unknownBlock` named `Block <eid>`. Channels of a non-audio block come from its bulk
+   * shape (one slice or four), else from its status entry; unknown → every value `channel-unknown`.
+   */
+  async #paramsMapped(eid: number, family: string | undefined, entry: BlockMapEntry | undefined): Promise<BlockParamsV2DTO> {
+    const roster = entry?.confidence === 'roster';
+    const probe = this.#probeAvailability(eid);
+    // a known family (roster-only, or a confirmed block-map binding with rows)
+    if (family !== undefined && entry !== undefined && (roster || entry.confidence === 'confirmed')) {
+      const access = blockMapAccess(entry);
+      const forced = forcedGenericPids(family);
+      const index = buildParamIndex(this.#prof, family, forced ? { forceGeneric: forced } : undefined);
+      // a family that lists nothing (the III's IR Capture: no catalog section) has nothing a read could resolve
+      const shaped = index.entries.length === 0
+        ? { read: this.#unreadNonPositional(eid), hasChannels: false }
+        : await (async () => {
+          const raw = await this.#readRaw(eid);
+          return this.#sliceShaped(eid, raw, family, index, 'error' in raw ? null : shapeChannels(raw.bulk.itemCount, this.#prof.rangeSections[family]?.stride) ?? (raw.channel !== null ? true : null));
+        })();
+      const codecSlug = slugForEffectId(eid) ?? '';
+      const meta = BLOCK_META[codecSlug];
+      const ctx: BlockContext = roster
+        ? { family, slug: codecSlug || family.toLowerCase(), blockName: meta?.name ?? family, page: meta?.page ?? -1, hasChannels: shaped.hasChannels, read: shaped.read }
+        : { family, slug: '', blockName: `Block ${eid}`, page: -1, hasChannels: shaped.hasChannels, read: shaped.read };
+      const blockMap: BlockMapMeta = {
+        state: access.state, key: family, sectionTag: entry.sectionTag, evidence: [...entry.evidence],
+        ...(entry.candidates ? { candidates: [...entry.candidates] } : {}), probe
+      };
+      return this.#withBlockMap(this.#paramsGeneric(ctx, index), { unknown: !roster, access, blockMap });
+    }
+    // no family: the runtime bulk-shape match against the applied document's editor-cache sections
+    const sections = this.#bindableSections();
+    const persisted = entry?.confidence === 'candidate' && entry.candidates && entry.candidates.length > 0 ? entry : undefined;
+    const noInfo = (readError?: string): BlockParamsV2DTO => {
+      // a failed read says nothing new: a refusal earned by an earlier read (`likely`) stands until a read settles it
+      if (readError === undefined) this.#runtimeLikely.delete(eid);
+      const blockMap: BlockMapMeta = persisted
+        ? { state: 'candidates', key: null, sectionTag: null, evidence: [...persisted.evidence], candidates: [...persisted.candidates!], probe }
+        : { state: 'none', key: null, sectionTag: null, evidence: [], probe };
+      return this.#unknownBlockResponse(eid, blockMap, readError);
+    };
+    if (sections.length === 0) return noInfo();
+    const raw = await this.#readRaw(eid);
+    if ('error' in raw) return noInfo(raw.error);
+    const shape = this.#matchShape(raw.bulk, sections);
+    if (shape.confidence !== 'likely' || shape.sectionTag === null) {
+      this.#runtimeLikely.delete(eid);
+      const fits = shape.candidates ?? [];
+      if (fits.length === 0) return noInfo();
+      return this.#unknownBlockResponse(eid, { state: 'candidates', key: null, sectionTag: null, evidence: ['bulk-shape'], candidates: [...fits], probe });
+    }
+    const key = sections.find((s) => s.tag === shape.sectionTag)!.key;
+    this.#runtimeLikely.set(eid, shape.sectionTag);
+    const access = blockMapAccess({ confidence: 'likely', evidence: ['bulk-shape'] });
+    const index = buildParamIndex(this.#prof, key);
+    const shaped = this.#sliceShaped(eid, raw, key, index, shape.channels);
+    const ctx: BlockContext = { family: key, slug: '', blockName: `Block ${eid}`, page: -1, hasChannels: shaped.hasChannels, read: shaped.read };
+    const blockMap: BlockMapMeta = { state: access.state, key, sectionTag: shape.sectionTag, evidence: ['bulk-shape'], probe };
+    return this.#withBlockMap(this.#paramsGeneric(ctx, index), { unknown: true, access, blockMap });
+  }
+
+  /** The runtime bulk-shape match of a block's body against editor-cache sections (`matchBulkShape`: a section's rows
+   *  are the applied document's own rows of its key) under the model's catalog. */
+  #matchShape(bulk: { itemCount: number; values: readonly number[] }, sections: readonly DerivedSection[]): ReturnType<typeof matchBulkShape> {
+    const keyOf = new Map(sections.map((s) => [s.tag, s.key] as const));
+    const docRows = this.#prof.profileFacts?.ranges ?? {};
+    const enumRaw = new Map(bulk.values.map((v, i) => [i, v] as const));
+    const rowsOf = (tag: number): ReadonlyMap<number, CodecRangeDef> =>
+      new Map(Object.entries(docRows[keyOf.get(tag) ?? ''] ?? {}).map(([pid, row]) => [Number(pid), row] as const));
+    return matchBulkShape(bulk.itemCount, enumRaw, sections, rowsOf, profileCatalogFor(this.#prof.model));
+  }
+
+  /** The block probe's sizing read (services/blockProbe.ts): the editor-cache sections of the applied document a placed
+   *  block's bulk read fits (`matchBulkShape` — one for `likely`, several for `candidates`, none), with their strides.
+   *  Null when the applied profile has no section a block may bind to (nothing is read then); empty when the read
+   *  failed or nothing fits. One status + bulk read. */
+  async probeShape(eid: number): Promise<Array<{ tag: number; stride: number }> | null> {
+    const sections = this.#bindableSections();
+    if (sections.length === 0) return null;
+    const raw = await this.#readRaw(eid);
+    if ('error' in raw) return [];
+    const shape = this.#matchShape(raw.bulk, sections);
+    const tags = shape.confidence === 'likely' && shape.sectionTag !== null ? [shape.sectionTag] : shape.candidates ?? [];
+    return tags.map((tag) => ({ tag, stride: sections.find((s) => s.tag === tag)!.stride }));
+  }
+
+  /** The generic response of a block that lists nothing (no family, or nothing to bind it to). */
+  #unknownBlockResponse(eid: number, blockMap: BlockMapMeta, readError?: string): BlockParamsV2DTO {
+    return {
+      block: `Block ${eid}`, slug: '', page: -1, named: [], enums: [], type: null, unknownBlock: true,
+      definitions: { family: null, profile: 'none', positional: false, channel: null, persistentWrites: false, hidden: [], blockMap },
+      ...(readError !== undefined ? { readError } : {})
+    };
+  }
+
+  /** A generic response of a block-map block: the block-level write mode (a read-only binding serves every param with
+   *  `write: null` and the block's reason), `unknownBlock` for a block without a catalog family, and
+   *  `definitions.blockMap`. */
+  #withBlockMap(res: BlockParamsV2DTO, o: { unknown: boolean; access: BlockMapAccess; blockMap: BlockMapMeta }): BlockParamsV2DTO {
+    const reason = o.access.writable ? undefined : o.access.readOnlyReason ?? 'unconfirmed-block';
+    const readOnly = <T extends NamedParamV2 | EnumParamV2>(p: T): T => (reason ? { ...p, write: null, readOnlyReason: reason } : p);
+    const { block, slug, page, named, enums, type, layout, definitions, readError } = res;
+    return {
+      block, slug, page, named: named.map(readOnly), enums: enums.map(readOnly), type,
+      ...(o.unknown ? { unknownBlock: true as const } : {}),
+      ...(layout ? { layout } : {}),
+      definitions: { ...definitions, blockMap: o.blockMap },
+      ...(readError !== undefined ? { readError } : {})
+    };
+  }
+
+  /** The applied document's editor-cache sections a block may bind to (`blockBindableSection` under the model's
+   *  catalog: unassigned ones, and those of catalog families without an effect id). Empty without a profile document. */
+  #bindableSections(): DerivedSection[] {
+    const all = this.#prof.profileFacts?.byteSections ?? [];
+    if (all.length === 0) return [];
+    const firstEid = profileCatalogFor(this.#prof.model).familyFirstEid;
+    return all.filter((s) => blockBindableSection(s, firstEid));
+  }
+
+  /** Whether the block probe would read `eid` now (`definitions.blockMap.probe`), by the route's own rules
+   *  (services/blockProbe.ts): never for a block the bundled catalog places (`catalogFamilyOfBlock`: the route's
+   *  409 `known-block`, a roster-only family included; no reason); else the probe gate of the running firmware — and
+   *  above effect id 160 the above-160 gate too — (`not-verified`), then the edit-buffer grid as last read
+   *  (`not-placed`; known follow-up: like the route, it trusts the last read, which a front-panel change can make
+   *  stale). No device traffic. */
+  #probeAvailability(eid: number): BlockMapMeta['probe'] {
+    if (catalogFamilyOfBlock(this.#prof.model, eid) !== undefined) return { available: false };
+    const gates = this.#ctx.walkScope?.();
+    const gated = gates?.blockProbe === true && (eid <= LIVE_WALK_LIMITS.standardMaxBlock || gates.above160 === true);
+    if (!gated) return { available: false, reason: 'not-verified' };
+    if (!(this.placedEffectIds() ?? []).includes(eid)) return { available: false, reason: 'not-placed' };
+    return { available: true };
+  }
+
+  /** One block's status entry (its active channel, null when the status names none) and its fn-0x1F body, unsliced.
+   *  The read the block-map blocks share; a failed bulk read comes back as `error`. */
+  async #readRaw(eid: number): Promise<{ bulk: { itemCount: number; values: number[] }; channel: number | null } | { error: string }> {
+    try {
+      const dev = await this.#conn();
+      const status = (await this.#statusByEffectId()).get(eid);
+      const frames = await this.#bulkRead(dev, eid, dev.slow ? 8000 : 2500, dev.slow ? 600 : 120);
+      const bulk = this.#codec.assembleGen3BlockBulkRead(frames);
+      return { bulk: { itemCount: bulk.itemCount, values: [...bulk.values] }, channel: status ? status.channel : null };
+    } catch (e) {
+      return { error: e instanceof Error ? e.message : String(e) };
+    }
+  }
+
+  /** A raw block read sliced for `family`: `channels` true = four channel slices (the status channel's is served;
+   *  unknown channel → `channel-unknown`), false = one slice, null = unknown (every value `channel-unknown`). Primes the
+   *  device-edit baseline like #readBlock. */
+  #sliceShaped(
+    eid: number,
+    raw: { bulk: { itemCount: number; values: number[] }; channel: number | null } | { error: string },
+    family: string, index: BlockIndex, channels: boolean | null
+  ): { read: BlockRead; hasChannels: boolean } {
+    const hasChannels = channels !== false;
+    if ('error' in raw) return { read: { values: null, readError: raw.error, channel: null, stride: 0, base: 0, positional: index.positional ?? false }, hasChannels };
+    const { bulk } = raw;
+    const activeCh = channels === true ? raw.channel ?? 0 : 0;
+    this.#watchedChannel = activeCh;
+    const { stride, base, channelCount } = this.#channelSlice(family, bulk, activeCh, channels === true);
+    const channel = channels === true && raw.channel !== null ? Math.min(raw.channel, channelCount - 1) : null;
+    const positional = this.#isPositional(index, bulk, stride, hasChannels);
+    if (positional) {
+      this.#editSnapshot.set(eid, bulk.values.slice(base, base + stride));
+      this.#nonPositional.delete(eid);
+    } else {
+      this.#nonPositional.add(eid);
+    }
+    return { read: { values: bulk.values, channel, stride, base, positional }, hasChannels };
+  }
+
+  /** The classic response (see blockParams). */
+  #paramsClassic(c: BlockContext, index: BlockIndex): BlockParamsDTO {
+    const { family, slug, hasChannels, read } = c;
     // knobs = every continuous param with a usable range: a float-kind range AND a continuous catalog
     // unit (KNOB_UNITS; this keeps selectors that carry a float-typed range record out of the dial
     // list). We expose ALL real controls (the UI organizes them); besides that only genuinely-dead
@@ -1158,98 +1787,91 @@ class Gen3Driver implements DeviceDriver {
     const knobs = knobParams(this.#prof, family);
     // enums = every discrete selector. The family TYPE selector is excluded (header retype palette),
     // plus the raw bypass flag; everything else (modes, slopes, mics, mic/cab pickers…) is shown, and so
-    // are the float-row selectors (enumParams: the III's GLOBALMIX toggles).
-    const typeSel = this.#typeSelector(family, slug);
-    const typeId = typeSel.id;
-    const enumDefs = enumParams(this.#prof, family, typeId);
+    // are the float-row selectors (enumParams: the III's GLOBALMIX toggles). The entry set stays the
+    // catalog's; the type VALUE is read where the type selector sits on the connected device (it follows its
+    // name when the row moved, the pid setType writes), else at the catalog's pid.
+    const catalogTypeId = typeSelectorPid(this.#prof, family);
+    const typeId = index.typePid ?? catalogTypeId;
+    const enumDefs = enumParams(this.#prof, family, catalogTypeId);
     const named: NamedParam[] = [];
     const enums: EnumParam[] = [];
     let type: { value: number; name: string } | null = null;
-    let readOk = false; // the bulk read decoded (else the values above are a zeroed fallback)
-    // Layout-variant key of a family whose '…TYPE' fallback was skipped (no roster — see #typeSelector).
-    // Where the family has a `<FAM>_BASETYPE` selector it IS the variant key (MULTITAP algorithm, PLEX
-    // base type — the variants are valued by it), so the variant follows its live value. Otherwise the
-    // pick the old fallback always made is kept: it decoded as ordinal 0 on every read (FORGEFX-56).
-    let legacyLayoutType: number | undefined;
-    {
-      const dev = await this.#conn();
-      try {
-        // Read the block's CURRENT channel (A-D) so a channel switch actually reloads that channel's
-        // params/type: the fn-0x1F body is channel-blocked and holds ALL channels, so we must slice the
-        // active one, not always channel A. Costs one status round-trip per open — worth it for correctness.
-        const activeCh = (await this.#statusByEffectId()).get(eid)?.channel ?? 0;
-        if (observe) this.#watchedChannel = activeCh; // keep the device-edit-burst diff on the same channel (see decodeEditBurst)
-        const frames = await this.#bulkRead(dev, eid, dev.slow ? 8000 : 2500, dev.slow ? 600 : 120);
-        const bulk = this.#codec.assembleGen3BlockBulkRead(frames);
-        const { stride, base } = this.#channelSlice(family, bulk, activeCh, hasChannels);
-        // Prime the device-edit-push baseline with the OPEN channel's values so a later front-panel
-        // edit's burst diffs cleanly to the moved param (no first-sight reload — see decodeEditBurst).
-        this.#editSnapshot.set(eid, bulk.values.slice(base, base + stride));
-        for (const p of knobs) {
-          const raw = bulk.values[base + p.paramId] ?? 0;
-          named.push({ id: p.paramId, name: paramLabel(p), ...this.#display(family, p.paramId, raw) });
-        }
-        for (const p of enumDefs) {
-          const range = this.#prof.ranges[family]![p.paramId]!;
-          const max = Math.round(range.displayMax);
-          const min = Math.round(range.displayMin);
-          const raw = bulk.values[base + p.paramId] ?? 0;
-          // An enum-KIND row stores the ordinal; if the wire value looks 16-bit-scaled, unscale it. A FLOAT
-          // row (the float-row selectors admitted by enumParams) always carries the normalized raw/65534
-          // value, so it is always scaled onto the label range: guessing "ordinal or scaled" there would
-          // read raw 1 (~0.0) as ON. Midpoint: raw 32767 (exactly 0.5) rounds up, like Math.round does
-          // for the rest of the decode.
-          const value =
-            range.kind === 'float'
-              ? Math.min(max, Math.max(min, Math.round((raw / 65534) * (max - min)) + min))
-              : raw > max ? Math.round((raw / 65534) * (max - min)) + min : raw;
-          enums.push({ id: p.paramId, name: paramLabel(p), value, options: this.#enumOptions(family, p.paramId, p.name, min, max) });
-        }
-        // current model/type (for EQ band layout etc.)
-        if (typeId != null) {
-          const roster = this.#prof.rosterFor(slug);
-          const max = Math.max(0, roster.length - 1);
-          const raw = bulk.values[base + typeId] ?? 0;
-          const tv = raw > max ? Math.round((raw / 65534) * max) : raw;
-          type = { value: tv, name: roster[tv]?.name ?? '' };
-        } else if (typeSel.skippedFallback) {
-          const baseTypeId = this.#paramId(family, `${family}_BASETYPE`);
-          const baseType = baseTypeId != null ? enums.find((e) => e.id === baseTypeId) : undefined;
-          legacyLayoutType = baseType ? baseType.value : 0;
-        }
-        readOk = true;
-      } catch {
-        named.length = 0; // a mid-loop throw left partial data — reset before the zeroed fallback
-        for (const p of knobs) named.push({ id: p.paramId, name: paramLabel(p), value: 0, norm: 0 });
+    if (read.values) {
+      const values = read.values;
+      // The number a param gets even when the read has nothing for it: the classic response falls back to
+      // whatever sits at the slot, else 0, and the entry says so through `unresolved`.
+      const rawOf = (slot: number | UnresolvedReason, pid: number): number => (typeof slot === 'number' ? slot : (values[read.base + pid] ?? 0));
+      for (const p of knobs) {
+        const slot = readSlot(read, hasChannels, p.paramId);
+        const raw = rawOf(slot, p.paramId);
+        const item: NamedParam = { id: p.paramId, name: paramLabel(p), ...this.#display(family, p.paramId, raw) };
+        const why = typeof slot === 'string' ? slot : raw > 65534 ? 'out-of-range' : undefined;
+        if (why) item.unresolved = why;
+        named.push(item);
       }
+      for (const p of enumDefs) {
+        const range = this.#prof.ranges[family]![p.paramId]!;
+        const slot = readSlot(read, hasChannels, p.paramId);
+        const dec = decodeSelector(range, rawOf(slot, p.paramId));
+        const item: EnumParam = {
+          id: p.paramId, name: paramLabel(p), value: dec.value,
+          options: this.#enumOptions(family, p.paramId, p.name, dec.lo, dec.hi)
+        };
+        const why = typeof slot === 'string' ? slot : dec.inRange ? undefined : 'out-of-range';
+        if (why) item.unresolved = why;
+        enums.push(item);
+      }
+      // current model/type (for EQ band layout etc.)
+      if (typeId != null) {
+        const roster = this.#prof.rosterFor(slug);
+        const max = Math.max(0, roster.length - 1);
+        const raw = rawOf(readSlot(read, hasChannels, typeId), typeId);
+        const tv = raw > max ? Math.round((raw / 65534) * max) : raw;
+        type = { value: tv, name: roster[tv]?.name ?? '' };
+      }
+    } else {
+      // the read failed: dials at rest (the selectors cannot be told apart from a lost read, so none are listed)
+      for (const p of knobs) named.push({ id: p.paramId, name: paramLabel(p), value: 0, norm: 0, unresolved: 'read-failed' });
     }
     // Current value of any page/control selector param, keyed by its editor symbol: the family type
-    // selector answers with the type just decoded; other selectors (EQ type, drive type, …) with the
-    // block's read enum/knob value. Lets layoutFor filter the served pages down to the ones the editor
-    // would actually show — collapsing e.g. the amp's per-model 'Authentic' pages to the current model.
-    const valueByPid = new Map<number, number>();
-    for (const e of enums) valueByPid.set(e.id, e.value);
-    for (const n of named) if (typeof n.value === 'number') valueByPid.set(n.id, n.value);
+    // selector answers with the type just decoded; a selector listed as an enum with the ordinal it decoded;
+    // every other selector (listed as a dial or not listed at all: REVERB_BASETYPE, a `count` float row this
+    // response never lists) with the ordinal read from its raw body value (selectorOrdinal) — never a dial's
+    // display value, which no editor `value` list names. Lets layoutFor filter the served pages down to the
+    // ones the editor would actually show — collapsing e.g. the amp's per-model 'Authentic' pages to the
+    // current model.
+    const enumValueByPid = new Map<number, number>();
+    for (const e of enums) enumValueByPid.set(e.id, e.value);
+    const selectorAt = (pid: number): number | undefined => {
+      if (enumValueByPid.has(pid)) return enumValueByPid.get(pid);
+      const slot = readSlot(read, hasChannels, pid);
+      return typeof slot === 'number' ? selectorOrdinal(this.#prof.ranges[family]?.[pid], slot) : undefined;
+    };
     const selectors: SelectorValues = (selectorParamName) => {
-      const pid = this.#paramId(family, selectorParamName);
+      const pid = this.#paramId(family, selectorParamName); // a catalog pid
       if (pid == null) return undefined;
-      if (typeId != null && pid === typeId) return type?.value;
-      return valueByPid.get(pid);
+      if (pid === catalogTypeId) return type?.value;
+      return selectorAt(pid);
     };
     // Re-resolve the layout to the variant selected by the block's CURRENT type value (EQ band count,
-    // amp firmware-pinned variant, etc.) and filter its pages to the current selector/firmware state;
-    // falls back to the null/first variant when type is unknown.
-    layout = this.#prof.layoutFor(family, type?.value ?? legacyLayoutType, selectors);
+    // amp firmware-pinned variant, etc.) and filter its pages to the current selector/firmware state. A family
+    // without a type selector is told apart by its variant selector instead (the cab's Legacy / DynaCab mode,
+    // the plex's base type); a variant folded from another selector (the Delay's DELAY_TYPE) is keyed by that
+    // selector's value; falls back to the null/first variant when the value is unknown. Firmware gates are
+    // evaluated against the connected firmware (the newest when it is not known).
+    const variantPid = variantSelectorPid(this.#prof, family);
+    const variantValue = typeId != null ? type?.value : variantPid != null ? selectorAt(variantPid) : undefined;
+    const layout = this.#prof.layoutFor(family, variantValue, selectors, this.#layoutFirmware());
     // disambiguate repeated labels within a block (e.g. the cab's 4× "Low Cut", amp's two "Depth")
     // so identical names get a 1/2/3 suffix the UI can tell apart.
     dedupeLabels(named);
     dedupeLabels(enums);
     // a failed read is not "the block has none": flag it, so the client says the block could not be read
-    const blockState: BlockStateDTO = readOk ? this.#blockState(family, enums) : { sceneIgnore: null, bypassMode: null, readError: true };
+    const blockState: BlockStateDTO = !read.readError ? this.#blockState(family, enums) : { sceneIgnore: null, bypassMode: null, readError: true };
     // ADDITIVE: the read-only displays this block can show, narrowed to its current type/variant (see
-    // blockVisualsFor). Last key, so existing response consumers see the same leading shape.
+    // blockVisualsFor). Last keys, so existing response consumers see the same leading shape.
     const visuals = blockVisualsFor(this.#prof, family, layout, [...named.map((n) => n.id), ...enums.map((e) => e.id)]);
-    return { block: blockName, slug, page, named, enums, type, layout, blockState, visuals };
+    return { block: c.blockName, slug, page: c.page, named, enums, type, layout, blockState, visuals };
   }
 
   /** Tag the block's Scene Ignore + Bypass Mode (additive `blockState`, capability `blockState`). WHICH param
@@ -1267,7 +1889,7 @@ class Gen3Driver implements DeviceDriver {
         paramId: si.paramId,
         value: siEnum.value,
         supported,
-        ...(supported || !si.minFw ? {} : { reason: `Needs firmware ≥ ${formatBlockStateFirmware(si.minFw)}` })
+        ...(supported || !si.minFw ? {} : { reason: `Needs firmware = ${formatBlockStateFirmware(si.minFw)}` })
       };
     }
     let bypassMode: BlockStateDTO['bypassMode'] = null;
@@ -1281,6 +1903,211 @@ class Gen3Driver implements DeviceDriver {
       };
     }
     return { sceneIgnore, bypassMode };
+  }
+
+  /** The generic response (see blockParams): one item per index entry, in index order. */
+  #paramsGeneric(c: BlockContext, index: BlockIndex): BlockParamsV2DTO {
+    const { family, slug, hasChannels, read } = c;
+    const named: NamedParamV2[] = [];
+    const enums: EnumParamV2[] = [];
+    const enumValueByPid = new Map<number, number>();
+    const catalogRows = (this.#prof.staticBase ?? this.#prof).ranges[family] ?? {};
+    for (const e of index.entries) {
+      const slot = readSlot(read, hasChannels, e.pid);
+      const meta = paramMetaOf(e);
+      if (e.list === 'named') {
+        const why = typeof slot === 'string' ? slot : slot > 65534 ? 'out-of-range' : undefined;
+        // no reading: the row's facts alone
+        const d = this.#displayRow(e.row, e.def?.unit, why ? 0 : (slot as number), { fromProfile: e.source === 'profile', catalogRow: catalogRows[e.pid] });
+        named.push({
+          id: e.pid, name: e.name,
+          value: why ? null : d.value, norm: why ? null : d.norm,
+          ...(d.unit !== undefined ? { unit: d.unit } : {}),
+          ...(d.unitSource !== undefined ? { unitSource: d.unitSource } : {}),
+          ...(d.min !== undefined ? { min: d.min } : {}),
+          ...(d.max !== undefined ? { max: d.max } : {}),
+          ...(d.log ? { log: true } : {}),
+          ...(d.taperSource !== undefined ? { taperSource: d.taperSource } : {}),
+          ...meta,
+          ...(why ? { unresolved: why } : {}),
+        });
+      } else {
+        const dec = decodeSelector(e.row, typeof slot === 'number' ? slot : 0);
+        const why = typeof slot === 'string' ? slot : dec.inRange ? undefined : 'out-of-range';
+        const { lo, hi } = e.options!;
+        const opts = buildEnumOptions(lo, hi, e.labels, e.def ? resolveEnumValues(e.def.name)?.values : undefined);
+        enums.push({
+          id: e.pid, name: e.name, value: why ? null : dec.value, options: opts.options,
+          ...meta,
+          ...(opts.truncated ? { optionsTruncated: true as const } : {}),
+          ...(why ? { unresolved: why } : {}),
+        });
+        if (!why) enumValueByPid.set(e.pid, dec.value);
+      }
+    }
+    // the type selector is hidden from the lists (the header retype palette shows it): read it on its own
+    let type: { value: number; name: string } | null = null;
+    const typeId = index.typePid;
+    if (typeId != null) {
+      const slot = readSlot(read, hasChannels, typeId);
+      if (typeof slot === 'number') {
+        const roster = this.#prof.rosterFor(slug);
+        const max = Math.max(0, roster.length - 1);
+        const tv = slot > max ? Math.round((slot / 65534) * max) : slot;
+        type = { value: tv, name: roster[tv]?.name ?? '' };
+      }
+    }
+    // The catalog symbols of the editor layout resolve to the pids that carry those names on this device: a name
+    // that moved with its row follows it (listed or hidden, the type selector too), a name the device no longer
+    // has resolves to nothing.
+    const served = (catalogPid: number | undefined): number | undefined => (catalogPid === undefined ? undefined : index.namedAt.get(catalogPid));
+    // A selector served as an enum keys by the ordinal it decoded (none when its reading is unresolved); any other
+    // one — a listed dial or a hidden row — by the ordinal read from its raw body value (selectorOrdinal), never by a
+    // dial's display value: the device reads REVERB_BASETYPE raw 6 (base type 6), which the dial shows as 0.0007.
+    const selectorAt = (pid: number): number | undefined => {
+      const entry = index.byPid.get(pid);
+      if (entry?.list === 'enums') return enumValueByPid.get(pid);
+      const slot = readSlot(read, hasChannels, pid);
+      return typeof slot === 'number' ? selectorOrdinal(entry?.row ?? this.#prof.ranges[family]?.[pid], slot) : undefined;
+    };
+    const selectors: SelectorValues = (selectorParamName) => {
+      const pid = served(this.#paramId(family, selectorParamName));
+      if (pid == null) return undefined;
+      if (typeId != null && pid === typeId) return type?.value;
+      return selectorAt(pid);
+    };
+    const variantValue = typeId != null ? type?.value : index.variantPid != null ? selectorAt(index.variantPid) : undefined;
+    let layout = this.#prof.layoutFor(family, variantValue, selectors, this.#layoutFirmware());
+    if (layout) layout = this.#servedLayout(layout, family, index);
+    dedupeLabels(named);
+    dedupeLabels(enums);
+    return {
+      block: c.blockName, slug, page: c.page, named, enums, type,
+      ...(layout ? { layout } : {}),
+      definitions: {
+        family,
+        profile: index.profile,
+        ...(index.suspect ? { suspect: true as const } : {}),
+        positional: read.positional,
+        channel: read.channel,
+        persistentWrites: family === 'GLOBAL' || family === 'FC',
+        hidden: index.hidden.map((h) => ({ id: h.id, reason: h.reason })),
+      },
+      ...(read.readError !== undefined ? { readError: read.readError } : {}),
+    };
+  }
+
+  /** The firmware the editor layouts' firmware gates are evaluated against: the registry's layout firmware (the running
+   *  firmware, else the last one this connected unit reported: a later re-read that got no answer does not flip the
+   *  layouts to the newest firmware mid-session), else the running firmware for a ctx without it; null (the newest
+   *  firmware) when none was read. */
+  #layoutFirmware(): LayoutFirmware {
+    return this.#ctx.getLayoutFirmware ? this.#ctx.getLayoutFirmware() : this.#ctx.getFirmware?.() ?? null;
+  }
+
+  /** The generic response's layout: the editor layout with its controls bound to the params the connected device
+   *  serves (the classic response keeps the editor layout as it is). A control names its param in the family that
+   *  owns it: its cross-block reference's family (`crossBlock.family`), else the layout's own family.
+   *  - A button control (`<F>_BTN_<X><n>`, an editor pseudo id) gains `boundParamId`: the served param it presses.
+   *  - A control whose catalog name now sits at another pid of the owning family (the name followed its row) is
+   *    pointed there: `paramId` becomes that pid and `movedFrom` keeps the catalog pid; a cross-block reference's
+   *    `paramId` follows along. The owning family's own param index decides: the REFERENCED family's `namedAt` for a
+   *    control that addresses another block (FORGEFX-48).
+   *  - A control whose catalog name the device does not serve any more although the catalog has a device-mined row
+   *    for it (a byte-exact profile dropped it, or a shift left its name without a unique row) keeps its `paramId`
+   *    and is marked `unbound`, so it is not written to whatever sits at that pid now. Display-only controls
+   *    (meters, readouts, labels, graphs) and rows the catalog made up from inline bounds are never unbound.
+   *  - Every cross-block reference gains `crossBlock.effectId`: the effect id of the block that owns the referenced
+   *    param on this device (#crossBlockOwners), or null where there is none to address (modifier slots, preset-level
+   *    data, a family without an effect id, an instance the device does not have). A write to that block keeps every
+   *    guard its own address has (GLOBAL's setup writes are persistent; #guardParamWrite).
+   *  A reference that did not resolve to a family, a reference into another family that does not name that family's
+   *  catalog param at its catalog pid, pseudo ids and names that did not move keep their binding. Every control that
+   *  changes is a copy; the profile's layout objects are never modified. */
+  #servedLayout(layout: DeviceLayout, family: string, index: BlockIndex): DeviceLayout {
+    type Owner = { index: BlockIndex; defByName: ReadonlyMap<string, ParamDef>; catalogRows: Readonly<Record<number, RangeDef>> };
+    const owners = new Map<string, Owner | null>();
+    const ownerOf = (fam: string): Owner | null => {
+      let o = owners.get(fam);
+      if (o !== undefined) return o;
+      const defs = this.#prof.params[fam] ?? [];
+      if (fam !== family && defs.length === 0) o = null; // no catalog family of this device (PRESET)
+      else {
+        const defByName = new Map<string, ParamDef>();
+        for (const d of defs) if (!defByName.has(d.name)) defByName.set(d.name, d);
+        o = { index: fam === family ? index : buildParamIndex(this.#prof, fam), defByName, catalogRows: (this.#prof.staticBase ?? this.#prof).ranges[fam] ?? {} };
+      }
+      owners.set(fam, o);
+      return o;
+    };
+    let ownerEid: ((ref: CrossBlockRefKey) => number | null) | undefined;
+    const bound = (c: DeviceLayoutControl): DeviceLayoutControl => {
+      if (!c.paramName) return c;
+      const button = BUTTON_SYMBOL.exec(c.paramName);
+      if (button) {
+        const catalogPid = ownerOf(family)!.defByName.get(`${button[1]}_${button[2]}`)?.paramId;
+        const at = catalogPid === undefined ? undefined : index.namedAt.get(catalogPid);
+        return at !== undefined && index.byPid.has(at) ? { ...c, boundParamId: at } : c;
+      }
+      const ownerFamily = c.crossBlock ? c.crossBlock.family : family;
+      if (ownerFamily === null) return c; // a reference that did not resolve names no param of ours
+      const owner = ownerOf(ownerFamily);
+      if (!owner) return c;
+      if (c.paramId == null || c.paramId > MAX_WIRE_PID) return c;
+      const def = owner.defByName.get(c.crossBlock?.paramName ?? c.paramName);
+      if (!def || def.paramId > MAX_WIRE_PID) return c; // not a symbol of the owning family
+      // a reference into another family is followed only where it names that family's catalog param at its catalog pid
+      if (ownerFamily !== family && (c.crossBlock!.paramId ?? c.paramId) !== def.paramId) return c;
+      const at = owner.index.namedAt.get(def.paramId);
+      if (at === def.paramId) return c;
+      if (at !== undefined) {
+        const crossBlock = c.crossBlock && c.crossBlock.paramId === def.paramId ? { crossBlock: { ...c.crossBlock, paramId: at } } : {};
+        return { ...c, paramId: at, movedFrom: def.paramId, ...crossBlock };
+      }
+      // Only a row the catalog mined from the device proves the param existed: a row the III table made up from
+      // inline bounds (synthetic) is not in any device cache, so its absence from the profile says nothing (the
+      // gain-reduction meters). A control that only displays something writes nothing to protect.
+      const row = owner.catalogRows[def.paramId];
+      return row && isInformativeRow(row) && !row.synthetic && !DISPLAY_ONLY_WIDGETS.has(c.widget) ? { ...c, unbound: true } : c;
+    };
+    return mapLayoutControls(layout, (c) => {
+      const out = bound(c);
+      if (!out.crossBlock) return out;
+      ownerEid ??= this.#crossBlockOwners();
+      return { ...out, crossBlock: { ...out.crossBlock, effectId: ownerEid(out.crossBlock) } };
+    });
+  }
+
+  /** The owning effect id of a layout's cross-block reference on this device (codec `crossBlockEffectId`:
+   *  `firstId(family) + instance - 1` from the reference's `ID_<SYMBOL><n>` token), over a table of THIS device: the
+   *  model's own first effect ids (profileCatalogFor: FM3, FM9 and Axe-Fx III each their own table, the virtual blocks
+   *  GLOBAL 1 / CONTROLLERS 2 / FC 199 included, the development hook's hidden family left out), plus every catalog
+   *  family that table gives no effect id but the applied profile's block map binds `confirmed` (first id = its
+   *  lowest bound effect id, instances = the run of consecutive bound ids from there). The instance must exist on the
+   *  device: at most the model's instance count of the family (`instanceLimits`, 1 when unlisted) and never beyond
+   *  the effect-id span the gen-3 roster reserves for it (`gen3RosterSpan`). MOD (modifier slots) and PRESET
+   *  (preset-level data) references, a reference without a family, a family without an effect id and an instance
+   *  beyond the device's count resolve to null. Pure apart from reading the profile. */
+  #crossBlockOwners(): (ref: CrossBlockRefKey) => number | null {
+    const catalog = profileCatalogFor(this.#prof.model);
+    const first: Record<string, number | null> = { ...(catalog.familyFirstEid ?? {}) };
+    const counts: Record<string, number> = { ...(catalog.instanceLimits ?? {}) };
+    const mapped = new Map<string, number[]>();
+    for (const eid of this.#prof.profileFacts?.confirmedBlocks ?? []) {
+      const key = this.#prof.familyForEffectId(eid);
+      if (key === undefined || isSyntheticFamilyKey(key) || first[key] != null) continue; // the static table places it
+      let eids = mapped.get(key);
+      if (!eids) mapped.set(key, (eids = []));
+      eids.push(eid);
+    }
+    for (const [key, eids] of mapped) {
+      eids.sort((a, b) => a - b);
+      let n = 1;
+      while (eids.includes(eids[0]! + n)) n++;
+      first[key] = eids[0]!;
+      counts[key] = n;
+    }
+    return (ref) => crossBlockEffectId(ref, first, ref.family !== null ? counts[ref.family] ?? 1 : 1, gen3RosterSpan);
   }
 
   /** Read specific paramIds of an effect via per-pid fn 0x01 GET (sub 01 00) — the path FM3-Edit
@@ -1607,7 +2434,8 @@ class Gen3Driver implements DeviceDriver {
           const d = this.#display(family, id, bulk.values[base + id] ?? 0);
           vals[id] = { norm: d.norm, value: d.value, unit: d.unit, min: d.min, max: d.max, log: d.log };
         }
-        const typeId = this.#typeSelector(family, slug).id;
+        // the type selector where it sits on the connected device (see #paramsClassic), else the catalog's pid
+        const typeId = buildParamIndex(this.#prof, family).typePid ?? typeSelectorPid(this.#prof, family);
         if (typeId != null) {
           const roster = this.#prof.rosterFor(slug);
           const tmax = Math.max(0, roster.length - 1);
@@ -1683,10 +2511,12 @@ class Gen3Driver implements DeviceDriver {
     return out;
   }
 
-  /** Looper page telemetry: the live waveform envelope + playhead position + level (FM3 capture 2026-07-04;
-   *  gen-3 shared). Waveform = fn 0x01 sub 0x23 (~595 raw 7-bit magnitudes → 0..1); position = sub 0x19
-   *  pid 14 (0..1 across the loop); level = sub 0x19 pid 22. Returns empty with NO device I/O when the
-   *  block isn't a looper, so Axis can poll it for whatever block is open without cost. */
+  /** Looper page telemetry: the live waveform envelope + playhead position + level (gen-3 shared).
+   *  Waveform = fn 0x01 sub 0x23 at curve slot 0: the same 609-byte container as the block graph curves,
+   *  decoded to 128 envelope magnitudes. Those are device values whose envelope can exceed 1 (observed
+   *  up to ~2.17), so each is clamped to 0..1 for this method's HTTP contract. Position = sub 0x19 pid 14
+   *  (0..1 across the loop); level = sub 0x19 pid 22. Returns empty with NO device I/O when the block
+   *  isn't a looper, so Axis can poll it for whatever block is open without cost. */
   async looperTelemetry(eid: number): Promise<{ wave: number[]; position: number | null; level: number | null }> {
     if (slugForEffectId(eid) !== 'looper') return { wave: [], position: null, level: null };
     const dev = await this.#conn();
@@ -1697,7 +2527,7 @@ class Gen3Driver implements DeviceDriver {
     try {
       const wf = await dev.request(buildLooperWaveformPoll(eid, model), { timeoutMs: 900, quietMs: 60, routine: true, match: (fs) => fs.some((f) => isLooperWaveformResponse(f, eid)) });
       const r = wf.find((f) => isLooperWaveformResponse(f, eid));
-      if (r) wave = parseLooperWaveform(r);
+      if (r) wave = parseLooperWaveform(r).map((v) => Math.max(0, Math.min(1, v)));
     } catch { /* no waveform this tick */ }
     for (const [pid, isPos] of [[14, true], [22, false]] as const) {
       try {
@@ -1727,51 +2557,85 @@ class Gen3Driver implements DeviceDriver {
     return { ok: true };
   }
 
-  /** Build dropdown options for an enum param. Labels come from fractal-midi's enum overlay
-   * (matched by device param name) where known; otherwise the bare ordinal. */
-  #enumOptions(family: string, paramId: number, name: string, min: number, max: number): { value: number; label: string }[] {
-    const cache = this.#prof.enumLabelsFor(family, paramId); // device-true labels from the editor cache
-    const ov = resolveEnumValues(name); // III overlay fallback
-    const out: { value: number; label: string }[] = [];
-    for (let v = min; v <= max && out.length < 128; v++) {
-      out.push({ value: v, label: cache?.[v] ?? ov?.values?.[v] ?? String(v) });
+  /** One page's device-rendered graph curve (fn 0x01 sub 0x23): the block page asks for it on a state
+   *  change (page open, parameter echo, type/zoom), NOT on a timer. The reply is a fixed container whose
+   *  declared byte count sizes it (a full-size curve is 609 bytes = 128 float32 magnitudes). Null when no
+   *  reply matched; a frame for another block/slot is ignored by the matcher. */
+  async blockCurve(eid: number, slot: number): Promise<{ eid: number; slot: number; values: number[] } | null> {
+    if (!Number.isInteger(slot) || slot < 0 || slot >= GRAPH_CURVE_SLOTS) {
+      throw new Error(`curve slot ${slot} out of range 0..${GRAPH_CURVE_SLOTS - 1}`);
     }
-    return out;
+    const dev = await this.#conn();
+    const frames = await dev.request(buildGraphCurvePoll(eid, slot, this.#prof.model), {
+      timeoutMs: 900, quietMs: 60, routine: true,
+      match: (fs) => fs.some((f) => isGraphCurveResponse(f, eid, slot))
+    });
+    const r = frames.find((f) => isGraphCurveResponse(f, eid, slot));
+    if (!r) return null;
+    return { eid, slot, values: parseGraphCurve(r) };
+  }
+
+  /** Build dropdown options for the enum param over the ordinals `min..max`. A label is the device's own list
+   * (the editor cache) at `v - min`, else fractal-midi's enum overlay (matched by device param name) where
+   * known, else the bare ordinal. */
+  #enumOptions(family: string, paramId: number, name: string, min: number, max: number): EnumOption[] {
+    return buildEnumOptions(min, max, this.#prof.enumLabelsFor(family, paramId), resolveEnumValues(name)?.values).options;
   }
 
   /** Map a raw 0..65534 wire value to {value, norm, unit, min, max, log} via the device-true FM3 range.
    * Taper: a device-true explicit `range.taper` ('log'→log10; 'linear'|'flat'|'custom'→linear) wins;
    * absent it falls back to the typecode heuristic (middle nibble 4 = log10, e.g. freq cuts; every other nibble linear). */
-  #display(family: string | undefined, paramId: number, raw: number): { value: number; norm: number; unit?: string; min?: number; max?: number; log?: boolean } {
-    const norm = clamp01(raw / 65534);
+  #display(family: string | undefined, paramId: number, raw: number): DisplayReading {
     const range = family ? this.#prof.ranges[family]?.[paramId] : undefined;
+    const unitCode = family ? this.#prof.params[family]?.find((x) => x.paramId === paramId)?.unit : undefined;
+    return this.#displayRow(range, unitCode, raw);
+  }
+
+  /** `#display` for a row the caller already holds, with the catalog unit code of the param it belongs to. With
+   *  `sourced` (the generic response) the reading also says where its unit and taper came from (`unitSource` /
+   *  `taperSource`), and a row without a device or catalog unit takes the one its typecode implies (the codec's
+   *  typecode rules, read-time only). Without it (the classic response, meters) the reading is what it always was. */
+  #displayRow(range: RangeDef | undefined, unitCode: string | undefined, raw: number, sourced?: RowProvenance): DisplayReading {
+    const norm = clamp01(raw / 65534);
     if (range && range.kind === 'float' && Number.isFinite(range.displayMin) && Number.isFinite(range.displayMax) && range.displayMin !== range.displayMax) {
       try {
         // Taper (log vs linear). A device-true explicit taper from the capture catalog WINS over the
-        // typecode-nibble heuristic: 'log' → log sweep; 'linear' | 'flat' | 'custom' → linear. A
+        // typecode rule: 'log' → log sweep; 'linear' | 'flat' | 'custom' → linear. A
         // 'custom' taper's `taperPoints` are NOT applied on the wire yet, so custom is served linear
         // for now (the Axis side documents the same). A log sweep still requires a positive range —
-        // wireToDisplay throws on log10 with displayMin<=0 — the same guard the nibble heuristic uses.
-        // When NO explicit taper is present, fall back to the typecode-nibble heuristic: only nibble 4
-        // marks a log taper, every other nibble is linear. Nibble 5 used to count as log too, but the
-        // explicit tapers in the FM9 and Axe-Fx III catalogs have it linear every time (7 and 17 params,
-        // none log), while nibble 4 is log for all but a few. The FM3 catalog carries no explicit tapers,
-        // so for the FM3 the rule is carried over from those two devices, not measured on it.
-        // `range.taper` reads device-true from a static-catalog row today, and reads the same field once
-        // walk-built RangeDefs carry it (parallel WP) — no rework needed here either way.
+        // wireToDisplay throws on log10 with displayMin<=0 — the same guard the typecode rule gets.
+        // When NO explicit taper is present, the codec's typecode rules decide (`typecodeTaper`): middle
+        // nibble 4 is a log taper, 3 and 5..9 linear, every other nibble predicts nothing (served linear).
+        // That is the nibble heuristic this code carried before, checked by the codec against the explicit
+        // tapers of the committed FM3 / FM9 / Axe-Fx III catalogs. `range.taper` reads device-true from a
+        // static-catalog row, and from a profile row that carries one.
+        const rowFromDevice = (field: 'taper' | 'unit') => !!sourced && (sourced.fromProfile || sourced.catalogRow?.[field] !== range[field]);
         let log: boolean;
+        let taperSource: ValueSource | undefined;
         if (range.taper) {
           log = range.taper === 'log' && range.displayMin > 0;
+          taperSource = rowFromDevice('taper') ? 'device' : 'catalog';
         } else {
-          const taperNib = (range.typecode >> 4) & 0xf;
-          log = taperNib === 4 && range.displayMin > 0;
+          const rule = typecodeTaper(range.typecode);
+          log = rule?.taper === 'log' && range.displayMin > 0;
+          if (rule) taperSource = 'typecode';
         }
         const v = wireToDisplay(raw, { displayMin: range.displayMin, displayMax: range.displayMax, displayScale: log ? 'log10' : 'linear' });
         // Prefer the DEVICE-TRUE unit captured by the live-walk (RangeDef.unit, view 0x00)
         // over the AM4-name-overlay catalog code; fall back to the overlay when absent
-        // (byte-source/.cache profiles carry no device-true unit).
-        const unitCode = family && this.#prof.params[family] ? unitOfParam(this.#prof.params[family], paramId) : undefined;
-        return { value: round3(v), norm, unit: range.unit ?? ((unitCode && UNIT_LABEL[unitCode]) || undefined), min: range.displayMin, max: range.displayMax, log: log || undefined };
+        // (byte-source/.cache profiles carry no device-true unit). The generic response then falls back to the unit
+        // the row's typecode implies (`typecodeUnit`: a few exact typecodes, measured, never contradicting a
+        // catalog unit); the classic response does not.
+        const catalogUnit = (unitCode && UNIT_LABEL[unitCode]) || undefined;
+        const typecodeUnitCode = sourced && range.unit === undefined && catalogUnit === undefined ? typecodeUnit(range.typecode)?.unit : undefined;
+        const unit = range.unit ?? catalogUnit ?? (typecodeUnitCode !== undefined ? UNIT_LABEL[typecodeUnitCode] : undefined);
+        const unitSource: ValueSource | undefined = range.unit !== undefined ? (rowFromDevice('unit') ? 'device' : 'catalog')
+          : catalogUnit !== undefined ? 'catalog' : unit !== undefined ? 'typecode' : undefined;
+        return {
+          value: round3(v), norm, unit, min: range.displayMin, max: range.displayMax, log: log || undefined,
+          ...(sourced && unitSource ? { unitSource } : {}),
+          ...(sourced && taperSource ? { taperSource } : {}),
+        };
       } catch {
         /* fall through to 0..10 position */
       }
@@ -1779,39 +2643,15 @@ class Gen3Driver implements DeviceDriver {
     return { value: Math.round(norm * 1000) / 100, norm }; // 0..10 fallback
   }
 
-  /** Resolve a param name (display label or catalog symbol) → device-true paramId. The family's
-   *  model/type selector is NOT resolved here: use #typeSelector(family, slug). */
+  /** Resolve a param name (display label) → device-true paramId. 'Type' → the family's type selector
+   *  (`typeSelectorPid`): `<FAM>_MODEL` where it exists (DELAY: its `DELAY_TYPE` is the 8-value MONO/STEREO
+   *  routing enum, the real model list lives on `DELAY_MODEL`), else the EXACT `<FAM>_TYPE` name regardless of
+   *  unit (the catalogs tag it `unverified`; guessing "the first enum that ends in TYPE" picked a DIFFERENT
+   *  selector: FUZZ → FUZZ_CLIPTYPE, PITCH → PITCH_XFADETYPE, CABINET → CABINET_PRETYPE). A family with
+   *  neither has no type: its other selectors list like any param. */
   #paramId(family: string, name: string): number | undefined {
-    const defs = this.#prof.params[family] ?? [];
-    return defs.find((p) => p.displayLabel === name || p.name === name)?.paramId;
-  }
-
-  /** The family's model/type selector, in strict preference order:
-   *    1. `<FAM>_MODEL` — DELAY: its `DELAY_TYPE` is the 8-value MONO/STEREO routing enum, the
-   *       real model list lives on `DELAY_MODEL` (cache-confirmed FM3/FM9/III 2026-07-06);
-   *    2. the EXACT `<FAM>_TYPE` name regardless of unit — the FM3/FM9 device-true catalogs tag
-   *       it `unverified`, and the old `unit==='enum' && /TYPE$/` heuristic then matched a
-   *       DIFFERENT selector entirely (FUZZ → FUZZ_CLIPTYPE pid 10, PITCH → PITCH_XFADETYPE
-   *       pid 46; III DYNDIST → DYNDIST_BQTYPE) — so the Drive block's "type" read AND wrote
-   *       the clipping-diode param (the field-reported drive-type bug);
-   *    3. the enum-unit /TYPE$/ heuristic, as the last resort for families with neither — and only
-   *       when the family has a type roster (`slug` = the roster key, as blockParams uses it). Without
-   *       a roster the param cannot be decoded into a type anyway (every value clamps to ordinal 0,
-   *       name '') and it is usually an ordinary selector of the block — CONTROLLERS_LFO1TYPE,
-   *       GLOBAL_CC_BYPASS_TYPE, MULTITAP_BASETYPE, PLEX_FILTERTYPE / PLEX_BASETYPE … — which must stay
-   *       in the enum list. `skippedFallback` marks that case for blockParams' layout-variant pick.
-   *       (With CONTROLLERS_LFO1TYPE back in the enum list, the block's repeated "Type" labels number
-   *       one higher than before — LFO 2 "Type 2", ADSR 1 "Type 3", ADSR 2 "Type 4" — clients key
-   *       params by id, so nothing persisted changes.) The wider fallback problem (families whose real
-   *       selector is a differently named param, e.g. the FM3 CABINET) is FORGEFX-56. */
-  #typeSelector(family: string, slug: string): { id: number | undefined; skippedFallback: boolean } {
-    const defs = this.#prof.params[family] ?? [];
-    const direct = defs.find((p) => p.name === `${family}_MODEL`) ?? defs.find((p) => p.name === `${family}_TYPE`);
-    if (direct) return { id: direct.paramId, skippedFallback: false };
-    const fallback = defs.find((p) => p.unit === 'enum' && /TYPE$/i.test(p.name));
-    if (!fallback) return { id: undefined, skippedFallback: false };
-    if (this.#prof.rosterFor(slug).length === 0) return { id: undefined, skippedFallback: true };
-    return { id: fallback.paramId, skippedFallback: false };
+    if (name.toLowerCase() === 'type') return typeSelectorPid(this.#prof, family);
+    return (this.#prof.params[family] ?? []).find((p) => p.displayLabel === name || p.name === name)?.paramId;
   }
 
   // ── device-edit push (capability deviceEditPush): reflect front-panel / editor edits the device
@@ -1820,6 +2660,8 @@ class Gen3Driver implements DeviceDriver {
   // yields only the moved param(s). blockParams() primes the baseline when a block is opened. ──
   #editSnapshot = new Map<number, number[]>(); // effectId → last-known active-channel wire values
   #watchedEid: number | null = null; // FM3 poll target: the block Axis last opened (set in blockParams)
+  /** Blocks whose body is not indexed by param id (GLOBAL): nothing to diff, so the poll leaves them alone. */
+  #nonPositional = new Set<number>();
   #watchedChannel = 0; // active channel (0-3) of the watched block — the burst slice the poll diffs against
   #lastLocalEditAt = 0; // ms of the last local param write — the FM3 poll pauses briefly after (no self-echo)
 
@@ -1832,6 +2674,7 @@ class Gen3Driver implements DeviceDriver {
     const eid = this.#watchedEid;
     if (eid == null) return { changed: false }; // no block opened yet — nothing to watch
     if (Date.now() - this.#lastLocalEditAt < 2000) return { changed: false }; // mid local edit → skip (avoid echo)
+    if (this.#nonPositional.has(eid)) return { changed: false }; // no per-param information in that body to diff
     const dev = await this.#conn();
     let frames: number[][];
     try {
@@ -1848,32 +2691,107 @@ class Gen3Driver implements DeviceDriver {
     try { bulk = this.#codec.assembleGen3BlockBulkRead(frames); } catch { return { events: [], reload: false }; }
     const eid = bulk.blockId;
     if (bulk.values.length === 0) return { events: [], reload: false }; // head-only / empty — nothing to read
-    const audioFamily = SLUG_FAMILY[(slugForEffectId(eid) ?? '').toLowerCase()];
-    const family = audioFamily ?? this.#prof.familyForEffectId(eid);
-    const defs = family ? (this.#prof.params[family] ?? []) : [];
-    if (!family || defs.length === 0) return { events: [], reload: false }; // no param family mapped
+    const { audio: audioFamily, family } = this.#resolveBlock(eid);
+    if (!family) return { events: [], reload: false }; // no param family mapped
+    const defs = this.#prof.params[family] ?? [];
+    const index = buildParamIndex(this.#prof, family);
+    if (defs.length === 0 && index.entries.length === 0) return { events: [], reload: false }; // nothing to report on
+    // A block the catalog cannot place on its own (a roster-only family, a block-map binding) has channels when its body
+    // is four slices of its section; a body that is neither one slice nor four says nothing about any pid.
+    let channelBlocked = !!audioFamily;
+    if (!audioFamily && this.#prof.blockMapFor?.(eid) !== undefined) {
+      const ch = shapeChannels(bulk.itemCount, this.#prof.rangeSections[family]?.stride);
+      if (ch === null) return { events: [], reload: false };
+      channelBlocked = ch;
+    }
     // Slice the block's ACTIVE channel (the one blockParams surfaced) — the body is channel-blocked, so
     // diffing against channel A while the user has B-D open would flag every A/B-different param as "moved".
-    const { stride, base } = this.#channelSlice(family, bulk, eid === this.#watchedEid ? this.#watchedChannel : 0, !!audioFamily);
+    const { stride, base } = this.#channelSlice(family, bulk, eid === this.#watchedEid ? this.#watchedChannel : 0, channelBlocked);
+    // A body that is not indexed by param id (GLOBAL: one record per param) says nothing about any pid: no
+    // events, and no baseline to prime.
+    if (!this.#isPositional(index, bulk, stride, channelBlocked)) {
+      this.#nonPositional.add(eid);
+      return { events: [], reload: false };
+    }
+    this.#nonPositional.delete(eid);
     const cur = bulk.values.slice(base, base + stride);
     const prev = this.#editSnapshot.get(eid);
     this.#editSnapshot.set(eid, cur);
     // First sight of this block (never opened) → we can't diff. Ask the registry for a full reload so the
     // edit isn't lost; subsequent edits on this block then diff per-param.
     if (!prev) return { events: [], reload: true };
+    // The params that can move: the catalog's (with a row) and everything the index lists, generic params
+    // included; not the rows the connected firmware no longer has.
+    const removed = new Set(index.hidden.filter((h) => h.reason === 'removed').map((h) => h.id));
+    const pids: number[] = [];
+    const seen = new Set<number>();
+    const add = (id: number) => { if (!seen.has(id) && !removed.has(id)) { seen.add(id); pids.push(id); } };
+    for (const p of defs) if (this.#prof.ranges[family]?.[p.paramId]) add(p.paramId); // only real controls (skip internal churn)
+    for (const e of index.entries) add(e.pid);
     const events: { effectId: number; paramId: number; norm: number }[] = [];
-    for (const p of defs) {
-      const id = p.paramId;
+    for (const id of pids) {
       if (id >= stride) continue;
       if (cur[id] === undefined || cur[id] === prev[id]) continue; // unchanged / truncated → skip
-      if (!this.#prof.ranges[family]?.[id]) continue; // only real controls (skip internal/bypass churn)
       events.push({ effectId: eid, paramId: id, norm: clamp01((cur[id] ?? 0) / 65534) });
     }
     return { events, reload: false };
   }
 
+  /** Refuses a param write the connected device cannot take, before anything is sent (thrown with a
+   *  `statusCode`, which both the Fastify app and the runtime router keep):
+   *  - 400: the id is no wire parameter (above 0x3FFF sit the editor's pseudo ids, e.g. the cab's
+   *    `_BTN_` buttons; a negative or fractional id is none either);
+   *  - 409: the block's family has a row at that id, the row is an unused slot (all-zero placeholder) on the
+   *    connected firmware, and the catalog defines no param there. "On the connected firmware" is the
+   *    effective row, and for a byte-exact profile also the profile's own row. A live profile's placeholder
+   *    rows are no information (the merge skips them, and the param index lists the effective row), so only
+   *    the effective row counts there. A catalog param with a placeholder row (`MOD_MIN`/`MOD_MAX`/`MOD_PARAM`,
+   *    the `*_GLOBALMIX` toggles) is a real param and stays writable, and so does an id with no row at all (the
+   *    FC block, a cross-block write).
+   *  - 409: a block the catalog cannot place on its own whose binding is read-only (see below), and a pid of a
+   *    synthetic family (`section:<tag>` / `block:<eid>`, a block known from its device rows alone) without an
+   *    informative row: no definition says what that pid is.
+   *  A param the generic response marks `write: null` is NOT refused: that mark is advice for the UI. */
+  #guardParamWrite(eid: number, paramId: number): void {
+    const refuse = (statusCode: number, message: string): never => {
+      throw Object.assign(new Error(message), { statusCode });
+    };
+    if (!Number.isInteger(paramId) || paramId < 0 || paramId > MAX_WIRE_PID) refuse(400, `param id ${paramId} is not a wire parameter`);
+    const { audio, family, mapEntry } = this.#resolveBlock(eid);
+    if (!audio) {
+      // a block the catalog cannot place on its own: its block-map binding decides (drivers/blockMapState.ts) — a
+      // roster-only family and a live-only binding are read-only, a byte-bridged binding is writable (the guards below
+      // still apply). A block the last generic read served as a runtime bulk-shape match (`likely`) is read-only too,
+      // whatever persisted entry it has, unless that entry itself serves the block with writable params (a confirmed
+      // byte-bridged binding the profile resolves): a `candidate` entry, or a confirmed one whose key the profile does
+      // not serve, never makes a `likely` block writable. Candidates / no binding and no `likely` read: nothing is
+      // known, nothing is refused.
+      const access = mapEntry ? blockMapAccess(mapEntry) : null;
+      const entryRefuses = !!access && access.serves && !access.writable;
+      const entryServesWritable = !!access && access.serves && access.writable && mapEntry!.key !== null && family === mapEntry!.key;
+      if (entryRefuses || (this.#runtimeLikely.has(eid) && !entryServesWritable)) refuse(409, blockWriteRefusedMessage(eid));
+    }
+    if (!family) return;
+    if (isSyntheticFamilyKey(family)) {
+      const row = this.#prof.ranges[family]?.[paramId];
+      if (!row || !isInformativeRow(row)) refuse(409, `param ${paramId} of block ${eid} has no definition on this device; write refused`);
+    }
+    const catalog = this.#prof.staticBase ?? this.#prof;
+    if ((catalog.params[family] ?? []).some((d) => d.paramId === paramId)) return;
+    const facts = this.#prof.profileFacts;
+    const effective = this.#prof.ranges[family]?.[paramId];
+    // a byte-exact profile's own row (byte-exact per family: a merged profile document can provide this family from
+    // a live walk only); a suspect family's profile section belongs to another family, so its rows say nothing about
+    // this one
+    const profiled = facts?.isByteExactFamily(family) && !facts.suspectFamilies.includes(family) ? facts.ranges[family]?.[paramId] : undefined;
+    if ((effective && isPlaceholderRow(effective)) || (profiled && isPlaceholderRow(profiled))) {
+      refuse(409, `param ${paramId} of ${family} is an unused slot on this firmware; write refused`);
+    }
+  }
+
   // ── writes (all address the exact placed instance by effect id) ──
   async setParam(eid: number, paramId: number, value: number, continuous: boolean) {
+    this.#guardParamWrite(eid, paramId); // throws (400/409) before anything goes on the wire
     // continuous knob writes stream at high frequency → fire-and-forget (instant);
     // a discrete write (enum) is rarer + worth confirming, so reject-watch it.
     const r = continuous ? await this.#send(this.#codec.buildSetParameterContinuous(eid, paramId, clamp01(value))) : await this.#write(this.#codec.buildSetParameter(eid, paramId, value));
@@ -1883,9 +2801,10 @@ class Gen3Driver implements DeviceDriver {
   }
   /** Change a block's model/type (the family TYPE selector ordinal). */
   async setType(eid: number, value: number) {
-    const typeSlug = (slugForEffectId(eid) ?? '').toLowerCase();
-    const family = SLUG_FAMILY[typeSlug];
-    const tid = family ? this.#typeSelector(family, typeSlug).id : undefined;
+    const family = audioFamilyOf(eid);
+    // the pid that carries the family's type selector on this device (it follows its name when the row moved);
+    // a family without one (CABINET, PLEX, …) has no type to set
+    const tid = family ? buildParamIndex(this.#prof, family).typePid : undefined;
     if (tid == null) return { ok: false };
     const r = await this.#write(this.#codec.buildSetParameter(eid, tid, value));
     this.#emit({ type: 'changed', scope: 'grid' });

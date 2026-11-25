@@ -23,13 +23,16 @@
 // Mocked transport, no hardware.
 import { createGen3Driver, knobParams } from '../../src/drivers/gen3.js';
 import { cadenceFor } from '../../src/drivers/telemetryProfiles.js';
-import { SLUG_FAMILY, profileForModel } from '../../src/devices.js';
+import { SLUG_FAMILY, profileForModel, runtimeProfileFrom } from '../../src/devices.js';
 import type { DeviceProfile } from '../../src/devices.js';
 import { effectRoster } from 'forgefx-midi/devices/gen3';
 import { createModernFractalCodec, packValue16 } from 'forgefx-midi/gen3/axe-fx-iii';
 import { MockTransport, assert, assertEqual } from '../helpers/mock.js';
+import { mockBlockDevice } from '../helpers/blockRead.js';
+import { catalogBuilt } from '../helpers/catalogProfile.js';
+import { typecodeTaper, typecodeUnit } from 'forgefx-midi/cache';
 
-export const KNOB_UNITS_CASE_COUNT = 8;
+export const KNOB_UNITS_CASE_COUNT = 11;
 
 const PROVISIONAL_UNITS = new Set(['unverified', 'count', 'pf']);
 /** Semantic selectors / non-dials that used to leak in as knobs when the provisional units were admitted. */
@@ -213,4 +216,102 @@ export async function runKnobUnitsTests(): Promise<void> {
     assert(!served.named.some((p) => p.id === pd!.paramId), `${name} is not served as a knob by blockParams()`);
   }
   console.log('  drivers/knob-units: blockParams() serves the pf knob and keeps CABINET_ZOOM, TENTAP_DECAYSTYLE and REVERB_BASETYPE out of the dials');
+
+  // ---- Case 9: the generic response lists every classic dial, classified by the row and not by the unit ----
+  // The classic rule (KNOB_UNITS + the provisional-unit vetting) decides which params are dials. The generic
+  // response classifies by the device row first (a float row without labels is a dial: knob, or stepper when
+  // its integral steps are detents), so it must list every classic dial under `named`, and never list an enum
+  // row there.
+  for (const dev of profs) {
+    for (const slug of ['amp', 'cab', 'reverb', 'delay'] as const) {
+      const family = SLUG_FAMILY[slug]!;
+      const eid = eidOf(slug);
+      const values = new Array<number>(dev.rangeSections[family]!.stride * 4).fill(0);
+      const { driver } = mockBlockDevice(dev, { [eid]: { values, channel: 0 } });
+      const classic = await driver.blockParams(eid);
+      const generic = await driver.blockParams(eid, { generic: true });
+      const genericNamed = new Set(generic.named.map((n) => n.id));
+      for (const n of classic.named) assert(genericNamed.has(n.id), `${dev.key} ${slug} ${n.name} (pid ${n.id}): a classic dial is a generic dial too`);
+      for (const n of generic.named) assertEqual(n.kind, 'float', `${dev.key} ${slug} ${n.name}: no enum row among the dials`);
+      assert(generic.named.length >= classic.named.length, `${dev.key} ${slug}: the generic response lists at least the classic dials`);
+    }
+  }
+  console.log('  drivers/knob-units: every classic dial of amp / cab / reverb / delay is a generic dial on FM3, FM9 and III; no enum row is');
+  // ---- Case 10: units and tapers from the typecode rules (M3 §6.1): the classic dials are unchanged, the generic ----
+  // response says where each unit and taper came from and fills a unit only where neither the device row nor the
+  // catalog has one. A catalog unit is never replaced (the typecode units agree with every catalog unit that exists).
+  const LABEL: Record<string, string> = { hz: 'Hz', db: 'dB', percent: '%' };
+  const typecodeFills: Record<string, number> = {};
+  for (const dev of profs) {
+    let fills = 0;
+    for (const slug of ['amp', 'cab', 'reverb', 'delay', 'drive', 'chorus', 'filter', 'peq'] as const) {
+      const family = SLUG_FAMILY[slug]!;
+      const eid = eidOf(slug);
+      const values = new Array<number>(dev.rangeSections[family]!.stride * 4).fill(0);
+      const { driver } = mockBlockDevice(dev, { [eid]: { values, channel: 0 } });
+      const classic = await driver.blockParams(eid);
+      const generic = await driver.blockParams(eid, { generic: true });
+      const byId = new Map(generic.named.map((n) => [n.id, n] as const));
+      for (const c of classic.named) {
+        const where = `${dev.key} ${slug} ${c.name} (pid ${c.id})`;
+        assert(!('unitSource' in c) && !('taperSource' in c), `${where}: the classic response carries no source fields`);
+        const g = byId.get(c.id)!;
+        const row = dev.ranges[family]![c.id]!;
+        const catalogUnit = dev.params[family]!.find((d) => d.paramId === c.id)?.unit;
+        // the classic unit and taper are what they always were: the row's unit, else the catalog code's label;
+        // log only for an explicit log taper or (without one) a middle-nibble-4 typecode, on a positive range
+        const wantLog = (row.taper ? row.taper === 'log' : ((row.typecode >> 4) & 0xf) === 4) && row.displayMin > 0;
+        assertEqual(c.log === true, wantLog, `${where}: classic taper unchanged`);
+        assertEqual(g.log === true, wantLog, `${where}: the generic response tapers the same`);
+        if (c.unit !== undefined) {
+          assertEqual(g.unit, c.unit, `${where}: a unit the catalog (or the row) has is served unchanged`);
+          assertEqual(g.unitSource, 'catalog', `${where}: from the catalog`);
+        } else {
+          const tc = typecodeUnit(row.typecode);
+          assertEqual(g.unit, tc ? LABEL[tc.unit] : undefined, `${where}: no catalog unit → the typecode's, if any`);
+          assertEqual(g.unitSource, tc ? 'typecode' : undefined, `${where}: unitSource`);
+          if (tc) fills++;
+        }
+        const tt = typecodeTaper(row.typecode);
+        assertEqual(g.taperSource, row.taper ? 'catalog' : tt ? 'typecode' : undefined, `${where}: taperSource`);
+        if (catalogUnit && LABEL[catalogUnit] && typecodeUnit(row.typecode)) {
+          assertEqual(LABEL[typecodeUnit(row.typecode)!.unit], LABEL[catalogUnit], `${where}: the typecode unit agrees with the catalog unit`);
+        }
+      }
+    }
+    typecodeFills[dev.key] = fills;
+    assert(fills > 0, `${dev.key}: the typecode rules fill at least one unit on these blocks (the case is not vacuous)`);
+  }
+  console.log(`  drivers/knob-units: typecode rules — classic units/tapers unchanged, generic unitSource/taperSource, units filled only where none exists (${Object.entries(typecodeFills).map(([k, n]) => `${k} ${n}`).join(', ')} on amp/cab/reverb/delay/drive/chorus/filter/peq)`);
+
+  // ---- Case 11: a device row's own unit and taper win and are marked 'device' (synthetic live profile row) ----
+  {
+    const fm3 = profileForModel(0x11);
+    const family = 'CHORUS';
+    const eid = eidOf('chorus');
+    const knob = knobParams(fm3, family).find((p) => {
+      const r = fm3.ranges[family]![p.paramId]!;
+      return !r.taper && !r.unit && r.displayMin > 0;
+    });
+    assert(knob !== undefined, 'premise: an FM3 chorus knob with a positive range and no explicit taper or row unit');
+    const row = fm3.ranges[family]![knob.paramId]!;
+    const built = catalogBuilt(0x11, 'live');
+    (built.ranges[family] as Record<number, typeof row>)[knob.paramId] = { ...row, unit: 'ms', taper: 'log' };
+    const live = runtimeProfileFrom(built, fm3);
+    const values = new Array<number>(live.rangeSections[family]!.stride * 4).fill(0);
+    const { driver } = mockBlockDevice(live, { [eid]: { values, channel: 0 } });
+    const g = (await driver.blockParams(eid, { generic: true })).named.find((n) => n.id === knob.paramId)!;
+    assertEqual(`${g.unit}/${g.unitSource}/${g.log === true}/${g.taperSource}`, 'ms/device/true/device', 'the device row\'s unit and log taper are served as device facts');
+    const c = (await driver.blockParams(eid)).named.find((n) => n.id === knob.paramId)!;
+    assertEqual(`${c.unit}/${c.log === true}`, 'ms/true', 'the classic response uses the device row too (as before)');
+    // a row of the bundled catalog with an explicit taper (FM9 / III capture tapers) is a catalog fact
+    const fm9 = profileForModel(0x12);
+    const tapered = Object.entries(fm9.ranges.DISTORT ?? {}).find(([pid, r]) => r.kind === 'float' && r.taper === 'log' && r.displayMin > 0 && knobParams(fm9, 'DISTORT').some((p) => p.paramId === Number(pid)));
+    assert(tapered !== undefined, 'premise: an FM9 amp knob with an explicit log taper in the catalog');
+    const v9 = new Array<number>(fm9.rangeSections.DISTORT!.stride * 4).fill(0);
+    const g9 = (await mockBlockDevice(fm9, { [eidOf('amp')]: { values: v9, channel: 0 } }).driver.blockParams(eidOf('amp'), { generic: true })).named.find((n) => n.id === Number(tapered[0]))!;
+    assertEqual(`${g9.log === true}/${g9.taperSource}`, 'true/catalog', 'an explicit catalog taper is a catalog fact');
+  }
+  console.log("  drivers/knob-units: a device row's unit and taper are served as 'device', an explicit catalog taper as 'catalog'");
 }
+

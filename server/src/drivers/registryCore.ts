@@ -34,8 +34,7 @@ import {
   meterRmsToDb,
   buildCpuPoll,
   isCpuResponse,
-  parseCpuRawLoad,
-  cpuPercentFromRaw
+  parseCpuPercent
 } from 'forgefx-midi/gen3/axe-fx-iii';
 // Per-device capability declarations (the package's single source of truth: scenes, channels, slot
 // model, save, …). Surfaced via /device so Axis drives its UI from what each model actually supports,
@@ -46,51 +45,61 @@ import { AXEFX2_DESCRIPTOR } from 'forgefx-midi/devices/gen2';
 import { AXEFXGEN1_DESCRIPTOR } from 'forgefx-midi/devices/gen1';
 import { TRANSPORT_TIMEOUT_CODE, isTransportTimeout, type Transport, type Conn, type ConnKind } from '../transport/types.js';
 import { DEFAULT_PROFILE, PROFILES, profileForModel, profileForKey, runtimeProfileFrom, type DeviceProfile } from '../devices.js';
-import { checkProfileSchema } from '../profileSchema.js';
+import { checkProfileSchema, forgetProfileVerdict, lastProfileVerdict, profileSummaryOf, type ProfileSummary, type ProfileVerdict } from '../profileSchema.js';
+import { deviceCacheKey } from '../profileCatalog.js';
 import { createGen3Driver, GEN3_SHUNT_BASE } from './gen3.js';
 import { createAm4Driver, type Am4Driver } from './am4.js';
 import { createGen2Driver } from './gen2.js';
 import { createGen1Driver } from './gen1.js';
 import { createVp4Driver } from './vp4.js';
-import type { DeviceDriver, DeviceEvent, DriverCtx, DriverCapabilities } from './types.js';
+import type { DeviceDriver, DeviceEvent, DriverCtx, DriverCapabilities, DefinitionsCaps } from './types.js';
+import { definitionsDrift, type AppliedDefinitions } from './definitionsDiff.js';
 import { assertRawProbeAllowed } from './sendPolicy.js';
 import { cadenceFor, isTelemetryMode, TELEMETRY_MODES, type TelemetryMode, type CadenceProfile } from './telemetryProfiles.js';
+import { walkScopeGates, type WalkScopeGates, type WalkScopeOverride } from '../services/walkScope.js';
 
-/** Device-cache doc key for the deviceCaches store collection: `<model-hex>_<major>p<minor>`
- *  (e.g. FM3 fw 12.0 → `11_12p0`). Shared by the registry (runtime profile swap) + the deviceCache
- *  service (status / build / delete) so both address the exact same doc. */
-export function deviceCacheKey(modelId: number, major: number, minor: number): string {
-  return `${modelId.toString(16).padStart(2, '0')}_${major}p${minor}`;
-}
+/** Device-cache doc key for the deviceCaches store collection (`<model-hex>_<major>p<minor>`): defined in
+ *  profileCatalog.ts (the gen-3 driver keys its `definitions` events by it too), re-exported here for its callers. */
+export { deviceCacheKey };
 
-/** Per gen-3 model, the HIGHEST firmware (major.minor) on which the cache build's FULL mode — the live
- *  self-describe walk that also taper-sweeps, i.e. WRITES to the device — is allowed. Each entry is a
- *  version on which a full capture was actually carried out successfully; anything newer is refused
- *  (fail closed) because a newer firmware may change the end-of-table behaviour the walk relies on —
- *  FM3 firmware 13.0 did: a walk without the table-end bound does not stop at the end of a block (the
- *  end-marker replies are counted as real records), so it runs for a very long time and would write sweep
- *  values to parameters that do not exist. The bounded walk is verified on FM3 13.0. Fractal numbers firmware per model (the Axe-Fx III is on 32.x while the
+/** A firmware version as the full-capture policy sees it (major.minor). */
+type FirmwareVersion = { readonly major: number; readonly minor: number };
+
+/** Per gen-3 model, the firmware RANGE (inclusive `min`..`max`, major.minor) on which the cache build's FULL
+ *  mode — the live self-describe walk that also taper-sweeps, i.e. WRITES to the device — is allowed. The
+ *  range is the span a full capture has actually been carried out on successfully (its ends are versions
+ *  that were each run): a firmware outside it is refused (fail closed) in BOTH directions. A newer firmware
+ *  may change the end-of-table behaviour the walk relies on — FM3 firmware 13.0 did: a walk without the
+ *  table-end bound does not stop at the end of a block (the end-marker replies are counted as real records),
+ *  so it runs for a very long time and would write sweep values to parameters that do not exist. The bounded
+ *  walk is verified on FM3 12.0 and 13.0. An older firmware is equally unverified: its tables, parameter
+ *  layout and write behaviour were never exercised by a full capture, and a sweep that writes to a device
+ *  we have not seen would be a guess. Fractal numbers firmware per model (the Axe-Fx III is on 32.x while the
  *  FM3/FM9 are on 12.x/13.x), so the table is keyed by model byte. A model without an entry is never
- *  allowed. Add or raise an entry only after a full capture has completed on that model and version.
+ *  allowed. Extend an entry (lower `min` / raise `max`) only after a full capture has completed on that model
+ *  at that version; a version strictly inside the range is covered by its two verified ends.
  *  The FM9 has NO entry: no full capture has completed on an FM9 yet (the attempts on firmware 12.0
  *  stopped responding part-way through the walk), so full mode stays off there until one does.
  *  Read-only mode is intentionally NOT governed by this table. */
-export const FULL_CAPTURE_MAX_VERIFIED_FW: Readonly<Record<number, { readonly major: number; readonly minor: number }>> = {
-  0x11: { major: 13, minor: 0 }, // FM3 (13.0 verified with the table-end-bounded walk)
-  0x10: { major: 32, minor: 6 }  // Axe-Fx III (a complete full capture exists on 32.6)
+export const FULL_CAPTURE_VERIFIED_FW: Readonly<Record<number, { readonly min: FirmwareVersion; readonly max: FirmwareVersion }>> = {
+  0x11: { min: { major: 12, minor: 0 }, max: { major: 13, minor: 0 } }, // FM3 (12.0 and 13.0 verified; 13.0 with the table-end-bounded walk)
+  0x10: { min: { major: 32, minor: 6 }, max: { major: 32, minor: 6 } }  // Axe-Fx III (a complete full capture exists on 32.6 only)
 };
 
 /** Whether FULL-mode capture is permitted for `modelId` on the given running firmware: only a KNOWN,
- *  well-formed firmware (major >= 1) that is at or below the model's entry in
- *  {@link FULL_CAPTURE_MAX_VERIFIED_FW} (major.minor comparison). Unknown firmware, an unknown model, or
- *  a version above the verified one is refused — full mode writes to the device, so it never runs
- *  against a version it has not been verified on. Shared by the cache-build service (the actual gate)
- *  and the capabilities DTO (so the UI does not offer it). */
+ *  well-formed firmware (major >= 1) that lies inside the model's verified range in
+ *  {@link FULL_CAPTURE_VERIFIED_FW} (inclusive `min`..`max`, major.minor comparison). Unknown firmware, an
+ *  unknown model, or a version below the range's minimum or above its maximum is refused — full mode writes
+ *  to the device, so it never runs against a version it has not been verified on. Shared by the cache-build
+ *  service (the actual gate), the diagnostic capture's full-walk step and the capabilities DTO (so the UI
+ *  does not offer it). */
 export function fullCaptureAllowedOnFirmware(modelId: number, fw: { major: number; minor: number } | null | undefined): boolean {
   if (fw == null || !Number.isInteger(fw.major) || !Number.isInteger(fw.minor) || fw.major < 1 || fw.minor < 0) return false;
-  const max = FULL_CAPTURE_MAX_VERIFIED_FW[modelId];
-  if (!max) return false;
-  return fw.major < max.major || (fw.major === max.major && fw.minor <= max.minor);
+  const range = FULL_CAPTURE_VERIFIED_FW[modelId];
+  if (!range) return false;
+  const atLeastMin = fw.major > range.min.major || (fw.major === range.min.major && fw.minor >= range.min.minor);
+  const atMostMax = fw.major < range.max.major || (fw.major === range.max.major && fw.minor <= range.max.minor);
+  return atLeastMin && atMostMax;
 }
 
 /** Whether the in-app diagnostic capture (POST /diagnostics/capture) may run on a device: gen-3 units whose
@@ -182,6 +191,10 @@ export interface RegistryDeps {
    *  should return only profiles this build may use (`loadUsableProfile`); applyRuntimeCache re-checks
    *  the schema anyway, so a hook that forgets cannot make a stale profile live. */
   loadDeviceCache?(key: string): BuiltCache | null | Promise<BuiltCache | null>;
+  /** The walk-scope development override (services/walkScope.ts), read at call time. Only the Node registry supplies it
+   *  (from its environment, with the opt-in FORGEFX_DEV_HOOKS=1, ignored in production); absent → no override
+   *  (Browser Direct, the fail-closed default). */
+  walkScopeOverride?(): WalkScopeOverride;
 }
 
 const NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
@@ -228,6 +241,24 @@ export class DeviceRegistry {
   // Running firmware, populated best-effort during detect() on gen-3 units (fn 0x08). null until a
   // reply lands (silence/timeout/non-gen-3 keeps it null); surfaced via deviceInfo() + firmwareInfo().
   #firmware: { major: number; minor: number; version: string; build: string } | null = null;
+  // The last firmware a read of the CONNECTED unit answered with, with the model it came from: what the editor layouts
+  // are resolved for while `#firmware` is null again (every read clears it first, and a re-read the unit does not
+  // answer leaves it null), so a silent re-read never flips an older unit to the newest firmware's layout mid-session.
+  // Forgotten only when the unit may have changed: a new transport (disconnect / reconnect, a re-plug or reboot), a
+  // port change (selectConnection), or a read for another model.
+  #lastFirmware: { modelId: number; major: number; minor: number } | null = null;
+  // Device-cache key (`deviceCacheKey`) of the runtime profile applyRuntimeCache last layered over the bundled
+  // one; null while the bundled profile is live. Only meaningful together with `#prof.profileFacts` (a model
+  // switch replaces `#prof` with a static profile, which carries none): capabilities.definitions reads both.
+  #appliedProfileKey: string | null = null;
+  // Format, raw sources and document coverage of the applied runtime profile (with `#appliedProfileKey`), and
+  // what applyRuntimeCache last found stored under the running firmware's key (absent / usable / stale), so
+  // capabilities.definitions can tell `partial` and `stale` from `none` and `unprofiled`.
+  #appliedSummary: ProfileSummary | null = null;
+  // The stored document the applied runtime profile was layered from (with `#appliedProfileKey`): what the
+  // definitions diff compares against the catalog, without reading the store or the device again.
+  #appliedDoc: BuiltCache | null = null;
+  #storedVerdict: { key: string; verdict: ProfileVerdict } | null = null;
   // The active driver — set ONLY by detect() from a positively identified (or forced) model. No
   // identification → no active driver → the telemetry supervisor never fires a frame at an unknown
   // unit (this replaces the old `#modelId === -1` wait-loop AND every #isAm4() gate).
@@ -238,8 +269,33 @@ export class DeviceRegistry {
     transport: () => this.transport(),
     emit: (e) => this.#emit(e),
     getCadence: () => this.#cadence(),
-    getFirmware: () => this.#firmware // read at call time: drivers are built before detect() reads it
+    getFirmware: () => this.#firmware, // read at call time: drivers are built before detect() reads it
+    getLayoutFirmware: () => this.layoutFirmware(),
+    walkScope: () => this.walkScopeGates()
   };
+
+  /** The firmware the editor layouts are resolved for (DriverCtx.getLayoutFirmware): the running firmware when it is
+   *  known, else the last one the connected unit reported (`#lastFirmware`, only while the identified model is the one
+   *  it came from), else null (the newest firmware). No device traffic. */
+  layoutFirmware(): { major: number; minor: number } | null {
+    if (this.#firmware) return { major: this.#firmware.major, minor: this.#firmware.minor };
+    const last = this.#lastFirmware;
+    return last && last.modelId === this.#modelId ? { major: last.major, minor: last.minor } : null;
+  }
+
+  /** The walk-scope gates of the identified model on the running firmware (services/walkScope.ts): the verified
+   *  (model, firmware) table plus the Node registry's development override. Every flag false while no model is
+   *  identified or the firmware is unknown (fail closed). No device traffic. */
+  walkScopeGates(): WalkScopeGates {
+    return this.#walkGatesFor(this.#modelId);
+  }
+
+  /** The walk-scope gates of model `mid` on the running firmware (see `walkScopeGates`). */
+  #walkGatesFor(mid: number): WalkScopeGates {
+    let override: WalkScopeOverride | undefined;
+    try { override = this.#deps.walkScopeOverride?.(); } catch { override = undefined; }
+    return walkScopeGates(mid, mid >= 0 ? this.#firmware : null, override);
+  }
 
   get profile() { return this.#prof; }
 
@@ -254,9 +310,18 @@ export class DeviceRegistry {
   /** Re-read the running firmware (fn 0x08, the same path detect() uses) for the CURRENT model and
    *  return it — null when the device is silent / replies for another model / reports major 0. The
    *  previous value is always cleared first, so a unit that changed firmware (or went quiet) since
-   *  detect() never leaves a stale version behind. Used by the full-capture gate right before it decides. */
-  async refreshFirmware(): Promise<{ major: number; minor: number; version: string; build: string } | null> {
+   *  detect() never leaves a stale version behind. Used by the full-capture gate right before it decides.
+   *  `keepOnSilence`: when the read gets no version, the previously read value is kept (and null still returned) —
+   *  the walk-scope gate of a read-only build uses it: an unreadable version only narrows that build to the standard
+   *  scope, it must not unset the firmware the rest of the session relies on. Without it the running firmware stays
+   *  unknown after a silent read, but the editor layouts keep the last version this unit reported (layoutFirmware). */
+  async refreshFirmware(opts: { keepOnSilence?: boolean } = {}): Promise<{ major: number; minor: number; version: string; build: string } | null> {
+    const before = this.#firmware;
     await this.#populateFirmware(this.#modelId);
+    if (this.#firmware === null && opts.keepOnSilence) {
+      this.#firmware = before;
+      return null;
+    }
     return this.#firmware;
   }
   /** Public emit seam: services (device-cache build progress) publish on the same SSE bus the drivers
@@ -420,10 +485,16 @@ export class DeviceRegistry {
         // read over the previous one can no longer be trusted. Clear it rather than re-read here: the read
         // itself goes through transport() (it would recurse), and the next detect() redoes it. Null is the
         // safe value — the FM3 store-ack scope reads it as "unknown" (lenient), deviceInfo() reports no
-        // firmware, and applyRuntimeCache() simply does nothing (no cache key is built from a stale value).
+        // firmware, and applyRuntimeCache() falls back to the bundled profile (no cache key is built from a stale value).
         // (Today a dropped connection goes through selectConnection(), which clears it too; this keeps the
         // invariant for any other path that ends up opening a new transport.)
+        // The layouts' last known firmware goes too: a new transport is a disconnect, after which the unit may be
+        // another one or the same one with new firmware.
         this.#firmware = null;
+        this.#lastFirmware = null;
+        // for the same reason the active driver forgets what it learned over the previous transport (gen-3: dump-header
+        // strictness, the known slot, the placed blocks behind the runtime `unmapped-block` gap); a first open has none
+        this.#active?.resetSession?.();
         return t;
       })().catch((e) => {
         this.#connecting = null; // allow a retry on the next request
@@ -500,6 +571,7 @@ export class DeviceRegistry {
     this.#connecting = null;
     this.#detected = false;
     this.#firmware = null; // re-query firmware against whatever the next detect identifies
+    this.#lastFirmware = null; // a port change may reach another unit: the layouts forget its firmware too
     this.#active = null; // the next detect re-identifies — never poll the new port with the old model
     return { ok: true, chosen: await this.#deps.resolveConn(), profileOverride: this.#deps.getProfileOverride() };
   }
@@ -552,7 +624,7 @@ export class DeviceRegistry {
       // FULL-mode self-describe write-sweep (POST /device/cache/build with mode:'full'). True only for the
       // CaptureRig-proven gen-3 trio (III/FM3/FM9); false on VP4/AM4/gen-1/gen-2. Derived from the driver
       // cap so the DTO can't drift. Inserted after cacheImport (additive-only ordering — see #capabilitiesDto).
-      // Also firmware-gated per model (FULL_CAPTURE_MAX_VERIFIED_FW; unknown firmware = false): detect()
+      // Also firmware-gated per model (FULL_CAPTURE_VERIFIED_FW range; unknown firmware = false): detect()
       // populates #firmware before any caps DTO is served, so the UI never offers a mode the build route
       // would refuse. (The build route re-reads the firmware itself right before gating.)
       fullCapture: c.fullCapture && fullCaptureAllowedOnFirmware(mid, this.#firmware),
@@ -577,7 +649,87 @@ export class DeviceRegistry {
       // layout's graph slots. Derived from the driver cap AND the route method so the DTO can't drift.
       blockVisuals: !!c.blockVisuals && !!d.blockParams,
       // The waveform is an editor visual with its own demand, independent of live block meters.
-      looperTelemetry: !!d.looperTelemetry
+      looperTelemetry: !!d.looperTelemetry,
+      // What the generic block-params response (`?generic=1`) can rely on: whether the driver serves it, the
+      // catalog's firmware, the applied runtime profile's provenance and whether the running firmware has
+      // definitions to go by. Present on every device (drivers without it say genericParams:false). Appended
+      // here, right after virtualEffects, so it lands before telemetryControl/supportsSave in
+      // #capabilitiesDto and the pretty-printed caps diff stays additive-only (its ordering contract).
+      definitions: this.#definitionsCaps(mid, d)
+    };
+  }
+
+  /** `capabilities.definitions` for model `mid` served by driver `d`. Only a gen-3 grid driver serves the generic
+   *  block params and has a bundled catalog and a swappable runtime profile (the Axe-Fx II is a grid too, the
+   *  AM4 and VP4 are linear): the predicate applyRuntimeCache uses, plus the grid. Firmware strings are
+   *  compared as `formatFirmwareVersion` produced them ("13.0"): the running firmware, the profile document's
+   *  and the catalog baseline's all use that form. */
+  #definitionsCaps(mid: number, d: DeviceDriver): DefinitionsCaps {
+    return this.#definitionsState(mid, d).caps;
+  }
+
+  /** `capabilities.definitions` for model `mid` served by driver `d`, plus the applied profile it describes (key,
+   *  stored document, runtime profile) — one computation for the capabilities and the definitions diff, so the
+   *  diff's `state` is the caps' `drift` of the same moment. No device traffic. */
+  #definitionsState(mid: number, d: DeviceDriver): { caps: DefinitionsCaps; applied: AppliedDefinitions | null } {
+    const gen3Grid = d.capabilities.slotModel === 'grid' && d.capabilities.selfDescribe && !!d.applyRuntimeProfile;
+    const catalogFirmware = gen3Grid ? profileForModel(mid).catalogFirmware : null;
+    // the applied runtime profile: `#prof` is one only while it carries facts and belongs to this model (an
+    // AM4 detect keeps the previous gen-3 `#prof`, which must not leak into its caps)
+    const facts = gen3Grid && this.#prof.model === mid ? this.#prof.profileFacts : undefined;
+    let profile: DefinitionsCaps['profile'] = null;
+    let applied: AppliedDefinitions | null = null;
+    // the runtime gap: a block of the last read grid that no family describes (state != confirmed)
+    let unmapped = false;
+    if (facts && this.#appliedProfileKey) {
+      const summary = this.#appliedSummary;
+      unmapped = (d.unmappedPlacedEffectIds?.() ?? []).length > 0;
+      const gaps = (summary?.coverage.gaps ?? []).map((g) => g.kind);
+      if (unmapped && !gaps.includes('unmapped-block')) gaps.push('unmapped-block');
+      profile = {
+        key: this.#appliedProfileKey, source: facts.source, byteExact: facts.byteExact, firmware: facts.firmware, suspectFamilies: [...facts.suspectFamilies],
+        format: summary?.format ?? 1,
+        sources: [...new Set((summary?.sources ?? []).map((s) => s.kind))],
+        coverage: { complete: (summary?.coverage.complete ?? true) && !unmapped, gaps }
+      };
+      if (this.#appliedDoc) applied = { key: this.#appliedProfileKey, doc: this.#appliedDoc, profile: this.#prof };
+    }
+    const running = this.#firmware?.version ?? null;
+    const runningKey = running !== null && this.#firmware ? deviceCacheKey(mid, this.#firmware.major, this.#firmware.minor) : null;
+    const storedStale = runningKey !== null && this.#storedVerdict?.key === runningKey && this.#storedVerdict.verdict.state === 'stale';
+    const drift = definitionsDrift({
+      running, catalogFirmware, unmapped, storedStale,
+      applied: profile ? { firmware: profile.firmware, blocking: !(this.#appliedSummary?.coverage.complete ?? true) } : null
+    });
+    // editor-cache contribution: the generic-params trio, an editor-cache importer, a firmware to key the file by
+    const contribute = gen3Grid && d.capabilities.cacheImport && running !== null;
+    // the walk-scope gates of the running firmware: only a gen-3 grid driver walks definitions at all
+    const walk: WalkScopeGates = gen3Grid ? this.#walkGatesFor(mid) : { extendedIds: false, above160: false, blockProbe: false, farIds: false };
+    // `.axisdefs` export/import: the same gen-3 grid trio (stored sources to write, a catalog to derive against)
+    // the spot check of shared definitions (a cloud pull checks them against the unit first): the gen-3 grid trio with a
+    // bundled catalog of its model and a firmware read. Computed here, not imported from services/spotCheck.ts (the
+    // registry stays below the services); the pull applies the same conditions (`spotCheckSupported` + firmware).
+    // Appended after `portable` (additive-only key order).
+    const spotCheck = gen3Grid && running !== null && PROFILES[mid] !== undefined;
+    return { caps: { genericParams: gen3Grid, catalogFirmware, profile, drift, contribute, walk, portable: gen3Grid, spotCheck }, applied };
+  }
+
+  /** What `GET /device/definitions/diff` reads, all of it state the registry and the driver already hold (no
+   *  detection, no store read, no device traffic): the detected model, its `capabilities.definitions` of this moment,
+   *  the running firmware, the bundled profile, the applied runtime profile and its document, and the blocks of the
+   *  edit-buffer grid as last read. Null when no unit has been identified yet (detection is never triggered here),
+   *  or no driver serves the identified model. */
+  definitionsDiffContext(): {
+    model: number; caps: DefinitionsCaps; firmware: string | null; staticProfile: DeviceProfile; applied: AppliedDefinitions | null;
+    placedEids: number[] | null; unmappedEids: number[] | null;
+  } | null {
+    const mid = this.#modelId;
+    const d = mid >= 0 ? this.#driverFor(mid) : null;
+    if (mid < 0 || !d) return null;
+    const { caps, applied } = this.#definitionsState(mid, d);
+    return {
+      model: mid, caps, firmware: this.#firmware?.version ?? null, staticProfile: profileForModel(mid), applied,
+      placedEids: d.placedEffectIds?.() ?? null, unmappedEids: d.unmappedPlacedEffectIds?.() ?? null
     };
   }
 
@@ -746,9 +898,12 @@ export class DeviceRegistry {
    *  previous value first, so silence/timeout, a non-gen-3 model, a reply whose model byte is not the
    *  connected model, or a major of 0 all leave `#firmware` null (= unknown) instead of a stale version;
    *  never throws (detection must not depend on it). The store-ack scope and the device-cache key
-   *  both read it; while the read is in flight the value is null, which consumers treat as "unknown". */
+   *  both read it; while the read is in flight the value is null, which consumers treat as "unknown".
+   *  A version read here is also remembered for the editor layouts (`#lastFirmware`, see layoutFirmware), which
+   *  keep it through a later read that gets no answer; a read for another model forgets it (another unit). */
   async #populateFirmware(modelId: number): Promise<void> {
     this.#firmware = null;
+    if (this.#lastFirmware && this.#lastFirmware.modelId !== modelId) this.#lastFirmware = null;
     if (modelId < 0 || DEVICE_MODELS[modelId]?.gen !== 3) return;
     try {
       const dev = await this.transport();
@@ -762,29 +917,63 @@ export class DeviceRegistry {
       // only a reply from the CONNECTED model counts (f[4] = model byte); a major of 0 is no real version
       const f = frames.find((x) => isFractalHeaderFrame(x) && x[5] === FN_FIRMWARE_VERSION && x[4] === modelId);
       const v = f ? parseFirmwareVersionReply(f) : null;
-      if (v && v.major > 0) this.#firmware = { major: v.major, minor: v.minor, version: formatFirmwareVersion(v.major, v.minor), build: v.build ?? '' };
+      if (v && v.major > 0) {
+        this.#firmware = { major: v.major, minor: v.minor, version: formatFirmwareVersion(v.major, v.minor), build: v.build ?? '' };
+        this.#lastFirmware = { modelId, major: v.major, minor: v.minor };
+      }
     } catch {
       /* silence / timeout / dead port → firmware stays null */
     }
   }
 
-  /** Swap the active driver's profile for a device-cache-derived RUNTIME profile when a cache doc
-   *  exists for the attached model+firmware. Called on a fresh detect AND by the deviceCache service
-   *  after a build completes. No-op without a loadDeviceCache hook, a selfDescribe driver, known
-   *  firmware, or a stored cache this build may use (a profile with a missing/outdated/newer schema
-   *  is never applied — the static profile stays). Never throws. */
+  /** Make the active driver's profile match the stored device cache for the attached model+firmware:
+   *  swap in the device-cache-derived RUNTIME profile when a usable cache doc exists, and fall back to the
+   *  bundled static profile when none does (the doc was deleted, the firmware changed to one without a
+   *  profile, the firmware is unknown), so a profile of an earlier firmware never stays live. Called on a
+   *  fresh detect, by the deviceCache service after a build completes and after a delete. No-op without a
+   *  loadDeviceCache hook or a selfDescribe driver. A stored profile with a missing/outdated/newer schema
+   *  counts as none (it is never applied; the static profile stays). Never throws. */
   async applyRuntimeCache(): Promise<void> {
     if (!this.#deps.loadDeviceCache) return;
     const d = this.#active;
     const mid = this.#modelId;
-    if (mid < 0 || !d || !d.capabilities.selfDescribe || !d.applyRuntimeProfile || !this.#firmware) return;
-    const key = deviceCacheKey(mid, this.#firmware.major, this.#firmware.minor);
+    if (mid < 0 || !d || !d.capabilities.selfDescribe || !d.applyRuntimeProfile) return;
     let built: BuiltCache | null = null;
-    try { built = (await this.#deps.loadDeviceCache(key)) ?? null; } catch { built = null; }
-    if (!built || !checkProfileSchema(built).usable) return; // absent, or stale (see profileSchema.ts): keep the static profile
-    const runtime = runtimeProfileFrom(built, PROFILES[mid] ?? this.#prof);
+    let key: string | null = null;
+    this.#storedVerdict = null;
+    if (this.#firmware) {
+      key = deviceCacheKey(mid, this.#firmware.major, this.#firmware.minor);
+      // the hook goes through loadUsableProfile, which records what it found (absent / usable / stale) for the
+      // caps; forget the previous answer first so a hook that does not leaves no stale verdict behind
+      forgetProfileVerdict(key);
+      try { built = (await this.#deps.loadDeviceCache(key)) ?? null; } catch { built = null; }
+      const verdict = lastProfileVerdict(key);
+      if (verdict) {
+        this.#storedVerdict = { key, verdict };
+        // the load re-derived the stored doc from its raw sources and wrote it back: tell live UIs
+        if (verdict.upgraded) this.emitEvent({ type: 'definitions', reason: 'rederived', key });
+      }
+    }
+    const bundled = PROFILES[mid];
+    if (!built || !checkProfileSchema(built).usable) {
+      // no usable profile for this model+firmware: the bundled profile is the live one
+      this.#appliedProfileKey = null;
+      this.#appliedSummary = null;
+      this.#appliedDoc = null;
+      if (bundled) {
+        d.applyRuntimeProfile(bundled);
+        this.#prof = bundled;
+      }
+      return;
+    }
+    const runtime = runtimeProfileFrom(built, bundled ?? this.#prof);
     d.applyRuntimeProfile(runtime);
-    if (PROFILES[mid]) this.#prof = runtime; // keep /diag + reporting profile in sync for gen-3
+    if (bundled) {
+      this.#prof = runtime; // keep /diag + reporting profile in sync for gen-3
+      this.#appliedProfileKey = key;
+      this.#appliedSummary = profileSummaryOf(built, mid);
+      this.#appliedDoc = built;
+    }
   }
 
   /** Pause the telemetry supervisor for the duration of an exclusive operation (the device-cache
@@ -936,8 +1125,9 @@ export class DeviceRegistry {
   //   METERS — fn 0x01 sub 0x19, round-robin over Output 1/2 × L/R (addr 0x2A/0x2B, sub 0x10/0x11).
   //     Reply bytes[12..16] = 5-septet-LE float32 = RMS energy → dB = 10·log10(v), floor −40. The REAL,
   //     calibrated meters (matched the live readout to ~1 dB). 0x2E bytes 35/36 saturate → not used.
-  //   CPU — fn 0x01 sub 0x2E, byte 37 = block DSP load → CPU% ≈ CPU_BASE + byte37·CPU_SLOPE. That's a
-  //     590-byte frame, so we read it only once per round-robin cycle (meters are tiny 23-byte reads).
+  //   CPU — fn 0x01 sub 0x2E is the preset status + routing grid block; its declared payload carries
+  //     the DSP load as a float32 percentage. That's a ≥590-byte frame, so we read it only once per
+  //     round-robin cycle (meters are tiny 23-byte reads).
   // Runs while ≥1 SSE client is subscribed AND the active driver's telemetry capability allows it.
   #startMeters() {
     if (!this.#meterDemand) return; // the meter round-robin runs only while a client has its meters on (METER toggle)
@@ -1004,11 +1194,14 @@ export class DeviceRegistry {
           }
         }
         this.#emit({ type: 'meters', out1L: this.#mDb[0]!, out1R: this.#mDb[1]!, out2L: this.#mDb[2]!, out2R: this.#mDb[3]! });
-        // CPU is a heavy 590-byte read → poll it only occasionally (every Nth tick), off the meter path.
+        // CPU is a heavy status-block read → poll it only occasionally (every Nth tick), off the meter path.
         if (step % cad.cpuEveryNTicks === 0) {
           const frames = await dev.request(buildCpuPoll(d.modelId), { timeoutMs: 400, quietMs: 25, routine: true, match: (fs) => fs.some((f) => isCpuResponse(f)) });
           const f = frames.find((x) => isCpuResponse(x));
-          if (f) this.#emit({ type: 'cpu', percent: cpuPercentFromRaw(parseCpuRawLoad(f)) });
+          if (f) {
+            const percent = parseCpuPercent(f);
+            if (percent != null) this.#emit({ type: 'cpu', percent });
+          }
         }
       });
       // The cheap scene/channel reflection watches run on BOTH link speeds — on a slow link each

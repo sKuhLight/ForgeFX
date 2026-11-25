@@ -24,6 +24,7 @@ import { CACHE_SCHEMA, type BuiltCache, type CacheRecord, type LiveWalkOptions }
 import { createCloud } from '../../src/runtime/cloud.js';
 import { MockTransport, handshakeReply, isIdentifyBroadcast, assert, assertEqual } from '../helpers/mock.js';
 import { seedRecords, fakeCacheDoc, sectionsDoc } from './device-cache.test.js';
+import { liveSource, profileDoc } from '../helpers/profileDocs.js';
 import { CACHE_BYTES } from './editor-cache-import.test.js';
 
 export const PROFILE_SCHEMA_CASE_COUNT = 11;
@@ -49,6 +50,9 @@ function docWithSchema(schema: unknown): BuiltCache {
 }
 
 const staleDoc = (): BuiltCache => docWithSchema(undefined);
+
+/** A current profile-v2 doc of FM3 fw 12.0 holding one complete local read-only walk (a build is "already"). */
+const currentV2Doc = (): BuiltCache => profileDoc([liveSource(seedRecords())]) as unknown as BuiltCache;
 
 function firmwareReply(model: number, major: number, minor: number): number[] {
   return [0xf0, 0x00, 0x01, 0x74, model, 0x08, major, minor, 0x00, 0x00, 0xf7];
@@ -229,14 +233,25 @@ async function buildOverStale(): Promise<void> {
     }
     assertEqual(walks.length, STALE_STAMPS.length, 'each stale rebuild walked exactly once');
 
-    // current schema: the cache-hit short-circuit is unchanged (no walk)
-    putDoc(docWithSchema(CACHE_SCHEMA));
+    // current schema, profile v2: a doc holding a complete local read-only walk short-circuits (no walk)
+    putDoc(currentV2Doc());
     const hit = await makeApp();
     try {
       const r = await deviceCache.startCacheBuild(store.defaultStore, hit.registry, { walkImpl: walk });
       assertEqual((r.body as { already?: boolean }).already, true, 'current profile: already built');
       assertEqual(walks.length, STALE_STAMPS.length, 'current profile: no walk');
     } finally { await hit.app.close(); }
+
+    // a current LEGACY (format-1) doc is usable but holds no raw source: the build walks and writes a format-2 doc
+    putDoc(docWithSchema(CACHE_SCHEMA));
+    const legacy = await makeApp();
+    try {
+      const r = await deviceCache.startCacheBuild(store.defaultStore, legacy.registry, { walkImpl: walk });
+      assertEqual((r.body as { started?: boolean }).started, true, 'current legacy profile: the build walks');
+      await deviceCache.cacheBuildPromise(legacy.registry);
+      assertEqual(walks.length, STALE_STAMPS.length + 1, 'current legacy profile: walked once');
+      assertEqual((storedData()!.meta as { format?: number }).format, 2, 'current legacy profile: replaced by a format-2 doc');
+    } finally { await legacy.app.close(); }
 
     // a cancelled rebuild leaves the stale profile exactly where it was (nothing deletes it up front)
     putDoc(staleDoc());
@@ -445,7 +460,8 @@ async function walkLimitsIgnoreStale(): Promise<void> {
   const { app, registry } = await makeApp();
   try {
     putDoc(exact(CACHE_SCHEMA));
-    await deviceCache.startCacheBuild(store.defaultStore, registry, { force: true, walkImpl: walk });
+    // a legacy editor-cache import: only `replace` walks over it (no raw to merge a walk into)
+    await deviceCache.startCacheBuild(store.defaultStore, registry, { replace: true, walkImpl: walk });
     await deviceCache.cacheBuildPromise(registry);
     assertEqual(sizes[0], 40, 'a current byte-exact profile still refines the walk (chorus 40)');
 
@@ -490,6 +506,7 @@ async function routerParity(): Promise<void> {
     const cur = await both('GET', '/device/cache');
     assertEqual(cur.stale, false, 'parity: current status not stale');
     assertEqual((await both('GET', '/device/cache/sources', undefined, ['persisted'])).persisted, true, 'parity: current sources persisted');
+    putDoc(currentV2Doc()); // profile v2: a complete local read-only walk is what makes a build "already"
     const built = await both('POST', '/device/cache/build', {});
     assertEqual(built.already, true, 'parity: a current profile is already built on both twins');
   } finally { clearDoc(); await app.close(); }

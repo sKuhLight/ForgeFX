@@ -1,0 +1,162 @@
+{
+  "model": 17,
+  "firmware": "99.0",
+  "catalogFirmware": "12.0",
+  "state": "partial",
+  "profile": {
+    "key": "11_99p0",
+    "source": "editor-cache",
+    "byteExact": true,
+    "format": 2,
+    "sources": [
+      {"id":"editor-cache@2026-11-22T10:00:00.000Z#0","kind":"editor-cache","origin":"local","capturedAt":"2026-11-22T10:00:00.000Z","firmware":"99.0","records":0},
+      {"id":"live-probe@2026-11-22T11:00:00.000Z#0","kind":"live-probe","origin":"local","capturedAt":"2026-11-22T11:00:00.000Z","firmware":"99.0","records":5}
+    ]
+  },
+  "summary": {
+    "newParams": 6,
+    "changed": {"compatible":2,"incompatible":16},
+    "removed": 1,
+    "movedNames": 12,
+    "rosterChanges": 2,
+    "enumChanges": 1,
+    "strideChanges": 6,
+    "newSections": 1,
+    "unknownBlocks": 2,
+    "suspects": ["MIXER","OUTPUT"],
+    "disagreements": []
+  },
+  "families": [
+    {
+      "family": "CHORUS",
+      "eid": 78,
+      "status": "changed",
+      "params": {"added":[{"id":29,"name":"P29","kind":"float","generic":true,"min":0,"max":10}],"changed":[],"removed":[],"moved":[]},
+      "enums": [],
+      "stride": {"before":29,"after":30}
+    },
+    {"family":"COMP","eid":46,"status":"changed","params":{"added":[],"changed":[],"removed":[{"id":13,"name":"Compression","kind":"float","generic":false,"min":0,"max":10}],"moved":[]},"enums":[]},
+    {
+      "family": "DELAY",
+      "eid": 70,
+      "status": "changed",
+      "params": {"added":[{"id":89,"name":"P89","kind":"enum","generic":true,"options":5}],"changed":[],"removed":[],"moved":[]},
+      "enums": [],
+      "stride": {"before":88,"after":90}
+    },
+    {
+      "family": "DISTORT",
+      "eid": 58,
+      "status": "changed",
+      "params": {
+        "added": [],
+        "changed": [{"id":70,"name":"Power Tube Type","kind":"enum","generic":false,"options":27,"change":"compatible","fpBefore":"1:8790af11","fpAfter":"1:ed7191f5"}],
+        "removed": [],
+        "moved": []
+      },
+      "enums": [{"id":70,"name":"Power Tube Type","before":25,"after":27,"change":"appended"}]
+    },
+    {
+      "family": "ENHANCER",
+      "eid": 122,
+      "status": "changed",
+      "params": {
+        "added": [{"id":12,"name":"Scene Ignore","kind":"enum","generic":false,"options":2,"movedFrom":11}],
+        "changed": [
+          {"id":3,"name":"P3","kind":"float","generic":true,"min":0,"max":1,"change":"incompatible","fpBefore":"1:ffbaba1c","fpAfter":"1:7913885a"},
+          {"id":4,"name":"High Cut","kind":"float","generic":false,"min":200,"max":20000,"movedFrom":3,"change":"incompatible","fpBefore":"1:70f92dab","fpAfter":"1:ffbaba1c"},
+          {"id":5,"name":"Level","kind":"float","generic":false,"min":-80,"max":20,"movedFrom":4,"change":"incompatible","fpBefore":"1:371d81a6","fpAfter":"1:70f92dab"},
+          {"id":6,"name":"Bypass","kind":"float","generic":false,"min":0,"max":1,"movedFrom":5,"change":"incompatible","fpBefore":"1:bd624cd8","fpAfter":"1:371d81a6"},
+          {"id":7,"name":"TYPE","kind":"enum","generic":false,"options":3,"movedFrom":6,"change":"incompatible","fpBefore":"1:b639f6c3","fpAfter":"1:bd624cd8"},
+          {"id":8,"name":"Phase Invert","kind":"enum","generic":false,"options":4,"movedFrom":7,"change":"incompatible","fpBefore":"1:1069b0e9","fpAfter":"1:b639f6c3"},
+          {"id":10,"name":"P10","kind":"float","generic":true,"min":-100,"max":100,"change":"incompatible","fpBefore":"1:63434cb2","fpAfter":"1:1069b0e9"},
+          {"id":11,"name":"Balance","kind":"float","generic":false,"min":-100,"max":100,"movedFrom":10,"change":"incompatible","fpBefore":"1:02a8ec0b","fpAfter":"1:63434cb2"}
+        ],
+        "removed": [],
+        "moved": [
+          {"name":"High Cut","from":3,"to":4},
+          {"name":"Level","from":4,"to":5},
+          {"name":"Bypass","from":5,"to":6},
+          {"name":"TYPE","from":6,"to":7},
+          {"name":"Phase Invert","from":7,"to":8},
+          {"name":"Balance","from":10,"to":11},
+          {"name":"Scene Ignore","from":11,"to":12}
+        ]
+      },
+      "enums": [],
+      "stride": {"before":12,"after":13}
+    },
+    {
+      "family": "FLANGER",
+      "eid": 82,
+      "status": "changed",
+      "params": {"added":[],"changed":[{"id":1,"name":"Rate","kind":"float","generic":false,"min":0,"max":1,"change":"incompatible","fpBefore":"1:489a6114","fpAfter":"1:2a314fd2"}],"removed":[],"moved":[]},
+      "enums": []
+    },
+    {
+      "family": "FUZZ",
+      "eid": 118,
+      "status": "changed",
+      "params": {
+        "added": [{"id":43,"name":"P43","kind":"enum","generic":true,"options":2}],
+        "changed": [{"id":0,"name":"TYPE","kind":"enum","generic":false,"options":87,"change":"compatible","fpBefore":"1:b750e0dd","fpAfter":"1:be9e37bf"}],
+        "removed": [],
+        "moved": []
+      },
+      "roster": {"selectorId":0,"before":86,"after":87,"appended":["NEW FUZZ MODEL"],"inserted":[],"renamed":[],"removed":[],"ordinalShift":false},
+      "enums": [],
+      "stride": {"before":43,"after":44}
+    },
+    {"family":"MIXER","eid":126,"status":"suspect","params":{"added":[],"changed":[],"removed":null,"moved":[]},"enums":[]},
+    {"family":"OUTPUT","eid":42,"status":"suspect","params":{"added":[],"changed":[],"removed":null,"moved":[]},"enums":[]},
+    {
+      "family": "PHASER",
+      "eid": 90,
+      "status": "changed",
+      "params": {"added":[],"changed":[{"id":3,"name":"Type","kind":"float","generic":false,"min":0,"max":9,"change":"incompatible","fpBefore":"1:faebfda0","fpAfter":"1:63a8e2f3"}],"removed":[],"moved":[]},
+      "enums": []
+    },
+    {
+      "family": "REVERB",
+      "eid": 66,
+      "status": "changed",
+      "params": {
+        "added": [{"id":71,"name":"P71","kind":"enum","generic":true,"options":140}],
+        "changed": [{"id":0,"name":"TYPE","kind":"enum","generic":false,"options":80,"change":"incompatible","fpBefore":"1:f72887aa","fpAfter":"1:241ea858"}],
+        "removed": [],
+        "moved": []
+      },
+      "roster": {"selectorId":0,"before":79,"after":80,"appended":[],"inserted":[{"ordinal":3,"label":"NEW SPACE MODEL"}],"renamed":[],"removed":[],"ordinalShift":true},
+      "enums": [],
+      "stride": {"before":71,"after":72}
+    },
+    {
+      "family": "ROTARY",
+      "eid": 86,
+      "status": "changed",
+      "params": {
+        "added": [{"id":21,"name":"Scene Ignore","kind":"enum","generic":false,"options":2,"movedFrom":20}],
+        "changed": [
+          {"id":16,"name":"P16","kind":"float","generic":true,"min":0,"max":1,"change":"incompatible","fpBefore":"1:8597876b","fpAfter":"1:7913885a"},
+          {"id":17,"name":"Stereo Spread","kind":"float","generic":false,"min":-200,"max":200,"movedFrom":16,"change":"incompatible","fpBefore":"1:b606079b","fpAfter":"1:8597876b"},
+          {"id":18,"name":"Drive","kind":"float","generic":false,"min":0,"max":10,"movedFrom":17,"change":"incompatible","fpBefore":"1:ce3c0fe2","fpAfter":"1:b606079b"},
+          {"id":19,"name":"Mic Distance","kind":"float","generic":false,"min":0.01,"max":1,"movedFrom":18,"change":"incompatible","fpBefore":"1:85f7005e","fpAfter":"1:ce3c0fe2"},
+          {"id":20,"name":"Input Select","kind":"enum","generic":false,"options":3,"movedFrom":19,"change":"incompatible","fpBefore":"1:02a8ec0b","fpAfter":"1:85f7005e"}
+        ],
+        "removed": [],
+        "moved": [
+          {"name":"Stereo Spread","from":16,"to":17},
+          {"name":"Drive","from":17,"to":18},
+          {"name":"Mic Distance","from":18,"to":19},
+          {"name":"Input Select","from":19,"to":20},
+          {"name":"Scene Ignore","from":20,"to":21}
+        ]
+      },
+      "enums": [],
+      "stride": {"before":21,"after":22}
+    }
+  ],
+  "sections": [{"tag":60,"key":"section:60","role":"new","stride":5,"informative":5,"mappedEids":[203]}],
+  "blocks": [{"eid":203,"placed":true,"state":"confirmed","key":"section:60","sectionTag":60,"params":4},{"eid":205,"placed":true,"state":"none","key":null,"sectionTag":null,"params":0}],
+  "instances": [{"family":"MIXER","static":4,"seen":2}]
+}
