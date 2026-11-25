@@ -20,21 +20,32 @@
 // shims, SSE, static UI and the Node-gated cloud/remote/telemetry surface.
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
 import cors from '@fastify/cors';
-import { existsSync, statSync, createReadStream, readFileSync } from 'node:fs';
+import { existsSync, statSync, createReadStream, readFileSync, mkdirSync, writeFileSync } from 'node:fs';
+import { hostname } from 'node:os';
 import { join, resolve, extname } from 'node:path';
 import type { DeviceRegistry } from './drivers/registry.js';
 import { parseHexBytes, sendErrorStatus } from './drivers/sendPolicy.js';
 import * as backups from './services/backups.js';
 import * as convert from './services/convert.js';
 import type { ConverterPreset } from 'forgefx-midi/convert';
+import { GRAPH_CURVE_SLOTS } from 'forgefx-midi/gen3/axe-fx-iii';
 import * as deviceCache from './services/deviceCache.js';
 import * as editorCacheImport from './services/editorCacheImport.js';
 import * as editorCacheDiscovery from './services/editorCacheDiscovery.js';
+import type { DiscoverOpts } from './services/editorCacheDiscovery.js';
+import { FORBIDDEN_ORIGIN, REMOTE_RELAY_HEADER, createRequestPolicy, isStrictAllowed, loopbackOriginGuard, splitList, type RequestPolicyOptions } from './services/originGuard.js';
+import { selectBindHost } from './services/bindHost.js';
+import { staticTarget } from './services/staticFiles.js';
 import * as cloudProfiles from './services/cloudProfiles.js';
+import * as cloudShare from './services/cloudShare.js';
 import * as diagnostics from './services/diagnosticCapture.js';
+import * as contribution from './services/cacheContribution.js';
+import * as definitionsFile from './services/definitionsFile.js';
+import * as blockProbe from './services/blockProbe.js';
 import * as store from './store.js';
-import { createUnifiedHandlers } from './runtime/handlers.js';
+import { createUnifiedHandlers, genericFlag } from './runtime/handlers.js';
 import { putStoreDoc } from './runtime/services.js';
+import { FORBIDDEN_COLLECTION_BODY, isPrivateCollection, isWriteProtectedCollection } from './runtime/storeAccess.js';
 import { registerLocalRoutes } from './localStore.js';
 import { registerHelpRoutes } from './help.js';
 import { telemetryStatus, uploadDebugReport, type DebugReport } from './telemetry.js';
@@ -49,15 +60,85 @@ const FORGEFX_VERSION: string = (() => {
   }
 })();
 
-export async function buildApp(registry: DeviceRegistry): Promise<FastifyInstance> {
+/** Optional seams for the API tests; production passes nothing (real disk, real discovery roots). */
+export interface AppOptions {
+  /** Editor-cache disk access: where discovery looks (platform/home/env/fs) and how a discovered
+   *  candidate is read. Tests point discovery at a temp or fake tree and spy on the reader. */
+  editorCaches?: { discover?: DiscoverOpts; readFile?: (path: string) => { name: string; bytes: Uint8Array } };
+  /** Editor-cache contribution seams: a cloud client (tests pass a fake; production binds the AXIS_CLOUD one),
+   *  and the dry-run switches that otherwise come from FORGEFX_CONTRIBUTE_DRY_RUN / FORGEFX_CONTRIBUTE_DRY_RUN_DIR. */
+  contribute?: { cloud?: contribution.ContributionCloud | null; dryRun?: boolean; dryRunDir?: string | null };
+  /** Shared device-definition seam: the cloud client `GET /device/cache/cloud`, the pull and the share routes use (tests
+   *  pass a fake, also without AXIS_CLOUD; null = no cloud). Production passes nothing: the AXIS_CLOUD client, or the
+   *  disabled answer. */
+  cloudProfiles?: { cloud?: cloudShare.ShareCloud | null };
+  /** Origin/Host policy inputs (services/originGuard.ts). Each field omitted = production: the
+   *  FORGEFX_ALLOWED_ORIGINS / FORGEFX_ALLOWED_HOSTS env lists and `os.hostname()`. */
+  http?: RequestPolicyOptions;
+  /** Called for every route as it is registered (Fastify `onRoute`), before any route exists: lets the
+   *  tests enumerate the whole surface. */
+  onRoute?: (route: { method: string | string[]; url: string }) => void;
+}
+
+/** The 400 body for a JSON request body that does not parse (app-wide, see the parser in buildApp). */
+export const INVALID_JSON_BODY = { error: 'invalid-json' } as const;
+const INVALID_JSON_CODE = 'FORGEFX_INVALID_JSON';
+
+/** Dry-run copy for a manual check: `<dir>/<sha256>.cache` (the redacted bytes, exactly what an upload would
+ *  send) and `<dir>/<sha256>.json` (the exact reserve body). Node-only; a failure is logged, never fatal. */
+function writeContributionDryRun(dir: string, a: NonNullable<contribution.ContributeResult['dryRunArtifacts']>, log: { info(msg: string): void; warn(msg: string): void }): void {
+  try {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, `${a.sha256}.cache`), a.redacted);
+    writeFileSync(join(dir, `${a.sha256}.json`), JSON.stringify(a.reserveBody, null, 2));
+    log.info(`[forgefx] contribution dry run: wrote ${a.sha256}.cache (${a.redacted.length} B) + .json`);
+  } catch (e) {
+    log.warn(`[forgefx] contribution dry run: could not write the copy: ${(e as Error).message}`);
+  }
+}
+
+export async function buildApp(registry: DeviceRegistry, opts: AppOptions = {}): Promise<FastifyInstance> {
   const app = Fastify({ logger: { level: process.env.LOG_LEVEL ?? 'info' } });
-  await app.register(cors, { origin: true });
+  if (opts.onRoute) { const onRoute = opts.onRoute; app.addHook('onRoute', (r) => onRoute({ method: r.method, url: r.url })); }
+
+  // ── origin + host policy (FORGEFX-51, services/originGuard.ts) ──
+  // ONE app-wide onRequest hook, added before anything else so it runs first on every route (CORS
+  // preflights and the static/404 handler included): a Host that is not a loopback name, an
+  // FORGEFX_ALLOWED_HOSTS entry or (non-loopback bind only) an IP literal / this machine's name → 403
+  // forbidden-host (DNS rebinding); then, except on the public requests (GET /healthz, unmatched GETs =
+  // static SPA), `Sec-Fetch-Site: cross-site` without a listed Origin, or an Origin that is not absent,
+  // loopback, same-origin or an FORGEFX_ALLOWED_ORIGINS entry → 403 forbidden-origin. Routes that read
+  // local files or reveal local paths add the STRICT loopbackOriginGuard (loopback peer) on top.
+  const policy = createRequestPolicy({
+    allowedOrigins: opts.http?.allowedOrigins ?? splitList(process.env.FORGEFX_ALLOWED_ORIGINS),
+    allowedHosts: opts.http?.allowedHosts ?? splitList(process.env.FORGEFX_ALLOWED_HOSTS),
+    machineHostnames: opts.http?.machineHostnames ?? [hostname()],
+    // index.ts passes the address it listens on; the same default otherwise (loopback inside Electron)
+    bindHost: opts.http?.bindHost ?? selectBindHost()
+  });
+  for (const e of policy.ignored) app.log.warn(`[forgefx] ignoring the unparseable allowlist entry ${e}`);
+  app.addHook('onRequest', policy.onRequest);
+  // CORS reflects loopback and operator-listed origins only (same-origin needs no CORS header; any other
+  // origin was already refused above, or is on a public route whose answer it then cannot read).
+  await app.register(cors, { origin: (origin, cb) => cb(null, policy.isCorsOrigin(origin)) });
+
   // tolerate an empty JSON body (no-body POSTs like /cloud/sync, /cloud/logout, /tempo/tap send
-  // content-type: application/json with no payload → Fastify would 400 by default).
-  app.addContentTypeParser('application/json', { parseAs: 'string' }, (_req, body, done) => {
+  // content-type: application/json with no payload → Fastify would 400 by default). A body that does not
+  // parse is the client's error: 400 { error: 'invalid-json' } on every route (the error handler below).
+  // Parsing is Fastify's own secure parser (secure-json-parse): a `__proto__` key or a
+  // `constructor.prototype` path is refused like malformed JSON instead of reaching a handler.
+  const secureJson = app.getDefaultJsonParser('error', 'error');
+  const invalidJson = () => Object.assign(new Error(INVALID_JSON_BODY.error), { statusCode: 400, code: INVALID_JSON_CODE });
+  app.addContentTypeParser('application/json', { parseAs: 'string' }, (req, body, done) => {
     const s = body as string;
     if (!s || !s.length) return done(null, {});
-    try { done(null, JSON.parse(s)); } catch (e) { done(e as Error); }
+    secureJson(req, s, (err, parsed) => (err ? done(invalidJson()) : done(null, parsed)));
+  });
+  // App-wide error handler: only the invalid-JSON shape is ours; every other error goes on to Fastify's
+  // default handler unchanged. A route-level errorHandler that re-sends an error lands here too.
+  app.setErrorHandler((err: { code?: string }, _req, reply) => {
+    if (err.code === INVALID_JSON_CODE) return reply.code(400).send(INVALID_JSON_BODY);
+    return reply.send(err);
   });
   // accept raw .syx bytes (preset files) on POST /preset/decode
   app.addContentTypeParser('application/octet-stream', { parseAs: 'buffer' }, (_req, body, done) => done(null, body));
@@ -69,7 +150,7 @@ export async function buildApp(registry: DeviceRegistry): Promise<FastifyInstanc
     presetSelectH, presetStoreH, presetNameH, locationsH,
     backupH, restoreH, fwValidateH, deviceParamH, modModelH,
     telemetryConfigH, telemetrySetH,
-    decodeH, decodeBytes
+    decodeH, decodeBytes, definitionsDiffH
   } = createUnifiedHandlers(registry);
 
   // ── deprecated-alias plumbing (the folded /am4/* routes) ──
@@ -130,8 +211,15 @@ export async function buildApp(registry: DeviceRegistry): Promise<FastifyInstanc
   // Start a background build (501 no selfDescribe / no fullCapture; 501 reason:'firmware' for mode 'full' on a firmware
   // it has not been verified on — FAIL CLOSED: full mode on unknown/unreadable firmware is 501 too, no longer 503;
   // 503 no device/firmware for read-only; 409 already building). Read-only is never firmware-gated.
-  app.post<{ Body: { force?: boolean; mode?: 'read-only' | 'full' } }>('/device/cache/build', async (req, reply) => {
-    const r = await deviceCache.startCacheBuild(store.defaultStore, registry, { force: req.body?.force, mode: req.body?.mode });
+  // Profile v2: the walk MERGES into the stored doc (`replace: true` replaces it); `already` only when the doc holds
+  // a complete local source of the requested kind; `scope` 'standard' | 'extended' (default 'extended' for a
+  // read-only build when a walk-scope gate of the freshly read firmware is open): an extended build adds the
+  // read-only extension walk (phase B) after the standard walk, which is persisted first; the terminal `done` event
+  // carries `extension: 'done' | 'skipped' | 'aborted'` (+ `abortReason`), see services/deviceCache.ts.
+  app.post<{ Body: { force?: boolean; mode?: 'read-only' | 'full'; scope?: 'standard' | 'extended'; replace?: boolean } }>('/device/cache/build', async (req, reply) => {
+    const r = await deviceCache.startCacheBuild(store.defaultStore, registry, {
+      force: req.body?.force, mode: req.body?.mode, scope: req.body?.scope, replace: req.body?.replace === true
+    });
     reply.code(r.code);
     return r.body;
   });
@@ -139,23 +227,84 @@ export async function buildApp(registry: DeviceRegistry): Promise<FastifyInstanc
   app.post('/device/cache/cancel', () => deviceCache.cancelCacheBuild(registry));
   // Delete the current key's stored cache.
   app.delete('/device/cache', () => deviceCache.deleteCache(store.defaultStore, registry));
+  // Definitions diff: the bundled catalog against the applied profile (`family=` repeatable, `include=` parts). Reads
+  // state the registry holds — no detection, no device traffic (runtime/handlers.ts definitionsDiffH).
+  app.get<{ Querystring: { family?: string | string[]; include?: string | string[] } }>('/device/definitions/diff', (req, reply) =>
+    definitionsDiffH(reply, { family: req.query.family, include: req.query.include }));
+  // `.axisdefs` export / import (services/definitionsFile.ts; capability definitions.portable). The export is a plain GET
+  // (the Remote relay may read it) whose file name rides in `Content-Disposition`. The import is STRICT-origin guarded like
+  // the contribution routes (the person at this machine hands the file over, never a LAN page or a web page), takes the
+  // file as the JSON body (≤ 8 MiB, a larger one answers 413 `too-large` before it is read) and is not on the Remote
+  // allowlist. `?force=1` / `?replace=1` are the person's flags; a flag inside the file is not read.
+  app.get('/device/definitions/export', async (_req, reply) => {
+    const r = await definitionsFile.exportDefinitions(store.defaultStore, registry, { versions: { forgefx: FORGEFX_VERSION } });
+    reply.code(r.code);
+    if (r.filename) reply.header('content-disposition', definitionsFile.attachmentHeader(r.filename));
+    return r.body;
+  });
+  app.post<{ Body: unknown; Querystring: { force?: string | string[]; replace?: string | string[] } }>(
+    '/device/definitions/import',
+    {
+      onRequest: loopbackOriginGuard,
+      bodyLimit: definitionsFile.AXISDEFS_MAX_BYTES,
+      // a body over the limit never reaches the handler: answer it in the route's 413 shape
+      errorHandler: (err: { statusCode?: number; code?: string }, req, reply) => {
+        if (err.statusCode === 413 || err.code === 'FST_ERR_CTP_BODY_TOO_LARGE') {
+          return reply.code(413).send(definitionsFile.tooLargeBody(Number(req.headers['content-length'] ?? NaN)));
+        }
+        return reply.send(err);
+      }
+    },
+    async (req, reply) => {
+      const r = await definitionsFile.importDefinitions(store.defaultStore, registry, req.body, {
+        force: definitionsFile.flagOn(req.query.force), replace: definitionsFile.flagOn(req.query.replace)
+      });
+      reply.code(r.code);
+      return r.body;
+    }
+  );
+
+  // Block probe (services/blockProbe.ts): one read-only definition walk of a placed block the catalog does not know, so
+  // the block map can bind it (gated per firmware: 501 reason 'firmware' until verified; 400/404/409/503/504 per the
+  // service; every refusal before any device traffic). Not on the Remote allowlist (it walks the device and persists).
+  app.post<{ Params: { eid: string } }>('/device/definitions/blocks/:eid/probe', async (req, reply) => {
+    const r = await blockProbe.probeBlock(store.defaultStore, registry, req.params.eid);
+    reply.code(r.code);
+    return r.body;
+  });
 
   // ── editor-cache import (SECOND cache source: an official-editor effectDefinitions_*.cache file;
   //    capability cacheImport). See services/editorCacheImport.ts + editorCacheDiscovery.ts. ──
+  // Origin guards (FORGEFX-47, services/originGuard.ts): a foreign web page gets 403 before any fs
+  // access (the app-wide hook). Sources and the `{ path }` import read the disk or return local paths:
+  // STRICT on top (loopback or no Origin). The bytes import reads nothing local and keeps the app-wide
+  // rule, so a LAN browser on a headless ForgeFX (Docker, Raspberry Pi) that serves the SPA can still
+  // drop a .cache file.
+  const discoverOpts = opts.editorCaches?.discover ?? {};
+  const readCandidate = opts.editorCaches?.readFile ?? editorCacheDiscovery.readCandidateFile;
   // Sources: is a cache already persisted for the attached device + which on-disk editor caches exist.
-  app.get('/device/cache/sources', async () => {
+  app.get('/device/cache/sources', { onRequest: loopbackOriginGuard }, async () => {
     const persisted = await editorCacheImport.isPersisted(store.defaultStore, registry);
-    return { persisted, candidates: editorCacheDiscovery.discoverEditorCaches() };
+    return { persisted, candidates: editorCacheDiscovery.discoverEditorCaches(discoverOpts) };
   });
   // Import: raw octet-stream of the .cache file + ?name=<filename> (& ?force=1), OR JSON { path } to
   // read a discovered candidate off disk. 501 no cacheImport, 409 model/firmware mismatch (force skips fw).
-  app.post<{ Body: Buffer | { path?: string }; Querystring: { name?: string; force?: string } }>('/device/cache/import', async (req, reply) => {
+  // The app-wide hook applies; the `{ path }` branch re-checks the strict rule (403) before discovery
+  // runs. `{ path }` must then be one of a fresh discovery's candidates (400 not-a-discovered-cache
+  // otherwise; the path is never opened or stat-ed); the read uses the candidate's own path.
+  // Profile v2: the editor cache MERGES into the stored doc; `?replace=1` (or `replace: true` next to `path`)
+  // replaces the whole doc instead.
+  app.post<{ Body: Buffer | { path?: string; replace?: boolean }; Querystring: { name?: string; force?: string; replace?: string } }>('/device/cache/import', async (req, reply) => {
     const force = req.query.force === '1' || req.query.force === 'true';
     const b = req.body;
+    const replace = req.query.replace === '1' || req.query.replace === 'true' || (!!b && !Buffer.isBuffer(b) && b.replace === true);
     let bytes: Uint8Array;
     let name: string;
     if (b && !Buffer.isBuffer(b) && typeof b.path === 'string' && b.path) {
-      try { const read = editorCacheDiscovery.readCandidateFile(b.path); bytes = read.bytes; name = read.name; }
+      if (!isStrictAllowed(req.headers.origin, req.socket?.remoteAddress)) { reply.code(403); return { error: FORBIDDEN_ORIGIN }; }
+      const candidate = editorCacheDiscovery.findDiscoveredCandidate(b.path, discoverOpts);
+      if (!candidate) { reply.code(400); return { error: editorCacheImport.NOT_A_DISCOVERED_CACHE }; }
+      try { const read = readCandidate(candidate.path); bytes = read.bytes; name = read.name; }
       catch (e) { reply.code(400); return { error: 'cannot read path', message: (e as Error).message }; }
     } else if (Buffer.isBuffer(b)) {
       const nm = req.query.name;
@@ -164,7 +313,112 @@ export async function buildApp(registry: DeviceRegistry): Promise<FastifyInstanc
     } else {
       reply.code(400); return { error: 'POST the .cache bytes as application/octet-stream with ?name=<filename>, or JSON { path }' };
     }
-    const r = await editorCacheImport.importEditorCache(registry, store.defaultStore, bytes, { name, force });
+    const r = await editorCacheImport.importEditorCache(registry, store.defaultStore, bytes, { name, force, replace });
+    reply.code(r.code);
+    return r.body;
+  });
+
+  // ── editor-cache contribution (services/cacheContribution.ts; capability definitions.contribute) ──
+  // Send the editor's definitions cache for the connected firmware to Axis Cloud: validated, user names
+  // redacted, only the redacted copy uploaded. Every route is STRICT-origin guarded (the status lists local
+  // paths; a POST reads a local file and consent must come from the person at this machine, not a web page).
+  // Not on the Remote allowlist (remote.ts): the status GET is readable there, the POSTs are refused.
+  // The cloud client is late-bound (set in the AXIS_CLOUD block below); without one the status says
+  // cloud.enabled:false and an upload answers 503 cloud-disabled, while dry runs and decisions still work.
+  // Dry run server-wide: FORGEFX_CONTRIBUTE_DRY_RUN=1, or FORGEFX_CONTRIBUTE_DRY_RUN_DIR=<dir>, which also writes
+  // <dir>/<sha256>.cache (the redacted bytes) + <dir>/<sha256>.json (the exact reserve body) for a manual check.
+  let contributionCloud: contribution.ContributionCloud | null = null;
+  const contributionCloudOf = (): contribution.ContributionCloud | null =>
+    opts.contribute?.cloud !== undefined ? opts.contribute.cloud : contributionCloud;
+  const contributeDryRunDir = (): string | null =>
+    opts.contribute?.dryRunDir !== undefined ? opts.contribute.dryRunDir : (process.env.FORGEFX_CONTRIBUTE_DRY_RUN_DIR || null);
+  const contributeServerDryRun = (): boolean =>
+    (opts.contribute?.dryRun ?? process.env.FORGEFX_CONTRIBUTE_DRY_RUN === '1') || !!contributeDryRunDir();
+  app.get<{ Querystring: { refresh?: string } }>('/device/cache/contribute', { onRequest: loopbackOriginGuard }, async (req) =>
+    contribution.contributionStatus(store.defaultStore, registry, contributionCloudOf(), editorCacheDiscovery.discoverEditorCaches(discoverOpts), {
+      refresh: req.query.refresh === '1' || req.query.refresh === 'true'
+    }));
+  // Sources: JSON { source: { path }, consent, consentVersion, import?, acceptFirmwareMismatch?, dryRun?,
+  // axisVersion? } with a path from a FRESH discovery (400 not-a-discovered-cache otherwise; never opened or
+  // stat-ed), or the raw bytes as application/octet-stream + ?name=<file>&consent=1&consentVersion=2&... The
+  // consent gate runs before any file is read. Body limit: the 4 MiB cap plus room for a JSON envelope.
+  app.post<{ Body: Buffer | Record<string, unknown> | undefined; Querystring: Record<string, string | undefined> }>(
+    '/device/cache/contribute',
+    {
+      onRequest: loopbackOriginGuard,
+      bodyLimit: contribution.MAX_CONTRIBUTION_BYTES + 64 * 1024,
+      // a body over the limit never reaches the handler: answer it in the contract's 413 shape
+      errorHandler: (err: { statusCode?: number; code?: string }, req, reply) => {
+        if (err.statusCode === 413 || err.code === 'FST_ERR_CTP_BODY_TOO_LARGE') {
+          const r = contribution.bodyTooLarge(Number(req.headers['content-length'] ?? NaN));
+          return reply.code(r.code).send(r.body);
+        }
+        return reply.send(err);
+      }
+    },
+    async (req, reply) => {
+      const b = req.body;
+      const isBytes = Buffer.isBuffer(b);
+      const f = contribution.parseContributionFlags((isBytes ? req.query : b && typeof b === 'object' ? b : {}) as Record<string, unknown>, isBytes);
+      if (!f.ok) { reply.code(f.code); return f.body; }
+      let source: { bytes: Uint8Array; name: string };
+      if (isBytes) {
+        const name = req.query.name;
+        if (!name) { reply.code(400); return contribution.NO_SOURCE_BODY; }
+        source = { bytes: new Uint8Array(b), name };
+      } else {
+        const path = (b as { source?: { path?: unknown } } | undefined)?.source?.path;
+        if (typeof path !== 'string' || !path) { reply.code(400); return contribution.NO_SOURCE_BODY; }
+        const candidate = editorCacheDiscovery.findDiscoveredCandidate(path, discoverOpts);
+        if (!candidate) { reply.code(400); return contribution.NOT_A_DISCOVERED_CACHE_BODY; }
+        // the size discovery saw: never read a file the cap refuses anyway
+        const tooBig = contribution.sizeRefusal(candidate.size);
+        if (tooBig) { reply.code(tooBig.code); return tooBig.body; }
+        try { source = { bytes: readCandidate(candidate.path).bytes, name: candidate.file }; }
+        catch (e) { reply.code(400); return { error: 'cannot-read-file', message: (e as Error).message }; }
+      }
+      const r = await contribution.contribute(store.defaultStore, registry, contributionCloudOf(), source, f.flags, {
+        serverDryRun: contributeServerDryRun(), versions: { forgefx: FORGEFX_VERSION }
+      });
+      const dir = contributeDryRunDir();
+      if (r.dryRunArtifacts && dir) writeContributionDryRun(dir, r.dryRunArtifacts, req.log);
+      reply.code(r.code);
+      return r.body;
+    }
+  );
+  app.post<{ Body: unknown }>('/device/cache/contribute/decision', { onRequest: loopbackOriginGuard }, async (req, reply) => {
+    const r = await contribution.setContributionDecision(store.defaultStore, registry, req.body);
+    reply.code(r.code);
+    return r.body;
+  });
+  app.post('/device/cache/contribute/withdraw', { onRequest: loopbackOriginGuard }, async (_req, reply) => {
+    const r = await contribution.withdrawContribution(store.defaultStore, registry, contributionCloudOf(), { serverDryRun: contributeServerDryRun() });
+    reply.code(r.code);
+    return r.body;
+  });
+
+  // ── sharing device definitions (cloud v2; services/cloudShare.ts) ── a consented, deliberate step: the status says what
+  // could be shared and what was; a share sends this install's own sanitized sources (consent gate first, `dryRun` answers
+  // the exact envelopes and sends nothing); withdraw removes one share or all. Served with or without AXIS_CLOUD (the
+  // cloud client is late-bound like the contribution's; without one the status says cloud.enabled:false and a send
+  // answers 503 cloud-disabled). Behind the app-wide origin policy (ADR 0004); not on the Remote allowlist (remote.ts):
+  // the status GET is readable there, the POSTs are refused.
+  let shareCloud: cloudShare.ShareCloud | null = null;
+  const shareCloudOf = (): cloudShare.ShareCloud | null =>
+    opts.cloudProfiles?.cloud !== undefined ? opts.cloudProfiles.cloud : shareCloud;
+  // over the Remote relay: `?refresh=1` is ignored (the remote does not make this install ask the cloud under its
+  // sessions) and the anonymous shares are left out (which rows this install shared anonymously stays on this machine)
+  app.get<{ Querystring: { refresh?: string } }>('/device/cache/cloud/share', async (req) => cloudShare.cloudShareStatus(
+    shareCloudOf(), store.defaultStore, registry,
+    { refresh: req.query.refresh === '1' || req.query.refresh === 'true', relayed: req.headers[REMOTE_RELAY_HEADER] !== undefined }
+  ));
+  app.post<{ Body: unknown }>('/device/cache/cloud/share', async (req, reply) => {
+    const r = await cloudShare.cloudShare(shareCloudOf(), store.defaultStore, registry, req.body, { versions: { forgefx: FORGEFX_VERSION } });
+    reply.code(r.code);
+    return r.body;
+  });
+  app.post<{ Body: unknown }>('/device/cache/cloud/share/withdraw', async (req, reply) => {
+    const r = await cloudShare.cloudShareWithdraw(shareCloudOf(), store.defaultStore, registry, req.body);
     reply.code(r.code);
     return r.body;
   });
@@ -188,16 +442,29 @@ export async function buildApp(registry: DeviceRegistry): Promise<FastifyInstanc
   // Full per-block decoded params for one preset (every family/param) — deep-search + browser detail.
   app.get<{ Params: { n: string } }>('/presets/:n/params', async (req, reply) => presetParamsH(reply, req.params.n));
   // ── persistent store: documents (Axis config · library metadata · layouts) ──
-  app.get<{ Params: { c: string } }>('/store/:c', (req) => ({ docs: store.listDocs(req.params.c) }));
-  app.get<{ Params: { c: string; id: string } }>('/store/:c/:id', (req, reply) => {
+  // Private collections (the auth sessions in `cloud`) are refused on every method: 403 forbidden-collection,
+  // checked before the body is parsed and before anything is read or written (runtime/storeAccess.ts).
+  const privateCollection = async (req: FastifyRequest, reply: FastifyReply): Promise<FastifyReply | undefined> => {
+    const c = (req.params as { c?: unknown }).c;
+    if (typeof c === 'string' && isPrivateCollection(c)) return reply.code(403).send(FORBIDDEN_COLLECTION_BODY);
+    return undefined;
+  };
+  // writes: the private collections and the write-protected ones (state a dedicated API owns)
+  const protectedWrite = async (req: FastifyRequest, reply: FastifyReply): Promise<FastifyReply | undefined> => {
+    const c = (req.params as { c?: unknown }).c;
+    if (typeof c === 'string' && isWriteProtectedCollection(c)) return reply.code(403).send(FORBIDDEN_COLLECTION_BODY);
+    return undefined;
+  };
+  app.get<{ Params: { c: string } }>('/store/:c', { onRequest: privateCollection }, (req) => ({ docs: store.listDocs(req.params.c) }));
+  app.get<{ Params: { c: string; id: string } }>('/store/:c/:id', { onRequest: privateCollection }, (req, reply) => {
     const d = store.getDoc(req.params.c, req.params.id);
     if (!d) { reply.code(404); return { error: 'not found' }; }
     return d;
   });
   // Config writes fan out to every live UI (host SSE + remote relay) — see runtime/services.ts.
-  app.put<{ Params: { c: string; id: string }; Body: { data: unknown; origin?: string } }>('/store/:c/:id', (req) =>
+  app.put<{ Params: { c: string; id: string }; Body: { data: unknown; origin?: string } }>('/store/:c/:id', { onRequest: protectedWrite }, (req) =>
     putStoreDoc(store.defaultStore, registry, req.params.c, req.params.id, req.body?.data, req.body?.origin));
-  app.delete<{ Params: { c: string; id: string } }>('/store/:c/:id', (req) => { store.delDoc(req.params.c, req.params.id); return { ok: true }; });
+  app.delete<{ Params: { c: string; id: string } }>('/store/:c/:id', { onRequest: protectedWrite }, (req) => { store.delDoc(req.params.c, req.params.id); return { ok: true }; });
 
   // ── local storage folder (Presets/ library + Sync/ plain-syx mirror; see localStore.ts) ──
   registerLocalRoutes(app, decodeBytes);
@@ -382,7 +649,10 @@ export async function buildApp(registry: DeviceRegistry): Promise<FastifyInstanc
 
   // ── live block params (addressed by the placed block's canonical address `addr`: gen-3 = the
   //    effect id, AM4 = the block's pidLow — exactly what each device's grid/blocks report) ──
-  app.get<{ Params: { eid: string } }>('/preset/blocks/:eid/params', async (req, reply) => blockParamsH(reply, Number(req.params.eid)));
+  app.get<{ Params: { eid: string }; Querystring: { generic?: string | string[] } }>(
+    '/preset/blocks/:eid/params',
+    async (req, reply) => blockParamsH(reply, Number(req.params.eid), { generic: genericFlag(req.query.generic) })
+  );
   app.put<{ Params: { eid: string; paramId: string }; Body: { value: number; continuous?: boolean } }>(
     '/preset/blocks/:eid/params/:paramId',
     async (req, reply) => setParamH(reply, Number(req.params.eid), Number(req.params.paramId), req.body.value, req.body.continuous ?? true)
@@ -509,6 +779,22 @@ export async function buildApp(registry: DeviceRegistry): Promise<FastifyInstanc
       return await d.looperControl(eid as number, action, on !== false);
     } catch (e) { reply.code(503); return { error: (e as Error).message }; }
   });
+  // Device-rendered block graph curve for one page slot (EQ/PEQ/filter/comp/LFO/ADSR/modifier/cab/RTA).
+  // `slot` is the page's graph index (default 0); the driver answers null when no reply matched.
+  app.get<{ Params: { eid: string }; Querystring: { slot?: string } }>('/preset/blocks/:eid/curve', async (req, reply) => {
+    const eid = Number(req.params.eid);
+    const raw = req.query.slot;
+    const slot = raw != null && raw !== '' ? Number(raw) : 0;
+    try {
+      const d = await driver();
+      if (!d.capabilities.telemetry.graphCurves || !d.blockCurve) return unsupported(reply, 'graphCurves');
+      if (!Number.isFinite(eid)) { reply.code(400); return { error: 'eid must be a number' }; }
+      if (!Number.isInteger(slot) || slot < 0 || slot >= GRAPH_CURVE_SLOTS) {
+        reply.code(400); return { error: `slot must be an integer 0..${GRAPH_CURVE_SLOTS - 1}` };
+      }
+      return await d.blockCurve(eid, slot);
+    } catch (e) { reply.code(503); return { error: (e as Error).message }; }
+  });
   // FC current switch state via the sub-0x01 structured config-selector read (the read FM3-Edit uses on
   // FC-page entry). Returns the decoded current state (category/function/display/color + labels) for one
   // (layout,view,switch), read via the sub-0x1b value channel that tracks param edits (fcReadState).
@@ -630,11 +916,14 @@ export async function buildApp(registry: DeviceRegistry): Promise<FastifyInstanc
   app.get('/events', (req, reply) => {
     reply.hijack();
     const raw = reply.raw;
+    // hijacked: the CORS plugin's headers are not sent, so apply the same rule here (never `*`)
+    const origin = req.headers.origin;
     raw.writeHead(200, {
       'content-type': 'text/event-stream',
       'cache-control': 'no-cache',
       connection: 'keep-alive',
-      'access-control-allow-origin': '*'
+      vary: 'Origin',
+      ...(origin && policy.isCorsOrigin(origin) ? { 'access-control-allow-origin': origin } : {})
     });
     raw.write(': connected\n\n');
     const unsub = registry.subscribe((e) => raw.write(`data: ${JSON.stringify(e)}\n\n`));
@@ -649,6 +938,10 @@ export async function buildApp(registry: DeviceRegistry): Promise<FastifyInstanc
   // When FORGEFX_STATIC points at a built SPA (Axis), serve it for any non-API GET, with SPA
   // fallback to index.html. Registered as the not-found handler so it never shadows API routes.
   // Used by the desktop app (loads http://localhost:PORT) and headless/Pi single-binary setups.
+  // Public (the app-wide hook skips the origin check for unmatched GET/HEAD): it serves build output only.
+  // Paths are contained by services/staticFiles.ts (escape or a Windows device name → 404, undecodable →
+  // 400; only regular files are opened), and the pages may not be framed by another site (a framed UI
+  // would make same-origin calls on a hostile page's behalf). HEAD answers the GET headers, no body.
   const STATIC = process.env.FORGEFX_STATIC;
   if (STATIC) {
     const root = resolve(STATIC);
@@ -658,13 +951,27 @@ export async function buildApp(registry: DeviceRegistry): Promise<FastifyInstanc
       '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.webp': 'image/webp', '.ico': 'image/x-icon',
       '.woff': 'font/woff', '.woff2': 'font/woff2', '.ttf': 'font/ttf', '.map': 'application/json', '.wasm': 'application/wasm'
     };
+    const index = join(root, 'index.html');
     app.setNotFoundHandler((req, reply) => {
-      if (req.method !== 'GET') return reply.code(404).send({ error: 'not found' });
-      const urlPath = decodeURIComponent(req.url.split('?')[0] ?? '/');
-      let file = join(root, urlPath === '/' ? 'index.html' : urlPath);
-      if (!resolve(file).startsWith(root) || !existsSync(file) || statSync(file).isDirectory()) file = join(root, 'index.html');
-      if (!existsSync(file)) return reply.code(404).send({ error: 'not found' });
-      return reply.type(MIME[extname(file).toLowerCase()] ?? 'application/octet-stream').send(createReadStream(file));
+      if (req.method !== 'GET' && req.method !== 'HEAD') return reply.code(404).send({ error: 'not found' });
+      const t = staticTarget(root, req.url);
+      if (t.kind === 'invalid-url') return reply.code(400).send({ error: 'invalid-url' });
+      if (t.kind === 'outside' || t.kind === 'reserved') return reply.code(404).send({ error: 'not found' });
+      let file = t.kind === 'file' ? t.path : index;
+      let size: number;
+      try {
+        let st = existsSync(file) ? statSync(file) : null;
+        if (!st || !st.isFile()) { file = index; st = existsSync(file) ? statSync(file) : null; }
+        if (!st || !st.isFile()) return reply.code(404).send({ error: 'not found' });
+        size = st.size;
+      } catch { return reply.code(404).send({ error: 'not found' }); }
+      reply
+        .header('x-frame-options', 'SAMEORIGIN')
+        .header('content-security-policy', "frame-ancestors 'self'")
+        .type(MIME[extname(file).toLowerCase()] ?? 'application/octet-stream');
+      // HEAD: the GET headers (length included) without opening the file
+      if (req.method === 'HEAD') return reply.header('content-length', String(size)).send();
+      return reply.send(createReadStream(file));
     });
   }
 
@@ -698,9 +1005,16 @@ export async function buildApp(registry: DeviceRegistry): Promise<FastifyInstanc
   });
 
   // ── cloud sync (GATED: only when AXIS_CLOUD=1; release builds never load supabase-js) ──
+  // Every /cloud/* and /remote/* route sits behind the app-wide origin + host policy (no Origin, a loopback
+  // origin, the server's own origin or an operator-listed one), so a LAN/Docker UI served by this server keeps
+  // working while no other web page can sign this install into an account of its choosing, sign it out, delete
+  // the account, switch Remote on, or read who is signed in. Non-browser callers (Electron main, the Remote
+  // relay) send no Origin and are unaffected.
   if (process.env.AXIS_CLOUD === '1') {
     const { cloud } = await import('./cloud.js');
     diagCloud = cloud;
+    contributionCloud = cloud;
+    shareCloud = cloud;
     type Creds = { email: string; password: string };
     app.get('/cloud/status', async () => cloud.status());
     app.post<{ Body: Creds }>('/cloud/register', async (req, reply) => { try { return await cloud.register(req.body.email, req.body.password); } catch (e) { reply.code(400); return { error: (e as Error).message }; } });
@@ -711,8 +1025,16 @@ export async function buildApp(registry: DeviceRegistry): Promise<FastifyInstanc
     app.get('/cloud/index', async (_req, reply) => { try { return await cloud.cloudIndex(); } catch (e) { reply.code(503); return { error: (e as Error).message }; } });
 
     // ── shared device-definition profiles (THIRD cache source; services/cloudProfiles.ts) ──
-    app.get('/device/cache/cloud', async () => cloudProfiles.cloudCacheCheck(cloud, store.defaultStore, registry));
-    app.post('/device/cache/cloud/pull', async (_req, reply) => { const r = await cloudProfiles.cloudCachePull(cloud, store.defaultStore, registry); reply.code(r.code); return r.body; });
+    const profilesCloud = opts.cloudProfiles?.cloud !== undefined ? opts.cloudProfiles.cloud : cloud;
+    app.get<{ Querystring: { refresh?: string } }>('/device/cache/cloud', async (req) => cloudProfiles.cloudCacheCheck(
+      profilesCloud, store.defaultStore, registry, { refresh: req.query.refresh === '1' || req.query.refresh === 'true' }
+    ));
+    // the pull (v2 + v1, preview, device check; never relayed by Remote)
+    app.post<{ Body: unknown }>('/device/cache/cloud/pull', async (req, reply) => {
+      const r = await cloudProfiles.cloudPullRoute(profilesCloud, store.defaultStore, registry, req.body, { app: { forgefx: FORGEFX_VERSION } });
+      reply.code(r.code);
+      return r.body;
+    });
     app.post('/device/cache/cloud/publish', async (_req, reply) => { const r = await cloudProfiles.cloudCachePublish(cloud, store.defaultStore, registry); reply.code(r.code); return r.body; });
 
     // ── Axis Cloud Remote — host agent (off by default; toggled by the Axis UI) ──
@@ -725,7 +1047,19 @@ export async function buildApp(registry: DeviceRegistry): Promise<FastifyInstanc
   } else {
     app.get('/cloud/status', async () => ({ enabled: false, user: null })); // so Axis can gate its UI without erroring
     app.get('/remote/status', async () => ({ enabled: false, connected: false, userId: null }));
-    app.get('/device/cache/cloud', async () => ({ enabled: false, available: false })); // same non-erroring gate for the defs prompt
+    // same non-erroring gate for the defs prompt ({ enabled: false, available: false }); a test seam may supply a cloud
+    app.get<{ Querystring: { refresh?: string } }>('/device/cache/cloud', async (req) => cloudProfiles.cloudCacheCheck(
+      opts.cloudProfiles?.cloud ?? null, store.defaultStore, registry, { refresh: req.query.refresh === '1' || req.query.refresh === 'true' }
+    ));
+    // the pull only when the test seam supplies a cloud (production without AXIS_CLOUD keeps no pull route)
+    const seamCloud = opts.cloudProfiles?.cloud ?? null;
+    if (seamCloud) {
+      app.post<{ Body: unknown }>('/device/cache/cloud/pull', async (req, reply) => {
+        const r = await cloudProfiles.cloudPullRoute(seamCloud, store.defaultStore, registry, req.body, { app: { forgefx: FORGEFX_VERSION } });
+        reply.code(r.code);
+        return r.body;
+      });
+    }
   }
 
   // ── telemetry / diagnostics ── status is always served (so Axis gates its UI without erroring). The

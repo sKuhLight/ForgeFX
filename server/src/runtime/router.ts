@@ -20,11 +20,17 @@ import * as backups from '../services/backups.js';
 import * as deviceCache from '../services/deviceCache.js';
 import * as editorCacheImport from '../services/editorCacheImport.js';
 import * as cloudProfiles from '../services/cloudProfiles.js';
+import * as cloudShare from '../services/cloudShare.js';
 import * as diagnostics from '../services/diagnosticCapture.js';
+import * as contribution from '../services/cacheContribution.js';
+import * as definitionsFile from '../services/definitionsFile.js';
+import * as blockProbe from '../services/blockProbe.js';
 import { blockHelpBySlug, helpIndex } from '../help.js';
-import { createUnifiedHandlers } from './handlers.js';
+import { GRAPH_CURVE_SLOTS } from 'forgefx-midi/gen3/axe-fx-iii';
+import { createUnifiedHandlers, genericFlag } from './handlers.js';
 import { sendErrorStatus } from '../drivers/sendPolicy.js';
 import { putStoreDoc } from './services.js';
+import { FORBIDDEN_COLLECTION_BODY, isPrivateCollection, isWriteProtectedCollection } from './storeAccess.js';
 import { createLocalService } from './localService.js';
 import type { FolderAdapter } from './folderAdapter.js';
 import type { ScanCachePersistence } from './localFolder.js';
@@ -35,6 +41,9 @@ export interface RouterResponse {
   status: number;
   contentType: string;
   body: string | Uint8Array;
+  /** Response headers beyond the content type, lower-case names (only present when a route set one: the export of
+   *  `GET /device/definitions/export` carries its `content-disposition` file name here, as Fastify sends it). */
+  headers?: Record<string, string>;
 }
 
 /** The /local/* bindings a runtime supplies (see runtime/localService.ts for each hook's contract).
@@ -69,7 +78,9 @@ export interface RuntimeDeps {
 /** Per-request status recorder — the StatusSink the shared handlers code() into. */
 class Reply {
   statusCode = 200;
+  headers: Record<string, string> = {};
   code(n: number): this { this.statusCode = n; return this; }
+  header(name: string, value: string): this { this.headers[name.toLowerCase()] = value; return this; }
 }
 
 interface Ctx {
@@ -83,7 +94,9 @@ interface Ctx {
 }
 
 type Handler = (ctx: Ctx) => unknown | Promise<unknown>;
-interface Route { method: string; segs: string[]; octet: boolean; handler: Handler }
+/** A route's request body limit (Fastify's `bodyLimit`): a body above `bytes` is refused before parsing, with `tooLarge`'s 413 body. */
+interface BodyLimit { bytes: number; tooLarge(size: number): unknown }
+interface Route { method: string; segs: string[]; octet: boolean; limit?: BodyLimit; handler: Handler }
 
 const JSON_TYPE = 'application/json; charset=utf-8';
 const OCTET_TYPE = 'application/octet-stream';
@@ -117,8 +130,8 @@ export function createRouter(deps: RuntimeDeps): {
   });
 
   const routes: Route[] = [];
-  const on = (method: string, path: string, handler: Handler, opts?: { octet?: boolean }) =>
-    routes.push({ method, segs: path.split('/').filter(Boolean), octet: !!opts?.octet, handler });
+  const on = (method: string, path: string, handler: Handler, opts?: { octet?: boolean; limit?: BodyLimit }) =>
+    routes.push({ method, segs: path.split('/').filter(Boolean), octet: !!opts?.octet, ...(opts?.limit ? { limit: opts.limit } : {}), handler });
 
   // ── system ──
   // /healthz carries the unified-API version handshake (mirrored as apiVersion on /device).
@@ -144,38 +157,122 @@ export function createRouter(deps: RuntimeDeps): {
   // ── device cache (on-connect self-describe build; capability selfDescribe) ──
   on('GET', '/device/cache', () => deviceCache.cacheStatus(store, registry));
   on('POST', '/device/cache/build', async (c) => {
-    const body = c.body as { force?: boolean; mode?: 'read-only' | 'full' } | undefined;
-    const r = await deviceCache.startCacheBuild(store, registry, { force: !!body?.force, mode: body?.mode });
+    const body = c.body as { force?: boolean; mode?: 'read-only' | 'full'; scope?: 'standard' | 'extended'; replace?: boolean } | undefined;
+    const r = await deviceCache.startCacheBuild(store, registry, { force: !!body?.force, mode: body?.mode, scope: body?.scope, replace: body?.replace === true });
     c.reply.code(r.code);
     return r.body;
   });
   on('POST', '/device/cache/cancel', () => deviceCache.cancelCacheBuild(registry));
   on('DELETE', '/device/cache', () => deviceCache.deleteCache(store, registry));
+  // definitions diff (shared handler; an absent `include` is no `include`, like Fastify's missing key)
+  on('GET', '/device/definitions/diff', (c) =>
+    h.definitionsDiffH(c.reply, { family: c.query.getAll('family'), include: c.query.has('include') ? c.query.getAll('include') : undefined }));
+  // `.axisdefs` export / import (services/definitionsFile.ts). The export's file name rides in the response headers
+  // (`content-disposition`, like Fastify's); the import is an in-page call, so it has no Origin guard (the server's
+  // loopback guard has nothing to check here) and its 8 MiB body limit is the route's `limit`. `force` / `replace`
+  // are query flags only: the body is the file, and a file never chooses them.
+  on('GET', '/device/definitions/export', async (c) => {
+    const r = await definitionsFile.exportDefinitions(store, registry, { versions: deps.versions });
+    c.reply.code(r.code);
+    if (r.filename) c.reply.header('content-disposition', definitionsFile.attachmentHeader(r.filename));
+    return r.body;
+  });
+  on('POST', '/device/definitions/import', async (c) => {
+    const r = await definitionsFile.importDefinitions(store, registry, c.body, {
+      force: definitionsFile.flagOn(c.query.getAll('force')), replace: definitionsFile.flagOn(c.query.getAll('replace'))
+    });
+    c.reply.code(r.code);
+    return r.body;
+  }, { limit: { bytes: definitionsFile.AXISDEFS_MAX_BYTES, tooLarge: definitionsFile.tooLargeBody } });
+  // block probe (services/blockProbe.ts): the same service and answers as the server route
+  on('POST', '/device/definitions/blocks/:eid/probe', async (c) => {
+    const r = await blockProbe.probeBlock(store, registry, c.params.eid);
+    c.reply.code(r.code);
+    return r.body;
+  });
   // ── editor-cache import (SECOND cache source; capability cacheImport). Disk discovery is Node-only,
-  //    so the browser twin returns an empty candidate list (discovery:'unavailable') + octet-only import. ──
+  //    so the browser twin returns an empty candidate list (discovery:'unavailable') + octet-only import.
+  //    No loopback-origin guard here (app.ts has one, FORGEFX-47): the router is an in-page function call
+  //    with no HTTP request and no Origin, and it never touches a file path. A JSON `{ path }` body gets
+  //    the server's allowlist answer, since no path is a discovered cache when nothing is discovered. ──
   on('GET', '/device/cache/sources', async () => {
     const persisted = await editorCacheImport.isPersisted(store, registry);
     return { persisted, candidates: [], discovery: 'unavailable' };
   });
   on('POST', '/device/cache/import', async (c) => {
+    const path = (c.body as { path?: unknown } | null)?.path;
+    if (!c.raw && typeof path === 'string' && path) { c.reply.code(400); return { error: editorCacheImport.NOT_A_DISCOVERED_CACHE }; }
     if (!c.raw || !c.raw.length) { c.reply.code(400); return { error: 'POST the .cache bytes as application/octet-stream with ?name=<filename>' }; }
     const name = c.query.get('name');
     if (!name) { c.reply.code(400); return { error: 'missing ?name=<filename>' }; }
     const force = c.query.get('force') === '1' || c.query.get('force') === 'true';
-    const r = await editorCacheImport.importEditorCache(registry, store, c.raw, { name, force });
+    const replace = c.query.get('replace') === '1' || c.query.get('replace') === 'true';
+    const r = await editorCacheImport.importEditorCache(registry, store, c.raw, { name, force, replace });
     c.reply.code(r.code);
     return r.body;
   }, { octet: true });
+  // ── editor-cache contribution (services/cacheContribution.ts). No discovery here: the status lists no
+  //    candidates (discovery:'unavailable') and a POST takes the bytes (file picker / remembered folder) as
+  //    application/octet-stream + ?name=&consent=1&consentVersion=2&...; a `{ source: { path } }` body gets the
+  //    same 400 as an undiscovered path on the server. No origin guard (an in-page call, no HTTP request).
+  //    deps.cloud absent → cloud.enabled:false in the status, 503 cloud-disabled on a non-dry send. ──
+  on('GET', '/device/cache/contribute', (c) => contribution.contributionStatus(store, registry, deps.cloud ?? null, null, {
+    refresh: c.query.get('refresh') === '1' || c.query.get('refresh') === 'true'
+  }));
+  on('POST', '/device/cache/contribute', async (c) => {
+    const isBytes = !!c.raw;
+    const f = contribution.parseContributionFlags(isBytes ? Object.fromEntries(c.query) : ((c.body ?? {}) as Record<string, unknown>), isBytes);
+    if (!f.ok) { c.reply.code(f.code); return f.body; }
+    const name = c.query.get('name');
+    if (!c.raw || !name) {
+      const path = (c.body as { source?: { path?: unknown } } | null)?.source?.path;
+      c.reply.code(400);
+      return !c.raw && typeof path === 'string' && path ? contribution.NOT_A_DISCOVERED_CACHE_BODY : contribution.NO_SOURCE_BODY;
+    }
+    const r = await contribution.contribute(store, registry, deps.cloud ?? null, { bytes: c.raw, name }, f.flags, {
+      versions: { forgefx: deps.versions?.forgefx, codec: deps.versions?.codec }
+    });
+    c.reply.code(r.code);
+    return r.body;
+  }, { octet: true });
+  on('POST', '/device/cache/contribute/decision', async (c) => {
+    const r = await contribution.setContributionDecision(store, registry, c.body);
+    c.reply.code(r.code);
+    return r.body;
+  });
+  on('POST', '/device/cache/contribute/withdraw', async (c) => {
+    const r = await contribution.withdrawContribution(store, registry, deps.cloud ?? null);
+    c.reply.code(r.code);
+    return r.body;
+  });
   // ── shared device-definition profiles (THIRD cache source; services/cloudProfiles.ts). deps.cloud is
   //    optional — absent (no cloud in this runtime) degrades to the same non-erroring disabled shape. ──
-  on('GET', '/device/cache/cloud', () => cloudProfiles.cloudCacheCheck(deps.cloud ?? null, store, registry));
+  on('GET', '/device/cache/cloud', (c) => cloudProfiles.cloudCacheCheck(deps.cloud ?? null, store, registry, {
+    refresh: c.query.get('refresh') === '1' || c.query.get('refresh') === 'true'
+  }));
+  // the pull (v2 + v1, preview, device check over this runtime's link; services/cloudProfiles.ts)
   on('POST', '/device/cache/cloud/pull', async (c) => {
-    const r = await cloudProfiles.cloudCachePull(deps.cloud ?? null, store, registry);
+    const r = await cloudProfiles.cloudPullRoute(deps.cloud ?? null, store, registry, c.body, deps.versions ? { app: { ...deps.versions } } : {});
     c.reply.code(r.code);
     return r.body;
   });
   on('POST', '/device/cache/cloud/publish', async (c) => {
     const r = await cloudProfiles.cloudCachePublish(deps.cloud ?? null, store, registry);
+    c.reply.code(r.code);
+    return r.body;
+  });
+  // sharing device definitions (cloud v2; services/cloudShare.ts): status, share (consent gate first, `dryRun` sends
+  // nothing), withdraw. No cloud dep → cloud.enabled:false in the status, 503 cloud-disabled on a send.
+  on('GET', '/device/cache/cloud/share', (c) => cloudShare.cloudShareStatus(deps.cloud ?? null, store, registry, {
+    refresh: c.query.get('refresh') === '1' || c.query.get('refresh') === 'true'
+  }));
+  on('POST', '/device/cache/cloud/share', async (c) => {
+    const r = await cloudShare.cloudShare(deps.cloud ?? null, store, registry, c.body, deps.versions ? { versions: { forgefx: deps.versions.forgefx, axis: deps.versions.axis } } : {});
+    c.reply.code(r.code);
+    return r.body;
+  });
+  on('POST', '/device/cache/cloud/share/withdraw', async (c) => {
+    const r = await cloudShare.cloudShareWithdraw(deps.cloud ?? null, store, registry, c.body);
     c.reply.code(r.code);
     return r.body;
   });
@@ -290,7 +387,7 @@ export function createRouter(deps: RuntimeDeps): {
   });
 
   // ── live block params (addressed by the placed block's canonical address `addr`) ──
-  on('GET', '/preset/blocks/:eid/params', (c) => h.blockParamsH(c.reply, Number(c.params.eid)));
+  on('GET', '/preset/blocks/:eid/params', (c) => h.blockParamsH(c.reply, Number(c.params.eid), { generic: genericFlag(c.query.getAll('generic')) }));
   on('PUT', '/preset/blocks/:eid/params/:paramId', (c) => {
     const b = c.body as { value: number; continuous?: boolean };
     return h.setParamH(c.reply, Number(c.params.eid), Number(c.params.paramId), b.value, b.continuous ?? true);
@@ -436,6 +533,22 @@ export function createRouter(deps: RuntimeDeps): {
       return await d.looperControl(eid as number, action, onv !== false);
     } catch (e) { c.reply.code(503); return { error: (e as Error).message }; }
   });
+  // Device-rendered block graph curve for one page slot (see app.ts): `slot` default 0, 400 on a
+  // non-finite eid / out-of-range slot, 501 where telemetry.graphCurves is false, 503 on a driver error.
+  on('GET', '/preset/blocks/:eid/curve', async (c) => {
+    const eid = Number(c.params.eid);
+    const raw = c.query.get('slot');
+    const slot = raw != null && raw !== '' ? Number(raw) : 0;
+    try {
+      const d = await driver();
+      if (!d.capabilities.telemetry.graphCurves || !d.blockCurve) return unsupported(c.reply, 'graphCurves');
+      if (!Number.isFinite(eid)) { c.reply.code(400); return { error: 'eid must be a number' }; }
+      if (!Number.isInteger(slot) || slot < 0 || slot >= GRAPH_CURVE_SLOTS) {
+        c.reply.code(400); return { error: `slot must be an integer 0..${GRAPH_CURVE_SLOTS - 1}` };
+      }
+      return await d.blockCurve(eid, slot);
+    } catch (e) { c.reply.code(503); return { error: (e as Error).message }; }
+  });
   // FC current switch state via the sub-0x01 structured config-selector read (see app.ts).
   on('GET', '/fc/state', async (c) => {
     const layout = Number(c.query.get('layout') ?? 0);
@@ -470,18 +583,23 @@ export function createRouter(deps: RuntimeDeps): {
   });
 
   // ── persistent store: documents (Axis config · library metadata · layouts) ──
-  on('GET', '/store/:c', (c) => ({ docs: store.listDocs(c.params.c!) }));
+  // Private collections (the auth sessions in `cloud`) are refused like on the server (storeAccess.ts).
+  const refused = (c: Ctx): boolean => { if (!isPrivateCollection(c.params.c!)) return false; c.reply.code(403); return true; };
+  const refusedWrite = (c: Ctx): boolean => { if (!isWriteProtectedCollection(c.params.c!)) return false; c.reply.code(403); return true; };
+  on('GET', '/store/:c', (c) => (refused(c) ? FORBIDDEN_COLLECTION_BODY : { docs: store.listDocs(c.params.c!) }));
   on('GET', '/store/:c/:id', (c) => {
+    if (refused(c)) return FORBIDDEN_COLLECTION_BODY;
     const d = store.getDoc(c.params.c!, c.params.id!);
     if (!d) { c.reply.code(404); return { error: 'not found' }; }
     return d;
   });
   // Config writes fan out to every live UI (router subscribers, like the host's SSE) — shared putStoreDoc.
   on('PUT', '/store/:c/:id', (c) => {
+    if (refusedWrite(c)) return FORBIDDEN_COLLECTION_BODY;
     const b = c.body as { data?: unknown; origin?: string } | undefined;
     return putStoreDoc(store, registry, c.params.c!, c.params.id!, b?.data, b?.origin);
   });
-  on('DELETE', '/store/:c/:id', (c) => { store.delDoc(c.params.c!, c.params.id!); return { ok: true }; });
+  on('DELETE', '/store/:c/:id', (c) => { if (refusedWrite(c)) return FORBIDDEN_COLLECTION_BODY; store.delDoc(c.params.c!, c.params.id!); return { ok: true }; });
 
   // ── local storage folder (Presets/ library + Sync/ mirror; shared service — see localService.ts) ──
   on('GET', '/local/config', async (c) => send(c, await local.config()));
@@ -584,10 +702,19 @@ export function createRouter(deps: RuntimeDeps): {
     return params;
   };
 
-  const respond = (status: number, body: unknown): RouterResponse =>
-    body instanceof Uint8Array
-      ? { status, contentType: OCTET_TYPE, body }
-      : { status, contentType: JSON_TYPE, body: JSON.stringify(body) };
+  const respond = (status: number, body: unknown, headers?: Record<string, string>): RouterResponse => {
+    const extra = headers && Object.keys(headers).length > 0 ? { headers: { ...headers } } : {};
+    return body instanceof Uint8Array
+      ? { status, contentType: OCTET_TYPE, body, ...extra }
+      : { status, contentType: JSON_TYPE, body: JSON.stringify(body), ...extra };
+  };
+
+  /** Size of a request body in bytes. A string that cannot exceed `limit` is reported by its length (the answer is only
+   *  used to compare with the limit and, over it, to report the size: exact then). */
+  const bodyBytes = (body: string | Uint8Array, limit: number): number => {
+    if (typeof body !== 'string') return body.byteLength;
+    return body.length * 3 <= limit ? body.length : new TextEncoder().encode(body).length; // UTF-8 is at most 3 bytes per UTF-16 unit
+  };
 
   const handle = async (method: string, path: string, body?: string | Uint8Array): Promise<RouterResponse> => {
     const m = method.toUpperCase();
@@ -601,6 +728,11 @@ export function createRouter(deps: RuntimeDeps): {
       const params = match(route, segs);
       if (!params) continue;
 
+      // A route's body limit: refused before anything is parsed, in the route's own 413 shape.
+      if (route.limit && body != null) {
+        const size = bodyBytes(body, route.limit.bytes);
+        if (size > route.limit.bytes) return respond(413, route.limit.tooLarge(size));
+      }
       // Body decode mirrors app.ts's parsers: Uint8Array = application/octet-stream on the raw-bytes
       // routes; everything else is JSON (empty/absent → {}, like the tolerant empty-JSON parser).
       let raw: Uint8Array | null = null;
@@ -610,14 +742,14 @@ export function createRouter(deps: RuntimeDeps): {
         const s = typeof body === 'string' ? body : new TextDecoder().decode(body);
         if (s.length) {
           try { json = JSON.parse(s); }
-          catch { return respond(400, { statusCode: 400, error: 'Bad Request', message: 'Body is not valid JSON' }); }
+          catch { return respond(400, { error: 'invalid-json' }); } // same body as app.ts's JSON parser
         }
       }
 
       const ctx: Ctx = { params, query, body: json, raw, reply: new Reply() };
       try {
         const out = await route.handler(ctx);
-        return respond(ctx.reply.statusCode, out);
+        return respond(ctx.reply.statusCode, out, ctx.reply.headers);
       } catch (e) {
         // uncaught handler error → Fastify's default error envelope: a thrown error carrying a 4xx/5xx
         // `statusCode` (a driver's 400 "no such instance" / 409 "already placed") keeps it, anything else is a 500

@@ -1,0 +1,142 @@
+{
+  "block": "Chorus",
+  "definitions": {
+    "channel": 0,
+    "family": "CHORUS",
+    "hidden": [{"id":0,"reason":"type"},{"id":15,"reason":"bypass"}],
+    "persistentWrites": false,
+    "positional": true,
+    "profile": "byte-exact"
+  },
+  "enums": [
+    {"fp":"1:a81ff246","generic":false,"id":3,"kind":"enum","name":"Tempo 1","nameConfidence":"high","nameSource":"catalog","options":"#0","source":"profile","value":3,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:faebfda0","generic":false,"id":8,"kind":"enum","name":"LFO Type","nameConfidence":"high","nameSource":"catalog","options":"#1","source":"profile","value":8,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:efb0158d","generic":false,"id":9,"kind":"enum","name":"Auto Depth","nameConfidence":"high","nameSource":"catalog","options":"#2","source":"profile","value":0,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:10a2c0d2","generic":false,"id":13,"kind":"enum","name":"Bypass Mode","nameConfidence":"high","nameSource":"catalog","options":"#3","source":"profile","value":1,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:b639f6c3","generic":false,"id":16,"kind":"enum","name":"Phase Reverse","nameConfidence":"high","nameSource":"catalog","options":"#4","source":"profile","value":0,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:892cce6b","generic":false,"id":23,"kind":"enum","name":"Dimension Mode","nameConfidence":"high","nameSource":"catalog","options":"#5","source":"profile","value":3,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:a81ff246","generic":false,"id":27,"kind":"enum","name":"Tempo 2","nameConfidence":"high","nameSource":"catalog","options":"#0","source":"profile","value":27,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:02a8ec0b","generic":false,"id":28,"kind":"enum","name":"Scene Ignore","nameConfidence":"high","nameSource":"catalog","options":"#6","source":"profile","value":0,"widget":"toggle","widgetSource":"device","write":"ordinal"}
+  ],
+  "layout": {
+    "editorName": "Chorus",
+    "family": "CHORUS",
+    "pages": [
+      {
+        "name": "Basic",
+        "pageNum": 0,
+        "rows": [
+          {
+            "controls": [
+              {"label":"Number of Voices","paramId":1,"paramName":"CHORUS_VOICES","rawWidget":"knob","widget":"knob"},
+              {"label":"Rate","paramId":2,"paramName":"CHORUS_RATE","rawWidget":"knob","widget":"knob"},
+              {"label":"Tempo","paramId":3,"paramName":"CHORUS_TEMPO","rawWidget":"dropdown1","widget":"dropdown"},
+              {"label":"Depth","paramId":4,"paramName":"CHORUS_DEPTH","rawWidget":"knob","widget":"knob"},
+              {"label":"","paramId":null,"paramName":null,"rawWidget":"spacer","widget":"spacer"},
+              {"label":"Delay Time","paramId":6,"paramName":"CHORUS_DELAYTIME","rawWidget":"knob","widget":"knob"}
+            ],
+            "section": "parameters"
+          },
+          {
+            "controls": [
+              {"label":"Mix","paramId":10,"paramName":"CHORUS_MIX","rawWidget":"knob","widget":"knob"},
+              {"label":"Level","paramId":11,"paramName":"CHORUS_LEVEL","rawWidget":"knob","widget":"knob"},
+              {"label":"Balance","paramId":12,"paramName":"CHORUS_PAN","rawWidget":"knob","widget":"knob"}
+            ],
+            "section": "mixer"
+          },
+          {
+            "controls": [
+              {"label":"Stereo\nSpread","paramId":22,"paramName":"CHORUS_SPREAD","rawWidget":"knob","widget":"knob"},
+              {"label":"","paramId":null,"paramName":null,"rawWidget":"spacer","widget":"spacer"},
+              {"label":"Bypass\nMode","paramId":13,"paramName":"CHORUS_BYPASSMODE","rawWidget":"dropdown1Tight","widget":"dropdown"},
+              {"label":"Bypass","paramId":15,"paramName":"CHORUS_BYPASS","rawWidget":"btnBypass","widget":"button"},
+              {"fw":{"gtet":"5,3"},"label":"Scene\nIgnore","paramId":28,"paramName":"CHORUS_SCENEIGNORE","rawWidget":"btnIgnoreScene","widget":"button"}
+            ],
+            "section": "mixer"
+          }
+        ]
+      },
+      {
+        "name": "Expert",
+        "pageNum": 1,
+        "rows": [
+          {
+            "controls": [
+              {"label":"Low Cut","paramId":21,"paramName":"CHORUS_LOWCUT","placement":{"col":0},"rawWidget":"knob","widget":"knob"},
+              {"label":"High Cut","paramId":5,"paramName":"CHORUS_HICUT","placement":{"col":1},"rawWidget":"knob","widget":"knob"},
+              {"label":"Drive","paramId":20,"paramName":"CHORUS_DRIVE","placement":{"col":2},"rawWidget":"knob","widget":"knob"},
+              {"label":"LFO Type","paramId":8,"paramName":"CHORUS_LFOTYPE","placement":{"col":5},"rawWidget":"dropdown1LFO","widget":"dropdown"},
+              {"label":"LFO Phase","paramId":7,"paramName":"CHORUS_LFOPHASE","placement":{"col":6},"rawWidget":"knob","widget":"knob"}
+            ],
+            "section": "parameters"
+          },
+          {
+            "controls": [
+              {"label":"Phase Reverse","paramId":16,"paramName":"CHORUS_PHASEREV","placement":{"col":0},"rawWidget":"dropdown1","widget":"dropdown"},
+              {"label":"Dimension Mode","paramId":23,"paramName":"CHORUS_MODE","placement":{"col":1},"rawWidget":"dropdown1","widget":"dropdown"},
+              {"label":"Width","paramId":17,"paramName":"CHORUS_WIDTH","placement":{"col":3},"rawWidget":"knob","widget":"knob"},
+              {"label":"Auto Depth","paramId":9,"paramName":"CHORUS_AUTO","placement":{"col":4},"rawWidget":"dropdown1","widget":"dropdown"},
+              {"label":"LFO2 Rate","paramId":18,"paramName":"CHORUS_RATE2","placement":{"col":5},"rawWidget":"knob","widget":"knob"},
+              {"label":"LFO2 Depth","paramId":19,"paramName":"CHORUS_DEPTH2","placement":{"col":6},"rawWidget":"knob","widget":"knob"}
+            ],
+            "section": "parameters"
+          },
+          {
+            "controls": [
+              {"label":"Mix","paramId":10,"paramName":"CHORUS_MIX","rawWidget":"knob","widget":"knob"},
+              {"label":"Level","paramId":11,"paramName":"CHORUS_LEVEL","rawWidget":"knob","widget":"knob"},
+              {"label":"Balance","paramId":12,"paramName":"CHORUS_PAN","rawWidget":"knob","widget":"knob"}
+            ],
+            "section": "mixer"
+          },
+          {
+            "controls": [
+              {"label":"Stereo\nSpread","paramId":22,"paramName":"CHORUS_SPREAD","rawWidget":"knob","widget":"knob"},
+              {"label":"","paramId":null,"paramName":null,"rawWidget":"spacer","widget":"spacer"},
+              {"label":"Bypass\nMode","paramId":13,"paramName":"CHORUS_BYPASSMODE","rawWidget":"dropdown1Tight","widget":"dropdown"},
+              {"label":"Bypass","paramId":15,"paramName":"CHORUS_BYPASS","rawWidget":"btnBypass","widget":"button"},
+              {"fw":{"gtet":"5,3"},"label":"Scene\nIgnore","paramId":28,"paramName":"CHORUS_SCENEIGNORE","rawWidget":"btnIgnoreScene","widget":"button"}
+            ],
+            "section": "mixer"
+          }
+        ]
+      }
+    ],
+    "variantName": "Chorus",
+    "variantValue": null
+  },
+  "named": [
+    {"fp":"1:d68d5a32","generic":false,"id":1,"kind":"float","max":8,"min":2,"name":"Number of Voices","nameConfidence":"high","nameSource":"catalog","norm":0.0152134769737846,"source":"profile","value":2.091,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:6b294890","generic":false,"id":2,"kind":"float","log":true,"max":10,"min":0.1,"name":"Rate","nameConfidence":"high","nameSource":"catalog","norm":0.0304269539475692,"source":"profile","taperSource":"typecode","unit":"Hz","unitSource":"catalog","value":0.115,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:318ec60c","generic":false,"id":4,"kind":"float","max":100,"min":0,"name":"Depth 1","nameConfidence":"high","nameSource":"catalog","norm":0.0608539078951384,"source":"profile","step":0.1,"taperSource":"typecode","unit":"%","unitSource":"catalog","value":6.085,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:ffbaba1c","generic":false,"id":5,"kind":"float","log":true,"max":20000,"min":200,"name":"High Cut","nameConfidence":"high","nameSource":"catalog","norm":0.076067384868923,"source":"profile","taperSource":"typecode","unit":"Hz","unitSource":"catalog","value":283.9,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:3a8934e8","generic":false,"id":6,"kind":"float","max":50,"min":0.1,"name":"Delay Time","nameConfidence":"high","nameSource":"catalog","norm":0.0912808618427076,"source":"profile","step":0.01,"taperSource":"typecode","unit":"ms","unitSource":"catalog","value":4.655,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:45f2cc74","generic":false,"id":7,"kind":"float","max":180,"min":0,"name":"LFO Phase","nameConfidence":"high","nameSource":"catalog","norm":0.1064943388164922,"source":"profile","step":0.18,"taperSource":"typecode","value":19.169,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:0173bcd6","generic":false,"id":10,"kind":"float","max":100,"min":0,"name":"Mix","nameConfidence":"high","nameSource":"catalog","norm":0.152134769737846,"source":"profile","step":0.1,"taperSource":"typecode","unit":"%","unitSource":"catalog","value":15.213,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:70f92dab","generic":false,"id":11,"kind":"float","max":20,"min":-80,"name":"Level","nameConfidence":"high","nameSource":"catalog","norm":0.1673482467116306,"source":"profile","step":0.1,"taperSource":"typecode","unit":"dB","unitSource":"catalog","value":-63.265,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:63434cb2","generic":false,"id":12,"kind":"float","max":100,"min":-100,"name":"Balance","nameConfidence":"high","nameSource":"catalog","norm":0.1825617236854152,"source":"profile","step":0.2,"taperSource":"typecode","unit":"%","unitSource":"catalog","value":-63.488,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:318ec60c","generic":false,"id":17,"kind":"float","max":100,"min":0,"name":"Width","nameConfidence":"high","nameSource":"catalog","norm":0.2586291085543382,"source":"profile","step":0.1,"taperSource":"typecode","unit":"%","unitSource":"catalog","value":25.863,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:6b294890","generic":false,"id":18,"kind":"float","log":true,"max":10,"min":0.1,"name":"LFO2 Rate","nameConfidence":"high","nameSource":"catalog","norm":0.2738425855281228,"source":"profile","taperSource":"typecode","value":0.353,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:318ec60c","generic":false,"id":19,"kind":"float","max":100,"min":0,"name":"LFO2 Depth","nameConfidence":"high","nameSource":"catalog","norm":0.2890560625019074,"source":"profile","step":0.1,"taperSource":"typecode","value":28.906,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:b606079b","generic":false,"id":20,"kind":"float","max":10,"min":0,"name":"Drive","nameConfidence":"high","nameSource":"catalog","norm":0.304269539475692,"source":"profile","taperSource":"device","value":3.043,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:2d114219","generic":false,"id":21,"kind":"float","log":true,"max":2000,"min":20,"name":"Low Cut","nameConfidence":"high","nameSource":"catalog","norm":0.31948301644947663,"source":"profile","taperSource":"typecode","unit":"Hz","unitSource":"catalog","value":87.096,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:8597876b","generic":false,"id":22,"kind":"float","max":200,"min":-200,"name":"Stereo Spread","nameConfidence":"high","nameSource":"catalog","norm":0.3346964934232612,"source":"profile","step":0.2,"taperSource":"typecode","value":-66.121,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:318ec60c","generic":false,"id":24,"kind":"float","max":100,"min":0,"name":"Depth 2","nameConfidence":"high","nameSource":"catalog","norm":0.3651234473708304,"source":"profile","step":0.1,"taperSource":"typecode","unit":"%","unitSource":"catalog","value":36.512,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:318ec60c","generic":false,"id":25,"kind":"float","max":100,"min":0,"name":"Center Depth","nameConfidence":"high","nameSource":"catalog","norm":0.380336924344615,"source":"profile","step":0.1,"taperSource":"typecode","unit":"%","unitSource":"catalog","value":38.034,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:318ec60c","generic":false,"id":26,"kind":"float","max":100,"min":0,"name":"Depth 3","nameConfidence":"high","nameSource":"catalog","norm":0.39555040131839964,"source":"profile","step":0.1,"taperSource":"typecode","unit":"%","unitSource":"catalog","value":39.555,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:b8c6bac6","generic":true,"id":29,"isNew":true,"kind":"float","max":10,"min":0,"name":"P29","nameSource":"generic","norm":0.4411908322397534,"pageHint":"new-in-firmware","source":"profile","step":0.01,"taperSource":"typecode","value":4.412,"widget":"knob","widgetSource":"device","write":"norm"}
+  ],
+  "page": 78,
+  "slug": "chorus",
+  "type": {"name":"Digital Mono","value":0},
+  "optionLists": [
+    [{"label":"NONE ","value":0},{"label":"1/64 TRIP","value":1},{"label":"1/64","value":2},{"label":"1/64 DOT","value":3},{"label":"1/32 TRIP","value":4},{"label":"1/32","value":5},{"label":"1/32 DOT","value":6},{"label":"1/16 TRIP","value":7},{"label":"1/16","value":8},{"label":"1/16 DOT","value":9},{"label":"1/8 TRIP","value":10},{"label":"1/8","value":11},{"label":"1/8 DOT","value":12},{"label":"1/4 TRIP","value":13},{"label":"1/4","value":14},{"label":"1/4 DOT","value":15},{"label":"1/2 TRIP","value":16},{"label":"1/2","value":17},{"label":"1/2 DOT","value":18},{"label":"1 TRIP","value":19},{"label":"1","value":20},{"label":"1 DOT","value":21},{"label":"2","value":22},{"label":"3","value":23},{"label":"4","value":24},{"label":"4/3","value":25},{"label":"5/4","value":26},{"label":"5/64","value":27},{"label":"7/64","value":28},{"label":"9/64","value":29},{"label":"10/64 (5/32)","value":30},{"label":"11/64","value":31},{"label":"13/64","value":32},{"label":"14/64 (7/32)","value":33},{"label":"15/64","value":34},{"label":"17/64","value":35},{"label":"18/64 (9/32)","value":36},{"label":"19/64","value":37},{"label":"20/64 (5/16)","value":38},{"label":"21/64","value":39},{"label":"22/64 (11/32)","value":40},{"label":"23/64","value":41},{"label":"25/64","value":42},{"label":"26/64 (13/32)","value":43},{"label":"27/64","value":44},{"label":"28/64 (7/16)","value":45},{"label":"29/64","value":46},{"label":"30/64 (15/32)","value":47},{"label":"31/64","value":48},{"label":"33/64","value":49},{"label":"34/64 (17/32)","value":50},{"label":"35/64","value":51},{"label":"36/64 (9/16)","value":52},{"label":"37/64","value":53},{"label":"38/64 (19/32)","value":54},{"label":"39/64","value":55},{"label":"40/64 (5/8)","value":56},{"label":"41/64","value":57},{"label":"42/64 (21/32)","value":58},{"label":"43/64","value":59},{"label":"44/64 (11/16)","value":60},{"label":"45/64","value":61},{"label":"46/64 (23/32)","value":62},{"label":"47/64","value":63},{"label":"49/64","value":64},{"label":"50/64 (25/32)","value":65},{"label":"51/64","value":66},{"label":"52/64 (13/16)","value":67},{"label":"53/64","value":68},{"label":"54/64 (27/32)","value":69},{"label":"55/64","value":70},{"label":"56/64 (7/8)","value":71},{"label":"57/64","value":72},{"label":"58/64 (29/32)","value":73},{"label":"59/64","value":74},{"label":"60/64 (15/16)","value":75},{"label":"61/64","value":76},{"label":"62/64 (31/32)","value":77},{"label":"63/64","value":78}],
+    [{"label":"SINE","value":0},{"label":"TRIANGLE","value":1},{"label":"SQUARE","value":2},{"label":"SAW UP","value":3},{"label":"SAW DOWN","value":4},{"label":"RANDOM","value":5},{"label":"LOG","value":6},{"label":"EXP","value":7},{"label":"TRAPEZOID","value":8},{"label":"ASTABLE","value":9}],
+    [{"label":"OFF","value":0},{"label":"LOW","value":1},{"label":"HIGH","value":2}],
+    [{"label":"THRU","value":0},{"label":"MUTE FX OUT","value":1},{"label":"MUTE OUT","value":2}],
+    [{"label":"NONE","value":0},{"label":"RIGHT","value":1},{"label":"LEFT","value":2},{"label":"BOTH","value":3}],
+    [{"label":"OFF","value":0},{"label":"LOW","value":1},{"label":"MED","value":2},{"label":"HIGH","value":3}],
+    [{"label":"OFF","value":0},{"label":"ON","value":1}]
+  ]
+}

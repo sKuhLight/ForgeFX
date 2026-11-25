@@ -28,6 +28,20 @@ services:
       - "/dev/serial/by-id/usb-Fractal_Audio_Systems_FM3-if03:/dev/fm3"
     environment:
       - FORGEFX_SERIAL=/dev/fm3
+      # --- browser access by name / through a proxy (ADR 0004, docs/api-design.md) ---
+      # The server refuses requests whose Host is a name it does not know (DNS
+      # rebinding protection). By IP address (http://192.168.1.20:5056) nothing is
+      # needed. Inside a container the hostname is the container's, not the Pi's,
+      # so list every name you open ForgeFX by (comma-separated, ports ignored):
+      # - FORGEFX_ALLOWED_HOSTS=raspberrypi.local
+      # Behind a proxy that keeps the Host header (Traefik and Caddy by default),
+      # list the public name: FORGEFX_ALLOWED_HOSTS=forgefx.example.com
+      # A proxy that rewrites Host to the upstream (nginx's default for
+      # `proxy_pass http://forgefx:5056`) needs the upstream name, unless it is an
+      # IP, in FORGEFX_ALLOWED_HOSTS, and the public origin (exact scheme://host[:port])
+      # in FORGEFX_ALLOWED_ORIGINS, because the page's origin no longer matches Host:
+      # - FORGEFX_ALLOWED_HOSTS=forgefx
+      # - FORGEFX_ALLOWED_ORIGINS=https://forgefx.example.com
 
     # If the container user can't open the serial device, grant the host's serial
     # group (find it with `getent group dialout uucp`), or as a last resort run
@@ -39,7 +53,8 @@ services:
     # --- reverse proxy (optional) ---------------------------------------------
     # Example Traefik labels — uncomment and join the proxy's network to expose
     # ForgeFX at https://forgefx.example.com. For Caddy/nginx, just proxy to
-    # http://forgefx:5056 from your proxy config instead.
+    # http://forgefx:5056 from your proxy config instead. Either way, add the
+    # matching FORGEFX_ALLOWED_HOSTS / FORGEFX_ALLOWED_ORIGINS lines above.
     # labels:
     #   - "traefik.enable=true"
     #   - "traefik.http.routers.forgefx.rule=Host(`forgefx.example.com`)"

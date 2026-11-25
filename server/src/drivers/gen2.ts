@@ -72,7 +72,7 @@ class Gen2Driver implements DeviceDriver {
     presetDump: false, // gen-2 dump is an opaque .syx blob (no gen-3 decode) → backup via backupPreset, not the gen-3 service
     presetConvert: false, // the gen-2 preset-parse decoder isn't reachable through the codec's public exports (only the descriptor barrel); the lift is name-only anyway
     blockParamDecode: false, // params come from the fn 0x1F dump, not a preset-body decode (that path is FM3-only)
-    telemetry: { tuner: false, outputMeters: false, cpu: false }, // no gen-3 telemetry frames on gen-2
+    telemetry: { tuner: false, outputMeters: false, cpu: false, graphCurves: false }, // no gen-3 telemetry frames on gen-2
     fcModel: false,
     fcLiveRead: false,
     modBind: false,

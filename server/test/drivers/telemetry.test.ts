@@ -10,7 +10,7 @@ import type { DeviceDriver, DriverCapabilities } from '../../src/drivers/types.j
 import { cadenceFor, TELEMETRY_MODES } from '../../src/drivers/telemetryProfiles.js';
 import { MockTransport, handshakeReply, isIdentifyBroadcast, assert, assertEqual, sleep } from '../helpers/mock.js';
 
-export const TELEMETRY_CASE_COUNT = 6;
+export const TELEMETRY_CASE_COUNT = 7;
 
 function makeReg(conn: Conn | null, mock: MockTransport): DeviceRegistry {
   return __createRegistryForTest({
@@ -22,11 +22,11 @@ function makeReg(conn: Conn | null, mock: MockTransport): DeviceRegistry {
 const serial = (mock: MockTransport): Conn => ({ transport: 'serial', id: mock.label });
 
 /** Minimal fake gen-3 driver (model 0x11) with just the capability flags a supervisor test toggles. */
-function fakeGen3(opts: { outputMeters?: boolean; editPush?: boolean; onBurst?: () => void }): DeviceDriver {
+function fakeGen3(opts: { outputMeters?: boolean; cpu?: boolean; editPush?: boolean; onBurst?: () => void }): DeviceDriver {
   const caps = {
     slotModel: 'grid', grid: { rows: 4, cols: 12 }, gridEdit: true, scenes: 8, channels: true,
     presetDump: true, blockParamDecode: true,
-    telemetry: { tuner: false, outputMeters: !!opts.outputMeters, cpu: false },
+    telemetry: { tuner: false, outputMeters: !!opts.outputMeters, cpu: !!opts.cpu },
     fcModel: false, fcLiveRead: false, modBind: false, cabIrs: false, editorLayouts: false, supportsSave: true,
     deviceEditPush: !!opts.editPush
   } as DriverCapabilities;
@@ -202,6 +202,57 @@ async function yieldStarvation(): Promise<void> {
   assert(busyDelta >= 1, `starvation guard still forces a poll through (busy ${busyDelta})`);
 }
 
+/** Pack bytes into one continuous MSB-first 7-bit stream — the payload container of a `sub 0x2E` reply. */
+function septets(bytes: readonly number[]): number[] {
+  const out: number[] = [];
+  let acc = 0;
+  let bits = 0;
+  for (const b of bytes) {
+    acc = (acc << 8) | b;
+    bits += 8;
+    while (bits >= 7) {
+      bits -= 7;
+      out.push((acc >>> bits) & 0x7f);
+    }
+  }
+  if (bits > 0) out.push((acc << (7 - bits)) & 0x7f);
+  return out;
+}
+
+/** A real 590-byte FM3 system-status reply: 496 declared payload bytes with `percent` as the float32
+ *  percentage at payload offset 0x0C (the field the old byte-37 estimate approximated), checksum + F7. */
+function statusFrame(percent: number): number[] {
+  const payload = new Uint8Array(496);
+  new DataView(payload.buffer).setFloat32(0x0c, percent, true);
+  const head = [0xf0, 0x00, 0x01, 0x74, 0x11, 0x01, 0x2e, ...new Array<number>(12).fill(0), 496 & 0x7f, (496 >> 7) & 0x7f];
+  const body = [...head, ...septets(payload)];
+  return [...body, body.reduce((acc, b) => acc ^ b, 0) & 0x7f, 0xf7];
+}
+
+/** g. CPU: the supervisor emits the EXACT float32 percentage from the status frame — never the old
+ *     byte-37 estimate (which would answer 32 + raw·0.5). */
+async function cpuPercentEvent(): Promise<void> {
+  const percent = 41.75;
+  const frame = statusFrame(percent);
+  const mock = new MockTransport('serial', '/dev/ttyACM0');
+  mock.reply = (req) => {
+    if (isIdentifyBroadcast(req)) return [handshakeReply(0x11)];
+    if (req[5] === 0x01 && req[6] === 0x2e) return [frame];
+    return [];
+  };
+  const reg = makeReg(serial(mock), mock);
+  reg.__seedDriver(0x11, fakeGen3({ outputMeters: true, cpu: true }));
+  await reg.detect();
+  reg.setTelemetryMode('performance');
+  await reg.transport();
+  const seen: number[] = [];
+  const unsub = reg.subscribe((e) => { if (e.type === 'cpu') seen.push(e.percent); });
+  // the first meter tick polls CPU at once (step 0 % cpuEveryNTicks === 0)
+  for (let i = 0; i < 40 && seen.length === 0; i++) await sleep(30);
+  unsub();
+  assertEqual(seen[0], percent, 'cpu event carries the exact float32 percentage, not an estimate');
+}
+
 export async function runTelemetryTests(): Promise<void> {
   setConnOverride(null);
   setProfileOverride(null);
@@ -211,4 +262,5 @@ export async function runTelemetryTests(): Promise<void> {
   await echoGuardSuppression();
   await interactiveDetector();
   await yieldStarvation();
+  await cpuPercentEvent();
 }

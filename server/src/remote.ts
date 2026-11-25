@@ -7,6 +7,8 @@ import { gzipSync } from 'node:zlib';
 import type { FastifyInstance, InjectOptions } from 'fastify';
 import type { SupabaseClient, RealtimeChannel } from '@supabase/supabase-js';
 import type { DeviceEvent } from './drivers/types.js';
+import { isPrivateStorePath } from './runtime/storeAccess.js';
+import { REMOTE_RELAY_HEADER } from './services/originGuard.js';
 
 type Session = { client: SupabaseClient; userId: string };
 type Subscribe = (fn: (e: DeviceEvent) => void) => () => void;
@@ -22,10 +24,15 @@ const GZIP_MIN = 2048;
  *  live performance edits (params, bypass, channel, type, scene, tempo, tuner, grid moves/cables). NEVER
  *  remotely reachable: preset store-to-slot (/preset/store), backups/restore (incl. the Phase-6
  *  /preset/backup + /preset/restore dump movers), /firmware/validate (flash-adjacent byte mover), raw
- *  SysEx, cloud account, port selection, store writes/deletes, telemetry uploads, remote-enable itself. */
+ *  SysEx, cloud account (incl. the auth sessions in the private `cloud` store collection), port selection,
+ *  store writes/deletes, telemetry uploads, remote-enable itself. */
 export function remoteAllowed(method: string, path: string): boolean {
-  const p = (path.split('?')[0] || '').replace(/\/+$/, '') || '/';
-  if (method === 'GET') return !p.startsWith('/cloud') && !p.startsWith('/remote') && p !== '/debug/raw';
+  const n = normaliseRemotePath(path);
+  if (!n) return false;
+  const p = n.raw;
+  // reads: refused when EITHER spelling (as dispatched, or decoded with its dot segments resolved) names a
+  // refused area — never the cloud account, the remote toggle, raw SysEx or the auth sessions
+  if (method === 'GET') return !deniedRead(n.raw) && !deniedRead(n.decoded);
   if (method === 'PUT')
     return (
       /^\/preset\/blocks\/\d+\/params(\/\d+)?$/.test(p) ||
@@ -52,7 +59,38 @@ export function remoteAllowed(method: string, path: string): boolean {
   return false;
 }
 
+/** The path a relayed request reaches, the way the in-process inject resolves it (WHATWG URL against a local
+ *  base: dot segments, also percent-encoded ones, resolved; query dropped), plus a decoded spelling with the dot
+ *  segments the decoding revealed resolved and empty segments dropped. Null (refused): not an origin-relative
+ *  path (`//host/…`, an absolute URL, no leading slash) or not decodable. */
+export function normaliseRemotePath(path: string): { raw: string; decoded: string } | null {
+  if (typeof path !== 'string' || !path.startsWith('/') || path.startsWith('//') || path.includes('\\')) return null;
+  let u: URL;
+  try { u = new URL(path, 'http://remote.local'); } catch { return null; }
+  if (u.origin !== 'http://remote.local') return null;
+  const raw = u.pathname.replace(/\/+$/, '') || '/';
+  let dec: string;
+  try { dec = decodeURIComponent(u.pathname); } catch { return null; }
+  const segs: string[] = [];
+  for (const s of dec.split(/[\/\\]/)) {
+    if (s === '' || s === '.') continue;
+    if (s === '..') segs.pop(); else segs.push(s);
+  }
+  return { raw, decoded: '/' + segs.join('/') };
+}
+
+/** A read the relay never serves (matched case-insensitively). */
+function deniedRead(p: string): boolean {
+  const l = p.toLowerCase();
+  return l.startsWith('/cloud') || l.startsWith('/remote') || l === '/debug/raw' || isPrivateStorePath(p);
+}
+
 const TEXTY = /json|text|javascript|xml|svg/i;
+
+/** Device events the host bridges to a watching remote: discrete changes only (see `RemoteHost`). `definitions`
+ *  (stored device definitions changed, or the set of placed blocks without them) is rare and lets the remote
+ *  re-read caps and the open block. */
+export const RELAYED_EVENT_TYPES: ReadonlySet<string> = new Set(['param', 'changed', 'scene', 'tempo', 'config', 'telemetryConfig', 'definitions']);
 
 export class RemoteHost {
   #app: FastifyInstance;
@@ -113,9 +151,8 @@ export class RemoteHost {
     // poll (~8×/s), which would flood the relay. Those live-telemetry streams are a Phase 1.5 item.
     // 'traffic' stays local-only: a 1 Hz stream would break the zero-idle-cost rule below; remote
     // clients keep mode control (PUT relays) and just lose the live rate readout.
-    const RELAYED = new Set(['param', 'changed', 'scene', 'tempo', 'config', 'telemetryConfig']);
     this.#devUnsub = this.#subscribe((e) => {
-      if (!RELAYED.has(e.type)) return;
+      if (!RELAYED_EVENT_TYPES.has(e.type)) return;
       // Only bridge events while a remote is actually watching — a remote pulls config + full state at
       // connect, so nothing is missed, and idle/local editing spends zero Realtime messages.
       if (this.#remotesPresent === 0) return;
@@ -132,7 +169,7 @@ export class RemoteHost {
       res = { id: rq?.id ?? '?', status: 403, contentType: 'application/json', body: JSON.stringify({ error: 'not allowed remotely' }), encoding: 'utf8' };
     } else {
       try {
-        const inj: InjectOptions = { method: rq.method as InjectOptions['method'], url: rq.path, headers: { 'content-type': 'application/json' } };
+        const inj: InjectOptions = { method: rq.method as InjectOptions['method'], url: rq.path, headers: { 'content-type': 'application/json', [REMOTE_RELAY_HEADER]: '1' } };
         if (rq.body != null) inj.payload = rq.body;
         const r = await this.#app.inject(inj);
         const ct = (r.headers['content-type']?.toString()) ?? 'application/json';

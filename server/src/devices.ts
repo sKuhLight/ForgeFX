@@ -1,7 +1,8 @@
 // Per-device profile: everything that differs between gen-3 units (model byte, grid size, param
 // catalog, ranges, rosters, enum labels). The gen-3 effect codec itself is shared — only the data
 // changes — so the device client picks a profile by the detected model and is otherwise generic.
-import type { BuiltCache } from 'forgefx-midi/cache';
+import { familyAssignmentSuspects, isSyntheticFamilyKey } from 'forgefx-midi/cache';
+import type { BlockMapEntry, BuiltCache, DerivedSection, RangeDef as CodecRangeDef } from 'forgefx-midi/cache';
 import {
   FM3_RANGES,
   FM3_PARAMS_BY_FAMILY,
@@ -30,6 +31,7 @@ import {
   FM3_MOD_FIELDS,
   FM3_MONITOR_PARAMS,
   FM3_RANGE_SECTIONS,
+  FM3_CATALOG_BASELINE,
 } from 'forgefx-midi/gen3/fm3';
 import {
   FM9_RANGES, FM9_PARAMS_BY_FAMILY, FM9_ENUM_OVERRIDES, FM9_FAMILY_BY_EFFECT_ID, FM9_LAYOUTS,
@@ -39,6 +41,7 @@ import {
   FM9_MOD_EFFECT_ID, FM9_MOD_SLOT_COUNT, FM9_MOD_FIELDS,
   FM9_CAB_IRS,
   FM9_RANGE_SECTIONS,
+  FM9_CATALOG_BASELINE,
 } from 'forgefx-midi/gen3/fm9';
 import {
   PARAMS_BY_FAMILY as AXE3_PARAMS, resolveEnumValues as axe3Enum, GEN3_READ_ROSTERS, AXE3_LAYOUTS,
@@ -47,12 +50,31 @@ import {
   AXE3_FC_EFFECT_ID, AXE3_FC_CONFIGS, AXE3_FC_PARAMS_WIDTH, AXE3_FC_FIELDS,
   AXE3_MOD_EFFECT_ID, AXE3_MOD_SLOT_COUNT, AXE3_MOD_FIELDS, AXE3_MOD_SOURCES_STATUS,
   AXE3_RANGE_SECTIONS,
+  AXE3_CATALOG_BASELINE,
+  AXE3_CATALOG_SECTIONS,
+  AXE3_FAMILY_BY_EFFECT_ID,
+  axe3EffectIdEntry,
 } from 'forgefx-midi/gen3/axe-fx-iii';
 import type {
   DeviceEditorLayouts, EditorBlockLayout, EditorLayoutVariant, EditorLayoutPage,
-  EditorLayoutRow, EditorFwRange,
+  EditorLayoutRow, EditorLayoutControl, EditorFwRange, EditorWidgetKind,
 } from 'forgefx-midi/gen3/fm3';
 import { AM4_LAYOUTS } from 'forgefx-midi/am4';
+import { devHookValue, processEnv } from './devHooks.js';
+
+/** One served layout control: the codec's control, plus what the generic response adds (the classic response
+ *  serves the editor's controls as they are):
+ *  - `boundParamId`: the served param a button control presses (`CABINET_BTN_MUTE1` → `CABINET_MUTE1`); the
+ *    button's own `paramId` stays the editor's pseudo id.
+ *  - `movedFrom`: the control's catalog name sits at another pid on the connected device (it followed its row);
+ *    `paramId` is that pid, `movedFrom` the catalog pid.
+ *  - `unbound`: the device no longer serves the control's param (dropped, or its name could not follow a shifted
+ *    row); `paramId` stays the catalog pid, which may now hold another param, so the control must not write. */
+export type DeviceLayoutControl = EditorLayoutControl & { boundParamId?: number; movedFrom?: number; unbound?: true };
+/** One served layout row (the codec's row over served controls). */
+export type DeviceLayoutRow = Omit<EditorLayoutRow, 'controls'> & { controls: DeviceLayoutControl[] };
+/** One served layout page (the codec's page over served rows). */
+export type DeviceLayoutPage = Omit<EditorLayoutPage, 'rows'> & { rows: DeviceLayoutRow[] };
 
 // Editor-authentic UI layout (v2 schema — see forgefx-midi src/editorLayouts.ts). The wire `layout`
 // on /preset/blocks/:eid/params carries ONE resolved block-type/firmware variant of a block's editor
@@ -73,12 +95,67 @@ export type DeviceLayout = {
   /** True when the chosen variant is the firmware-current pinned one (amp DISTORT block). */
   pinned?: boolean;
   /** All pages of the chosen variant ONLY (editor display order); rows → controls verbatim from the codec. */
-  pages: EditorLayoutPage[];
+  pages: DeviceLayoutPage[];
 };
-// gen-3 shared virtual-effect effectIds (capture-confirmed on FM3; III reuses them since its package
-// ships layouts but no effectId table). Audio-block eids resolve via the codec (slugForEffectId).
+// ── development hook: hide one catalog family ─────────────────────────────────────────────────────────────────────
+/** Name of the leave-one-out development hook's environment variable. */
+export const HIDE_FAMILY_ENV = 'FORGEFX_DEFS_HIDE_FAMILY';
+/** The last active hook value seen (re-checked and re-announced only when it changes). */
+let hideState: { raw: string; family: string | null } | undefined;
+
+/**
+ * Development hook, off by default: `FORGEFX_DEFS_HIDE_FAMILY=<FAMILY>` (a catalog family symbol, upper case) hides that
+ * family from the bundled catalog for the session, so a block of it is served the way a block a newer firmware added
+ * is (unknown block → block map → probe): it leaves the static effect-id table (`familyForEffectId`, the codec slug
+ * resolution of the gen-3 driver), the static roster (walk bounds and hints, `staticFamilyForEffectId`), the
+ * derivation catalog (voter params and seeds, `familyFirstEid`, instance counts, rosters, reference rows and the
+ * section inventory — so its editor-cache section stays `section:<tag>`), see profileCatalog.ts. The bundled display
+ * tables (params, ranges, labels) are left alone. Read through a guarded process access (M2's diagnostic-hook
+ * pattern): a browser runtime has none and never hides anything. Like every development hook it needs the explicit
+ * opt-in `FORGEFX_DEV_HOOKS=1` and is ignored when `NODE_ENV=production` (devHooks.ts `devHookValue`, which announces
+ * an ignored value). One warning line per distinct active value. A malformed value (not an upper-case symbol) is
+ * ignored.
+ */
+export function hiddenFamily(): string | null {
+  const raw = devHookValue(processEnv(), HIDE_FAMILY_ENV)?.trim();
+  if (!raw) return null;
+  if (hideState?.raw === raw) return hideState.family;
+  let family: string | null = null;
+  if (!/^[A-Z][A-Z0-9_]*$/.test(raw)) console.warn(`[forgefx] ${HIDE_FAMILY_ENV}: ignored malformed value ${JSON.stringify(raw)} (expected a catalog family symbol, e.g. RESONATOR)`);
+  else {
+    family = raw;
+    console.warn(`[forgefx] ${HIDE_FAMILY_ENV}: the ${raw} family is hidden from the bundled catalog for this session (development hook)`);
+  }
+  hideState = { raw, family };
+  return family;
+}
+
+/** `family` unless it is the hidden one (`hiddenFamily`). */
+export const unlessHidden = (family: string | undefined): string | undefined =>
+  family !== undefined && family === hiddenFamily() ? undefined : family;
+
+// gen-3 shared virtual-effect effectIds (capture-confirmed on FM3; the III's effect-id table carries them too).
+// Audio-block eids resolve via the codec (slugForEffectId).
 const VIRTUAL_EID_FAMILY: Record<number, string> = { 1: 'GLOBAL', 2: 'CONTROLLERS', 3: 'MOD', 190: 'MIDIBLOCK', 199: 'FC' };
-const eidFamily = (map?: Record<number, string>) => (eid: number): string | undefined => map?.[eid] ?? VIRTUAL_EID_FAMILY[eid];
+const eidFamily = (map?: Record<number, string>) => (eid: number): string | undefined => unlessHidden(map?.[eid] ?? VIRTUAL_EID_FAMILY[eid]);
+
+/** The catalog section tag of `family` in an inventory (its first tag), null when it has none. */
+const inventoryTag = (inventory: ReadonlyArray<{ tag: number; family: string | null }>, family: string): number | null =>
+  inventory.find((s) => s.family === family)?.tag ?? null;
+
+/** The Axe-Fx III block-map entry of an effect id a family reserves that the III effect-id table names from the roster
+ *  only (`confidence: 'roster'`, FORGEFX-45: IR Capture 36, Vocoder 134-137, Crossover 142-145, Tone Match 170-173,
+ *  RTA 174-177, IR Player 195-198 — every reserved instance slot, as the static roster maps them): the family is known,
+ *  no device read has bound it, so it is served read-only (drivers/blockMapState.ts). `sectionTag` is the family's tag
+ *  in the III section inventory (a hint, null for IR Capture). Undefined for any other id and for the hidden family. */
+function axe3RosterEntry(eid: number): BlockMapEntry | undefined {
+  const hit = axe3EffectIdEntry(eid);
+  if (!hit || hit.entry.confidence !== 'roster' || unlessHidden(hit.entry.family) === undefined) return undefined;
+  return {
+    eid, key: hit.entry.family, sectionTag: inventoryTag(AXE3_CATALOG_SECTIONS, hit.entry.family),
+    confidence: 'roster', evidence: ['roster'], channels: null
+  };
+}
 
 // Parse a variant/page selector `value` ("10,11,12") into the numeric block-type values it activates.
 // Blank segments are dropped, so an EMPTY value ("") parses to NO values rather than to [0]: the editor
@@ -90,27 +167,54 @@ const parseSelectorValues = (value: string | null | undefined): number[] =>
     ? []
     : value.split(',').map((s) => s.trim()).filter((s) => s !== '').map(Number).filter((n) => Number.isFinite(n));
 
-// Pick the block-type / firmware variant that matches the block's CURRENT type value:
-//   1. variants whose selector `value` list contains typeValue win (the normal per-type case);
-//   2. else the unconditional (value === null) variants — the firmware-only-versioned Amp block, whose
-//      variants all carry value:null but differ by `fw`;
-//   3. else every variant (degenerate: nothing declared).
-// Within the winning set, prefer the firmware-pinned variant (amp DISTORT ships every historical fw
-// layout with exactly one pinned:true), else the variant named `preferName` (a per-family hint, see
-// AM4_PREFERRED_VARIANT), else the first in editor order.
-const selectVariant = (block: EditorBlockLayout, typeValue?: number, preferName?: string): EditorLayoutVariant | undefined => {
-  const variants = block.variants;
-  if (!variants.length) return undefined;
-  let cands = typeValue == null ? [] : variants.filter((v) => parseSelectorValues(v.value).includes(typeValue));
+// Pick the block-type / firmware variant that matches the block's CURRENT state, on the firmware level `fw`
+// (see layoutFirmwareLevel; the newest firmware when the connected one is not known):
+//   0. only variants that exist on that firmware take part: the variant's own gate holds, and so does the gate of
+//      at least one of its pages. A variant whose pages are all gated away is a legacy one even when the variant
+//      itself carries no gate (the shipped layouts have none since the codec folds an editor catch-all page into
+//      every type no sibling names — before that, TREMOLO types 0/2/4 had only their `lt 8,00` page). When nothing
+//      is left on a known firmware, the newest firmware decides; when nothing is left at all, every variant takes
+//      part (degenerate data);
+//   1. the key: a variant the generator folded from a page-level selector names that selector
+//      (`selectorParamName`, e.g. DELAY_TYPE: the Delay's routing type, not its model selector DELAY_MODEL;
+//      REVERB_BASETYPE, not the reverb's type REVERB_TYPE), so its `value` is that selector's CURRENT ordinal
+//      (`selectors`; see SelectorValues). An unknown selector value keys nothing (→ the folded family's default
+//      variant), never the type value, which is another selector's. A caller without a selector lookup keys by the
+//      type value;
+//   2. variants whose `value` list contains the key win (the normal per-type case);
+//   3. else the unconditional (value === null) variants — the firmware-only-versioned Amp block, whose
+//      variants all carry value:null but differ by `fw`, and a folded family's catch-all default;
+//   4. else every remaining variant.
+// Within the winning set, firmware siblings collapse to the one for the firmware (preferFw: a legacy and a current
+// variant of the same type, MULTITAP's `lt 9,02` / `gtet 9,02` pairs, keep the current one), then prefer the
+// firmware-pinned variant (amp DISTORT ships every historical fw layout with exactly one pinned:true), else the
+// variant named `preferName` (a per-family hint, see AM4_PREFERRED_VARIANT), else the first in editor order.
+const selectVariant = (
+  block: EditorBlockLayout, typeValue: number | undefined, selectors: SelectorValues | undefined, fw: number, preferName?: string,
+): EditorLayoutVariant | undefined => {
+  if (!block.variants.length) return undefined;
+  const existing = (at: number) => block.variants.filter((v) => fwGateHolds(v.fw, at) && v.pages.some((p) => fwGateHolds(p.fw, at)));
+  let at = fw;
+  let variants = existing(at);
+  if (!variants.length && at !== NEWEST_FW) variants = existing((at = NEWEST_FW));
+  if (!variants.length) variants = block.variants;
+  const selectorName = variants.find((v) => v.selectorParamName)?.selectorParamName;
+  const key = selectorName !== undefined && selectors ? selectors(selectorName) : typeValue;
+  let cands = key == null ? [] : variants.filter((v) => parseSelectorValues(v.value).includes(key));
   if (!cands.length) cands = variants.filter((v) => v.value == null);
   if (!cands.length) cands = variants;
+  cands = preferFw(cands, at);
   return cands.find((v) => v.pinned) ?? (preferName ? cands.find((v) => v.name === preferName) : undefined) ?? cands[0];
 };
 
 // Lookup from an editor selector parameter symbol (e.g. 'DISTORT_EQTYPE', 'DISTORT_TYPE') to the block's
-// CURRENT numeric value of that param, or undefined when unknown. The driver builds this from the block's
-// live read: the family type selector answers with the type already decoded in blockParams, other
-// selectors (EQ type / drive type / …) with the block's named/enum param values.
+// CURRENT ordinal of that param — the number the editor's variant / page `value` lists name — or undefined when
+// unknown. The driver builds this from the block's live read: the family type selector answers with the type
+// already decoded in blockParams, a selector served as an enum with the ordinal it decoded, any other selector
+// (a dial, or a row the response does not list: REVERB_BASETYPE is a `count` float row) with the ordinal read from
+// its RAW body value (gen3 `selectorOrdinal`: the raw value within the row's top ordinal or too small to be a scaled
+// reading — base types 9 / 10 beyond the row's 0..8 — else unscaled) — never a dial's display value (raw 6 = base
+// type 6 displays as 0.0007).
 export type SelectorValues = (selectorParamName: string) => number | undefined;
 
 // Parse an editor firmware bound ("maj,min", e.g. "6,03" / "12,00") into a comparable integer. Absent → 0.
@@ -120,12 +224,31 @@ const fwBound = (v?: string): number => {
   return maj * 1000 + min;
 };
 
+/** The connected device's firmware (`major.minor` as the device reports it, e.g. 13.0 → { major: 13, minor: 0 }),
+ *  which the editor layouts' firmware gates (`lt` / `gtet`) are evaluated against. Null or absent: not known — the
+ *  layout is resolved for the newest firmware. */
+export type LayoutFirmware = { major: number; minor: number } | null;
+
+/** The firmware level the newest firmware stands for: every `gtet` gate holds, no `lt` gate does. */
+const NEWEST_FW = Number.POSITIVE_INFINITY;
+
+/** A firmware on the scale of `fwBound` (13.0 → 13000, 9.02 → 9002); the newest firmware when it is not known. */
+export const layoutFirmwareLevel = (fw: LayoutFirmware | undefined): number =>
+  fw && Number.isInteger(fw.major) && Number.isInteger(fw.minor) && fw.major >= 0 && fw.minor >= 0 ? fw.major * 1000 + fw.minor : NEWEST_FW;
+
+/** Does an editor firmware gate hold on the firmware level `fw`? No gate always holds; `gtet` = at least that
+ *  firmware, `lt` = below it, both = the range in between. */
+const fwGateHolds = (gate: EditorFwRange | undefined, fw: number): boolean =>
+  !gate || ((gate.gtet == null || fw >= fwBound(gate.gtet)) && (gate.lt == null || fw < fwBound(gate.lt)));
+
 // Among same-named siblings (pages, or controls) that differ only by firmware gate, keep the one(s) that
 // apply to the NEWEST firmware — deterministic, no live firmware version needed:
 //   • a `gtet` (>=) sibling supersedes everything → keep the single highest `gtet`;
 //   • else null-gated (always-applicable) siblings supersede `lt`-only ones → keep the null-gated ones;
 //   • else (only `lt`-only siblings) the newest firmware reaches the highest `lt` bound → keep that one.
-// With no firmware gates in the set the siblings are genuinely distinct → all kept.
+// With no firmware gates in the set the siblings are genuinely distinct → all kept. (The layout resolution removes
+// every `lt`-gated sibling before it gets here — none applies to the newest firmware — so the last rule only
+// serves a caller that did not.)
 const preferNewestFw = <T extends { fw?: EditorFwRange }>(items: T[]): T[] => {
   if (items.length <= 1) return items;
   if (!items.some((i) => i.fw && (i.fw.gtet || i.fw.lt))) return items;
@@ -134,6 +257,19 @@ const preferNewestFw = <T extends { fw?: EditorFwRange }>(items: T[]): T[] => {
   const nullGated = items.filter((i) => !i.fw?.gtet && !i.fw?.lt);
   if (nullGated.length) return nullGated;
   return [items.reduce((a, b) => (fwBound(b.fw!.lt) > fwBound(a.fw!.lt) ? b : a))];
+};
+
+// Same-named firmware siblings whose gates all hold on the firmware level `fw`: the newest firmware → preferNewestFw;
+// a known firmware → the most specific gate wins, like a versioned editor page would be picked: the highest `gtet`
+// bound, then the lowest `lt` bound (a gated sibling beats an ungated one). One sibling is kept, the first on a tie
+// (the generator emits some pages twice); with no gate in the set every sibling is kept (genuinely distinct).
+const preferFw = <T extends { fw?: EditorFwRange }>(items: T[], fw: number): T[] => {
+  if (fw === NEWEST_FW) return preferNewestFw(items);
+  if (items.length <= 1) return items;
+  if (!items.some((i) => i.fw && (i.fw.gtet || i.fw.lt))) return items;
+  const low = (i: T) => (i.fw?.gtet ? fwBound(i.fw.gtet) : Number.NEGATIVE_INFINITY);
+  const high = (i: T) => (i.fw?.lt ? fwBound(i.fw.lt) : Number.POSITIVE_INFINITY);
+  return [items.reduce((a, b) => (low(b) > low(a) || (low(b) === low(a) && high(b) < high(a)) ? b : a))];
 };
 
 // Selector filter for one group of same-named pages: a page with no selector value is always kept; a
@@ -165,14 +301,14 @@ const filterPagesBySelector = (
   return [...ungated, ...(byType.length ? byType : fallback)];
 };
 
-// Drop controls that the newest firmware would hide: a control gated with an `lt` (only firmware < X)
-// bound never applies to the newest firmware (whether it also carries a `gtet` — a closed range — or not).
-// Controls with a `gtet`-only gate or no gate always apply and pass through untouched.
-const pruneControlsByFw = (page: EditorLayoutPage): EditorLayoutPage => {
+// Drop the controls the firmware level `fw` does not show: a control whose firmware gate does not hold. On the
+// newest firmware that is every control with an `lt` bound (whether it also carries a `gtet` — a closed range —
+// or not); controls with a `gtet`-only gate or no gate always apply there. Untouched pages and rows stay shared.
+const pruneControlsByFw = (page: EditorLayoutPage, fw: number): EditorLayoutPage => {
   let touched = false;
   const rows: EditorLayoutRow[] = page.rows.map((row) => {
     const controls = row.controls.filter((c) => {
-      const drop = c.fw?.lt != null;
+      const drop = !fwGateHolds(c.fw, fw);
       if (drop) touched = true;
       return !drop;
     });
@@ -181,37 +317,48 @@ const pruneControlsByFw = (page: EditorLayoutPage): EditorLayoutPage => {
   return touched ? { ...page, rows } : page;
 };
 
-// Filter a variant's pages down to what the editor actually shows for the block's current state: pages
-// group by display name (same-named pages are selector/firmware siblings), each group collapses to the
-// selector-matching page(s), firmware siblings collapse to the newest-firmware one, and per-control
-// firmware gates prune controls hidden on the newest firmware. Order preserved.
+// Filter a variant's pages down to what the editor actually shows for the block's current state on the connected
+// firmware (`firmware`; the newest firmware when it is not known): pages whose firmware gate does not hold are
+// dropped (on the newest firmware every `lt`-gated page, a lone one included), the rest group by display name
+// (same-named pages are selector/firmware siblings), each group collapses to the selector-matching page(s),
+// firmware siblings collapse to the one for the firmware (preferFw), and per-control firmware gates prune the
+// controls the firmware does not show. Order preserved.
 export const resolveLayoutPages = (
   pages: EditorLayoutPage[],
   typeValue?: number,
   selectors?: SelectorValues,
-): EditorLayoutPage[] => {
+  firmware?: LayoutFirmware,
+): EditorLayoutPage[] => resolvePagesAt(pages, typeValue, selectors, layoutFirmwareLevel(firmware));
+
+const resolvePagesAt = (pages: EditorLayoutPage[], typeValue: number | undefined, selectors: SelectorValues | undefined, fw: number): EditorLayoutPage[] => {
   const order: string[] = [];
   const groups = new Map<string, EditorLayoutPage[]>();
   for (const p of pages) {
+    if (!fwGateHolds(p.fw, fw)) continue;
     if (!groups.has(p.name)) { groups.set(p.name, []); order.push(p.name); }
     groups.get(p.name)!.push(p);
   }
   const out: EditorLayoutPage[] = [];
   for (const name of order) {
-    const kept = preferNewestFw(filterPagesBySelector(groups.get(name)!, typeValue, selectors));
-    for (const p of kept) out.push(pruneControlsByFw(p));
+    const kept = preferFw(filterPagesBySelector(groups.get(name)!, typeValue, selectors), fw);
+    for (const p of kept) out.push(pruneControlsByFw(p, fw));
   }
   return out;
 };
 
-// Resolve a family's editor layout to the wire DeviceLayout for the block's CURRENT type value, with the
-// selected variant's pages filtered to the current selector/firmware state (see resolveLayoutPages).
+// Resolve a family's editor layout to the wire DeviceLayout for the block's CURRENT state on the connected firmware
+// (`firmware`, the newest when not known): the variant per selectVariant, its pages filtered to the current
+// selector/firmware state (see resolveLayoutPages). A known firmware no variant exists on resolves as the newest.
 const layoutFrom = (layouts: DeviceEditorLayouts, preferredVariant: Record<string, string> = {}) =>
-  (family: string, typeValue?: number, selectors?: SelectorValues): DeviceLayout | undefined => {
+  (family: string, typeValue?: number, selectors?: SelectorValues, firmware?: LayoutFirmware): DeviceLayout | undefined => {
     const block = layouts[family];
     if (!block) return undefined;
-    const variant = selectVariant(block, typeValue, preferredVariant[family]);
+    let fw = layoutFirmwareLevel(firmware);
+    const variant = selectVariant(block, typeValue, selectors, fw, preferredVariant[family]);
     if (!variant) return undefined;
+    // the variant was picked on the newest firmware when none exists on the connected one: its pages are resolved
+    // on that level too, so the block is never served a variant without pages
+    if (fw !== NEWEST_FW && !(fwGateHolds(variant.fw, fw) && variant.pages.some((p) => fwGateHolds(p.fw, fw)))) fw = NEWEST_FW;
     return {
       editorName: block.editorName,
       family: block.family,
@@ -219,7 +366,7 @@ const layoutFrom = (layouts: DeviceEditorLayouts, preferredVariant: Record<strin
       variantValue: variant.value,
       ...(variant.fw ? { fw: variant.fw } : {}),
       ...(variant.pinned ? { pinned: true } : {}),
-      pages: resolveLayoutPages(variant.pages, typeValue, selectors),
+      pages: resolvePagesAt(variant.pages, typeValue, selectors, fw),
     };
   };
 
@@ -231,18 +378,20 @@ const AM4_FAMILY_BY_BLOCK: Record<string, string> = {
   chorus: 'CHORUS', flanger: 'FLANGER', rotary: 'ROTARY', phaser: 'PHASER', wah: 'WAH', volpan: 'VOLUME',
   tremolo: 'TREMOLO', filter: 'FILTER', drive: 'FUZZ', enhancer: 'ENHANCER', gate: 'GATE',
 };
-// The AM4 DISTORT layout holds two unconditional (value-less) variants: the device-global setup pages
-// ('Global': Audio / Footswitches / MIDI / Remote / Global — also the block's editorName) listed first, and
-// the actual 'Amp' editor. Plain first-wins selection served the global pages on the AM4 amp block, so name
-// the block editor. (The layout data itself should tag the global variant; that is a forgefx-midi matter.)
+// The AM4 DISTORT layout used to hold two unconditional (value-less) variants: the device-global setup pages
+// ('Global': Audio / Footswitches / MIDI / Remote / Global) listed first, and the actual 'Amp' editor, and plain
+// first-wins selection served the global pages on the AM4 amp block. The codec's layouts now file the global pages
+// under their own GLOBAL family (editorName 'Amp' on DISTORT); the hint stays so a regenerated layout that mixes
+// them again still serves the amp editor on the amp block.
 const AM4_PREFERRED_VARIANT: Record<string, string> = { DISTORT: 'Amp' };
 const am4LayoutOf = layoutFrom(AM4_LAYOUTS, AM4_PREFERRED_VARIANT);
 /** Editor-authentic layout for an AM4 block (by its lowercase block name, e.g. 'amp'/'drive'), for the
- *  block's current type value. Controls join to the AM4 catalog by cacheId in the codec; unresolved
- *  paramIds ride through as null (display-only). Undefined for a block with no AM4 layout. */
-export const am4LayoutFor = (block: string, typeValue?: number, selectors?: SelectorValues): DeviceLayout | undefined => {
+ *  block's current type value (and firmware, when known: see LayoutFirmware). Controls join to the AM4 catalog by
+ *  cacheId in the codec; unresolved paramIds ride through as null (display-only). Undefined for a block with no AM4
+ *  layout. */
+export const am4LayoutFor = (block: string, typeValue?: number, selectors?: SelectorValues, firmware?: LayoutFirmware): DeviceLayout | undefined => {
   const family = AM4_FAMILY_BY_BLOCK[block.toLowerCase()];
-  return family ? am4LayoutOf(family, typeValue, selectors) : undefined;
+  return family ? am4LayoutOf(family, typeValue, selectors, firmware) : undefined;
 };
 
 // FC + Modifier address models (FM3-decoded; other devices not decoded yet). Lets the client compute
@@ -375,15 +524,61 @@ export const SLUG_FAMILY: Record<string, string> = {
   multiplexer: 'MULTIPLEXER'
 };
 
-type ParamDef = { paramId: number; name: string; displayLabel?: string; unit?: string };
-// NOTE: `taper`/`taperPoints` are declared here so `#display` can read a device-true taper type-safely
-// from EITHER source `ranges` resolves to — a static-catalog row (which carries them today) or a
-// walk-built RangeDef (which gains `taper` in a parallel work package). Optional → both read cleanly,
-// no rework when the walk builder starts populating it. `custom` also carries `taperPoints`.
-type RangeDef = { kind: string; displayMin: number; displayMax: number; typecode: number; scale?: number; step?: number; unit?: string; taper?: 'linear' | 'log' | 'flat' | 'custom'; taperPoints?: ReadonlyArray<readonly [number, number]> };
+export type ParamDef = { paramId: number; name: string; displayLabel?: string; unit?: string };
+// A profile row is the codec's `RangeDef` (what the catalogs and the cache builder produce, so the codec's
+// row predicates and fingerprint take it as is), plus `synthetic`: a static row derived from a param table's
+// inline bounds instead of read from a device cache (see AXE3_RANGES). Its typecode is 0 and its kind a
+// guess, so it never takes part in a fingerprint comparison.
+export type RangeDef = CodecRangeDef & { synthetic?: true };
 type ParamsByFamily = Record<string, ParamDef[]>;
 type Ranges = Record<string, Record<number, RangeDef>>;
 type RangeSections = Record<string, { stride: number; recordCount: number }>;
+
+/** Friendly param label: the catalog displayLabel, else tidy the raw NAME (strip family prefix, _→space). */
+export function paramLabel(p: { displayLabel?: string; name: string }): string {
+  return p.displayLabel ?? p.name.replace(/^[A-Z0-9]+_/, '').replace(/_/g, ' ');
+}
+
+/** Where a runtime profile came from, normalised from `built.meta.source`: an editor-cache import
+ *  (the codec's raw byte-source value 'bytes' counts as one), a live walk, a pulled cloud profile, an
+ *  imported definitions file (`.axisdefs`), or anything else. */
+export type ProfileSource = 'editor-cache' | 'live' | 'cloud' | 'axisdefs' | 'unknown';
+
+/** Provenance and raw rows of the runtime profile a `DeviceProfile` was layered from. Set only by
+ *  `runtimeProfileFrom`; the static profiles carry none. The param index (drivers/paramIndex.ts) compares
+ *  these against the bundled catalog to decide what is new, removed or renamed on the connected firmware. */
+export interface ProfileFacts {
+  source: ProfileSource;
+  /** `isByteExactProfile(built.meta)`: the document as a whole (its best source), what the capabilities show. Whether a
+   *  given family's rows are byte-exact is `isByteExactFamily` — every consumer of the rows asks that one. */
+  byteExact: boolean;
+  /** Are the rows of `family` byte-exact device data (`familyByteExactness`)? A merged profile document decides per
+   *  family: the source that provides the family's existence facts (`provenance.existence`) is an editor cache (of
+   *  any origin — a cloud or file editor-cache source counts for display as `isByteExactProfile` counts cloud bytes;
+   *  walk bounds and hints never read this, see services/deviceCache.ts `localByteSource`). A family a live source
+   *  provides gets the live guards (no kind re-classification, no placeholder over a catalog row, no stride shrink).
+   *  A legacy (format-1) document: `byteExact` for every family. */
+  isByteExactFamily(family: string): boolean;
+  /** Effect ids the document's persisted block map binds with confidence `confirmed` (a block the catalog does not
+   *  place, matched to a section or walked live). Empty for a legacy document. */
+  confirmedBlocks: ReadonlySet<number>;
+  /** The document's editor-cache sections (`sections` with `space: 'section'`): what a placed block the catalog
+   *  cannot place is matched against by its bulk read (the runtime `likely`, `matchBulkShape`). Empty for a legacy
+   *  document and for one without an editor-cache source. */
+  byteSections: readonly DerivedSection[];
+  /** `built.firmware`, when the doc carries one. */
+  firmware: string | null;
+  /** `built.ranges` verbatim (placeholder rows included). */
+  ranges: Readonly<Record<string, Readonly<Record<number, CodecRangeDef>>>>;
+  /** `built.enumOverrides` verbatim (the device's label lists). */
+  enumLabels: Readonly<Record<string, Readonly<Record<string, readonly string[]>>>>;
+  /** family → pids whose EFFECTIVE row was taken from the profile by the merge. Not set for the rows a live
+   *  profile skips: placeholders, and kind conflicts that keep the catalog row. */
+  appliedRows: Readonly<Record<string, ReadonlySet<number>>>;
+  /** Families flagged by `familyAssignmentSuspects`: the cache section looks assigned to the wrong family.
+   *  Their rows, labels, sections and rosters were NOT merged. */
+  suspectFamilies: readonly string[];
+}
 
 export interface DeviceProfile {
   model: number; // SysEx model byte (f[4])
@@ -407,12 +602,31 @@ export interface DeviceProfile {
   enumLabelsFor(family: string, paramId: number): string[] | undefined;
   /** Cab IR names per bank (Factory 1/2, Legacy, Scratchpad) — for the cab IR picker. {} if the device has none. */
   cabIrs(): Record<string, string[]>;
-  /** effectId → catalog family, incl. virtual effects (GLOBAL=1, Controllers=2, Modifier=3, FC=199). */
+  /** effectId → catalog family, incl. virtual effects (GLOBAL=1, Controllers=2, Modifier=3, FC=199). A runtime profile
+   *  adds the block-map overlay: an effect id the applied document's block map binds `confirmed` resolves to the
+   *  entry's key (a catalog family, `section:<tag>` or `block:<eid>`). */
   familyForEffectId(eid: number): string | undefined;
+  /** The block-map entry of an effect id the catalog cannot place on its own: the static effect-id table's `roster`
+   *  entries (Axe-Fx III, FORGEFX-45), else (runtime profile) the applied document's persisted entry for an effect id
+   *  the static tables do not place. Undefined for every catalog block and every unknown one without an entry. How a
+   *  block is served per entry: drivers/blockMapState.ts. */
+  blockMapFor?(eid: number): BlockMapEntry | undefined;
   /** Editor-authentic UI layout for a family, resolved to the block-type/firmware variant selected by
-   *  the block's CURRENT type value (`typeValue`); the variant's pages are further filtered to the
-   *  block's current selector/firmware state via `selectors` (see resolveLayoutPages). Undefined if none. */
-  layoutFor(family: string, typeValue?: number, selectors?: SelectorValues): DeviceLayout | undefined;
+   *  the block's CURRENT state: its type value (`typeValue`), or the value of the selector a folded variant names
+   *  (`selectors`); the variant's pages are further filtered to the block's current selector state via `selectors`
+   *  and everything to the connected firmware (`firmware`; the newest firmware when it is not known), see
+   *  selectVariant / resolveLayoutPages. Undefined if none. */
+  layoutFor(family: string, typeValue?: number, selectors?: SelectorValues, firmware?: LayoutFirmware): DeviceLayout | undefined;
+  /** The raw editor layouts `layoutFor` resolves from (family → block → variants → pages → rows → controls).
+   *  Kept so `layoutWidgetIndex` can read which widget the editor draws for a parameter id. */
+  editorLayouts?: DeviceEditorLayouts;
+  /** Firmware the bundled catalog (ranges, enum labels, strides) was generated from, e.g. '12.0'; null
+   *  when that is not settled for the device. A running firmware that equals it needs no profile. */
+  catalogFirmware: string | null;
+  /** Runtime profile only (`runtimeProfileFrom`): where it came from and which rows the merge took. */
+  profileFacts?: ProfileFacts;
+  /** Runtime profile only: the static profile it was layered over. */
+  staticBase?: DeviceProfile;
   /** Foot Controller address model. FM3 supports live state read; FM9/III expose the address model only. */
   fcModel?: FcModel;
   /** Modifier address model. Field map (bind) confirmed on FM3/FM9/III; source enum FM3-only for now. */
@@ -499,7 +713,7 @@ const AXE3_RANGES: Ranges = (() => {
     out[fam] = {};
     for (const p of list) {
       if (p.displayMin == null || p.displayMax == null) continue;
-      out[fam][p.paramId] = { kind: CONT_UNITS.has(p.unit ?? '') ? 'float' : 'enum', displayMin: p.displayMin, displayMax: p.displayMax, typecode: 0 };
+      out[fam][p.paramId] = { kind: CONT_UNITS.has(p.unit ?? '') ? 'float' : 'enum', displayMin: p.displayMin, displayMax: p.displayMax, scale: 1, step: 0, typecode: 0, synthetic: true };
     }
   }
   for (const [fam, rows] of Object.entries(axe3DeviceRanges)) {
@@ -550,8 +764,12 @@ export const PROFILES: Record<number, DeviceProfile> = {
     rosterFor: axe3RosterFor,
     enumLabelsFor: axe3EnumLabels,
     cabIrs: () => AXE3_CAB_IRS as unknown as Record<string, string[]>, // factory banks bundled (III editor cache, fw 32.6 era); USER banks read live
-    familyForEffectId: eidFamily(), // III ships no effectId table → shared gen-3 virtual eids only
+    // the III effect-id table (FORGEFX-45): every family's first effect id, the six `roster` ids served read-only
+    familyForEffectId: eidFamily(AXE3_FAMILY_BY_EFFECT_ID as Record<number, string>),
+    blockMapFor: axe3RosterEntry,
     layoutFor: layoutFrom(AXE3_LAYOUTS as unknown as DeviceEditorLayouts),
+    editorLayouts: AXE3_LAYOUTS as unknown as DeviceEditorLayouts,
+    catalogFirmware: AXE3_CATALOG_BASELINE.firmware,
     fcModel: AXE3_FC_MODEL,
     modModel: AXE3_MOD_MODEL,
     monitorParams: AXE3_MONITOR_PARAMS
@@ -569,6 +787,8 @@ export const PROFILES: Record<number, DeviceProfile> = {
     cabIrs: () => fm3CabIrs, // device-true IR names per bank (fractal-midi FM3_CAB_IRS)
     familyForEffectId: eidFamily(FM3_FAMILY_BY_EFFECT_ID as Record<number, string>),
     layoutFor: layoutFrom(FM3_LAYOUTS as unknown as DeviceEditorLayouts),
+    editorLayouts: FM3_LAYOUTS as unknown as DeviceEditorLayouts,
+    catalogFirmware: FM3_CATALOG_BASELINE.firmware,
     fcModel: FM3_FC_MODEL,
     modModel: FM3_MOD_MODEL,
     monitorParams: FM3_MONITOR_PARAMS,
@@ -586,6 +806,8 @@ export const PROFILES: Record<number, DeviceProfile> = {
     cabIrs: () => FM9_CAB_IRS as unknown as Record<string, string[]>, // factory banks bundled (FM9-Edit cache 76p0); USER banks read live
     familyForEffectId: eidFamily(FM9_FAMILY_BY_EFFECT_ID as Record<number, string>),
     layoutFor: layoutFrom(FM9_LAYOUTS as unknown as DeviceEditorLayouts),
+    editorLayouts: FM9_LAYOUTS as unknown as DeviceEditorLayouts,
+    catalogFirmware: FM9_CATALOG_BASELINE.firmware,
     fcModel: FM9_FC_MODEL,
     modModel: FM9_MOD_MODEL,
     monitorParams: FM9_MONITOR_PARAMS
@@ -605,15 +827,149 @@ export const profileForKey = (key: string): DeviceProfile | undefined => Object.
  *   • 'cloud'        — a pulled profile (services/cloudProfiles.ts); the build kind it was published
  *                      from rides in `meta.origin` ('bytes' | 'live', normalised on publish), so it is
  *                      byte-exact only when that origin is a byte source;
+ *   • 'axisdefs'     — a profile imported from a definitions file; like 'cloud', the class of its best
+ *                      source rides in `meta.origin`;
  *   • 'bytes'        — the codec's raw byte-source value (never persisted as-is by ForgeFX, but it is
  *                      what a cloud profile's `origin` carries).
- * Anything else, including a missing source (GET /device/cache reports that as 'live' too), counts as
- * NOT byte-exact: unknown provenance gets the cautious live-walk treatment in runtimeProfileFrom.
+ * A merged (format-2) doc carries the class of its best-ranked source the same way (an editor-cache source
+ * outranks every live one). Anything else, including a missing source (GET /device/cache reports that as
+ * 'live' too), counts as NOT byte-exact: unknown provenance gets the cautious live-walk treatment in
+ * runtimeProfileFrom.
  */
 export function isByteExactProfile(meta: { source?: unknown; origin?: unknown } | undefined): boolean {
   const isByteKind = (v: unknown) => v === 'editor-cache' || v === 'bytes';
   if (!meta) return false;
-  return meta.source === 'cloud' ? isByteKind(meta.origin) : isByteKind(meta.source);
+  return meta.source === 'cloud' || meta.source === 'axisdefs' ? isByteKind(meta.origin) : isByteKind(meta.source);
+}
+
+// ── catalog reference for the section-assignment cross-check ─────────────────────────────────────────
+/** The row and label tables the cross-check compares a runtime profile against. */
+type CatalogTables = {
+  readonly ranges: Readonly<Record<string, Readonly<Record<number, CodecRangeDef>>>>;
+  readonly enumOverrides: Readonly<Record<string, Readonly<Record<string, readonly string[]>>>>;
+};
+
+/** The codec's own catalog tables per bundled profile: what the on-device rows of that device were
+ *  mined into, without the rows ForgeFX synthesises on top (the III's inline-bound rows have no
+ *  typecode, so they cannot be told apart by shape). */
+const CATALOG_TABLES = new WeakMap<DeviceProfile, CatalogTables>([
+  [PROFILES[0x10]!, { ranges: AXE3_DEVICE_RANGES, enumOverrides: AXE3_ENUM_OVERRIDES }],
+  [PROFILES[0x11]!, { ranges: FM3_RANGES, enumOverrides: FM3_ENUM_OVERRIDES }],
+  [PROFILES[0x12]!, { ranges: FM9_RANGES, enumOverrides: FM9_ENUM_OVERRIDES }],
+]);
+const DERIVED_CATALOG_TABLES = new WeakMap<DeviceProfile, CatalogTables>();
+
+/** The reference tables of a static profile: the codec's catalog tables for a bundled profile, else (a
+ *  hand-built profile) its own rows without the synthetic ones, with the labels `enumLabelsFor` serves. */
+function catalogTablesOf(staticProfile: DeviceProfile): CatalogTables {
+  const bundled = CATALOG_TABLES.get(staticProfile);
+  if (bundled) return bundled;
+  let derived = DERIVED_CATALOG_TABLES.get(staticProfile);
+  if (!derived) {
+    const ranges: Record<string, Record<number, RangeDef>> = {};
+    const enumOverrides: Record<string, Record<string, readonly string[]>> = {};
+    for (const [fam, rows] of Object.entries(staticProfile.ranges)) {
+      const famRows: Record<number, RangeDef> = {};
+      const famLabels: Record<string, readonly string[]> = {};
+      for (const [pidStr, row] of Object.entries(rows)) {
+        if (row.synthetic) continue;
+        famRows[Number(pidStr)] = row;
+        const labels = staticProfile.enumLabelsFor(fam, Number(pidStr));
+        if (labels?.length) famLabels[pidStr] = labels;
+      }
+      ranges[fam] = famRows;
+      enumOverrides[fam] = famLabels;
+    }
+    derived = { ranges, enumOverrides };
+    DERIVED_CATALOG_TABLES.set(staticProfile, derived);
+  }
+  return derived;
+}
+
+/** Families of a built profile whose rows match another family's catalog rows clearly better than their
+ *  own (`familyAssignmentSuspects`). A synthetic key (`section:<tag>` / `block:<eid>` of a profile document)
+ *  has no catalog rows of its own and is never listed. A malformed document must never fail the profile swap,
+ *  so a throw counts as "no suspects". */
+function suspectFamiliesOf(built: BuiltCache, staticProfile: DeviceProfile): string[] {
+  try {
+    return familyAssignmentSuspects(
+      { ranges: built.ranges ?? {}, enumOverrides: built.enumOverrides ?? {} },
+      catalogTablesOf(staticProfile.staticBase ?? staticProfile),
+    ).filter((f) => !isSyntheticFamilyKey(f));
+  } catch {
+    return [];
+  }
+}
+
+const profileSourceOf = (src: unknown): ProfileSource =>
+  src === 'editor-cache' || src === 'bytes' ? 'editor-cache' : src === 'live' ? 'live' : src === 'cloud' ? 'cloud' : src === 'axisdefs' ? 'axisdefs' : 'unknown';
+
+const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
+
+/**
+ * Per family: are its rows byte-exact device data? For a profile document (`meta.format: 2`) with provenance, the
+ * source that provides the family's existence facts (`provenance.existence[family]` → that source's kind, from the
+ * raw sources or `meta.sources`) decides: byte-exact only when it is an editor-cache source (any origin, like
+ * `isByteExactProfile` counts cloud bytes). A merged doc whose best source is an editor cache can still hold
+ * families only a live walk found — they keep the live-walk guards. A family the provenance does not name, a
+ * source it cannot resolve, and every family of a legacy (format-1) document: the document-level
+ * `isByteExactProfile(meta)`. Never throws.
+ */
+export function familyByteExactness(built: BuiltCache): (family: string) => boolean {
+  const docLevel = isByteExactProfile(built.meta);
+  const doc = built as unknown as { meta?: { format?: unknown; sources?: unknown }; raw?: { sources?: unknown }; provenance?: { existence?: unknown } };
+  const existence = doc.meta?.format === 2 && isRecord(doc.provenance) && isRecord(doc.provenance.existence) ? doc.provenance.existence : null;
+  if (!existence) return () => docLevel;
+  const kinds = new Map<string, string>();
+  for (const list of [doc.meta?.sources, isRecord(doc.raw) ? doc.raw.sources : undefined]) {
+    if (!Array.isArray(list)) continue;
+    for (const s of list) if (isRecord(s) && typeof s.id === 'string' && typeof s.kind === 'string' && !kinds.has(s.id)) kinds.set(s.id, s.kind);
+  }
+  return (family: string) => {
+    const winner = existence[family];
+    const kind = typeof winner === 'string' ? kinds.get(winner) : undefined;
+    return kind === undefined ? docLevel : kind === 'editor-cache';
+  };
+}
+
+/** Effect ids of a profile document's persisted block-map entries with confidence `confirmed` (empty when it has
+ *  none, or no block map at all — a legacy document). Never throws. */
+function confirmedBlocksOf(built: BuiltCache): ReadonlySet<number> {
+  const out = new Set<number>();
+  for (const e of blockMapOf(built)) if (e.confidence === 'confirmed') out.add(e.eid);
+  return out;
+}
+
+/** A profile document's persisted block-map entries that are well-formed (integer eid, string confidence, key a
+ *  string or null, evidence an array), first entry per eid. Empty for a legacy document. Never throws. */
+function blockMapOf(built: BuiltCache): BlockMapEntry[] {
+  const map = (built as unknown as { blockMap?: unknown }).blockMap;
+  const out: BlockMapEntry[] = [];
+  const seen = new Set<number>();
+  if (!Array.isArray(map)) return out;
+  for (const e of map) {
+    if (!isRecord(e) || !Number.isInteger(e.eid) || typeof e.confidence !== 'string' || seen.has(e.eid as number)) continue;
+    if (!(e.key === null || typeof e.key === 'string') || !Array.isArray(e.evidence)) continue;
+    seen.add(e.eid as number);
+    out.push({
+      eid: e.eid as number, key: e.key as string | null, sectionTag: Number.isInteger(e.sectionTag) ? (e.sectionTag as number) : null,
+      confidence: e.confidence as BlockMapEntry['confidence'], evidence: (e.evidence as unknown[]).filter((x): x is BlockMapEntry['evidence'][number] => typeof x === 'string'),
+      ...(isRecord(e.compared) ? { compared: e.compared as BlockMapEntry['compared'] } : {}),
+      ...(Array.isArray(e.candidates) ? { candidates: (e.candidates as unknown[]).filter((t): t is number => Number.isInteger(t)) } : {}),
+      channels: typeof e.channels === 'boolean' ? e.channels : null
+    });
+  }
+  return out;
+}
+
+/** A profile document's editor-cache sections (`sections` entries with `space: 'section'` and the fields the runtime
+ *  shape match reads). Empty for a legacy document. Never throws. */
+function byteSectionsOf(built: BuiltCache): DerivedSection[] {
+  const list = (built as unknown as { sections?: unknown }).sections;
+  if (!Array.isArray(list)) return [];
+  return list.filter((s): s is DerivedSection =>
+    isRecord(s) && s.space === 'section' && Number.isInteger(s.tag) && typeof s.key === 'string' && (s.family === null || typeof s.family === 'string')
+    && typeof s.role === 'string' && typeof s.stride === 'number');
 }
 
 /**
@@ -623,26 +979,44 @@ export function isByteExactProfile(meta: { source?: unknown; origin?: unknown } 
  *     mapped from slug via SLUG_FAMILY), with the STATIC roster's manufacturer/basedOn LINEAGE
  *     overlaid by value (the cache carries names only); families the walk didn't map fall back to static.
  *   • enumLabelsFor — `built.enumOverrides` first, else static.
- *   • ranges / rangeSections — the cache's per-family entries merged OVER the static ones. A profile
- *     that is not byte-exact (`isByteExactProfile`: a live walk, a cloud profile that came from one,
- *     unknown provenance) is the exception: it never re-classifies the kind of a catalog-known param,
- *     never overwrites a catalog range with a placeholder row (min === max), and never shrinks a
+ *   • ranges / rangeSections — the cache's per-family entries merged OVER the static ones. A family whose
+ *     rows are not byte-exact (`familyByteExactness`: a live walk, a cloud profile that came from one,
+ *     unknown provenance — per family in a merged profile document, where a live source can provide
+ *     families the editor cache lacks) is the exception: it never re-classifies the kind of a catalog-known
+ *     param, never overwrites a catalog range with a placeholder row (min === max), and never shrinks a
  *     catalog stride (see the comments in the body).
  *   • cabIrs — the cache's banks when non-empty, else static.
+ *   • a family whose cache rows match another family's catalog rows clearly better than their own (a
+ *     section assigned to the wrong family, see `familyAssignmentSuspects`) is left out of the merge
+ *     altogether: ranges, labels, section and roster stay static. It is listed in `profileFacts`.
+ *   • familyForEffectId / blockMapFor — the block-map overlay of a profile document: an effect id the static tables
+ *     do not place and the document's block map binds `confirmed` resolves to the entry's key (when the merged rows
+ *     carry it); `blockMapFor` hands out the static roster-only entries first, then the document's entry of such an
+ *     effect id. How each is served (read-only or writable): drivers/blockMapState.ts.
  * The model byte, grid dims, instanceLimits, params, layouts, FC/Mod/monitor models, and write mode
- * all stay from the static profile (the walk doesn't recover them). Pure — returns a fresh profile.
+ * all stay from the static profile (the walk doesn't recover them). `profileFacts` records the
+ * provenance and which rows the merge took; `staticBase` the profile this one was layered over.
+ * Pure (apart from one log line for suspect families) — returns a fresh profile.
  */
 export function runtimeProfileFrom(built: BuiltCache, staticProfile: DeviceProfile): DeviceProfile {
   const builtRosters = built.rosters ?? {};
-  const builtEnums = (built.enumOverrides ?? {}) as Record<string, Record<string, string[]>>;
+  const builtEnums = built.enumOverrides ?? {};
   const builtCabIrs = built.cabIrs ?? {};
 
-  // Provenance decides how far the cache may override the static tables. A byte-exact profile (an
-  // editor cache import, or a cloud profile that was published from one) is exact device data for its
-  // firmware, possibly newer than the static catalog, so it always wins. Everything else is treated
-  // as a live-walk reconstruction (a heuristic), including a cloud profile that came from a walk and
-  // a profile of unknown provenance.
-  const live = !isByteExactProfile(built.meta);
+  // Provenance decides how far the cache may override the static tables. Byte-exact rows (an editor cache
+  // import, or a cloud profile that was published from one) are exact device data for their firmware,
+  // possibly newer than the static catalog, so they always win. Everything else is treated as a live-walk
+  // reconstruction (a heuristic), including a cloud profile that came from a walk and a profile of unknown
+  // provenance. Decided PER FAMILY (`familyByteExactness`): a merged profile document can hold families only
+  // a live walk provides next to the editor cache's.
+  const byteFamily = familyByteExactness(built);
+  const docByteExact = isByteExactProfile(built.meta);
+
+  const suspectFamilies = suspectFamiliesOf(built, staticProfile);
+  const suspects = new Set(suspectFamilies);
+  if (suspectFamilies.length > 0) {
+    console.warn(`[forgefx] device profile: the cache sections of ${suspectFamilies.join(', ')} match other families' catalog rows better than their own; keeping the bundled definitions for them`);
+  }
 
   // ranges: static per-family maps, then the cache's rows merged over them (device-true wins).
   // One exception, for a live-walk profile only: its enum/float split is a numeric heuristic (integral
@@ -656,10 +1030,13 @@ export function runtimeProfileFrom(built: BuiltCache, staticProfile: DeviceProfi
   // for its firmware an all-zero row says the slot is unused, which is device-true (and it is excluded
   // from the knob/enum lists by its empty range).
   const mergedRanges: Ranges = {};
+  const appliedRows: Record<string, Set<number>> = {};
   for (const [fam, rows] of Object.entries(staticProfile.ranges)) mergedRanges[fam] = { ...rows };
   for (const [fam, rows] of Object.entries(built.ranges ?? {})) {
+    if (suspects.has(fam)) continue;
+    const live = !byteFamily(fam);
     const dst = (mergedRanges[fam] ??= {});
-    for (const [pidStr, row] of Object.entries(rows as Record<number, RangeDef>)) {
+    for (const [pidStr, row] of Object.entries(rows)) {
       const pid = Number(pidStr);
       const stat = dst[pid];
       if (live) {
@@ -670,6 +1047,7 @@ export function runtimeProfileFrom(built: BuiltCache, staticProfile: DeviceProfi
         }
       }
       dst[pid] = row;
+      (appliedRows[fam] ??= new Set()).add(pid);
     }
   }
 
@@ -681,18 +1059,53 @@ export function runtimeProfileFrom(built: BuiltCache, staticProfile: DeviceProfi
   // hint: #channelSlice validates it against the reply's itemCount before slicing a channel.
   const mergedSections: RangeSections = { ...staticProfile.rangeSections };
   for (const [fam, meta] of Object.entries(built.rangeSections ?? {})) {
+    if (suspects.has(fam)) continue;
     const cached = meta as unknown as RangeSections[string];
     const stat = mergedSections[fam];
-    mergedSections[fam] = live && stat ? { ...cached, stride: Math.max(stat.stride, cached.stride) } : cached;
+    mergedSections[fam] = !byteFamily(fam) && stat ? { ...cached, stride: Math.max(stat.stride, cached.stride) } : cached;
   }
+
+  // Block-map overlay: an effect id the static tables do not place and the document's block map binds `confirmed`
+  // resolves to the entry's key — when the merged rows have that key (a key without rows describes nothing). The
+  // static tables win for every effect id they place (the codec never maps one of those); the hidden family of the
+  // development hook is never a key.
+  const mapEntries = blockMapOf(built);
+  const mapByEid = new Map(mapEntries.map((e) => [e.eid, e] as const));
+  const overlay = new Map<number, string>();
+  for (const e of mapEntries) {
+    if (e.confidence === 'confirmed' && e.key !== null && mergedRanges[e.key] !== undefined && unlessHidden(e.key) !== undefined) overlay.set(e.eid, e.key);
+  }
+
+  const profileFacts: ProfileFacts = {
+    source: profileSourceOf(built.meta?.source),
+    byteExact: docByteExact,
+    isByteExactFamily: byteFamily,
+    confirmedBlocks: confirmedBlocksOf(built),
+    byteSections: byteSectionsOf(built),
+    firmware: typeof built.firmware === 'string' ? built.firmware : null,
+    ranges: built.ranges ?? {},
+    enumLabels: builtEnums,
+    appliedRows,
+    suspectFamilies,
+  };
 
   return {
     ...staticProfile,
     ranges: mergedRanges,
     rangeSections: mergedSections,
+    profileFacts,
+    staticBase: staticProfile.staticBase ?? staticProfile,
+    familyForEffectId(eid: number): string | undefined {
+      return staticProfile.familyForEffectId(eid) ?? overlay.get(eid);
+    },
+    blockMapFor(eid: number): BlockMapEntry | undefined {
+      const fixed = staticProfile.blockMapFor?.(eid);
+      if (fixed) return fixed;
+      return staticProfile.familyForEffectId(eid) === undefined ? mapByEid.get(eid) : undefined;
+    },
     rosterFor(slug: string): TypeModel[] {
       const fam = SLUG_FAMILY[slug.toLowerCase()];
-      const cacheRoster = fam ? builtRosters[fam] : undefined;
+      const cacheRoster = fam && !suspects.has(fam) ? builtRosters[fam] : undefined;
       if (!cacheRoster?.length) return staticProfile.rosterFor(slug); // walk didn't map this family → static
       const byValue = new Map(staticProfile.rosterFor(slug).map((t) => [t.value, t]));
       return cacheRoster.map((t) => {
@@ -701,10 +1114,83 @@ export function runtimeProfileFrom(built: BuiltCache, staticProfile: DeviceProfi
       });
     },
     enumLabelsFor(family: string, paramId: number): string[] | undefined {
-      return builtEnums[family]?.[String(paramId)] ?? staticProfile.enumLabelsFor(family, paramId);
+      return (suspects.has(family) ? undefined : builtEnums[family]?.[String(paramId)]) ?? staticProfile.enumLabelsFor(family, paramId);
     },
     cabIrs(): Record<string, string[]> {
       return Object.keys(builtCabIrs).length > 0 ? builtCabIrs : staticProfile.cabIrs();
     }
   };
+}
+
+// ── param selectors and layout evidence ──────────────────────────────────────────────────────────────
+
+/** The family's user-facing type (model) selector: `<F>_MODEL` where it exists, else `<F>_TYPE`, by exact
+ *  name. Families with neither (CABINET, PLEX, MULTITAP, CONTROLLERS, GLOBAL, …) have none: a param that
+ *  merely ends in TYPE (`CABINET_PRETYPE`, `CONTROLLERS_LFO1TYPE`) is an ordinary selector. */
+export function typeSelectorPid(p: DeviceProfile, family: string): number | undefined {
+  return modelSelectorPid(p.params, family);
+}
+
+/** The param whose value picks the layout variant of a family's block: the type selector, else
+ *  `<F>_BASETYPE` (PLEX, MULTITAP), else `<F>_MODE` (CABINET: Legacy / DynaCab), by exact name. */
+export function variantSelectorPid(p: DeviceProfile, family: string): number | undefined {
+  const named = (name: string) => p.params[family]?.find((d) => d.name === name)?.paramId;
+  return typeSelectorPid(p, family) ?? named(`${family}_BASETYPE`) ?? named(`${family}_MODE`);
+}
+
+/** `FAMILY.NAME` of every param that is a selector ('enum' unit) on ANY gen-3 device's static catalog.
+ *  The same param can carry a confirmed unit on one device and 'unverified' on another (TENTAP_DECAYSTYLE
+ *  is a 2-way selector on the Axe-Fx III). Consulted only where this device's catalog unit proves nothing. */
+let enumElsewhere: Set<string> | undefined;
+export function isEnumOnAnyDevice(family: string, name: string): boolean {
+  if (!enumElsewhere) {
+    enumElsewhere = new Set();
+    for (const prof of Object.values(PROFILES)) {
+      for (const [fam, list] of Object.entries(prof.params)) for (const q of list) if (q.unit === 'enum') enumElsewhere.add(`${fam}.${q.name}`);
+    }
+  }
+  return enumElsewhere.has(`${family}.${name}`);
+}
+
+// How strongly a widget kind counts as evidence when several controls of the editor name the same param:
+// the selector kinds win (they decide how a float row is served), then any other input widget, then a knob;
+// the kinds that only display something (a readout, a meter, a label, a graph, a button) come last.
+const DISPLAY_ONLY_WIDGETS: ReadonlySet<EditorWidgetKind> = new Set(['readout', 'meter', 'label', 'graph', 'button', 'spacer']);
+const widgetRank = (w: EditorWidgetKind): number => (w === 'dropdown' ? 4 : w === 'toggle' ? 3 : w === 'knob' ? 1 : DISPLAY_ONLY_WIDGETS.has(w) ? 0 : 2);
+const NO_WIDGETS: ReadonlyMap<number, EditorWidgetKind> = new Map();
+const layoutWidgetCache = new WeakMap<DeviceEditorLayouts, ReadonlyMap<string, ReadonlyMap<number, EditorWidgetKind>>>();
+
+function buildLayoutWidgetIndex(layouts: DeviceEditorLayouts): ReadonlyMap<string, ReadonlyMap<number, EditorWidgetKind>> {
+  const byFamily = new Map<string, Map<number, EditorWidgetKind>>();
+  for (const block of Object.values(layouts)) {
+    for (const variant of block.variants) for (const page of variant.pages) for (const row of page.rows) for (const c of row.controls) {
+      // the param a control belongs to is the one its cross-block reference names, else the layout's own
+      let owner = block.family;
+      let pid = c.paramId;
+      if (c.crossBlock) {
+        if (!c.crossBlock.family) continue; // a reference that did not resolve names no param of ours
+        owner = c.crossBlock.family;
+        pid = c.crossBlock.paramId ?? c.paramId;
+      }
+      if (pid == null || pid > 0x3fff) continue; // pseudo ids (button / picker / label slots) are no wire params
+      let m = byFamily.get(owner);
+      if (!m) byFamily.set(owner, (m = new Map()));
+      const prev = m.get(pid);
+      if (prev === undefined || widgetRank(c.widget) > widgetRank(prev)) m.set(pid, c.widget);
+    }
+  }
+  return byFamily;
+}
+
+/** Which widget the editor draws for each parameter id of a family (pid → widget kind), read from the
+ *  device's editor layouts: every variant, page, row and control. Evidence for how a parameter whose row
+ *  alone does not settle it should be shown. Pseudo ids (≥ 0xff00) are not indexed. Where controls
+ *  disagree the stronger evidence wins: dropdown, toggle, any other input widget, knob, then the kinds that
+ *  only display something. Memoised per layouts object. */
+export function layoutWidgetIndex(p: DeviceProfile, family: string): ReadonlyMap<number, EditorWidgetKind> {
+  const layouts = p.editorLayouts;
+  if (!layouts) return NO_WIDGETS;
+  let idx = layoutWidgetCache.get(layouts);
+  if (!idx) layoutWidgetCache.set(layouts, (idx = buildLayoutWidgetIndex(layouts)));
+  return idx.get(family) ?? NO_WIDGETS;
 }

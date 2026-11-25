@@ -14,6 +14,11 @@ export { createRegistry, DeviceRegistry, type RegistryDeps, type ConnInfo } from
 export { createGen3Driver } from '../drivers/gen3.js';
 export { createAm4Driver, type Am4Driver } from '../drivers/am4.js';
 export type { DeviceDriver, DriverCapabilities, DriverCtx, DeviceEvent } from '../drivers/types.js';
+// the block-params DTOs (classic and generic) a client of the runtime types its responses with
+export type {
+  BlockParamsDTO, BlockParamsV2DTO, BlockParamsOpts, BlockDefinitionsMeta, NamedParam, EnumParam, NamedParamV2, EnumParamV2,
+  ParamMeta, ParamWidget, HiddenParam, UnresolvedReason, DefinitionsCaps
+} from '../drivers/types.js';
 export type { Transport, RequestOpts, Conn, ConnKind } from '../transport/types.js';
 // the request/completion engine of the Node transports, for in-page transports to share (browser-safe)
 export {
@@ -30,8 +35,12 @@ export type { StoreBackend, StoreCodec, Doc, PresetVersion, Backup, JsonWriteOpt
 // ── device-definition profile schema gate (usable vs stale; the lookup behind every apply hook) ──
 export {
   CURRENT_CACHE_SCHEMA, checkProfileSchema, staleFields, loadStoredProfile, loadUsableProfile,
-  type StaleReason, type ProfileSchemaCheck, type StoredProfile
+  upgradeStoredProfile, profileFormatOf, profileSummaryOf, classifyProfile,
+  type StaleReason, type ProfileSchemaCheck, type StoredProfile, type ProfileFormat, type RederiveReason, type ProfileSummary
 } from '../profileSchema.js';
+
+// ── the portable definitions file (`.axisdefs`): the envelope's type and the names a file picker needs ──
+export { AXISDEFS_KIND, AXISDEFS_VERSION, AXISDEFS_EXTENSION, AXISDEFS_MAX_BYTES, type AxisDefsFile } from '../services/definitionsFile.js';
 
 // ── local storage folder (Presets/ library + Sync/ mirror) ──
 export type { FolderAdapter, FolderEntry } from './folderAdapter.js';
@@ -49,3 +58,15 @@ export { blockHelpBySlug, helpIndex, type BlockHelpDTO } from '../help.js';
 
 // ── cloud sync (optional router dep; supabase-js is isomorphic) ──
 export { createCloud, Cloud, type CloudConfig, type CloudService } from './cloud.js';
+export {
+  runSignedUpload, ANONYMOUS_UPLOADER_STORAGE_KEY, DEFINITION_SHARER_STORAGE_KEY,
+  type SignedUploadTransport, type SignedUploadSpec, type SignedUploadOutcome,
+  type EditorCacheReserveBody, type EditorCacheCloudOutcome, type UploaderSession
+} from './cloud.js';
+
+// ── editor-cache contribution (the shapes Axis' dialog consumes; the routes are in the router) ──
+export {
+  CONTRIBUTION_CONSENT_VERSION, SUPPORTED_CONSENT_VERSIONS, MAX_CONTRIBUTION_BYTES, CONTRIBUTIONS_COLLECTION,
+  type ContributionStatus, type ContributionCandidate, type ContributionDecision, type ContributionReason,
+  type ContributionImport, type ContributionCloud, type LocalProfileState, type ContributionUpload, type WithdrawItem
+} from '../services/cacheContribution.js';

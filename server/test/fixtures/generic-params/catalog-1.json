@@ -1,0 +1,744 @@
+{
+  "block": "GLOBAL",
+  "definitions": {"channel":null,"family":"GLOBAL","hidden":[],"persistentWrites":true,"positional":false,"profile":"byte-exact"},
+  "enums": [
+    {"fp":"1:bda980b7","generic":false,"id":3,"kind":"enum","name":"Cabinet Modeling","nameConfidence":"high","nameSource":"catalog","options":"#0","source":"profile","unresolved":"non-positional","value":null,"widget":"toggle","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:ab810718","generic":false,"id":4,"kind":"enum","name":"Power Amp Modeling","nameConfidence":"high","nameSource":"catalog","options":"#1","source":"profile","unresolved":"non-positional","value":null,"widget":"toggle","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:0611b7ff","generic":false,"id":6,"kind":"enum","name":"Mute","nameConfidence":"high","nameSource":"catalog","options":"#2","source":"profile","unresolved":"non-positional","value":null,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:168a1a32","generic":false,"id":7,"kind":"enum","name":"Spillover","nameConfidence":"high","nameSource":"catalog","options":"#3","source":"profile","unresolved":"non-positional","value":null,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:02a8ec0b","generic":false,"id":8,"kind":"enum","name":"Use Offsets","nameConfidence":"high","nameSource":"catalog","options":"#4","source":"profile","unresolved":"non-positional","value":null,"widget":"toggle","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:326cc244","generic":false,"id":40,"kind":"enum","name":"Tap Tempo","nameConfidence":"high","nameSource":"catalog","options":"#5","source":"profile","unresolved":"non-positional","value":null,"widget":"toggle","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:6f3e013b","generic":false,"id":41,"kind":"enum","name":"Input 2 Mode","nameConfidence":"high","nameSource":"catalog","options":"#6","source":"profile","unresolved":"non-positional","value":null,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:29991231","generic":false,"id":44,"kind":"enum","name":"Input 1 Pad","nameConfidence":"high","nameSource":"catalog","options":"#7","source":"profile","unresolved":"non-positional","value":null,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:eeccc13f","generic":false,"id":45,"kind":"enum","name":"Input 2 Pad","nameConfidence":"high","nameSource":"catalog","options":"#8","source":"profile","unresolved":"non-positional","value":null,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:d2a966ed","generic":false,"id":48,"kind":"enum","name":"Mode 1","nameConfidence":"high","nameSource":"catalog","options":"#9","source":"profile","unresolved":"non-positional","value":null,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:3617b786","generic":false,"id":49,"kind":"enum","name":"Mode 2","nameConfidence":"high","nameSource":"catalog","options":"#10","source":"profile","unresolved":"non-positional","value":null,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:e7aa6b27","generic":false,"id":52,"kind":"enum","name":"Phase 1","nameConfidence":"high","nameSource":"catalog","options":"#11","source":"profile","unresolved":"non-positional","value":null,"widget":"toggle","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:e7aa6b27","generic":false,"id":53,"kind":"enum","name":"Phase 2","nameConfidence":"high","nameSource":"catalog","options":"#11","source":"profile","unresolved":"non-positional","value":null,"widget":"toggle","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:50323c30","generic":false,"id":56,"kind":"enum","name":"Output Level 1","nameConfidence":"high","nameSource":"catalog","options":"#12","source":"profile","unresolved":"non-positional","value":null,"widget":"toggle","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:29991231","generic":false,"id":57,"kind":"enum","name":"Boost/Pad","nameConfidence":"high","nameSource":"catalog","options":"#7","source":"profile","unresolved":"non-positional","value":null,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:7341a9da","generic":false,"id":60,"kind":"enum","name":"Output 2 Copy","nameConfidence":"high","nameSource":"catalog","options":"#13","source":"profile","unresolved":"non-positional","value":null,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:d4cdff3d","generic":false,"id":61,"kind":"enum","name":"Input 1 Source","nameConfidence":"high","nameSource":"catalog","options":"#14","source":"profile","unresolved":"non-positional","value":null,"widget":"toggle","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:dcff6feb","generic":false,"id":63,"kind":"enum","name":"SPDIF Out Source","nameConfidence":"high","nameSource":"catalog","options":"#15","source":"profile","unresolved":"non-positional","value":null,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:7a5bf8a0","generic":false,"id":66,"kind":"enum","name":"Hold Function Timeout","nameConfidence":"high","nameSource":"catalog","options":"#16","source":"profile","unresolved":"non-positional","value":null,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:53bc50cf","generic":false,"id":68,"kind":"enum","name":"MIDI Channel","nameConfidence":"high","nameSource":"catalog","options":"#17","source":"profile","unresolved":"non-positional","value":null,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:02a8ec0b","generic":false,"id":69,"kind":"enum","name":"Program Change","nameConfidence":"high","nameSource":"catalog","options":"#4","source":"profile","unresolved":"non-positional","value":null,"widget":"toggle","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:02a8ec0b","generic":false,"id":70,"kind":"enum","name":"Ignore Red. PC","nameConfidence":"high","nameSource":"catalog","options":"#4","source":"profile","unresolved":"non-positional","value":null,"widget":"toggle","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:6d0babd3","generic":false,"id":73,"kind":"enum","name":"Send MIDI PC","nameConfidence":"high","nameSource":"catalog","options":"#18","source":"profile","unresolved":"non-positional","value":null,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:02a8ec0b","generic":false,"id":93,"kind":"enum","name":"Scene Revert","nameConfidence":"high","nameSource":"catalog","options":"#4","source":"profile","unresolved":"non-positional","value":null,"widget":"toggle","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:02a8ec0b","generic":false,"id":97,"kind":"enum","name":"MIDI MAPPING","nameConfidence":"high","nameSource":"catalog","options":"#4","source":"profile","unresolved":"non-positional","value":null,"widget":"toggle","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:922555ca","generic":false,"id":99,"kind":"enum","name":"USB Buffer Size","nameConfidence":"high","nameSource":"catalog","options":"#19","source":"profile","unresolved":"non-positional","value":null,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:8235fe26","generic":false,"id":100,"kind":"enum","name":"Source","nameConfidence":"high","nameSource":"catalog","options":"#20","source":"profile","unresolved":"non-positional","value":null,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:3986f53b","generic":false,"id":104,"kind":"enum","name":"Eff. Bypass Mode","nameConfidence":"high","nameSource":"catalog","options":"#21","source":"profile","unresolved":"non-positional","value":null,"widget":"toggle","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:e777cbdd","generic":false,"id":105,"kind":"enum","name":"Default Scene","nameConfidence":"high","nameSource":"catalog","options":"#22","source":"profile","unresolved":"non-positional","value":null,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:02a8ec0b","generic":false,"id":106,"kind":"enum","name":"Prompt on Edit","nameConfidence":"high","nameSource":"catalog","options":"#4","source":"profile","unresolved":"non-positional","value":null,"widget":"toggle","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:6604d924","generic":false,"id":107,"kind":"enum","name":"Value Knob Push","nameConfidence":"high","nameSource":"catalog","options":"#23","source":"profile","unresolved":"non-positional","value":null,"widget":"toggle","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:02a8ec0b","generic":false,"id":108,"kind":"enum","name":"Preset Num","nameConfidence":"high","nameSource":"catalog","options":"#4","source":"profile","unresolved":"non-positional","value":null,"widget":"toggle","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:02a8ec0b","generic":false,"id":109,"kind":"enum","name":"Scene Num","nameConfidence":"high","nameSource":"catalog","options":"#4","source":"profile","unresolved":"non-positional","value":null,"widget":"toggle","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:d42cd52c","generic":false,"id":112,"kind":"enum","name":"AC Line Frequency","nameConfidence":"high","nameSource":"catalog","options":"#24","source":"profile","unresolved":"non-positional","value":null,"widget":"toggle","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:02a8ec0b","generic":false,"id":113,"kind":"enum","name":"Send RT. Sysex","nameConfidence":"high","nameSource":"catalog","options":"#4","source":"profile","unresolved":"non-positional","value":null,"widget":"toggle","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:31c419f0","generic":false,"id":3598,"kind":"enum","name":"FC TYPE PFC1","nameConfidence":"high","nameSource":"catalog","options":"#25","source":"profile","unresolved":"non-positional","value":null,"widget":"toggle","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:31c419f0","generic":false,"id":3599,"kind":"enum","name":"FC TYPE PFC2","nameConfidence":"high","nameSource":"catalog","options":"#25","source":"profile","unresolved":"non-positional","value":null,"widget":"toggle","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:31c419f0","generic":false,"id":3600,"kind":"enum","name":"FC TYPE PFC3","nameConfidence":"high","nameSource":"catalog","options":"#25","source":"profile","unresolved":"non-positional","value":null,"widget":"toggle","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:f4e6f4c8","generic":false,"id":3606,"kind":"enum","name":"1","nameConfidence":"high","nameSource":"catalog","options":"#26","source":"profile","unresolved":"non-positional","value":null,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:ebff4a2c","generic":false,"id":3607,"kind":"enum","name":"2","nameConfidence":"high","nameSource":"catalog","options":"#27","source":"profile","unresolved":"non-positional","value":null,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:3b165e8b","generic":false,"id":3608,"kind":"enum","name":"3","nameConfidence":"high","nameSource":"catalog","options":"#28","source":"profile","unresolved":"non-positional","value":null,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:0127d914","generic":false,"id":3610,"kind":"enum","name":"FC LAYOUT SWITCHCFG BEGIN","nameConfidence":"high","nameSource":"catalog","options":"#29","source":"profile","unresolved":"non-positional","value":null,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:41399aa2","generic":false,"id":5995,"kind":"enum","name":"Master Layout \"Switch Combo\"","nameConfidence":"high","nameSource":"catalog","options":"#30","source":"profile","unresolved":"non-positional","value":null,"widget":"toggle","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:41399aa2","generic":false,"id":6113,"kind":"enum","name":"Per-Preset Overrides","nameConfidence":"high","nameSource":"catalog","options":"#30","source":"profile","unresolved":"non-positional","value":null,"widget":"toggle","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:b484ef60","generic":false,"id":6979,"kind":"enum","name":"CS1 ENABLE","nameConfidence":"high","nameSource":"catalog","options":"#31","source":"profile","unresolved":"non-positional","value":null,"widget":"toggle","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:0b914392","generic":false,"id":6985,"kind":"enum","name":"CS EDIT NUMBER","nameConfidence":"high","nameSource":"catalog","options":"#32","source":"profile","unresolved":"non-positional","value":null,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:77d888dc","generic":false,"id":6986,"kind":"enum","name":"CS COMMAND BEGIN","nameConfidence":"high","nameSource":"catalog","options":"#33","source":"profile","unresolved":"non-positional","value":null,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:f67d5afe","generic":false,"id":7107,"kind":"enum","name":"CS1 Exclusive","nameConfidence":"high","nameSource":"catalog","options":"#34","source":"profile","unresolved":"non-positional","value":null,"widget":"toggle","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:f67d5afe","generic":false,"id":7108,"kind":"enum","name":"CS2 Exclusive","nameConfidence":"high","nameSource":"catalog","options":"#34","source":"profile","unresolved":"non-positional","value":null,"widget":"toggle","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:f67d5afe","generic":false,"id":7109,"kind":"enum","name":"CS3 Exclusive","nameConfidence":"high","nameSource":"catalog","options":"#34","source":"profile","unresolved":"non-positional","value":null,"widget":"toggle","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:f67d5afe","generic":false,"id":7110,"kind":"enum","name":"CS4 Exclusive","nameConfidence":"high","nameSource":"catalog","options":"#34","source":"profile","unresolved":"non-positional","value":null,"widget":"toggle","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:f67d5afe","generic":false,"id":7111,"kind":"enum","name":"CS5 Exclusive","nameConfidence":"high","nameSource":"catalog","options":"#34","source":"profile","unresolved":"non-positional","value":null,"widget":"toggle","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:f67d5afe","generic":false,"id":7112,"kind":"enum","name":"CS6 Exclusive","nameConfidence":"high","nameSource":"catalog","options":"#34","source":"profile","unresolved":"non-positional","value":null,"widget":"toggle","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:67183973","generic":false,"id":7389,"kind":"enum","name":"Main LCD Notification Hold","nameConfidence":"high","nameSource":"catalog","options":"#35","source":"profile","unresolved":"non-positional","value":null,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:ddc22ae1","generic":false,"id":7422,"kind":"enum","name":"Hold Function Mode","nameConfidence":"high","nameSource":"catalog","options":"#36","source":"profile","unresolved":"non-positional","value":null,"widget":"toggle","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:9e326a64","generic":false,"id":7423,"kind":"enum","name":"USB 3,4 Record Source","nameConfidence":"high","nameSource":"catalog","options":"#37","source":"profile","unresolved":"non-positional","value":null,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:070d947d","generic":false,"id":7424,"kind":"enum","name":"USB 3,4 Playback Destination","nameConfidence":"high","nameSource":"catalog","options":"#38","source":"profile","unresolved":"non-positional","value":null,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:59271903","generic":false,"id":7425,"kind":"enum","name":"FC6 Layout Mode","nameConfidence":"high","nameSource":"catalog","options":"#39","source":"profile","unresolved":"non-positional","value":null,"widget":"toggle","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:1053dbf1","generic":false,"id":8293,"kind":"enum","name":"Footswitch Tuner Mode","nameConfidence":"high","nameSource":"catalog","options":"#40","source":"profile","unresolved":"non-positional","value":null,"widget":"toggle","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:02a8ec0b","generic":false,"id":8294,"kind":"enum","name":"Invert Mode","nameConfidence":"high","nameSource":"catalog","options":"#4","source":"profile","unresolved":"non-positional","value":null,"widget":"toggle","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:beede46a","generic":false,"id":8645,"kind":"enum","name":"Downtune","nameConfidence":"high","nameSource":"catalog","options":"#41","source":"profile","unresolved":"non-positional","value":null,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:7f8773a7","generic":false,"id":8646,"kind":"enum","name":"Display Mode","nameConfidence":"high","nameSource":"catalog","options":"#42","source":"profile","unresolved":"non-positional","value":null,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:daca8446","generic":false,"id":8647,"kind":"enum","name":"Output 1","nameConfidence":"high","nameSource":"catalog","options":"#43","source":"profile","unresolved":"non-positional","value":null,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:daca8446","generic":false,"id":8648,"kind":"enum","name":"Output 2","nameConfidence":"high","nameSource":"catalog","options":"#43","source":"profile","unresolved":"non-positional","value":null,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:50323c30","generic":false,"id":8679,"kind":"enum","name":"Output Level 2","nameConfidence":"high","nameSource":"catalog","options":"#12","source":"profile","unresolved":"non-positional","value":null,"widget":"toggle","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:be60d025","generic":false,"id":8680,"kind":"enum","name":"Output Type","nameConfidence":"high","nameSource":"catalog","options":"#44","source":"profile","unresolved":"non-positional","value":null,"widget":"toggle","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:02a8ec0b","generic":false,"id":8681,"kind":"enum","name":"Edit on Scn Change","nameConfidence":"high","nameSource":"catalog","options":"#4","source":"profile","unresolved":"non-positional","value":null,"widget":"toggle","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:41399aa2","generic":false,"id":8682,"kind":"enum","name":"Sw. Limits","nameConfidence":"high","nameSource":"catalog","options":"#30","source":"profile","unresolved":"non-positional","value":null,"widget":"toggle","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:6a31f2fc","generic":false,"id":8683,"kind":"enum","name":"Spkr Imp. Curve","nameConfidence":"high","nameSource":"catalog","options":"#45","source":"profile","unresolved":"non-positional","value":null,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:9cab7a68","generic":false,"id":8684,"kind":"enum","name":"USB 1,2 Playback Destination","nameConfidence":"high","nameSource":"catalog","options":"#46","source":"profile","unresolved":"non-positional","value":null,"widget":"toggle","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:c7a51034","generic":false,"id":14873,"kind":"enum","name":"Gapless","nameConfidence":"high","nameSource":"catalog","options":"#47","source":"profile","unresolved":"non-positional","value":null,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:02a8ec0b","generic":false,"id":14874,"kind":"enum","name":"Rcv MIDI Clk","nameConfidence":"high","nameSource":"catalog","options":"#4","source":"profile","unresolved":"non-positional","value":null,"widget":"toggle","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:02a8ec0b","generic":false,"id":14875,"kind":"enum","name":"Snd MIDI Clk","nameConfidence":"high","nameSource":"catalog","options":"#4","source":"profile","unresolved":"non-positional","value":null,"widget":"toggle","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:02a8ec0b","generic":false,"id":14878,"kind":"enum","name":"Metronome","nameConfidence":"high","nameSource":"catalog","options":"#4","source":"profile","unresolved":"non-positional","value":null,"widget":"toggle","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:a58995f2","generic":false,"id":14879,"kind":"enum","name":"METRONOME CC","nameConfidence":"high","nameSource":"catalog","options":"#48","source":"profile","unresolved":"non-positional","value":null,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:a58995f2","generic":true,"id":80,"kind":"enum","name":"P80","nameSource":"generic","options":"#48","pageHint":"more","source":"profile","unresolved":"non-positional","value":null,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:a58995f2","generic":true,"id":81,"kind":"enum","name":"P81","nameSource":"generic","options":"#48","pageHint":"more","source":"profile","unresolved":"non-positional","value":null,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:a58995f2","generic":true,"id":84,"kind":"enum","name":"P84","nameSource":"generic","options":"#48","pageHint":"more","source":"profile","unresolved":"non-positional","value":null,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:a58995f2","generic":true,"id":85,"kind":"enum","name":"P85","nameSource":"generic","options":"#48","pageHint":"more","source":"profile","unresolved":"non-positional","value":null,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:a58995f2","generic":true,"id":88,"kind":"enum","name":"P88","nameSource":"generic","options":"#48","pageHint":"more","source":"profile","unresolved":"non-positional","value":null,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:01dd30ef","generic":true,"id":89,"kind":"enum","name":"P89","nameSource":"generic","options":"#49","pageHint":"more","source":"profile","unresolved":"non-positional","value":null,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:01dd30ef","generic":true,"id":90,"kind":"enum","name":"P90","nameSource":"generic","options":"#49","pageHint":"more","source":"profile","unresolved":"non-positional","value":null,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:a58995f2","generic":true,"id":91,"kind":"enum","name":"P91","nameSource":"generic","options":"#48","pageHint":"more","source":"profile","unresolved":"non-positional","value":null,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:a58995f2","generic":true,"id":92,"kind":"enum","name":"P92","nameSource":"generic","options":"#48","pageHint":"more","source":"profile","unresolved":"non-positional","value":null,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:01dd30ef","generic":true,"id":94,"kind":"enum","name":"P94","nameSource":"generic","options":"#49","pageHint":"more","source":"profile","unresolved":"non-positional","value":null,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:01dd30ef","generic":true,"id":95,"kind":"enum","name":"P95","nameSource":"generic","options":"#49","pageHint":"more","source":"profile","unresolved":"non-positional","value":null,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:01dd30ef","generic":true,"id":115,"kind":"enum","name":"P115","nameSource":"generic","options":"#49","pageHint":"more","source":"profile","unresolved":"non-positional","value":null,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:01dd30ef","generic":true,"id":116,"kind":"enum","name":"P116","nameSource":"generic","options":"#49","pageHint":"more","source":"profile","unresolved":"non-positional","value":null,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:0127d914","generic":true,"id":3611,"kind":"enum","name":"P3611","nameSource":"generic","options":"#29","pageHint":"more","source":"profile","unresolved":"non-positional","value":null,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:0127d914","generic":true,"id":3612,"kind":"enum","name":"P3612","nameSource":"generic","options":"#29","pageHint":"more","source":"profile","unresolved":"non-positional","value":null,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:0127d914","generic":true,"id":3613,"kind":"enum","name":"P3613","nameSource":"generic","options":"#29","pageHint":"more","source":"profile","unresolved":"non-positional","value":null,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:0127d914","generic":true,"id":3614,"kind":"enum","name":"P3614","nameSource":"generic","options":"#29","pageHint":"more","source":"profile","unresolved":"non-positional","value":null,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:0127d914","generic":true,"id":3615,"kind":"enum","name":"P3615","nameSource":"generic","options":"#29","pageHint":"more","source":"profile","unresolved":"non-positional","value":null,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:0127d914","generic":true,"id":3616,"kind":"enum","name":"P3616","nameSource":"generic","options":"#29","pageHint":"more","source":"profile","unresolved":"non-positional","value":null,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:0127d914","generic":true,"id":3617,"kind":"enum","name":"P3617","nameSource":"generic","options":"#29","pageHint":"more","source":"profile","unresolved":"non-positional","value":null,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:0127d914","generic":true,"id":3618,"kind":"enum","name":"P3618","nameSource":"generic","options":"#29","pageHint":"more","source":"profile","unresolved":"non-positional","value":null,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:01dd30ef","generic":true,"id":7113,"kind":"enum","name":"P7113","nameSource":"generic","options":"#49","pageHint":"more","source":"profile","unresolved":"non-positional","value":null,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:01dd30ef","generic":true,"id":7114,"kind":"enum","name":"P7114","nameSource":"generic","options":"#49","pageHint":"more","source":"profile","unresolved":"non-positional","value":null,"widget":"dropdown","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:02a8ec0b","generic":true,"id":7427,"kind":"enum","name":"P7427","nameSource":"generic","options":"#4","pageHint":"more","source":"profile","unresolved":"non-positional","value":null,"widget":"toggle","widgetSource":"device","write":"ordinal"},
+    {"fp":"1:a58995f2","generic":true,"id":8292,"kind":"enum","name":"P8292","nameSource":"generic","options":"#48","pageHint":"more","source":"profile","unresolved":"non-positional","value":null,"widget":"dropdown","widgetSource":"device","write":"ordinal"}
+  ],
+  "layout": {
+    "editorName": "Global",
+    "family": "GLOBAL",
+    "pages": [
+      {
+        "fw": {"gtet":"8,0"},
+        "name": "Config",
+        "pageNum": 0,
+        "rows": [
+          {
+            "controls": [
+              {"label":"MODELING","paramId":null,"paramName":null,"placement":{"positionExact":"305,29"},"rawWidget":"sectionLabel","widget":"label"},
+              {"label":"Power Amp Modeling","paramId":4,"paramName":"GLOBAL_PWRAMPBYP","placement":{"col":0},"rawWidget":"dropdown1","widget":"dropdown"},
+              {"label":"Cabinet Modeling","paramId":3,"paramName":"GLOBAL_CABINETBYP","placement":{"col":1},"rawWidget":"dropdown1","widget":"dropdown"},
+              {"label":"Spkr Imp. Curve","paramId":8683,"paramName":"GLOBAL_SPRK_MODEL","placement":{"col":2},"rawWidget":"dropdown1p5","widget":"dropdown"},
+              {"label":"EFFECT MIXING","paramId":null,"paramName":null,"placement":{"positionExact":"620,29"},"rawWidget":"sectionLabel","widget":"label"},
+              {
+                "label": "Spillover",
+                "paramId": 7,
+                "paramName": "GLOBAL_DELAYSPILL",
+                "placement": {"positionExact":"620,50"},
+                "rawWidget": "dropdown1Tight1Line",
+                "widget": "dropdown"
+              },
+              {
+                "label": "Gapless",
+                "paramId": 14873,
+                "paramName": "GLOBAL_GAP_FILL",
+                "placement": {"positionExact":"620,130"},
+                "rawWidget": "dropdown1Tight1Line",
+                "widget": "dropdown"
+              },
+              {"label":"Reverb\nMix","paramId":1,"paramName":"GLOBAL_REVERBMIX","placement":{"positionExact":"705,50"},"rawWidget":"knob","widget":"knob"},
+              {"label":"Effects\nMix","paramId":2,"paramName":"GLOBAL_EFFECTSMIX","placement":{"positionExact":"790,50"},"rawWidget":"knob","widget":"knob"},
+              {
+                "label": "Noisegate Offset",
+                "paramId": 39,
+                "paramName": "GLOBAL_GATE_OFFSET",
+                "placement": {"positionExact":"875,50"},
+                "rawWidget": "knob",
+                "widget": "knob"
+              },
+              {"label":"Device Name","paramId":1334,"paramName":"GLOBAL_DEVICE_NAME_BEGIN","placement":{"col":8},"rawWidget":"readoutCtrl8","widget":"readout"}
+            ],
+            "section": "parameters"
+          },
+          {
+            "controls": [
+              {"label":"GENERAL","paramId":null,"paramName":null,"placement":{"positionExact":"305,209"},"rawWidget":"sectionLabel","widget":"label"},
+              {"label":"Prompt on Edit","paramId":106,"paramName":"GLOBAL_PRESET_PROMPT","placement":{"col":0},"rawWidget":"dropdown1","widget":"dropdown"},
+              {
+                "label": "Edit on Scn Change",
+                "paramId": 8681,
+                "paramName": "GLOBAL_EDIT_ON_SCENE_CHANGE",
+                "placement": {"col":1},
+                "rawWidget": "dropdown1",
+                "widget": "dropdown"
+              },
+              {"label":"Display Offset","paramId":72,"paramName":"GLOBAL_DISPLAY_OFFSET","placement":{"col":2},"rawWidget":"dropdown1","widget":"dropdown"},
+              {"label":"Default Scene","paramId":105,"paramName":"GLOBAL_DEFAULT_SCENE","placement":{"col":3},"rawWidget":"dropdown1","widget":"dropdown"},
+              {"label":"Tap Tempo","paramId":40,"paramName":"GLOBAL_TAP_TEMPO_MODE","placement":{"col":4},"rawWidget":"dropdown1","widget":"dropdown"},
+              {"label":"AC Line Frequency","paramId":112,"paramName":"GLOBAL_LINEFREQ","placement":{"col":5},"rawWidget":"dropdown1","widget":"dropdown"},
+              {"label":"Input 1 Gain","paramId":14871,"paramName":"GLOBAL_INPUT_GAIN","placement":{"col":6},"rawWidget":"knob","widget":"knob"},
+              {"label":"EQ TYPE","paramId":null,"paramName":null,"placement":{"positionExact":"985,209"},"rawWidget":"sectionLabel","widget":"label"},
+              {"label":"Output 1","paramId":8647,"paramName":"GLOBAL_EQ1_TYPE","placement":{"col":8},"rawWidget":"dropdown1","widget":"dropdown"},
+              {"label":"Output 2","paramId":8648,"paramName":"GLOBAL_EQ2_TYPE","placement":{"col":9},"rawWidget":"dropdown1","widget":"dropdown"}
+            ],
+            "section": "parameters"
+          }
+        ]
+      },
+      {
+        "fw": {"gtet":"5"},
+        "name": "Audio",
+        "pageNum": 1,
+        "rows": [
+          {
+            "controls": [
+              {"label":"INPUT CONFIG","paramId":null,"paramName":null,"placement":{"positionExact":"305,29"},"rawWidget":"sectionLabel","widget":"label"},
+              {"label":"INPUT 1","paramId":null,"paramName":null,"placement":{"positionExact":"305,60"},"rawWidget":"labelBold","widget":"label"},
+              {"label":"INPUT 2","paramId":null,"paramName":null,"placement":{"positionExact":"305,115"},"rawWidget":"labelBold","widget":"label"},
+              {
+                "label": "Source",
+                "paramId": 61,
+                "paramName": "GLOBAL_IN1_SOURCE",
+                "placement": {"positionExact":"390,60"},
+                "rawWidget": "dropdownThin1Line",
+                "widget": "dropdown"
+              },
+              {
+                "label": "Pad ",
+                "paramId": 44,
+                "paramName": "GLOBAL_IN1_TRIM",
+                "placement": {"positionExact":"516,60"},
+                "rawWidget": "dropdownThin1Line",
+                "widget": "dropdown"
+              },
+              {
+                "label": "Mode",
+                "paramId": 41,
+                "paramName": "GLOBAL_IN2_CONFIG",
+                "placement": {"positionExact":"390,115"},
+                "rawWidget": "dropdownThin1Line",
+                "widget": "dropdown"
+              },
+              {
+                "label": "Pad",
+                "paramId": 45,
+                "paramName": "GLOBAL_IN2_TRIM",
+                "placement": {"positionExact":"516,115"},
+                "rawWidget": "dropdownThin1Line",
+                "widget": "dropdown"
+              },
+              {"label":"OUTPUT CONFIG","paramId":null,"paramName":null,"placement":{"positionExact":"665,29"},"rawWidget":"sectionLabel","widget":"label"},
+              {"label":"OUTPUT 1","paramId":null,"paramName":null,"placement":{"positionExact":"665,60"},"rawWidget":"labelBold","widget":"label"},
+              {
+                "label": "Mode",
+                "paramId": 48,
+                "paramName": "GLOBAL_OUT1_CONFIG",
+                "placement": {"positionExact":"750,60"},
+                "rawWidget": "dropdownThin1Line",
+                "widget": "dropdown"
+              },
+              {
+                "label": "Output Level",
+                "paramId": 56,
+                "paramName": "GLOBAL_OUT1_PAD",
+                "placement": {"positionExact":"876,60"},
+                "rawWidget": "dropdownThin1Line",
+                "widget": "dropdown"
+              },
+              {
+                "label": "Phase",
+                "paramId": 52,
+                "paramName": "GLOBAL_OUT1_PHASE",
+                "placement": {"positionExact":"1002,60"},
+                "rawWidget": "dropdownThin1Line",
+                "widget": "dropdown"
+              },
+              {"label":"OUTPUT 2","paramId":null,"paramName":null,"placement":{"positionExact":"665,115"},"rawWidget":"labelBold","widget":"label"},
+              {
+                "label": "Output Type",
+                "paramId": 8680,
+                "paramName": "GLOBAL_OUT2_TYPE",
+                "placement": {"positionExact":"750,115"},
+                "rawWidget": "dropdownThin1Line",
+                "widget": "dropdown"
+              },
+              {
+                "label": "Boost/Pad",
+                "paramId": 57,
+                "paramName": "GLOBAL_OUT2_PAD",
+                "placement": {"positionExact":"876,115"},
+                "rawWidget": "dropdownThin1Line",
+                "widget": "dropdown"
+              },
+              {
+                "label": "Output Level",
+                "paramId": 8679,
+                "paramName": "GLOBAL_OUT2_LINE",
+                "placement": {"positionExact":"876,115"},
+                "rawWidget": "dropdownThin1Line",
+                "widget": "dropdown"
+              },
+              {
+                "label": "Phase",
+                "paramId": 53,
+                "paramName": "GLOBAL_OUT2_PHASE",
+                "placement": {"positionExact":"1002,115"},
+                "rawWidget": "dropdownThin1Line",
+                "widget": "dropdown"
+              },
+              {
+                "label": "Mode",
+                "paramId": 49,
+                "paramName": "GLOBAL_OUT2_CONFIG",
+                "placement": {"positionExact":"750,170"},
+                "rawWidget": "dropdownThin1Line",
+                "widget": "dropdown"
+              },
+              {
+                "label": "Output 2 Copy",
+                "paramId": 60,
+                "paramName": "GLOBAL_COPY_OUTPUT",
+                "placement": {"positionExact":"876,170"},
+                "rawWidget": "dropdownThin1Line",
+                "widget": "dropdown"
+              }
+            ],
+            "section": "parameters"
+          },
+          {
+            "controls": [
+              {"label":"DIGITAL I/O","paramId":null,"paramName":null,"placement":{"positionExact":"305,225"},"rawWidget":"sectionLabel","widget":"label"},
+              {
+                "label": "SPDIF Out Source",
+                "paramId": 63,
+                "paramName": "GLOBAL_AES_SOURCE",
+                "placement": {"positionExact":"305,255"},
+                "rawWidget": "dropdownThin2Line",
+                "widget": "dropdown"
+              },
+              {
+                "label": "USB 3,4 Record Source",
+                "paramId": 7423,
+                "paramName": "GLOBAL_USB_RECORD",
+                "placement": {"positionExact":"433,255"},
+                "rawWidget": "dropdownThin2Line",
+                "widget": "dropdown"
+              },
+              {
+                "label": "USB 1,2 Playback Destination",
+                "paramId": 8684,
+                "paramName": "GLOBAL_USB_1_2_PLAYBACK",
+                "placement": {"positionExact":"561,255"},
+                "rawWidget": "dropdownThin2Line",
+                "widget": "dropdown"
+              },
+              {
+                "label": "USB 3,4 Playback Destination",
+                "paramId": 7424,
+                "paramName": "GLOBAL_USB_3_4_PLAYBACK",
+                "placement": {"positionExact":"689,255"},
+                "rawWidget": "dropdownThin2Line",
+                "widget": "dropdown"
+              },
+              {
+                "label": "USB Buffer Size",
+                "paramId": 99,
+                "paramName": "GLOBAL_USB_OUTEP_BUFF_SIZE",
+                "placement": {"positionExact":"817,255"},
+                "rawWidget": "dropdownThin2Line",
+                "widget": "dropdown"
+              },
+              {
+                "label": "USB PLAYBACK LEVELS",
+                "paramId": null,
+                "paramName": null,
+                "placement": {"positionExact":"970,225"},
+                "rawWidget": "sectionLabel",
+                "widget": "label"
+              },
+              {"label":"USB 1/2","paramId":123,"paramName":"GLOBAL_USBLEVEL1","placement":{"positionExact":"970,246"},"rawWidget":"knob","widget":"knob"},
+              {"label":"USB 3/4","paramId":124,"paramName":"GLOBAL_USBLEVEL2","placement":{"positionExact":"1055,246"},"rawWidget":"knob","widget":"knob"}
+            ],
+            "section": "parameters"
+          }
+        ]
+      },
+      {
+        "fw": {"gtet":"1,2"},
+        "name": "Scales",
+        "pageNum": 2,
+        "rows": [
+          {
+            "controls": [
+              {
+                "label": "Custom Scale #",
+                "paramId": 96,
+                "paramName": "GLOBAL_CUSTOM_SCALE",
+                "placement": {"positionExact":"310,25"},
+                "rawWidget": "dropdownLeftLabel",
+                "widget": "dropdown"
+              },
+              {
+                "label": "Context Menu",
+                "paramId": 65522,
+                "paramName": "GLOBAL_SCALE_CONTEXT_MENU",
+                "placement": {"positionExact":"490,26"},
+                "rawWidget": "labelMenuArrow",
+                "widget": "label"
+              },
+              {
+                "label": "A",
+                "paramId": 902,
+                "paramName": "GLOBAL_CUSTOM_SHIFT_BEGIN",
+                "placement": {"positionExact":"520,25"},
+                "rawWidget": "readoutLeftLabel",
+                "widget": "readout"
+              },
+              {
+                "label": "A#/Bb",
+                "paramId": 902,
+                "paramName": "GLOBAL_CUSTOM_SHIFT_BEGIN",
+                "placement": {"positionExact":"520,53"},
+                "rawWidget": "readoutLeftLabel",
+                "widget": "readout"
+              },
+              {
+                "label": "B",
+                "paramId": 902,
+                "paramName": "GLOBAL_CUSTOM_SHIFT_BEGIN",
+                "placement": {"positionExact":"520,81"},
+                "rawWidget": "readoutLeftLabel",
+                "widget": "readout"
+              },
+              {
+                "label": "C",
+                "paramId": 902,
+                "paramName": "GLOBAL_CUSTOM_SHIFT_BEGIN",
+                "placement": {"positionExact":"520,109"},
+                "rawWidget": "readoutLeftLabel",
+                "widget": "readout"
+              },
+              {
+                "label": "C#/Db",
+                "paramId": 902,
+                "paramName": "GLOBAL_CUSTOM_SHIFT_BEGIN",
+                "placement": {"positionExact":"520,137"},
+                "rawWidget": "readoutLeftLabel",
+                "widget": "readout"
+              },
+              {
+                "label": "D",
+                "paramId": 902,
+                "paramName": "GLOBAL_CUSTOM_SHIFT_BEGIN",
+                "placement": {"positionExact":"520,165"},
+                "rawWidget": "readoutLeftLabel",
+                "widget": "readout"
+              },
+              {
+                "label": "D#/Eb",
+                "paramId": 902,
+                "paramName": "GLOBAL_CUSTOM_SHIFT_BEGIN",
+                "placement": {"positionExact":"520,193"},
+                "rawWidget": "readoutLeftLabel",
+                "widget": "readout"
+              },
+              {
+                "label": "E",
+                "paramId": 902,
+                "paramName": "GLOBAL_CUSTOM_SHIFT_BEGIN",
+                "placement": {"positionExact":"520,221"},
+                "rawWidget": "readoutLeftLabel",
+                "widget": "readout"
+              },
+              {
+                "label": "F",
+                "paramId": 902,
+                "paramName": "GLOBAL_CUSTOM_SHIFT_BEGIN",
+                "placement": {"positionExact":"520,249"},
+                "rawWidget": "readoutLeftLabel",
+                "widget": "readout"
+              },
+              {
+                "label": "F#/Gb",
+                "paramId": 902,
+                "paramName": "GLOBAL_CUSTOM_SHIFT_BEGIN",
+                "placement": {"positionExact":"520,277"},
+                "rawWidget": "readoutLeftLabel",
+                "widget": "readout"
+              },
+              {
+                "label": "G",
+                "paramId": 902,
+                "paramName": "GLOBAL_CUSTOM_SHIFT_BEGIN",
+                "placement": {"positionExact":"520,305"},
+                "rawWidget": "readoutLeftLabel",
+                "widget": "readout"
+              },
+              {
+                "label": "G#/Ab",
+                "paramId": 902,
+                "paramName": "GLOBAL_CUSTOM_SHIFT_BEGIN",
+                "placement": {"positionExact":"520,333"},
+                "rawWidget": "readoutLeftLabel",
+                "widget": "readout"
+              },
+              {
+                "label": "Set All",
+                "paramId": 65520,
+                "paramName": "GLOBAL_SCALE_SET_ALL",
+                "placement": {"positionExact":"900,25"},
+                "rawWidget": "btnRectangle",
+                "widget": "button"
+              },
+              {
+                "label": "0",
+                "paramId": 65521,
+                "paramName": "GLOBAL_SCALE_VAL_ALL",
+                "placement": {"positionExact":"985,25"},
+                "rawWidget": "readoutValueInt",
+                "widget": "readout"
+              }
+            ],
+            "section": "parameters"
+          }
+        ]
+      },
+      {
+        "fw": {"gtet":"3,2"},
+        "name": "Out 1 EQ",
+        "pageNum": 3,
+        "rows": [
+          {
+            "controls": [
+              {
+                "label": "EQ Disabled. To enable, set the \"Output 1 EQ Type\" on the Config page.",
+                "paramId": null,
+                "paramName": null,
+                "rawWidget": "sectionLabel",
+                "widget": "label"
+              }
+            ],
+            "section": "parameters"
+          }
+        ],
+        "selectorParamName": "GLOBAL_EQ1_TYPE",
+        "value": "0"
+      },
+      {
+        "fw": {"gtet":"3,2"},
+        "name": "Out 2 EQ",
+        "pageNum": 4,
+        "rows": [
+          {
+            "controls": [
+              {
+                "label": "EQ Disabled. To enable, set the \"Output 2 EQ Type\" on the Config page.",
+                "paramId": null,
+                "paramName": null,
+                "rawWidget": "sectionLabel",
+                "widget": "label"
+              }
+            ],
+            "section": "parameters"
+          }
+        ],
+        "selectorParamName": "GLOBAL_EQ2_TYPE",
+        "value": "0"
+      },
+      {
+        "name": "MIDI/Remote",
+        "pageNum": 5,
+        "rows": [
+          {
+            "controls": [
+              {
+                "fw": {"gtet":"9,01"},
+                "label": "GENERAL",
+                "paramId": null,
+                "paramName": null,
+                "placement": {"positionExact":"305,29"},
+                "rawWidget": "sectionLabel",
+                "widget": "label"
+              },
+              {"label":"MIDI Channel","paramId":68,"paramName":"GLOBAL_MIDI_CHAN","placement":{"col":0},"rawWidget":"knob","widget":"knob"},
+              {"label":"Display Offset","paramId":72,"paramName":"GLOBAL_DISPLAY_OFFSET","placement":{"col":1},"rawWidget":"dropdown1","widget":"dropdown"},
+              {"label":"Scene Revert","paramId":93,"paramName":"GLOBAL_SCENE_REVERT","placement":{"col":2},"rawWidget":"dropdown1","widget":"dropdown"},
+              {"label":"Eff. Bypass Mode","paramId":104,"paramName":"GLOBAL_CC_BYPASS_TYPE","placement":{"col":3},"rawWidget":"dropdown1","widget":"dropdown"},
+              {
+                "label": "Send RT. Sysex",
+                "paramId": 113,
+                "paramName": "GLOBAL_SEND_REALTIME_SYSEX",
+                "placement": {"col":4},
+                "rawWidget": "dropdown1",
+                "widget": "dropdown"
+              },
+              {
+                "fw": {"gtet":"9,01"},
+                "label": "Rcv MIDI Clk",
+                "paramId": 14874,
+                "paramName": "GLOBAL_RCV_MIDI_CLOCK",
+                "placement": {"positionExact":"730,50"},
+                "rawWidget": "dropdown1Tight1Line",
+                "widget": "dropdown"
+              },
+              {
+                "fw": {"gtet":"9,01"},
+                "label": "Snd MIDI Clk",
+                "paramId": 14875,
+                "paramName": "GLOBAL_SEND_MIDI_CLOCK",
+                "placement": {"positionExact":"730,120"},
+                "rawWidget": "dropdown1Tight1Line",
+                "widget": "dropdown"
+              }
+            ],
+            "section": "parameters"
+          },
+          {
+            "controls": [
+              {"label":"PC CONFIGURATION","paramId":null,"paramName":null,"placement":{"positionExact":"305,209"},"rawWidget":"sectionLabel","widget":"label"},
+              {"label":"Program Change","paramId":69,"paramName":"GLOBAL_MIDI_PROG_CHANGE","placement":{"col":0},"rawWidget":"dropdown1","widget":"dropdown"},
+              {"label":"Ignore Red. PC","paramId":70,"paramName":"GLOBAL_NO_REDUNDANT_PC","placement":{"col":1},"rawWidget":"dropdown1","widget":"dropdown"},
+              {"label":"Send MIDI PC","paramId":73,"paramName":"GLOBAL_SEND_MIDIPC","placement":{"col":2},"rawWidget":"dropdown1","widget":"dropdown"},
+              {"label":"MIDI PC Offset","paramId":71,"paramName":"GLOBAL_PC_OFFSET","placement":{"col":3},"rawWidget":"knob","widget":"knob"}
+            ],
+            "section": "parameters"
+          }
+        ]
+      }
+    ],
+    "variantName": "Global",
+    "variantValue": null
+  },
+  "named": [
+    {"fp":"1:546c813c","generic":false,"id":1,"kind":"float","max":150,"min":50,"name":"Reverb Mix","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","step":0.1,"taperSource":"typecode","unresolved":"non-positional","value":null,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:546c813c","generic":false,"id":2,"kind":"float","max":150,"min":50,"name":"Effects Mix","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","step":0.1,"taperSource":"typecode","unresolved":"non-positional","value":null,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:c2ad14d0","generic":false,"id":5,"kind":"float","max":450,"min":430,"name":"Calibration","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","step":0.1,"taperSource":"typecode","unresolved":"non-positional","value":null,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:c908a420","generic":false,"id":9,"kind":"float","max":25,"min":-25,"name":"E 1","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","step":0.05,"taperSource":"typecode","unresolved":"non-positional","value":null,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:c908a420","generic":false,"id":10,"kind":"float","max":25,"min":-25,"name":"B 2","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","step":0.05,"taperSource":"typecode","unresolved":"non-positional","value":null,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:c908a420","generic":false,"id":11,"kind":"float","max":25,"min":-25,"name":"G 3","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","step":0.05,"taperSource":"typecode","unresolved":"non-positional","value":null,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:c908a420","generic":false,"id":12,"kind":"float","max":25,"min":-25,"name":"D 4","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","step":0.05,"taperSource":"typecode","unresolved":"non-positional","value":null,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:c908a420","generic":false,"id":13,"kind":"float","max":25,"min":-25,"name":"A 5","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","step":0.05,"taperSource":"typecode","unresolved":"non-positional","value":null,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:c908a420","generic":false,"id":14,"kind":"float","max":25,"min":-25,"name":"E 6","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","step":0.05,"taperSource":"typecode","unresolved":"non-positional","value":null,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:cef97606","generic":false,"id":15,"kind":"float","max":12,"min":-12,"name":"31 1","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","step":0.025,"taperSource":"typecode","unresolved":"non-positional","value":null,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:cef97606","generic":false,"id":16,"kind":"float","max":12,"min":-12,"name":"63 1","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","step":0.025,"taperSource":"typecode","unresolved":"non-positional","value":null,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:cef97606","generic":false,"id":17,"kind":"float","max":12,"min":-12,"name":"125 1","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","step":0.025,"taperSource":"typecode","unresolved":"non-positional","value":null,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:cef97606","generic":false,"id":18,"kind":"float","max":12,"min":-12,"name":"250 1","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","step":0.025,"taperSource":"typecode","unresolved":"non-positional","value":null,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:cef97606","generic":false,"id":19,"kind":"float","max":12,"min":-12,"name":"500 1","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","step":0.025,"taperSource":"typecode","unresolved":"non-positional","value":null,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:cef97606","generic":false,"id":20,"kind":"float","max":12,"min":-12,"name":"1k 1","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","step":0.025,"taperSource":"typecode","unresolved":"non-positional","value":null,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:cef97606","generic":false,"id":21,"kind":"float","max":12,"min":-12,"name":"2k 1","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","step":0.025,"taperSource":"typecode","unresolved":"non-positional","value":null,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:cef97606","generic":false,"id":22,"kind":"float","max":12,"min":-12,"name":"4k 1","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","step":0.025,"taperSource":"typecode","unresolved":"non-positional","value":null,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:cef97606","generic":false,"id":23,"kind":"float","max":12,"min":-12,"name":"8k 1","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","step":0.025,"taperSource":"typecode","unresolved":"non-positional","value":null,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:cef97606","generic":false,"id":24,"kind":"float","max":12,"min":-12,"name":"16k 1","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","step":0.025,"taperSource":"typecode","unresolved":"non-positional","value":null,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:8775f33a","generic":false,"id":25,"kind":"float","max":12,"min":-12,"name":"Level 1","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","step":0.025,"taperSource":"typecode","unresolved":"non-positional","value":null,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:cef97606","generic":false,"id":26,"kind":"float","max":12,"min":-12,"name":"31 2","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","step":0.025,"taperSource":"typecode","unresolved":"non-positional","value":null,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:cef97606","generic":false,"id":27,"kind":"float","max":12,"min":-12,"name":"63 2","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","step":0.025,"taperSource":"typecode","unresolved":"non-positional","value":null,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:cef97606","generic":false,"id":28,"kind":"float","max":12,"min":-12,"name":"125 2","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","step":0.025,"taperSource":"typecode","unresolved":"non-positional","value":null,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:cef97606","generic":false,"id":29,"kind":"float","max":12,"min":-12,"name":"250 2","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","step":0.025,"taperSource":"typecode","unresolved":"non-positional","value":null,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:cef97606","generic":false,"id":30,"kind":"float","max":12,"min":-12,"name":"500 2","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","step":0.025,"taperSource":"typecode","unresolved":"non-positional","value":null,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:cef97606","generic":false,"id":31,"kind":"float","max":12,"min":-12,"name":"1k 2","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","step":0.025,"taperSource":"typecode","unresolved":"non-positional","value":null,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:cef97606","generic":false,"id":32,"kind":"float","max":12,"min":-12,"name":"2k 2","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","step":0.025,"taperSource":"typecode","unresolved":"non-positional","value":null,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:cef97606","generic":false,"id":33,"kind":"float","max":12,"min":-12,"name":"4k 2","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","step":0.025,"taperSource":"typecode","unresolved":"non-positional","value":null,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:cef97606","generic":false,"id":34,"kind":"float","max":12,"min":-12,"name":"8k 2","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","step":0.025,"taperSource":"typecode","unresolved":"non-positional","value":null,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:cef97606","generic":false,"id":35,"kind":"float","max":12,"min":-12,"name":"16k 2","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","step":0.025,"taperSource":"typecode","unresolved":"non-positional","value":null,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:8775f33a","generic":false,"id":36,"kind":"float","max":12,"min":-12,"name":"Level 2","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","step":0.025,"taperSource":"typecode","unresolved":"non-positional","value":null,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:23606e76","generic":false,"id":39,"kind":"float","max":40,"min":-40,"name":"Noisegate Offset","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","step":0.1,"taperSource":"typecode","unresolved":"non-positional","value":null,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:ebf683ad","generic":false,"id":67,"kind":"float","max":12,"min":1,"name":"Bank Size","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","step":1,"unresolved":"non-positional","value":null,"widget":"stepper","widgetSource":"device","write":"norm"},
+    {"fp":"1:e4c70ec2","generic":false,"id":71,"kind":"float","max":383,"min":0,"name":"MIDI PC Offset","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","unresolved":"non-positional","value":null,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:12e17c3f","generic":false,"id":72,"kind":"float","max":1,"min":0,"name":"Display Offset","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","unresolved":"non-positional","value":null,"widget":"stepper","widgetSource":"catalog","write":"norm"},
+    {"fp":"1:7f26f24f","generic":false,"id":110,"kind":"float","max":100,"min":25,"name":"Bright 1","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","step":1,"taperSource":"typecode","unresolved":"non-positional","value":null,"widget":"knob","widgetSource":"layout","write":"norm"},
+    {"fp":"1:6c4d8101","generic":false,"id":111,"kind":"float","max":50,"min":1,"name":"Dim","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","step":1,"taperSource":"typecode","unresolved":"non-positional","value":null,"widget":"stepper","widgetSource":"device","write":"norm"},
+    {"fp":"1:43a355ed","generic":false,"id":119,"kind":"float","max":20,"min":-40,"name":"Output 1","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","step":0.1,"taperSource":"typecode","unit":"dB","unitSource":"typecode","unresolved":"non-positional","value":null,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:43a355ed","generic":false,"id":120,"kind":"float","max":20,"min":-40,"name":"Output 2","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","step":0.1,"taperSource":"typecode","unit":"dB","unitSource":"typecode","unresolved":"non-positional","value":null,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:43a355ed","generic":false,"id":121,"kind":"float","max":20,"min":-40,"name":"USB / Digital","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","step":0.1,"taperSource":"typecode","unit":"dB","unitSource":"typecode","unresolved":"non-positional","value":null,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:43a355ed","generic":false,"id":123,"kind":"float","max":20,"min":-40,"name":"USB 1/2","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","step":0.1,"taperSource":"typecode","unit":"dB","unitSource":"typecode","unresolved":"non-positional","value":null,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:43a355ed","generic":false,"id":124,"kind":"float","max":20,"min":-40,"name":"USB 3/4","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","step":0.1,"taperSource":"typecode","unit":"dB","unitSource":"typecode","unresolved":"non-positional","value":null,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:43a355ed","generic":false,"id":125,"kind":"float","max":20,"min":-40,"name":"USB 5/6","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","step":0.1,"taperSource":"typecode","unit":"dB","unitSource":"typecode","unresolved":"non-positional","value":null,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:43a355ed","generic":false,"id":126,"kind":"float","max":20,"min":-40,"name":"USB 7/8","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","step":0.1,"taperSource":"typecode","unit":"dB","unitSource":"typecode","unresolved":"non-positional","value":null,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:43a355ed","generic":false,"id":131,"kind":"float","max":20,"min":-40,"name":"AES/SPDIF","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","step":0.1,"taperSource":"typecode","unit":"dB","unitSource":"typecode","unresolved":"non-positional","value":null,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:a93ef05d","generic":false,"id":3602,"kind":"float","max":9,"min":1,"name":"1 1","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","step":0.1,"unresolved":"non-positional","value":null,"widget":"stepper","widgetSource":"catalog","write":"norm"},
+    {"fp":"1:a93ef05d","generic":false,"id":3603,"kind":"float","max":9,"min":1,"name":"2 1","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","step":0.1,"unresolved":"non-positional","value":null,"widget":"stepper","widgetSource":"catalog","write":"norm"},
+    {"fp":"1:a93ef05d","generic":false,"id":3604,"kind":"float","max":9,"min":1,"name":"3 1","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","step":0.1,"unresolved":"non-positional","value":null,"widget":"stepper","widgetSource":"catalog","write":"norm"},
+    {"fp":"1:e8f7aae1","generic":false,"id":7010,"kind":"float","max":16,"min":1,"name":"CS CHAN BEGIN","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","step":1,"unresolved":"non-positional","value":null,"widget":"stepper","widgetSource":"device","write":"norm"},
+    {"fp":"1:d3ad0e26","generic":false,"id":7115,"kind":"float","max":100,"min":0,"name":"Bright 2","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","step":1,"taperSource":"typecode","unresolved":"non-positional","value":null,"widget":"knob","widgetSource":"layout","write":"norm"},
+    {"fp":"1:d3ad0e26","generic":false,"id":7116,"kind":"float","max":100,"min":0,"name":"Contrast","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","step":1,"taperSource":"typecode","unresolved":"non-positional","value":null,"widget":"knob","widgetSource":"layout","write":"norm"},
+    {"fp":"1:2d114219","generic":false,"id":8649,"kind":"float","log":true,"max":2000,"min":20,"name":"Frequency 1 1","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","taperSource":"typecode","unresolved":"non-positional","value":null,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:25273693","generic":false,"id":8650,"kind":"float","log":true,"max":20000,"min":20,"name":"Frequency 2 1","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","taperSource":"typecode","unresolved":"non-positional","value":null,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:25273693","generic":false,"id":8651,"kind":"float","log":true,"max":20000,"min":20,"name":"Frequency 3 1","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","taperSource":"typecode","unresolved":"non-positional","value":null,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:25273693","generic":false,"id":8652,"kind":"float","log":true,"max":20000,"min":20,"name":"Frequency 4 1","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","taperSource":"typecode","unresolved":"non-positional","value":null,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:138cddf1","generic":false,"id":8653,"kind":"float","log":true,"max":20000,"min":200,"name":"Frequency 5 1","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","taperSource":"typecode","unresolved":"non-positional","value":null,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:8f98e036","generic":false,"id":8654,"kind":"float","log":true,"max":10,"min":0.1,"name":"Q1 1","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","taperSource":"typecode","unresolved":"non-positional","value":null,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:8f98e036","generic":false,"id":8655,"kind":"float","log":true,"max":10,"min":0.1,"name":"Q2 1","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","taperSource":"typecode","unresolved":"non-positional","value":null,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:8f98e036","generic":false,"id":8656,"kind":"float","log":true,"max":10,"min":0.1,"name":"Q3 1","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","taperSource":"typecode","unresolved":"non-positional","value":null,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:8f98e036","generic":false,"id":8657,"kind":"float","log":true,"max":10,"min":0.1,"name":"Q4 1","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","taperSource":"typecode","unresolved":"non-positional","value":null,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:8f98e036","generic":false,"id":8658,"kind":"float","log":true,"max":10,"min":0.1,"name":"Q5 1","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","taperSource":"typecode","unresolved":"non-positional","value":null,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:784933cc","generic":false,"id":8659,"kind":"float","max":20,"min":-20,"name":"Gain 1 1","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","step":0.05,"taperSource":"typecode","unresolved":"non-positional","value":null,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:784933cc","generic":false,"id":8660,"kind":"float","max":20,"min":-20,"name":"Gain 2 1","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","step":0.05,"taperSource":"typecode","unresolved":"non-positional","value":null,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:784933cc","generic":false,"id":8661,"kind":"float","max":20,"min":-20,"name":"Gain 3 1","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","step":0.05,"taperSource":"typecode","unresolved":"non-positional","value":null,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:784933cc","generic":false,"id":8662,"kind":"float","max":20,"min":-20,"name":"Gain 4 1","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","step":0.05,"taperSource":"typecode","unresolved":"non-positional","value":null,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:784933cc","generic":false,"id":8663,"kind":"float","max":20,"min":-20,"name":"Gain 5 1","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","step":0.05,"taperSource":"typecode","unresolved":"non-positional","value":null,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:2d114219","generic":false,"id":8664,"kind":"float","log":true,"max":2000,"min":20,"name":"Frequency 1 2","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","taperSource":"typecode","unresolved":"non-positional","value":null,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:25273693","generic":false,"id":8665,"kind":"float","log":true,"max":20000,"min":20,"name":"Frequency 2 2","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","taperSource":"typecode","unresolved":"non-positional","value":null,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:25273693","generic":false,"id":8666,"kind":"float","log":true,"max":20000,"min":20,"name":"Frequency 3 2","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","taperSource":"typecode","unresolved":"non-positional","value":null,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:25273693","generic":false,"id":8667,"kind":"float","log":true,"max":20000,"min":20,"name":"Frequency 4 2","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","taperSource":"typecode","unresolved":"non-positional","value":null,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:138cddf1","generic":false,"id":8668,"kind":"float","log":true,"max":20000,"min":200,"name":"Frequency 5 2","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","taperSource":"typecode","unresolved":"non-positional","value":null,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:8f98e036","generic":false,"id":8669,"kind":"float","log":true,"max":10,"min":0.1,"name":"Q1 2","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","taperSource":"typecode","unresolved":"non-positional","value":null,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:8f98e036","generic":false,"id":8670,"kind":"float","log":true,"max":10,"min":0.1,"name":"Q2 2","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","taperSource":"typecode","unresolved":"non-positional","value":null,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:8f98e036","generic":false,"id":8671,"kind":"float","log":true,"max":10,"min":0.1,"name":"Q3 2","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","taperSource":"typecode","unresolved":"non-positional","value":null,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:8f98e036","generic":false,"id":8672,"kind":"float","log":true,"max":10,"min":0.1,"name":"Q4 2","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","taperSource":"typecode","unresolved":"non-positional","value":null,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:8f98e036","generic":false,"id":8673,"kind":"float","log":true,"max":10,"min":0.1,"name":"Q5 2","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","taperSource":"typecode","unresolved":"non-positional","value":null,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:784933cc","generic":false,"id":8674,"kind":"float","max":20,"min":-20,"name":"Gain 1 2","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","step":0.05,"taperSource":"typecode","unresolved":"non-positional","value":null,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:784933cc","generic":false,"id":8675,"kind":"float","max":20,"min":-20,"name":"Gain 2 2","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","step":0.05,"taperSource":"typecode","unresolved":"non-positional","value":null,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:784933cc","generic":false,"id":8676,"kind":"float","max":20,"min":-20,"name":"Gain 3 2","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","step":0.05,"taperSource":"typecode","unresolved":"non-positional","value":null,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:784933cc","generic":false,"id":8677,"kind":"float","max":20,"min":-20,"name":"Gain 4 2","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","step":0.05,"taperSource":"typecode","unresolved":"non-positional","value":null,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:784933cc","generic":false,"id":8678,"kind":"float","max":20,"min":-20,"name":"Gain 5 2","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","step":0.05,"taperSource":"typecode","unresolved":"non-positional","value":null,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:12dc3760","generic":false,"id":8686,"kind":"float","max":4,"min":1,"name":"1 2","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","step":1,"unresolved":"non-positional","value":null,"widget":"stepper","widgetSource":"device","write":"norm"},
+    {"fp":"1:2a4f3c4a","generic":false,"id":8687,"kind":"float","max":2,"min":1,"name":"2 2","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","step":1,"unresolved":"non-positional","value":null,"widget":"stepper","widgetSource":"device","write":"norm"},
+    {"fp":"1:2a4f3c4a","generic":false,"id":8688,"kind":"float","max":2,"min":1,"name":"3 2","nameConfidence":"high","nameSource":"catalog","norm":null,"source":"profile","step":1,"unresolved":"non-positional","value":null,"widget":"stepper","widgetSource":"device","write":"norm"},
+    {"fp":"1:f96db87b","generic":true,"id":117,"kind":"float","max":511,"min":0,"name":"P117","nameSource":"generic","norm":null,"pageHint":"more","source":"profile","unresolved":"non-positional","value":null,"widget":"knob","widgetSource":"device","write":"norm"},
+    {"fp":"1:f96db87b","generic":true,"id":118,"kind":"float","max":511,"min":0,"name":"P118","nameSource":"generic","norm":null,"pageHint":"more","source":"profile","unresolved":"non-positional","value":null,"widget":"knob","widgetSource":"device","write":"norm"}
+  ],
+  "page": -1,
+  "slug": "global",
+  "type": null,
+  "optionLists": [
+    [{"label":"ACTIVE","value":0},{"label":"BYPASSED","value":1}],
+    [{"label":"ON","value":0},{"label":"OFF","value":1}],
+    [{"label":"OFF","value":0},{"label":"OUTPUT","value":1},{"label":"INPUT","value":2}],
+    [{"label":"OFF","value":0},{"label":"DELAY","value":1},{"label":"REVERB","value":2},{"label":"DLY & REV","value":3},{"label":"ALL","value":4}],
+    [{"label":"OFF","value":0},{"label":"ON","value":1}],
+    [{"label":"AVERAGE","value":0},{"label":"LAST TWO","value":1}],
+    [{"label":"STEREO","value":0},{"label":"LEFT ONLY","value":1},{"label":"RIGHT ONLY","value":2},{"label":"SUM L+R","value":3}],
+    [{"label":"0 dB","value":0},{"label":"6 dB","value":1},{"label":"12 dB","value":2},{"label":"18 dB","value":3}],
+    [{"label":"0 dB","value":0},{"label":"10 dB","value":1},{"label":"18 dB","value":2}],
+    [{"label":"STEREO","value":0},{"label":"SUM L+R","value":1},{"label":"COPY L->R","value":2},{"label":"MUTE","value":3}],
+    [{"label":"STEREO","value":0},{"label":"SUM L+R","value":1},{"label":"COPY L->R","value":2}],
+    [{"label":"NORMAL","value":0},{"label":"INVERT","value":1}],
+    [{"label":"+4 dBu","value":0},{"label":"-10 dBV","value":1}],
+    [{"label":"NONE","value":0},{"label":"INPUT 1","value":1},{"label":"OUTPUT 1","value":2}],
+    [{"label":"ANALOG","value":0},{"label":"USB (CHANNELS 3/4)","value":1}],
+    [{"label":"OUTPUT 1","value":0},{"label":"OUTPUT 2","value":1},{"label":"INPUT 2","value":2}],
+    [{"label":"0.25 SECONDS","value":0},{"label":"0.50 SECONDS","value":1},{"label":"0.75 SECONDS","value":2},{"label":"1.00 SECONDS","value":3},{"label":"1.25 SECONDS","value":4},{"label":"1.50 SECONDS","value":5},{"label":"1.75 SECONDS","value":6},{"label":"2.00 SECONDS","value":7}],
+    [{"label":"1","value":0},{"label":"2","value":1},{"label":"3","value":2},{"label":"4","value":3},{"label":"5","value":4},{"label":"6","value":5},{"label":"7","value":6},{"label":"8","value":7},{"label":"9","value":8},{"label":"10","value":9},{"label":"11","value":10},{"label":"12","value":11},{"label":"13","value":12},{"label":"14","value":13},{"label":"15","value":14},{"label":"16","value":15},{"label":"OMNI","value":16}],
+    [{"label":"OFF","value":0},{"label":"CHAN 1","value":1},{"label":"CHAN 2","value":2},{"label":"CHAN 3","value":3},{"label":"CHAN 4","value":4},{"label":"CHAN 5","value":5},{"label":"CHAN 6","value":6},{"label":"CHAN 7","value":7},{"label":"CHAN 8","value":8},{"label":"CHAN 9","value":9},{"label":"CHAN 10","value":10},{"label":"CHAN 11","value":11},{"label":"CHAN 12","value":12},{"label":"CHAN 13","value":13},{"label":"CHAN 14","value":14},{"label":"CHAN 15","value":15},{"label":"CHAN 16","value":16},{"label":"OMNI","value":17}],
+    [{"label":"48","value":0},{"label":"96","value":1},{"label":"192","value":2},{"label":"384","value":3},{"label":"768","value":4},{"label":"1536","value":5}],
+    [{"label":"INPUT 1","value":0},{"label":"INPUT 2","value":1},{"label":"ALL","value":2}],
+    [{"label":"VALUE","value":0},{"label":"TOGGLE","value":1}],
+    [{"label":"AS SAVED","value":0},{"label":"SCENE 1","value":1},{"label":"SCENE 2","value":2},{"label":"SCENE 3","value":3},{"label":"SCENE 4","value":4},{"label":"SCENE 5","value":5},{"label":"SCENE 6","value":6},{"label":"SCENE 7","value":7},{"label":"SCENE 8","value":8}],
+    [{"label":"LAYOUT","value":0},{"label":"NONE","value":1}],
+    [{"label":"50 Hz","value":0},{"label":"60 Hz","value":1}],
+    [{"label":"6","value":1},{"label":"12","value":2}],
+    [{"label":"--","value":0},{"label":"FC #1","value":1},{"label":"FC #2","value":2}],
+    [{"label":"--","value":0},{"label":"FM3","value":1},{"label":"FC #2","value":2}],
+    [{"label":"--","value":0},{"label":"FM3","value":1},{"label":"FC #1","value":2}],
+    [{"label":"--","value":0},{"label":"6","value":1},{"label":"12","value":2}],
+    [{"label":"ENABLED","value":0},{"label":"DISABLED","value":1}],
+    [{"label":"YES","value":0},{"label":"NO","value":1}],
+    [{"label":"CS1","value":0},{"label":"CS2","value":1},{"label":"CS3","value":2},{"label":"CS4","value":3},{"label":"CS5","value":4},{"label":"CS6","value":5}],
+    [{"label":"--","value":0},{"label":"CC","value":1},{"label":"PC","value":2}],
+    [{"label":"Not Exclusive","value":0},{"label":"Exclusive","value":1}],
+    [{"label":"1 SECOND","value":1},{"label":"2 SECONDS","value":2},{"label":"3 SECONDS","value":3},{"label":"4 SECONDS","value":4},{"label":"5 SECONDS","value":5}],
+    [{"label":"AUTOMATIC","value":0},{"label":"SWITCH UP","value":1}],
+    [{"label":"INPUT 1","value":0},{"label":"INPUT 2","value":1},{"label":"OUTPUT 2","value":2}],
+    [{"label":"INPUT 1","value":0},{"label":"OUTPUT 1","value":1},{"label":"OUTPUT 2","value":2}],
+    [{"label":"Normal (Sw. 1-6)","value":0},{"label":"FC-12 Mode (Sw. 1-3/7-9)","value":1}],
+    [{"label":"DISABLED","value":0},{"label":"ENABLED","value":1}],
+    [{"label":"NONE","value":0},{"label":"1 SEMITONE","value":1},{"label":"2 SEMITONES","value":2},{"label":"3 SEMITONES","value":3},{"label":"4 SEMITONES","value":4}],
+    [{"label":"MIXED","value":0},{"label":"ALL FLATS","value":1},{"label":"ALL SHARPS","value":2}],
+    [{"label":"OFF","value":0},{"label":"GRAPHIC","value":1},{"label":"PARAMETRIC","value":2}],
+    [{"label":"UNITY GAIN","value":0},{"label":"LINE LEVEL","value":1}],
+    [{"label":"DEFAULT","value":0},{"label":"Resistive Load","value":1},{"label":"1x8 5F1 Tweed","value":2},{"label":"1x10 Princetone NR","value":3},{"label":"1x10 BF Princetone","value":4},{"label":"1x10 SF Princetone","value":5},{"label":"1x12 Tweed Emmi","value":6},{"label":"1x12 Vibrato Lux","value":7},{"label":"1x12 Deluxe Verb","value":8},{"label":"1x12 Deluxe Verb RI","value":9},{"label":"1x12 JR Blues","value":10},{"label":"1x12 Brit G12H55","value":11},{"label":"1x12 Brit G12H75","value":12},{"label":"1x12 Div13 CJ11","value":13},{"label":"1x12 Brit G12T","value":14},{"label":"1x12 V30","value":15},{"label":"1x12 AC-20 DLX","value":16},{"label":"1x12 Car Ambler","value":17},{"label":"1x12 AST BV25","value":18},{"label":"1x15 Vibrato Verb","value":19},{"label":"1x15 Portabass","value":20},{"label":"2x10 Super","value":21},{"label":"2x10 Vibrato Lux","value":22},{"label":"2x12 Bassguy","value":23},{"label":"2x12 Double Verb","value":24},{"label":"2x12 Double Verb SF","value":25},{"label":"1x12 Class-A 15W","value":26},{"label":"2x12 Class-A 30W","value":27},{"label":"2x12 TX Star","value":28},{"label":"2x12 Match Chief","value":29},{"label":"1x12 Hot Kitty","value":30},{"label":"2x12 Jazz 120","value":31},{"label":"4x10 Bassguy","value":32},{"label":"4x10 Brit JM45","value":33},{"label":"4x10 Super Verb","value":34},{"label":"4x10 SV Bass","value":35},{"label":"4x12 Brit TV","value":36},{"label":"4x12 Brit Greenback","value":37},{"label":"4x12 Basketweave","value":38},{"label":"4x12 Brit 800","value":39},{"label":"4x12 Brit AX","value":40},{"label":"4x12 Hipower","value":41},{"label":"4x12 USA MC90","value":42},{"label":"4x12 Recto Large","value":43},{"label":"4x12 Recto Small","value":44},{"label":"4x12 Recto Slant","value":45},{"label":"4x12 Recto Straight","value":46},{"label":"4x12 5153","value":47},{"label":"4x12 Citrus","value":48},{"label":"4x12 Rumble","value":49},{"label":"2x12 Lead 80","value":50},{"label":"4x12 Solo 100","value":51},{"label":"Load Box LB-2 UK","value":52},{"label":"Load Box LB-2 US","value":53},{"label":"4x12 Friedman","value":54},{"label":"2x12 Bassbuster","value":55},{"label":"1x12 Tweed Alnico Blue","value":56},{"label":"4x12 PVH 6160","value":57},{"label":"4x12 Euro","value":58},{"label":"2x12 Recto","value":59},{"label":"2x12 Godzilla","value":60},{"label":"1x12 Tweed C12Q","value":61},{"label":"1x12 Dirty Shirley EV12L","value":62},{"label":"1x12 USA Ext EV12L","value":63},{"label":"2x12 Band Commander SRO","value":64},{"label":"2x12 Guy Tron Alnico Blue","value":65},{"label":"1x12 G12T-75","value":66},{"label":"2x12 Class-A Greenback","value":67},{"label":"2x12 Two Stone 1265","value":68},{"label":"4x12 Lerxst Omega","value":69},{"label":"1x12 Deluxe Oxford","value":70},{"label":"4x12 Hipower Pete T","value":71},{"label":"4x12 USA Semi-Open","value":72},{"label":"2x12 Dizzy RV","value":73},{"label":"4x12 Hipower Lindsey B","value":74},{"label":"4x12 London Town Tall","value":75},{"label":"Oxbow Loadbox","value":76},{"label":"Double Notes Loadbox","value":77},{"label":"1x10 Metro Blues","value":78},{"label":"4x10 Bassguy RI","value":79},{"label":"2x12 Class-A 30W Silver","value":80},{"label":"2x10 Heart Key","value":81},{"label":"4x12 1960BV","value":82},{"label":"1x12 Deluxe Tweed","value":83},{"label":"1x15 Heart Key","value":84},{"label":"2x12 USA C90 Open Back","value":85},{"label":"1x12 Friedman","value":86},{"label":"2x12 5153 Stealth","value":87},{"label":"4x12 5153 Stealth","value":88},{"label":"1x12 Scholz","value":89},{"label":"1x8 Princetone","value":90},{"label":"1x12 Black Magick","value":91},{"label":"8x10 SV Bass","value":92},{"label":"Suhr Reactive Load","value":93}],
+    [{"label":"OUTPUT 1","value":0},{"label":"OUTPUT 2","value":1}],
+    [{"label":"OFF","value":0},{"label":"CHAN & SCENE","value":1},{"label":"ALL","value":2}],
+    [{"label":"CC #1","value":1},{"label":"CC #2","value":2},{"label":"CC #3","value":3},{"label":"CC #4","value":4},{"label":"CC #5","value":5},{"label":"CC #6","value":6},{"label":"CC #7","value":7},{"label":"CC #8","value":8},{"label":"CC #9","value":9},{"label":"CC #10","value":10},{"label":"CC #11","value":11},{"label":"CC #12","value":12},{"label":"CC #13","value":13},{"label":"CC #14","value":14},{"label":"CC #15","value":15},{"label":"CC #16","value":16},{"label":"CC #17","value":17},{"label":"CC #18","value":18},{"label":"CC #19","value":19},{"label":"CC #20","value":20},{"label":"CC #21","value":21},{"label":"CC #22","value":22},{"label":"CC #23","value":23},{"label":"CC #24","value":24},{"label":"CC #25","value":25},{"label":"CC #26","value":26},{"label":"CC #27","value":27},{"label":"CC #28","value":28},{"label":"CC #29","value":29},{"label":"CC #30","value":30},{"label":"CC #31","value":31},{"label":"CC #32","value":32},{"label":"CC #33","value":33},{"label":"CC #34","value":34},{"label":"CC #35","value":35},{"label":"CC #36","value":36},{"label":"CC #37","value":37},{"label":"CC #38","value":38},{"label":"CC #39","value":39},{"label":"CC #40","value":40},{"label":"CC #41","value":41},{"label":"CC #42","value":42},{"label":"CC #43","value":43},{"label":"CC #44","value":44},{"label":"CC #45","value":45},{"label":"CC #46","value":46},{"label":"CC #47","value":47},{"label":"CC #48","value":48},{"label":"CC #49","value":49},{"label":"CC #50","value":50},{"label":"CC #51","value":51},{"label":"CC #52","value":52},{"label":"CC #53","value":53},{"label":"CC #54","value":54},{"label":"CC #55","value":55},{"label":"CC #56","value":56},{"label":"CC #57","value":57},{"label":"CC #58","value":58},{"label":"CC #59","value":59},{"label":"CC #60","value":60},{"label":"CC #61","value":61},{"label":"CC #62","value":62},{"label":"CC #63","value":63},{"label":"CC #64","value":64},{"label":"CC #65","value":65},{"label":"CC #66","value":66},{"label":"CC #67","value":67},{"label":"CC #68","value":68},{"label":"CC #69","value":69},{"label":"CC #70","value":70},{"label":"CC #71","value":71},{"label":"CC #72","value":72},{"label":"CC #73","value":73},{"label":"CC #74","value":74},{"label":"CC #75","value":75},{"label":"CC #76","value":76},{"label":"CC #77","value":77},{"label":"CC #78","value":78},{"label":"CC #79","value":79},{"label":"CC #80","value":80},{"label":"CC #81","value":81},{"label":"CC #82","value":82},{"label":"CC #83","value":83},{"label":"CC #84","value":84},{"label":"CC #85","value":85},{"label":"CC #86","value":86},{"label":"CC #87","value":87},{"label":"CC #88","value":88},{"label":"CC #89","value":89},{"label":"CC #90","value":90},{"label":"CC #91","value":91},{"label":"CC #92","value":92},{"label":"CC #93","value":93},{"label":"CC #94","value":94},{"label":"CC #95","value":95},{"label":"CC #96","value":96},{"label":"CC #97","value":97},{"label":"CC #98","value":98},{"label":"CC #99","value":99},{"label":"CC #100","value":100},{"label":"CC #101","value":101},{"label":"CC #102","value":102},{"label":"CC #103","value":103},{"label":"CC #104","value":104},{"label":"CC #105","value":105},{"label":"CC #106","value":106},{"label":"CC #107","value":107},{"label":"CC #108","value":108},{"label":"CC #109","value":109},{"label":"CC #110","value":110},{"label":"CC #111","value":111},{"label":"CC #112","value":112},{"label":"CC #113","value":113},{"label":"CC #114","value":114},{"label":"CC #115","value":115},{"label":"CC #116","value":116},{"label":"CC #117","value":117},{"label":"CC #118","value":118},{"label":"CC #119","value":119},{"label":"CC #120","value":120},{"label":"CC #121","value":121},{"label":"CC #122","value":122},{"label":"CC #123","value":123},{"label":"CC #124","value":124},{"label":"CC #125","value":125},{"label":"CC #126","value":126},{"label":"CC #127","value":127},{"label":"NONE","value":128},{"label":"PEDAL 1 (EXP/SW TIP)","value":129},{"label":"PEDAL 2 (EXP/SW TIP)","value":130},{"label":"PEDAL 1 (SW RING)","value":131},{"label":"PEDAL 2 (SW RING)","value":132},{"label":"FC 1 PEDAL 1","value":133},{"label":"FC 1 PEDAL 2","value":134},{"label":"FC 1 PEDAL 3","value":135},{"label":"FC 1 PEDAL 4","value":136},{"label":"FC 1 SW 1","value":137},{"label":"FC 1 SW 2","value":138},{"label":"FC 1 SW 3","value":139},{"label":"FC 1 SW 4","value":140},{"label":"FC 2 PEDAL 1","value":141},{"label":"FC 2 PEDAL 2","value":142},{"label":"FC 2 PEDAL 3","value":143},{"label":"FC 2 PEDAL 4","value":144},{"label":"FC 2 SW 1","value":145},{"label":"FC 2 SW 2","value":146},{"label":"FC 2 SW 3","value":147},{"label":"FC 2 SW 4","value":148}],
+    [{"label":"CC #1","value":1},{"label":"CC #2","value":2},{"label":"CC #3","value":3},{"label":"CC #4","value":4},{"label":"CC #5","value":5},{"label":"CC #6","value":6},{"label":"CC #7","value":7},{"label":"CC #8","value":8},{"label":"CC #9","value":9},{"label":"CC #10","value":10},{"label":"CC #11","value":11},{"label":"CC #12","value":12},{"label":"CC #13","value":13},{"label":"CC #14","value":14},{"label":"CC #15","value":15},{"label":"CC #16","value":16},{"label":"CC #17","value":17},{"label":"CC #18","value":18},{"label":"CC #19","value":19},{"label":"CC #20","value":20},{"label":"CC #21","value":21},{"label":"CC #22","value":22},{"label":"CC #23","value":23},{"label":"CC #24","value":24},{"label":"CC #25","value":25},{"label":"CC #26","value":26},{"label":"CC #27","value":27},{"label":"CC #28","value":28},{"label":"CC #29","value":29},{"label":"CC #30","value":30},{"label":"CC #31","value":31},{"label":"CC #32","value":32},{"label":"CC #33","value":33},{"label":"CC #34","value":34},{"label":"CC #35","value":35},{"label":"CC #36","value":36},{"label":"CC #37","value":37},{"label":"CC #38","value":38},{"label":"CC #39","value":39},{"label":"CC #40","value":40},{"label":"CC #41","value":41},{"label":"CC #42","value":42},{"label":"CC #43","value":43},{"label":"CC #44","value":44},{"label":"CC #45","value":45},{"label":"CC #46","value":46},{"label":"CC #47","value":47},{"label":"CC #48","value":48},{"label":"CC #49","value":49},{"label":"CC #50","value":50},{"label":"CC #51","value":51},{"label":"CC #52","value":52},{"label":"CC #53","value":53},{"label":"CC #54","value":54},{"label":"CC #55","value":55},{"label":"CC #56","value":56},{"label":"CC #57","value":57},{"label":"CC #58","value":58},{"label":"CC #59","value":59},{"label":"CC #60","value":60},{"label":"CC #61","value":61},{"label":"CC #62","value":62},{"label":"CC #63","value":63},{"label":"CC #64","value":64},{"label":"CC #65","value":65},{"label":"CC #66","value":66},{"label":"CC #67","value":67},{"label":"CC #68","value":68},{"label":"CC #69","value":69},{"label":"CC #70","value":70},{"label":"CC #71","value":71},{"label":"CC #72","value":72},{"label":"CC #73","value":73},{"label":"CC #74","value":74},{"label":"CC #75","value":75},{"label":"CC #76","value":76},{"label":"CC #77","value":77},{"label":"CC #78","value":78},{"label":"CC #79","value":79},{"label":"CC #80","value":80},{"label":"CC #81","value":81},{"label":"CC #82","value":82},{"label":"CC #83","value":83},{"label":"CC #84","value":84},{"label":"CC #85","value":85},{"label":"CC #86","value":86},{"label":"CC #87","value":87},{"label":"CC #88","value":88},{"label":"CC #89","value":89},{"label":"CC #90","value":90},{"label":"CC #91","value":91},{"label":"CC #92","value":92},{"label":"CC #93","value":93},{"label":"CC #94","value":94},{"label":"CC #95","value":95},{"label":"CC #96","value":96},{"label":"CC #97","value":97},{"label":"CC #98","value":98},{"label":"CC #99","value":99},{"label":"CC #100","value":100},{"label":"CC #101","value":101},{"label":"CC #102","value":102},{"label":"CC #103","value":103},{"label":"CC #104","value":104},{"label":"CC #105","value":105},{"label":"CC #106","value":106},{"label":"CC #107","value":107},{"label":"CC #108","value":108},{"label":"CC #109","value":109},{"label":"CC #110","value":110},{"label":"CC #111","value":111},{"label":"CC #112","value":112},{"label":"CC #113","value":113},{"label":"CC #114","value":114},{"label":"CC #115","value":115},{"label":"CC #116","value":116},{"label":"CC #117","value":117},{"label":"CC #118","value":118},{"label":"CC #119","value":119},{"label":"CC #120","value":120},{"label":"CC #121","value":121},{"label":"CC #122","value":122},{"label":"CC #123","value":123},{"label":"CC #124","value":124},{"label":"CC #125","value":125},{"label":"CC #126","value":126},{"label":"CC #127","value":127},{"label":"NONE","value":128}]
+  ]
+}

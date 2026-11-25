@@ -17,6 +17,7 @@ import { build } from 'esbuild';
 
 const ENTRIES = [
   'src/runtime/index.ts',
+  'src/drivers/paramIndex.ts', // the pure param index (the runtime reaches it through the gen-3 driver)
 ];
 
 let failed = 0;
