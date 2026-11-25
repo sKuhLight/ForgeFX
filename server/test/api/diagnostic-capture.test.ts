@@ -456,6 +456,7 @@ async function reloadProbe(): Promise<void> {
   {
     const { registry, state } = await makeRig();
     const events: DeviceEvent[] = [];
+    registry.setMeterDemand(true);
     const unsub = registry.subscribe((e) => events.push(e));
     const b = await run(registry, { steps: ['reloadProbe'] });
     unsub();
@@ -474,6 +475,7 @@ async function reloadProbe(): Promise<void> {
   {
     const { registry, state } = await makeRig(fakeState({ editBuffer: rawPatch('Current', 1) }));
     const events: DeviceEvent[] = [];
+    registry.setMeterDemand(true);
     const unsub = registry.subscribe((e) => events.push(e));
     const b = await run(registry, { steps: ['reloadProbe'] });
     unsub();
@@ -565,6 +567,7 @@ async function unsavedEditsPreflight(): Promise<void> {
   // the preflight holds the device like a run (claim + telemetry hold) and reports a failing device apart
   {
     const { registry, mock } = await makeRig(fakeState({ editBuffer: rawPatch('Current', 1), dumpDelayMs: 150 }));
+    registry.setMeterDemand(true);
     const unsub = registry.subscribe(() => {});
     try {
       const p = diag.capturePreflight(registry);
@@ -607,6 +610,7 @@ async function unsavedEditsSave(): Promise<void> {
   {
     const { registry, state } = await makeRig(fakeState({ editBuffer: rawPatch('Current', 1, 6) }));
     const events: DeviceEvent[] = [];
+    registry.setMeterDemand(true);
     const unsub = registry.subscribe((e) => events.push(e));
     const b = await decided(registry, 'save');
     unsub();
@@ -793,6 +797,7 @@ async function fullWalkGate(): Promise<void> {
     const { registry } = await makeRig(fakeState({ fw: [13, 0] }));
     let mode: string | undefined;
     const events: DeviceEvent[] = [];
+    registry.setMeterDemand(true);
     const unsub = registry.subscribe((e) => events.push(e));
     const b = await run(registry, { steps: [], includeFullWalk: true }, { walkImpl: async (_t, o) => { mode = o.mode; await o.write!.reloadPreset(); return seedRecords(); } });
     unsub();
@@ -845,6 +850,7 @@ async function bundleOnCancel(): Promise<void> {
 async function cancelDuringFullWalk(): Promise<void> {
   const { registry, mock, state } = await makeRig(fakeState({ fw: [13, 0] }));
   const events: DeviceEvent[] = [];
+  registry.setMeterDemand(true);
   const unsub = registry.subscribe((e) => events.push(e)); // would run meters + edit watch once released
   let reloaded = false;
   const walk: diag.CaptureWalkImpl = async (_t, o) => {
@@ -1190,6 +1196,7 @@ async function telemetryHold(): Promise<void> {
   const r = await diag.startCapture(store.defaultStore, registry, { acknowledged: true, steps: ['readonlyWalk'] }, { ...QUICK, walkImpl: blockingWalk });
   assertEqual(r.code, 202, 'started');
   await sleep(20);
+  registry.setMeterDemand(true);
   const unsub = registry.subscribe(() => {}); // would start meters + edit watch on an FM3
   try {
     const before = mock.sent.length;

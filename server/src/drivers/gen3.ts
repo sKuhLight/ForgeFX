@@ -39,7 +39,10 @@ import {
   readBlockParamsForModel, modelsFromBlocks,
   effectRoster, blockRefForEid, slugForEffectId, blockInstances,
   retargetPresetDumpToEditBuffer,
-  type DecodedBlock
+  blockStateParams, hasBlockStateParams, firmwareAtLeast, formatBlockStateFirmware, isMutingBypassMode,
+  resolveBlockVisuals, layoutParamIds, hasBlockVisuals,
+  type DecodedBlock,
+  type BlockVisual
 } from 'forgefx-midi/devices/gen3';
 import { isTransportTimeout, type Transport } from '../transport/types.js';
 import {
@@ -54,7 +57,7 @@ import { EmptyPresetError } from './types.js';
 import type {
   DeviceDriver, DriverCapabilities, DriverCtx, DiagnosticDump, SelectPresetOpts,
   PresetGridDTO, GridCellDTO, PresetBlockDTO, PresetSummary, NamedParam, EnumParam, MeterVal,
-  FcSwitchState, FcReadState, StoreReason,
+  FcSwitchState, FcReadState, StoreReason, BlockStateDTO,
   BlockParamsDTO, BlockParamsV2DTO, BlockParamsOpts, NamedParamV2, EnumParamV2, ParamMeta, UnresolvedReason, BlockMapMeta,
   ValueSource
 } from './types.js';
@@ -293,13 +296,14 @@ interface DecodedDump {
  *  (beacons, other replies) that the strict frame-walking parser would reject; the old decoder
  *  skipped them the same way. */
 function dumpBytesFromFrames(frames: readonly (readonly number[])[]): Uint8Array {
-  const keep: number[] = [];
-  for (const f of frames) {
-    if (f.length < 8 || f[0] !== 0xf0 || f[1] !== 0x00 || f[2] !== 0x01 || f[3] !== 0x74) continue;
-    const fn = f[5];
-    if (fn === 0x77 || fn === 0x78 || fn === 0x79) keep.push(...f);
+  const kept = frames.filter((f) => f.length >= 8 && f[0] === 0xf0 && f[1] === 0x00 && f[2] === 0x01 && f[3] === 0x74 && (f[5] === 0x77 || f[5] === 0x78 || f[5] === 0x79));
+  const out = new Uint8Array(kept.reduce((n, f) => n + f.length, 0));
+  let at = 0;
+  for (const f of kept) {
+    out.set(f, at);
+    at += f.length;
   }
-  return Uint8Array.from(keep);
+  return out;
 }
 
 /** Full dump decode via the package pipeline (parse → raw_patch/CRC/Huffman → structured body),
@@ -404,6 +408,18 @@ function looksDiscrete(range: { displayMin: number; displayMax: number; step?: n
 
 type FamilyParam = DeviceProfile['params'][string][number];
 
+/** Unit code by paramId for one family's param list, built once per list (a block read asks per param). */
+const unitIndexes = new WeakMap<readonly FamilyParam[], Map<number, string | undefined>>();
+function unitOfParam(defs: readonly FamilyParam[], paramId: number): string | undefined {
+  let index = unitIndexes.get(defs);
+  if (!index) {
+    index = new Map();
+    for (const p of defs) if (!index.has(p.paramId)) index.set(p.paramId, p.unit);
+    unitIndexes.set(defs, index);
+  }
+  return index.get(paramId);
+}
+
 /** Is this catalog param a knob: a float-kind range with a usable span (min !== max), a continuous
  *  catalog unit (KNOB_UNITS), not the bypass flag and not a known non-dial (NOT_A_KNOB). A param on one
  *  of the provisional units ('unverified' / 'count' / 'pf') must also not be a selector on another
@@ -478,6 +494,45 @@ export function enumParams(profile: DeviceProfile, family: string, typeId?: numb
     floatSelectorIds.add(p.paramId);
     return true;
   });
+}
+
+/** The read-only visuals served with a gen-3 block's params: the family's role tables (forgefx-midi
+ *  visuals) resolved against THIS profile's catalog, so every role is the device's own paramId, limited
+ *  to the ids this response serves (knobs + selectors) and — when the block has a layout — STRICTLY to
+ *  the resolved layout variant's own controls (a sustain-only compressor type shows SUSTAIN, not THRESH →
+ *  gain reduction only; a comb-filter type shows no FREQ and no LFO → neither visual). A block without a
+ *  layout (DELAY) keeps every served role. Monitor roles (gain reduction) are never narrowed.
+ *
+ *  One exception: a variant whose pages share no page name with the family's Default variant (the
+ *  value-less one) is a partial variant that only ADDS pages to the Default ones — the REVERB types whose
+ *  only page is 'Pitch Shift' still have the Default's Basic page with Time / Pre-Delay. A visual the
+ *  strict pass drops is then resolved once more against the Default's controls PLUS the selected
+ *  variant's. Visuals the strict pass already keeps stay as they are (so e.g. the TREMOLO panner variant,
+ *  which also shares no page name with the Default 'Tremolo' page, does not pick up its depth knob).
+ *  Families without a Default variant (FILTER) stay strict. Exported for the mocked tests. */
+export function blockVisualsFor(
+  profile: DeviceProfile,
+  family: string,
+  layout: DeviceLayout | undefined,
+  servedIds: Iterable<number>,
+): BlockVisual[] {
+  if (!hasBlockVisuals(profile.model)) return [];
+  const served = new Set(servedIds);
+  const params = profile.params[family];
+  if (!layout) return resolveBlockVisuals(params, family, served);
+  const selectedIds = layoutParamIds(layout.pages);
+  const strict = resolveBlockVisuals(params, family, served, { layoutParamIds: selectedIds, pages: layout.pages });
+  if (layout.variantValue === null) return strict; // the selected variant IS a Default variant
+  const dflt = profile.layoutFor(family); // no type value → the value-less Default variant, if the family has one
+  if (!dflt || dflt.variantValue !== null) return strict;
+  const selectedNames = new Set(layout.pages.map((p) => p.name));
+  if (dflt.pages.some((p) => selectedNames.has(p.name))) return strict;
+  const union = new Set([...selectedIds, ...layoutParamIds(dflt.pages)]);
+  const relaxed = resolveBlockVisuals(params, family, served, { layoutParamIds: union, pages: [...layout.pages, ...dflt.pages] });
+  const strictKeys = new Set(strict.map((v) => v.key));
+  // keep the family's visual order: a strict visual where it exists, else the relaxed one
+  return relaxed.flatMap((v) => (strictKeys.has(v.key) ? strict.filter((s) => s.key === v.key) : [v]))
+    .concat(strict.filter((s) => !relaxed.some((v) => v.key === s.key)));
 }
 
 /** Append 1/2/3… to labels that repeat within a list (e.g. the cab's four "Low Cut" mic params),
@@ -746,6 +801,9 @@ class Gen3Driver implements DeviceDriver {
       modBind: !!profile.modModel,
       cabIrs: Object.keys(profile.cabIrs()).length > 0,
       editorLayouts: true, // FM3 / FM9 / Axe-Fx III all ship *_LAYOUTS (profile.layoutFor)
+      // Read-only block visuals (blockParams `visuals` + stamped layout graph slots): every model this
+      // driver serves has a catalog the codec's role tables resolve against.
+      blockVisuals: hasBlockVisuals(profile.model),
       supportsSave: true,
       // Live self-describe walk (fn 0x01 DEFINITION/ENUM-LABEL sweep) is HW-verified on the FM3 and
       // shares the gen-3 protocol on the FM9 / Axe-Fx III → the on-connect device-cache build is offered.
@@ -761,7 +819,9 @@ class Gen3Driver implements DeviceDriver {
       //    frames) → registry POLLS the open block instead (deviceEditWatch → readDeviceEditState below),
       //    the same poll-fallback shape as the AM4. Disable in the field via FORGEFX_FM3_EDITSYNC=0.
       deviceEditPush: profile.model !== 0x11,
-      deviceEditWatch: profile.model === 0x11 && process.env.FORGEFX_FM3_EDITSYNC !== '0'
+      deviceEditWatch: profile.model === 0x11 && process.env.FORGEFX_FM3_EDITSYNC !== '0',
+      // Scene Ignore + Bypass Mode tagged on the block-params response (codec blockStateParams: III/FM3/FM9).
+      blockState: hasBlockStateParams(profile.model)
     };
   }
 
@@ -958,7 +1018,12 @@ class Gen3Driver implements DeviceDriver {
     const what = target === EDIT_BUFFER ? 'edit buffer' : `slot ${target}`;
     let partial: number[][] = [];
     for (let attempt = 1; attempt <= 3; attempt++) {
+
       const plan = this.#dumpHeaderPlan(dev, target);
+      // The FM3 can pause for several hundred ms between the 0x77 header and its first 0x78 chunk (and
+      // needs ~5 s before it starts at all when its queue is busy). A 180 ms quiet gap aborted such a
+      // dump mid-read, retried, and piled another transfer onto the device's queue - which then starved
+      // every later slot. The 0x79 `settles` still ends a whole dump immediately.
       const frames = await dev.request(this.#codec.buildRequestPresetDump(target), presetDumpOpts(model, plan, slow ? 25000 : 5000, slow ? 1500 : 180));
       let whole = wholeDumps(frames, model, plan.named)[0];
       if (whole && headerNamesRequest(dumpHeaderNumber(whole[0]!), target)) this.#session(dev).learned.add(target === EDIT_BUFFER ? 'edit' : 'stored');
@@ -1426,7 +1491,9 @@ class Gen3Driver implements DeviceDriver {
   blockParams(eid: number, opts: BlockParamsOpts & { generic: true }): Promise<BlockParamsV2DTO>;
   blockParams(eid: number, opts?: BlockParamsOpts): Promise<BlockParamsDTO | BlockParamsV2DTO>;
   async blockParams(eid: number, opts?: BlockParamsOpts): Promise<BlockParamsDTO | BlockParamsV2DTO> {
-    this.#watchedEid = eid; // this is the block the user has open → the target the FM3 device-edit poll re-reads
+    // A background read (observe === false) must not retarget the device-edit watch: only the block the user has open is watched.
+    const observe = opts?.observe !== false;
+    if (observe) this.#watchedEid = eid; // this is the block the user has open → the target the FM3 device-edit poll re-reads
     const generic = opts?.generic === true;
     const codecSlug = slugForEffectId(eid) ?? ''; // audio blocks resolve via the codec
     // virtual effects (GLOBAL=1, Controllers=2, Modifier=3, FC=199) resolve via the profile's effectId map, and so do a
@@ -1453,7 +1520,7 @@ class Gen3Driver implements DeviceDriver {
     // it (every one is `non-positional`), so it is not read at all. The classic response still reads it.
     const read = generic && family === 'GLOBAL' && !hasChannels && index.positional === false
       ? this.#unreadNonPositional(eid)
-      : await this.#readBlock(eid, family, hasChannels, index);
+      : await this.#readBlock(eid, family, hasChannels, index, observe);
     const shared = { family, slug, blockName, page, hasChannels, read };
     return generic ? this.#paramsGeneric(shared, index) : this.#paramsClassic(shared, index);
   }
@@ -1468,7 +1535,7 @@ class Gen3Driver implements DeviceDriver {
   /** The block's status (active channel) and its fn-0x1F body, sliced to the active channel. Primes the
    *  device-edit baseline of a block whose body is indexed by param id; a family whose body is not (GLOBAL: one
    *  record per param, in id order) has no per-param information to diff and is never watched. */
-  async #readBlock(eid: number, family: string, hasChannels: boolean, index: BlockIndex): Promise<BlockRead> {
+  async #readBlock(eid: number, family: string, hasChannels: boolean, index: BlockIndex, observe = true): Promise<BlockRead> {
     const dev = await this.#conn();
     let channel: number | null = null;
     try {
@@ -1480,7 +1547,7 @@ class Gen3Driver implements DeviceDriver {
       const status = hasChannels ? (await this.#statusByEffectId()).get(eid) : undefined;
       channel = status ? status.channel : null;
       const activeCh = status?.channel ?? 0;
-      this.#watchedChannel = activeCh; // keep the device-edit-burst diff on the same channel (see decodeEditBurst)
+      if (observe) this.#watchedChannel = activeCh; // keep the device-edit-burst diff on the same channel (see decodeEditBurst)
       const frames = await this.#bulkRead(dev, eid, dev.slow ? 8000 : 2500, dev.slow ? 600 : 120);
       const bulk = this.#codec.assembleGen3BlockBulkRead(frames);
       const { stride, base, channelCount } = this.#channelSlice(family, bulk, activeCh, hasChannels);
@@ -1799,7 +1866,43 @@ class Gen3Driver implements DeviceDriver {
     // so identical names get a 1/2/3 suffix the UI can tell apart.
     dedupeLabels(named);
     dedupeLabels(enums);
-    return { block: c.blockName, slug, page: c.page, named, enums, type, layout };
+    // a failed read is not "the block has none": flag it, so the client says the block could not be read
+    const blockState: BlockStateDTO = !read.readError ? this.#blockState(family, enums) : { sceneIgnore: null, bypassMode: null, readError: true };
+    // ADDITIVE: the read-only displays this block can show, narrowed to its current type/variant (see
+    // blockVisualsFor). Last keys, so existing response consumers see the same leading shape.
+    const visuals = blockVisualsFor(this.#prof, family, layout, [...named.map((n) => n.id), ...enums.map((e) => e.id)]);
+    return { block: c.blockName, slug, page: c.page, named, enums, type, layout, blockState, visuals };
+  }
+
+  /** Tag the block's Scene Ignore + Bypass Mode (additive `blockState`, capability `blockState`). WHICH param
+   *  each one is comes from the codec (`blockStateParams`: by name in THIS model's catalog, with the firmware
+   *  gate); the VALUE is the active-channel enum just read into `enums`, so the header and the board's own
+   *  control can never disagree. A member is null when the family has no such param (a failed read is flagged by the caller). */
+  #blockState(family: string, enums: readonly EnumParam[]): BlockStateDTO {
+    const facts = blockStateParams(this.#prof.model, family);
+    let sceneIgnore: BlockStateDTO['sceneIgnore'] = null;
+    const si = facts.sceneIgnore;
+    const siEnum = si ? enums.find((e) => e.id === si.paramId) : undefined;
+    if (si && siEnum) {
+      const supported = firmwareAtLeast(this.#ctx.getFirmware?.() ?? null, si.minFw);
+      sceneIgnore = {
+        paramId: si.paramId,
+        value: siEnum.value,
+        supported,
+        ...(supported || !si.minFw ? {} : { reason: `Needs firmware ≥ ${formatBlockStateFirmware(si.minFw)}` })
+      };
+    }
+    let bypassMode: BlockStateDTO['bypassMode'] = null;
+    const bm = facts.bypassMode;
+    const bmEnum = bm ? enums.find((e) => e.id === bm.paramId) : undefined;
+    if (bm && bmEnum) {
+      bypassMode = {
+        paramId: bm.paramId,
+        value: bmEnum.value,
+        options: bmEnum.options.map((o) => ({ value: o.value, label: o.label, muting: isMutingBypassMode(o.label) }))
+      };
+    }
+    return { sceneIgnore, bypassMode };
   }
 
   /** The generic response (see blockParams): one item per index entry, in index order. */

@@ -2,7 +2,7 @@
 // pre-driver Device/Am4Device modules — their JSON shapes are the HTTP contract Axis consumes and
 // must not drift. `DeviceDriver` is the per-device surface the routes call; methods a device lacks
 // are optional and mirrored by `DriverCapabilities` so routes can answer 501 instead of guessing.
-import type { DecodedBlock } from 'forgefx-midi/devices/gen3';
+import type { DecodedBlock, BlockVisual } from 'forgefx-midi/devices/gen3';
 import type { TypeModel, DeviceLayout, DeviceProfile, ProfileSource } from '../devices.js';
 import type {
   HiddenParam, NameConfidence, NameSource, ParamKind, ParamSource, ParamWidget, ReadOnlyReason, WidgetSource, WriteMode
@@ -372,6 +372,11 @@ export interface BlockParamsDTO {
   named: NamedParam[]; enums: EnumParam[];
   type: { value: number; name: string } | null;
   layout?: DeviceLayout;
+  /** Additive `blockState`: the block's Scene Ignore + Bypass Mode on its active channel (gen-3
+   *  III/FM3/FM9, capability `blockState`). */
+  blockState?: BlockStateDTO;
+  /** Additive `visuals`: the read-only displays the block can show (capability `blockVisuals`). */
+  visuals?: BlockVisualDTO[];
 }
 /** The generic response (`?generic=1`): every param the block has on the connected device, values that are
  *  `null` where none could be resolved, and a `definitions` block. A client tells it from the classic one
@@ -387,7 +392,33 @@ export interface BlockParamsV2DTO extends Omit<BlockParamsDTO, 'named' | 'enums'
 export interface BlockParamsOpts {
   /** Serve the generic response. Drivers without it ignore the flag and answer the classic shape. */
   generic?: boolean;
+  /** Read live values (default true). `false` serves the block's definitions/named rows without a device
+   *  read: the Axis board build asks for the layout only, so opening a block does not queue behind the
+   *  telemetry poll on a busy serial link. */
+  observe?: boolean;
 }
+
+/** The block's Scene Ignore toggle on its ACTIVE channel (the param is per channel). `paramId` is the
+ *  device catalog's `<FAMILY>_SCENEIGNORE` id (codec `blockStateParams`) - the same id the block's
+ *  `enums[]` entry carries, so a write goes through the ordinary enum write (PUT .../params/:paramId,
+ *  continuous:false). `supported:false` + `reason` when the device firmware is known and below the
+ *  param's gate. */
+export interface BlockSceneIgnoreDTO { paramId: number; value: number; supported: boolean; reason?: string }
+/** The block's Bypass Mode selector (what the block does WHILE bypassed) on its active channel. Options are
+ *  the device's own labels; `muting` marks the modes that silence the block (codec `isMutingBypassMode`). */
+export interface BlockBypassModeDTO { paramId: number; value: number; options: { value: number; label: string; muting: boolean }[] }
+/** Additive `blockState` on the block-params response (gen-3 III / FM3 / FM9; capability `blockState`).
+ *  A null member = the block family has no such param. `readError: true` = the block's read failed, so
+ *  nothing is known about either param (both members null). */
+export interface BlockStateDTO { sceneIgnore: BlockSceneIgnoreDTO | null; bypassMode: BlockBypassModeDTO | null; readError?: true }
+/** ADDITIVE on the gen-3 block-params response: the read-only displays ("graphs") the block can show,
+ *  `{ key, kind, title, mode?, roles: { role: paramId } }` (forgefx-midi `BlockVisual`). Every role is a
+ *  paramId of THIS response (a served knob or selector, or a read-only monitor pid), already narrowed to
+ *  the block's current type/variant. Served only where `capabilities.blockVisuals` is true.
+ *  The served layout's graph slots carry the matching `graphKey`; a stamped key may have NO entry here
+ *  (the current variant lacks the visual's required params, or the key is 'eq') - clients treat such a
+ *  slot as a gap. Visuals without a stamped slot are offered but not anchored (e.g. DELAY, REVERB). */
+export type BlockVisualDTO = BlockVisual;
 export interface MeterVal { norm: number; value: number; unit?: string; min?: number; max?: number; log?: boolean; }
 /** One side (tap/hold) of an FC switch as read by the sub-0x01 structured read. `present` = the
  *  device returned a record whose config/side echo matched the request; `raw` = the 78-byte response
@@ -537,6 +568,11 @@ export interface DriverCapabilities {
   /** Editor-authentic block-editor UI layouts (v2 pages → rows → controls) served on the block-params
    *  `layout` field. True on the four devices that ship *_LAYOUTS (FM3 / FM9 / Axe-Fx III / AM4). */
   editorLayouts: boolean;
+  /** Read-only block visuals (`visuals` on the block-params response: role → paramId per display,
+   *  resolved against the device's own catalog and narrowed to the block's current type/variant), and
+   *  layout graph slots stamped with their normalised `graphKey`. Gen-3 grid units (FM3 / FM9 /
+   *  Axe-Fx III) only. */
+  blockVisuals: boolean;
   /** The server exposes GET/PUT /telemetry/config (cadence-mode control). Registry-level, not per-driver
    *  — advertised on every device so Axis can show the telemetry-mode control unconditionally. */
   telemetryControl?: boolean;
@@ -563,6 +599,9 @@ export interface DriverCapabilities {
    *  burst, so the registry installs a persistent RX listener that reflects them as `param` events
    *  via the driver's `decodeEditBurst()` (gen-3 — the push mirror of deviceEditWatch). Absent = no listener. */
   deviceEditPush?: boolean;
+  /** The block-params response carries `blockState` (Scene Ignore + Bypass Mode of the open block, tagged
+   *  from the codec's per-model catalog lookup). Gen-3 Axe-Fx III / FM3 / FM9 only; absent = false. */
+  blockState?: boolean;
 }
 
 /** What the registry hands each driver: the ONE shared transport (a single exclusive MIDI/serial
@@ -686,7 +725,7 @@ export interface DeviceDriver {
   >;
   liveMonitors?(onlyEid?: number): Promise<{ effectId: number; family: string; paramName: string; role: string; norm: number; db: number | null; minDb?: number; maxDb?: number }[]>;
   /** Looper page telemetry (GET /preset/looper): live waveform envelope (0..1 magnitudes) + playhead
-   *  position (0..1) + level (0..1). Empty when the block isn't a looper. gen-3 (capability liveMonitors). */
+   *  position (0..1) + level (0..1). Empty when the block isn't a looper. */
   looperTelemetry?(eid: number): Promise<{ wave: number[]; position: number | null; level: number | null }>;
   /** Toggle a looper transport control (POST /preset/looper/control). `action` ∈ record|play|stop|
    *  overdub|undo|once|reverse|half; `on` = 1.0/0.0. gen-3. */

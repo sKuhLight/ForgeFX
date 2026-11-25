@@ -59,6 +59,7 @@ import type {
   DeviceEditorLayouts, EditorBlockLayout, EditorLayoutVariant, EditorLayoutPage,
   EditorLayoutRow, EditorLayoutControl, EditorFwRange, EditorWidgetKind,
 } from 'forgefx-midi/gen3/fm3';
+import { stampGraphKeys } from 'forgefx-midi/gen3/fm3'; // pure, device-agnostic (visuals.ts re-export)
 import { AM4_LAYOUTS } from 'forgefx-midi/am4';
 import { devHookValue, processEnv } from './devHooks.js';
 
@@ -81,7 +82,9 @@ export type DeviceLayoutPage = Omit<EditorLayoutPage, 'rows'> & { rows: DeviceLa
 // layout: the block's editorName + family, plus which variant was chosen, plus ALL of that variant's
 // pages (tabs → rows → controls) passed through VERBATIM from the codec's *_LAYOUTS (widget / rawWidget /
 // placement / crossBlock / per-control fw preserved). No unioning across variants; the client renders
-// exactly the pages the editor would show for the current block type.
+// exactly the pages the editor would show for the current block type. A page's controls come in two places:
+// its `rows`, and (optional, absent when there are none) `pageControls`: the controls the editor places
+// directly on the page, e.g. the Synth's tracking mode. Both get the same per-control treatment.
 export type DeviceLayout = {
   editorName: string;
   family: string;
@@ -302,19 +305,27 @@ const filterPagesBySelector = (
 };
 
 // Drop the controls the firmware level `fw` does not show: a control whose firmware gate does not hold. On the
-// newest firmware that is every control with an `lt` bound (whether it also carries a `gtet` — a closed range —
-// or not); controls with a `gtet`-only gate or no gate always apply there. Untouched pages and rows stay shared.
+// newest firmware that is every control with an `lt` bound (whether it also carries a `gtet` - a closed range -
+// or not); controls with a `gtet`-only gate or no gate always apply there. One rule for row controls and
+// page-level ones (`pageControls`; the key goes with the last control it held). Untouched pages and rows stay shared.
 const pruneControlsByFw = (page: EditorLayoutPage, fw: number): EditorLayoutPage => {
   let touched = false;
-  const rows: EditorLayoutRow[] = page.rows.map((row) => {
-    const controls = row.controls.filter((c) => {
+  const prune = (controls: EditorLayoutRow['controls']): EditorLayoutRow['controls'] => {
+    const kept = controls.filter((c) => {
       const drop = !fwGateHolds(c.fw, fw);
       if (drop) touched = true;
       return !drop;
     });
-    return controls.length === row.controls.length ? row : { ...row, controls };
+    return kept.length === controls.length ? controls : kept;
+  };
+  const rows: EditorLayoutRow[] = page.rows.map((row) => {
+    const controls = prune(row.controls);
+    return controls === row.controls ? row : { ...row, controls };
   });
-  return touched ? { ...page, rows } : page;
+  const { pageControls, ...rest } = page;
+  const kept = pageControls && prune(pageControls);
+  if (!touched) return page;
+  return { ...rest, rows, ...(kept?.length ? { pageControls: kept } : {}) };
 };
 
 // Filter a variant's pages down to what the editor actually shows for the block's current state on the connected
@@ -349,7 +360,10 @@ const resolvePagesAt = (pages: EditorLayoutPage[], typeValue: number | undefined
 // Resolve a family's editor layout to the wire DeviceLayout for the block's CURRENT state on the connected firmware
 // (`firmware`, the newest when not known): the variant per selectVariant, its pages filtered to the current
 // selector/firmware state (see resolveLayoutPages). A known firmware no variant exists on resolves as the newest.
-const layoutFrom = (layouts: DeviceEditorLayouts, preferredVariant: Record<string, string> = {}) =>
+// `graphKeys` (gen-3 grid units): stamp every graph slot with its normalised visual key (forgefx-midi
+// stampGraphKeys → `graphKey` on the control), so a client can anchor the served `visuals` at the slot
+// without knowing the raw widget tokens. Additive; slots without a visual stay unstamped.
+const layoutFrom = (layouts: DeviceEditorLayouts, preferredVariant: Record<string, string> = {}, opts: { graphKeys?: boolean } = {}) =>
   (family: string, typeValue?: number, selectors?: SelectorValues, firmware?: LayoutFirmware): DeviceLayout | undefined => {
     const block = layouts[family];
     if (!block) return undefined;
@@ -359,6 +373,7 @@ const layoutFrom = (layouts: DeviceEditorLayouts, preferredVariant: Record<strin
     // the variant was picked on the newest firmware when none exists on the connected one: its pages are resolved
     // on that level too, so the block is never served a variant without pages
     if (fw !== NEWEST_FW && !(fwGateHolds(variant.fw, fw) && variant.pages.some((p) => fwGateHolds(p.fw, fw)))) fw = NEWEST_FW;
+    const pages = resolvePagesAt(variant.pages, typeValue, selectors, fw);
     return {
       editorName: block.editorName,
       family: block.family,
@@ -366,7 +381,7 @@ const layoutFrom = (layouts: DeviceEditorLayouts, preferredVariant: Record<strin
       variantValue: variant.value,
       ...(variant.fw ? { fw: variant.fw } : {}),
       ...(variant.pinned ? { pinned: true } : {}),
-      pages: resolvePagesAt(variant.pages, typeValue, selectors, fw),
+      pages: opts.graphKeys ? stampGraphKeys(block.family, pages) : pages,
     };
   };
 
@@ -767,7 +782,7 @@ export const PROFILES: Record<number, DeviceProfile> = {
     // the III effect-id table (FORGEFX-45): every family's first effect id, the six `roster` ids served read-only
     familyForEffectId: eidFamily(AXE3_FAMILY_BY_EFFECT_ID as Record<number, string>),
     blockMapFor: axe3RosterEntry,
-    layoutFor: layoutFrom(AXE3_LAYOUTS as unknown as DeviceEditorLayouts),
+    layoutFor: layoutFrom(AXE3_LAYOUTS as unknown as DeviceEditorLayouts, {}, { graphKeys: true }),
     editorLayouts: AXE3_LAYOUTS as unknown as DeviceEditorLayouts,
     catalogFirmware: AXE3_CATALOG_BASELINE.firmware,
     fcModel: AXE3_FC_MODEL,
@@ -786,7 +801,7 @@ export const PROFILES: Record<number, DeviceProfile> = {
     enumLabelsFor: fm3EnumLabels,
     cabIrs: () => fm3CabIrs, // device-true IR names per bank (fractal-midi FM3_CAB_IRS)
     familyForEffectId: eidFamily(FM3_FAMILY_BY_EFFECT_ID as Record<number, string>),
-    layoutFor: layoutFrom(FM3_LAYOUTS as unknown as DeviceEditorLayouts),
+    layoutFor: layoutFrom(FM3_LAYOUTS as unknown as DeviceEditorLayouts, {}, { graphKeys: true }),
     editorLayouts: FM3_LAYOUTS as unknown as DeviceEditorLayouts,
     catalogFirmware: FM3_CATALOG_BASELINE.firmware,
     fcModel: FM3_FC_MODEL,
@@ -805,7 +820,7 @@ export const PROFILES: Record<number, DeviceProfile> = {
     enumLabelsFor: fm9EnumLabels,
     cabIrs: () => FM9_CAB_IRS as unknown as Record<string, string[]>, // factory banks bundled (FM9-Edit cache 76p0); USER banks read live
     familyForEffectId: eidFamily(FM9_FAMILY_BY_EFFECT_ID as Record<number, string>),
-    layoutFor: layoutFrom(FM9_LAYOUTS as unknown as DeviceEditorLayouts),
+    layoutFor: layoutFrom(FM9_LAYOUTS as unknown as DeviceEditorLayouts, {}, { graphKeys: true }),
     editorLayouts: FM9_LAYOUTS as unknown as DeviceEditorLayouts,
     catalogFirmware: FM9_CATALOG_BASELINE.firmware,
     fcModel: FM9_FC_MODEL,

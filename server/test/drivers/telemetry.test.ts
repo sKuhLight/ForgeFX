@@ -111,6 +111,7 @@ async function echoGuardSuppression(): Promise<void> {
   const reg = makeReg(serial(mock), mock);
   reg.__seedDriver(0x11, fake);
   await reg.detect(); // activates the fake (deviceEditPush) over the open transport
+  reg.setMeterDemand(true);
   const unsub = reg.subscribe(() => {}); // attaches the edit-push RX listener
   const t = await reg.transport();
 
@@ -166,6 +167,7 @@ async function yieldStarvation(): Promise<void> {
     reg.setTelemetryMode('performance');
     await reg.transport();
     const base = mock.sent.length;
+    reg.setMeterDemand(true);
     const unsub = reg.subscribe(() => {});
     await sleep(WINDOW);
     unsub();
@@ -190,6 +192,7 @@ async function yieldStarvation(): Promise<void> {
     const t = await reg.transport();
     const held = t.request([0x11, 0x22, 0x33]); // interactive, in flight for the whole window
     const base = mock.sent.length;
+    reg.setMeterDemand(true);
     const unsub = reg.subscribe(() => {});
     await sleep(WINDOW);
     unsub();

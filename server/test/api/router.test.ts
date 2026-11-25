@@ -288,7 +288,7 @@ async function classicDriverGenericParity(): Promise<void> {
     assert(deepEq(bodies['/preset/blocks/58/params'], bodies['/preset/blocks/58/params?generic=1']), 'AM4: ?generic=1 answers the same body as the classic request');
     assert(deepEq(bodies['/preset/blocks/58/params'], classic), 'AM4: the body is the driver\'s, untouched');
     // the flag still reached the driver on both surfaces; the driver simply has no use for it
-    assertEqual(JSON.stringify(calls), JSON.stringify([[58, { generic: false }], [58, { generic: false }], [58, { generic: true }], [58, { generic: true }]]), 'AM4: the flag is handed to the driver on both surfaces');
+    assertEqual(JSON.stringify(calls), JSON.stringify([[58, { observe: true, generic: false }], [58, { observe: true, generic: false }], [58, { observe: true, generic: true }], [58, { observe: true, generic: true }]]), 'AM4: the flags are handed to the driver on both surfaces');
   } finally {
     await app.close();
   }

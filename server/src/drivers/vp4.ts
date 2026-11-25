@@ -64,6 +64,7 @@ class Vp4Driver implements DeviceDriver {
     modBind: false,
     cabIrs: false,
     editorLayouts: false, // no VP4 editor layouts shipped yet
+    blockVisuals: false, // block visuals are gen-3 grid units (FM3 / FM9 / Axe-Fx III) only
     supportsSave: true, // save is allowlisted (byte-exact captured; community-beta)
     // gen-3 self-describe is expected to work over the VP4's shared codec but is hardware-unverified —
     // keep the on-connect cache build off until a VP4 walk is captured, then flip this to true.

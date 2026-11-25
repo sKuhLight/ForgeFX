@@ -8,8 +8,12 @@
 //   • a non-enum selector (REVERB_BASETYPE, also beyond its catalog row's top ordinal; LOOPER_DUB) keys its variant by
 //     the raw body value, not a dial reading;
 //   • v2 passthrough: pages → rows → controls carry widget/rawWidget/placement/crossBlock verbatim;
+//   • page-level controls (`pageControls`): served beside the rows with the same per-control treatment;
 //   • AM4 gets a layout for the first time (family mapping via am4LayoutFor).
 import { PROFILES, am4LayoutFor, resolveLayoutPages, type DeviceLayout, type SelectorValues } from '../../src/devices.js';
+import { EDITOR_WIDGET_KINDS, FM3_LAYOUTS, FM3_PARAMS_BY_FAMILY, type DeviceEditorLayouts, type EditorLayoutControl, type EditorLayoutPage } from 'forgefx-midi/gen3/fm3';
+import { FM9_LAYOUTS } from 'forgefx-midi/gen3/fm9';
+import { AXE3_LAYOUTS } from 'forgefx-midi/gen3/axe-fx-iii';
 import { EDITOR_WIDGET_KINDS, type EditorLayoutPage } from 'forgefx-midi/gen3/fm3';
 import { mockBlockDevice, eidOfSlug, blockBulkFrames, compactHex, enc14, sysex } from '../helpers/blockRead.js';
 import { MockTransport, handshakeReply, isIdentifyBroadcast } from '../helpers/mock.js';
@@ -28,20 +32,32 @@ function* controlsOf(l: DeviceLayout) {
   for (const p of l.pages) for (const r of p.rows) for (const c of r.controls) yield { page: p, row: r, control: c };
 }
 
+// Every control of one page: its rows' controls, then its page-level ones.
+const pageAll = (p: EditorLayoutPage): EditorLayoutControl[] => [...p.rows.flatMap((r) => r.controls), ...(p.pageControls ?? [])];
+// The page-level controls of `param` per page of a resolved layout: page name → its controls.
+const pageLevel = (l: DeviceLayout | undefined, param: string): Array<[string, EditorLayoutControl[]]> =>
+  (l?.pages ?? []).map((p): [string, EditorLayoutControl[]] => [p.name, (p.pageControls ?? []).filter((c) => c.paramName === param)])
+    .filter(([, cs]) => cs.length > 0);
+
 // A resolved layout is v2-shaped and every control passes the codec fields through unchanged.
 function shapeOk(l: DeviceLayout): boolean {
   if (typeof l.editorName !== 'string' || typeof l.family !== 'string') return false;
   if (typeof l.variantName !== 'string') return false;
   if (!(l.variantValue === null || typeof l.variantValue === 'string')) return false;
   if (!Array.isArray(l.pages) || l.pages.length === 0) return false;
-  for (const { page, row, control } of controlsOf(l)) {
+  for (const { page, row } of controlsOf(l)) {
     if (typeof page.name !== 'string' || !Array.isArray(page.rows)) return false;
     if (row.section !== 'parameters' && row.section !== 'mixer') return false;
-    if (typeof control.label !== 'string') return false;
-    if (!(EDITOR_WIDGET_KINDS as readonly string[]).includes(control.widget)) return false;
-    if (typeof control.rawWidget !== 'string') return false;
-    if (!(control.paramName === null || typeof control.paramName === 'string')) return false;
-    if (!(control.paramId === null || typeof control.paramId === 'number')) return false;
+  }
+  for (const page of l.pages) {
+    if (page.pageControls !== undefined && !(Array.isArray(page.pageControls) && page.pageControls.length > 0)) return false;
+    for (const control of pageAll(page)) {
+      if (typeof control.label !== 'string') return false;
+      if (!(EDITOR_WIDGET_KINDS as readonly string[]).includes(control.widget)) return false;
+      if (typeof control.rawWidget !== 'string') return false;
+      if (!(control.paramName === null || typeof control.paramName === 'string')) return false;
+      if (!(control.paramId === null || typeof control.paramId === 'number')) return false;
+    }
   }
   return true;
 }
@@ -196,6 +212,108 @@ const checks: Array<{ name: string; ok: () => boolean }> = [
     const byName = new Map<string, number>();
     for (const p of l.pages) byName.set(p.name, (byName.get(p.name) ?? 0) + 1);
     return [...byName.values()].every((c) => c === 1); } },
+
+  // ── page-level controls (FORGEFX-59): the controls the editor places directly on a page, beside its rows ──
+  { name: 'Synth: the tracking mode is served on all three voice pages (FM3 / FM9 / III), verbatim from the codec', ok: () => {
+    // Gates are not evaluated against the connected firmware (rows neither): a `gtet`-only gate always serves,
+    // and travels along in `fw` so a client can apply it.
+    const want: Array<[DeviceLayout | undefined, string]> = [
+      [fm3.layoutFor('SYNTH', 0), '11,01'], [fm9.layoutFor('SYNTH', 0), '10,01'], [axe3.layoutFor('SYNTH', 0), '29,02'],
+    ];
+    return want.every(([l, gtet]) => {
+      const hits = pageLevel(l, 'SYNTH_PD_RANGE');
+      return hits.map(([n]) => n).join(',') === 'Voice 1,Voice 2,Voice 3'
+        && hits.every(([, cs]) => cs.length === 1 && JSON.stringify(cs[0]) === JSON.stringify({
+          label: 'Tracking\nMode', paramName: 'SYNTH_PD_RANGE', paramId: 41, widget: 'dropdown', rawWidget: 'dropdown1Tight',
+          placement: { positionExact: '196,230' }, fw: { gtet },
+        }));
+    }); } },
+  { name: 'Synth: the served tracking mode is a catalog param of the block, and no row shows it', ok: () => {
+    const l = fm3.layoutFor('SYNTH');
+    const pid = pageLevel(l, 'SYNTH_PD_RANGE')[0]?.[1][0]?.paramId;
+    const inRows = [...controlsOf(l!)].some(({ control }) => control.paramName === 'SYNTH_PD_RANGE');
+    return FM3_PARAMS_BY_FAMILY.SYNTH!.some((p) => p.name === 'SYNTH_PD_RANGE' && p.paramId === pid) && !inRows; } },
+  { name: 'FM3 amp: the EQ page serves its page-level type / location / zero / on-off controls, in editor order', ok: () => {
+    const sel: SelectorValues = (n) => (n === 'DISTORT_TYPE' ? 29 : undefined);
+    const l = fm3.layoutFor('DISTORT', 29, sel);
+    const hits = pageLevel(l, 'DISTORT_EQTYPE');
+    const page = l?.pages.find((p) => p.name === hits[0]?.[0]);
+    return hits.length === 1
+      && (page?.pageControls ?? []).filter((c) => c.paramName).map((c) => c.paramName).join(',') === 'DISTORT_EQTYPE,DISTORT_EQPOSITION,DISTORT_ZEROEQ,DISTORT_EQONOFF'; } },
+  { name: 'FM3 drive: every type with a page-level graphic-EQ switch gets the current-firmware one only', ok: () => {
+    // the editor carries it twice: a toggle below firmware 3.00, a dropdown from 3.00 on
+    let pages = 0;
+    for (const v of FM3_LAYOUTS.FUZZ!.variants) {
+      const l = fm3.layoutFor('FUZZ', v.value === null ? undefined : Number(v.value.split(',')[0]));
+      for (const [, cs] of pageLevel(l, 'FUZZ_EQON')) {
+        pages++;
+        if (cs.length !== 1 || cs[0]!.fw?.gtet !== '3,00' || cs[0]!.widget !== 'dropdown') return false;
+      }
+    }
+    return pages >= 10; } },
+  { name: 'no served page carries an lt-gated control, in a row or page-level (FM3 / FM9 / III: every family of each, without a type and at every value its variants and pages name)', ok: () => {
+    const devices: Array<[typeof fm3, DeviceEditorLayouts]> = [[fm3, FM3_LAYOUTS], [fm9, FM9_LAYOUTS], [axe3, AXE3_LAYOUTS]];
+    let gated = 0; // page-level lt gates in the codec data, so the check cannot pass on data without any
+    for (const [prof, layouts] of devices) {
+      for (const [fam, block] of Object.entries(layouts)) {
+        const pages = block.variants.flatMap((v) => v.pages);
+        for (const p of pages) gated += (p.pageControls ?? []).filter((c) => c.fw?.lt != null).length;
+        const values = [...block.variants.map((v) => v.value), ...pages.map((p) => p.value ?? null)]
+          .flatMap((v) => (v ?? '').split(',').filter((s) => s.trim() !== '').map(Number));
+        for (const t of [undefined, ...new Set(values)]) {
+          const served = prof.layoutFor(fam, t)?.pages;
+          if (!served?.length || served.some((p) => pageAll(p).some((c) => c.fw?.lt != null))) return false;
+        }
+      }
+    }
+    return gated > 0; } },
+  { name: "a served page-level paramId is a catalog param of the block's own family (FM3 / FM9 / III, every variant); another family's has none", ok: () => {
+    const devices: Array<[typeof fm3, DeviceEditorLayouts]> = [[fm3, FM3_LAYOUTS], [fm9, FM9_LAYOUTS], [axe3, AXE3_LAYOUTS]];
+    return devices.every(([prof, layouts]) => Object.entries(layouts).every(([fam, block]) => {
+      const own = new Map((prof.params[fam] ?? []).map((p) => [p.name, p.paramId]));
+      return block.variants.every((v) => resolveLayoutPages(v.pages).every((p) => (p.pageControls ?? []).every((c) =>
+        c.crossBlock !== undefined || c.paramId === (own.get(c.paramName ?? '') ?? null))));
+    })); } },
+  { name: 'AM4: the graphic EQ and amp pages serve their page-level controls', ok: () =>
+    pageLevel(am4LayoutFor('geq', 0), 'GEQ_MASTERQ').length > 0 && pageLevel(am4LayoutFor('amp', 7), 'DISTORT_EQTYPE').length > 0 },
+  { name: 'page-level control fw pruning: same rule as rows (lt-bounded dropped, gtet/ungated kept, order kept)', ok: () => {
+    const c = (label: string, fw?: EditorLayoutControl['fw']): EditorLayoutControl => ({ label, paramName: label, paramId: 1, widget: 'knob', rawWidget: 'knob', ...(fw ? { fw } : {}) });
+    const out = resolveLayoutPages([{ name: 'P', rows: [], pageControls: [
+      c('plain'), c('gtet', { gtet: '6,00' }), c('lt', { lt: '10,00' }), c('range', { gtet: '6,00', lt: '10,00' }), c('last'),
+    ] }]);
+    return out[0]!.pageControls!.map((x) => x.label).join(',') === 'plain,gtet,last'; } },
+  { name: 'page-level controls: the key is absent once every one is pruned; rows and the rest of the page stay', ok: () => {
+    const row = { section: 'parameters' as const, controls: [{ label: 'R', paramName: 'R', paramId: 2, widget: 'knob' as const, rawWidget: 'knob' }] };
+    const out = resolveLayoutPages([{ name: 'P', pageNum: 3, rows: [row], pageControls: [
+      { label: 'old', paramName: 'A', paramId: 1, widget: 'knob', rawWidget: 'knob', fw: { lt: '3,00' } },
+    ] }]);
+    return !('pageControls' in out[0]!) && out[0]!.pageNum === 3 && out[0]!.rows.length === 1 && out[0]!.rows[0] === row; } },
+  { name: 'page-level controls: pruning a row keeps them, pruning them keeps the rows; an untouched page is passed as is', ok: () => {
+    const c = (label: string, lt?: string): EditorLayoutControl => ({ label, paramName: label, paramId: 1, widget: 'knob', rawWidget: 'knob', ...(lt ? { fw: { lt } } : {}) });
+    const rowOnly: EditorLayoutPage = { name: 'A', rows: [{ section: 'parameters', controls: [c('r'), c('r-old', '2,00')] }], pageControls: [c('p')] };
+    const pageOnly: EditorLayoutPage = { name: 'B', rows: [{ section: 'parameters', controls: [c('r')] }], pageControls: [c('p-old', '2,00'), c('p')] };
+    const clean: EditorLayoutPage = { name: 'C', rows: [{ section: 'parameters', controls: [c('r')] }], pageControls: [c('p')] };
+    const [a, b, d] = resolveLayoutPages([rowOnly, pageOnly, clean]);
+    return pageAll(a!).map((x) => x.label).join(',') === 'r,p' && a!.pageControls === rowOnly.pageControls
+      && pageAll(b!).map((x) => x.label).join(',') === 'r,p' && b!.rows[0] === pageOnly.rows[0]
+      && d === clean && pageOnly.pageControls!.length === 2; } },
+  { name: 'page-level controls: cross-block reference, placement and decorative entries pass through verbatim; a page of them alone is served', ok: () => {
+    const pageControls: EditorLayoutControl[] = [
+      { label: 'VOICE 1', paramName: null, paramId: null, widget: 'label', rawWidget: 'sectionLabel', placement: { positionExact: '305,29' } },
+      { label: 'Tempo', paramName: 'GLOBAL_TEMPO', paramId: 9, widget: 'knob', rawWidget: 'knob', crossBlock: { effect: 'ID_GLOBAL', family: 'GLOBAL', paramName: 'GLOBAL_TEMPO', paramId: 9 } },
+    ];
+    const out = resolveLayoutPages([{ name: 'P', rows: [], pageControls }]);
+    return out.length === 1 && out[0]!.rows.length === 0 && out[0]!.pageControls === pageControls; } },
+  { name: 'page-level controls follow their page through selector and firmware sibling selection', ok: () => {
+    const c = (label: string): EditorLayoutControl => ({ label, paramName: label, paramId: 1, widget: 'knob', rawWidget: 'knob' });
+    const pages: EditorLayoutPage[] = [
+      { name: 'P', rows: [], selectorParamName: 'SEL', value: '1', pageControls: [c('one')] },
+      { name: 'P', rows: [], selectorParamName: 'SEL', value: '2', pageControls: [c('two')] },
+      { name: 'F', rows: [], fw: { lt: '3,00' }, pageControls: [c('old')] },
+      { name: 'F', rows: [], fw: { gtet: '3,00' }, pageControls: [c('new')] },
+    ];
+    const out = resolveLayoutPages(pages, undefined, (n) => (n === 'SEL' ? 2 : undefined));
+    return out.map((p) => p.pageControls!.map((x) => x.label).join()).join(',') === 'two,new'; } },
 
   // ── page filtering: split (single-selector) families with selector-free variant pages are unaffected ──
   { name: 'split family (selector-free variant pages) passes through unchanged', ok: () => {

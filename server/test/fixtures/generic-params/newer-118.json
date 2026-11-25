@@ -93,6 +93,17 @@
       },
       {
         "name": "Graphic EQ",
+        "pageControls": [
+          {
+            "fw": {"gtet":"3,00"},
+            "label": "Graphic EQ",
+            "paramId": 21,
+            "paramName": "FUZZ_EQON",
+            "placement": {"positionExact":"196,230"},
+            "rawWidget": "dropdown1",
+            "widget": "dropdown"
+          }
+        ],
         "pageNum": 2,
         "rows": [
           {
@@ -131,6 +142,7 @@
       {
         "fw": {"gtet":"11,01"},
         "name": "Advanced",
+        "pageControls": [{"label":"LO FI","paramId":null,"paramName":null,"placement":{"positionExact":"645,209"},"rawWidget":"sectionLabel","widget":"label"}],
         "pageNum": 3,
         "rows": [
           {

@@ -32,6 +32,30 @@ To move a block, clear the source cell first, then place it at the destination.
 5-septet float32 — for a knob it's the normalized 0..1 value; for a model/type select it's the
 roster ordinal as a float.
 
+### Block state: Scene Ignore and Bypass Mode
+
+Both are ordinary per-block enum params of the block's ACTIVE channel: `<FAMILY>_SCENEIGNORE` (OFF / ON —
+with ON the block keeps its state on scene changes) and `<FAMILY>_BYPASSMODE` (THRU / MUTE / MUTE IN / MUTE OUT /
+MUTE FX IN / MUTE FX OUT, 2–5 per block; it only acts while the block is bypassed). Their ids differ per model and
+family (amp: FM3 137, FM9 6, Axe-Fx III 135), so the gen-3 driver resolves them through the codec
+(`blockStateParams(model, family)`, by name in the model's own catalog, with the firmware gate) and tags them on
+`GET /preset/blocks/:eid/params` as the additive `blockState`:
+
+```json
+"blockState": {
+  "sceneIgnore": { "paramId": 137, "value": 1, "supported": true },
+  "bypassMode": { "paramId": 3, "value": 0, "options": [{ "value": 0, "label": "THRU", "muting": false }, { "value": 1, "label": "MUTE", "muting": true }] }
+}
+```
+
+`supported:false` + `reason` ("Needs firmware ≥ 5.03") when the unit's firmware is known and below the gate; a
+member is `null` when the family has no such param; when the block's read fails the tag is
+`{ "sceneIgnore": null, "bypassMode": null, "readError": true }` (unknown, not "none"). Capability `blockState` (gen-3 Axe-Fx III / FM3 / FM9; false on
+the VP4, whose discrete writes are not decoded, and on every other device). There is no dedicated route: the client
+writes them with the ordinary enum write (`PUT /preset/blocks/:eid/params/:paramId`, `continuous:false` → fn `0x01`
+sub `0x09 00`, `float32(ordinal)`). That write shape is hardware-verified for type selects; for these two params it
+is inferred (same opcode, same discrete encoding) until confirmed on a unit.
+
 ## Accept / reject model
 
 The device sends **nothing on accept** (except store — see Safety). On rejection it returns a `0x64`

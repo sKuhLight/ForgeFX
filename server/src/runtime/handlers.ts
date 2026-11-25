@@ -111,13 +111,14 @@ export function createUnifiedHandlers(registry: DeviceRegistry) {
     } catch (e) { return decodeFail(reply, 'scene-state', e); }
   };
   // `opts.generic` (the `?generic=1` query on both surfaces) asks for the generic response; a driver without
-  // it ignores the flag and answers the classic shape.
+  // it ignores the flag and answers the classic shape. `opts.observe: false` (`?observe=0`) serves the
+  // definitions without a device read.
   const blockParamsH = async (reply: StatusSink, addr: number, opts?: BlockParamsOpts) => {
     try {
       const d = await driver();
       if (!d.blockParams) return unsupported(reply, 'blockParams');
       return await d.blockParams(addr, opts);
-    } catch (e) { reply.code(404); return { error: (e as Error).message }; }
+    } catch (e) { reply.code(503); return { error: (e as Error).message }; }
   };
   // Unified param write: {value, continuous}. continuous:true → the driver's normalized write
   // (gen-3 continuous SET; AM4 SET_NORM with value as 0..1), continuous:false → discrete ordinal.
@@ -207,12 +208,18 @@ export function createUnifiedHandlers(registry: DeviceRegistry) {
   // its resolved cadence + the mode list; PUT switches the mode (400 on an unknown value) and the
   // setter emits a `telemetryConfig` event so every live UI reflects it.
   const telemetryConfigH = () => registry.getTelemetryConfig();
-  const telemetrySetH = (reply: StatusSink, mode?: string) => {
-    if (mode == null || !registry.telemetryModes().includes(mode as never)) {
+  const telemetrySetH = (reply: StatusSink, mode?: string, meters?: boolean) => {
+    if (mode == null && typeof meters !== 'boolean') {
+      reply.code(400);
+      return { error: 'mode or meters is required', modes: registry.telemetryModes() };
+    }
+    if (mode != null && !registry.telemetryModes().includes(mode as never)) {
       reply.code(400);
       return { error: 'unknown mode', modes: registry.telemetryModes() };
     }
-    return registry.setTelemetryMode(mode);
+    if (mode != null) registry.setTelemetryMode(mode);
+    if (typeof meters === 'boolean') registry.setMeterDemand(meters);
+    return registry.getTelemetryConfig();
   };
   // Offline preset decode with model-byte dispatch: sniff frame[4] of the first F0 frame. 0x15 →
   // the AM4 offline decoder (works whatever unit is attached — decode touches no transport);

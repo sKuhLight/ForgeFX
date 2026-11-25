@@ -24,8 +24,10 @@ import { runChannelSliceTests, CHANNEL_SLICE_CASE_COUNT } from './drivers/channe
 import { runWalkReclassificationTests, WALK_RECLASSIFICATION_CASE_COUNT } from './drivers/walk-reclassification.test.js';
 import { runKnobUnitsTests, KNOB_UNITS_CASE_COUNT } from './drivers/knob-units.test.js';
 import { runFloatRowSelectorsTests, FLOAT_ROW_SELECTORS_CASE_COUNT } from './drivers/float-row-selectors.test.js';
+import { runBlockStateTests, BLOCK_STATE_CASE_COUNT } from './drivers/block-state.test.js';
 import { runTablesTests, TABLES_CASE_COUNT } from './drivers/tables.test.js';
 import { runLayoutsTests, LAYOUTS_CASE_COUNT } from './drivers/layouts.test.js';
+import { runBlockVisualsTests, BLOCK_VISUALS_CASE_COUNT } from './drivers/block-visuals.test.js';
 import { runProfileFactsTests, PROFILE_FACTS_CASE_COUNT } from './drivers/profile-facts.test.js';
 import { runSelectorsTests, SELECTORS_CASE_COUNT } from './drivers/selectors.test.js';
 import { runParamIndexTests, PARAM_INDEX_CASE_COUNT } from './drivers/param-index.test.js';
@@ -94,8 +96,10 @@ const tests: Array<{ name: string; run: () => void | Promise<void> }> = [
   { name: `drivers/walk-reclassification (${WALK_RECLASSIFICATION_CASE_COUNT} cases, non-byte-exact profiles never reclassify a catalog kind; editor-cache / cloud-from-cache override)`, run: runWalkReclassificationTests },
   { name: `drivers/knob-units (${KNOB_UNITS_CASE_COUNT} cases, knob selection: continuous units in, selectors and steppers out)`, run: runKnobUnitsTests },
   { name: `drivers/float-row-selectors (${FLOAT_ROW_SELECTORS_CASE_COUNT} cases, float-row selectors: the III global-mix toggles list as enums, nothing else changes category)`, run: runFloatRowSelectorsTests },
+  { name: `drivers/block-state (${BLOCK_STATE_CASE_COUNT} cases, Scene Ignore + Bypass Mode tagged per model: ids FM3 137 / FM9 6 / III 135, values per active channel, write frames, firmware gate, a failed read flagged, caps)`, run: runBlockStateTests },
   { name: `drivers/tables (${TABLES_CASE_COUNT} identity checks, paramId cross-contamination guard)`, run: runTablesTests },
   { name: `drivers/layouts (${LAYOUTS_CASE_COUNT} editor-layout v2 variant-selection + passthrough)`, run: runLayoutsTests },
+  { name: `drivers/block-visuals (${BLOCK_VISUALS_CASE_COUNT} cases, caps flag per model, blockParams visuals narrowed to the current variant with device-own ids, DELAY without layout, CONTROLLERS instances, AMP Input/Output EQ, stamped layout graph slots, route passthrough; mocked)`, run: runBlockVisualsTests },
   { name: `drivers/profile-facts (${PROFILE_FACTS_CASE_COUNT} cases, runtime-profile provenance + applied rows + section-assignment suspects, registry reverts to the bundled profile after a delete / a firmware without a profile / an unknown firmware; synthetic + catalog data, mocked)`, run: runProfileFactsTests },
   { name: `drivers/selectors (${SELECTORS_CASE_COUNT} cases, type vs variant selector per device, layout widget index: ownership, pseudo ids, conflicts, memo; catalog + synthetic)`, run: runSelectorsTests },
   { name: `drivers/param-index (${PARAM_INDEX_CASE_COUNT} cases, catalog/profile reconciliation: the five cases + unnamed, name shift + guards, live never hides, byte-exact removal, suspect family, widget/write table, FM3 goldens, no enum in named over FM3/FM9/III; synthetic + catalog)`, run: runParamIndexTests },

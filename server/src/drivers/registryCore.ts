@@ -111,7 +111,7 @@ export function diagnosticCaptureSupported(modelId: number, caps: Pick<DriverCap
 
 /** The /telemetry/config DTO both surfaces serve: the current mode, its resolved cadence, and the
  *  full mode list. Cumulative-counter-free — traffic rides the SSE `traffic` event + /diag. */
-export interface TelemetryConfigDto { mode: TelemetryMode; effective: CadenceProfile; modes: readonly TelemetryMode[]; }
+export interface TelemetryConfigDto { mode: TelemetryMode; effective: CadenceProfile; modes: readonly TelemetryMode[]; meters: boolean; }
 
 const DESCRIPTOR_BY_MODEL: Record<number, { capabilities: Record<string, unknown> }> = {
   0x01: AXEFXGEN1_DESCRIPTOR as never,
@@ -330,6 +330,7 @@ export class DeviceRegistry {
 
   // ── telemetry cadence mode (in-memory; resets to the balanced default on restart) ──
   #telemetryMode: TelemetryMode = 'balanced';
+  #meterDemand = false;
   /** The cadence bundle for the CURRENT mode + the ACTIVE driver's model family (falls back to the
    *  detected/provisional model, then generic). Resolved AT CALL TIME so a mode switch applies on the
    *  next reschedule of every loop without touching timers directly. */
@@ -339,7 +340,7 @@ export class DeviceRegistry {
   }
   /** GET /telemetry/config payload. */
   getTelemetryConfig(): TelemetryConfigDto {
-    return { mode: this.#telemetryMode, effective: this.#cadence(), modes: TELEMETRY_MODES };
+    return { mode: this.#telemetryMode, effective: this.#cadence(), modes: TELEMETRY_MODES, meters: this.#meterDemand };
   }
   /** Set the cadence mode (PUT /telemetry/config). Validates, stores in-memory, and emits a
    *  `telemetryConfig` event so every live UI reflects it. Throws on an unknown mode (the route maps
@@ -348,6 +349,13 @@ export class DeviceRegistry {
     if (!isTelemetryMode(mode)) throw new Error(`unknown telemetry mode '${mode}'`);
     this.#telemetryMode = mode;
     this.#emit({ type: 'telemetryConfig', mode });
+    return this.getTelemetryConfig();
+  }
+  /** Turn the server's meter round-robin on or off. Off by default: it runs only while a client has its meters on. */
+  setMeterDemand(on: boolean): TelemetryConfigDto {
+    this.#meterDemand = on;
+    if (on) this.#startMeters();
+    else this.#stopMeters();
     return this.getTelemetryConfig();
   }
   /** The accepted mode set — the route uses it to 400 an unknown value before calling the setter. */
@@ -633,6 +641,15 @@ export class DeviceRegistry {
       versionStore: !!d.dumpRaw && !!d.loadPresetBytes,
       deviceParams: !!d.setParamByKey,
       virtualEffects: grid ? GEN3_VIRTUAL_EFFECTS : [],
+      // The block-params response carries `blockState` (Scene Ignore + Bypass Mode, tagged from the codec's
+      // per-model catalog lookup; written through the ordinary enum write). Gen-3 III / FM3 / FM9 only.
+      // Appended last (additive-only ordering).
+      blockState: !!c.blockState,
+      // Read-only block visuals: `visuals` on GET /preset/blocks/:eid/params + `graphKey` on the served
+      // layout's graph slots. Derived from the driver cap AND the route method so the DTO can't drift.
+      blockVisuals: !!c.blockVisuals && !!d.blockParams,
+      // The waveform is an editor visual with its own demand, independent of live block meters.
+      looperTelemetry: !!d.looperTelemetry,
       // What the generic block-params response (`?generic=1`) can rely on: whether the driver serves it, the
       // catalog's firmware, the applied runtime profile's provenance and whether the running firmware has
       // definitions to go by. Present on every device (drivers without it say genericParams:false). Appended
@@ -1113,6 +1130,8 @@ export class DeviceRegistry {
   //     round-robin cycle (meters are tiny 23-byte reads).
   // Runs while ≥1 SSE client is subscribed AND the active driver's telemetry capability allows it.
   #startMeters() {
+    // The loop runs while a listener is present (the CPU read and the scene/channel reflection want it);
+    // the four METER reads inside it run only while a client has its meters on (METER toggle).
     if (this.#metersTimer || this.#telemetryHolds > 0) return; // held by an exclusive operation (pauseTelemetry)
     if (this.#active && !this.#active.capabilities.telemetry.outputMeters) return; // no gen-3 meter frames on this device
     this.#metersTimer = setTimeout(() => this.#pollMeters(), this.#cadence().meterTickMs); // primer at the mode's meter tick
@@ -1161,21 +1180,24 @@ export class DeviceRegistry {
         this.#lastMeterTs = now;
         const aUp = DeviceRegistry.#meterFactor(DeviceRegistry.METER_ATTACK, dt);
         const aDn = DeviceRegistry.#meterFactor(DeviceRegistry.METER_RELEASE, dt);
-        // Read ALL 4 output meters back-to-back each tick (tiny 23-byte reads — this is exactly what
+        // Read ALL 4 output meters back-to-back each tick (tiny 23-byte reads - this is exactly what
         // FM3-Edit's leveling page does; NOT the many-block sweep that stutters audio) so every bar
-        // refreshes every tick, not once per round-robin → smooth, not choppy.
-        for (let i = 0; i < 4; i++) {
-          const meter = GEN3_OUTPUT_METERS[i]!;
-          const frames = await dev.request(buildOutputMeterPoll(meter, d.modelId), { timeoutMs: 200, quietMs: 12, routine: true, match: (fs) => fs.some((f) => isOutputMeterResponse(f, meter)) });
-          const f = frames.find((x) => isOutputMeterResponse(x, meter));
-          if (f) {
-            const raw = meterRmsToDb(parseOutputMeterRms(f), DeviceRegistry.METER_FLOOR, DeviceRegistry.METER_CEIL);
-            const prev = this.#mDb[i]!;
-            const a = raw > prev ? aUp : aDn;
-            this.#mDb[i] = prev + a * (raw - prev);
+        // refreshes every tick, not once per round-robin → smooth, not choppy. Skipped while no client
+        // asks for meters (METER off) - the loop itself keeps running for CPU + the reflection watches.
+        if (this.#meterDemand) {
+          for (let i = 0; i < 4; i++) {
+            const meter = GEN3_OUTPUT_METERS[i]!;
+            const frames = await dev.request(buildOutputMeterPoll(meter, d.modelId), { timeoutMs: 200, quietMs: 12, routine: true, match: (fs) => fs.some((f) => isOutputMeterResponse(f, meter)) });
+            const f = frames.find((x) => isOutputMeterResponse(x, meter));
+            if (f) {
+              const raw = meterRmsToDb(parseOutputMeterRms(f), DeviceRegistry.METER_FLOOR, DeviceRegistry.METER_CEIL);
+              const prev = this.#mDb[i]!;
+              const a = raw > prev ? aUp : aDn;
+              this.#mDb[i] = prev + a * (raw - prev);
+            }
           }
+          this.#emit({ type: 'meters', out1L: this.#mDb[0]!, out1R: this.#mDb[1]!, out2L: this.#mDb[2]!, out2R: this.#mDb[3]! });
         }
-        this.#emit({ type: 'meters', out1L: this.#mDb[0]!, out1R: this.#mDb[1]!, out2L: this.#mDb[2]!, out2R: this.#mDb[3]! });
         // CPU is a heavy status-block read → poll it only occasionally (every Nth tick), off the meter path.
         if (step % cad.cpuEveryNTicks === 0) {
           const frames = await dev.request(buildCpuPoll(d.modelId), { timeoutMs: 400, quietMs: 25, routine: true, match: (fs) => fs.some((f) => isCpuResponse(f)) });
