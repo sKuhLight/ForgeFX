@@ -34,8 +34,7 @@ import {
   meterRmsToDb,
   buildCpuPoll,
   isCpuResponse,
-  parseCpuRawLoad,
-  cpuPercentFromRaw
+  parseCpuPercent
 } from 'forgefx-midi/gen3/axe-fx-iii';
 // Per-device capability declarations (the package's single source of truth: scenes, channels, slot
 // model, save, …). Surfaced via /device so Axis drives its UI from what each model actually supports,
@@ -1109,8 +1108,9 @@ export class DeviceRegistry {
   //   METERS — fn 0x01 sub 0x19, round-robin over Output 1/2 × L/R (addr 0x2A/0x2B, sub 0x10/0x11).
   //     Reply bytes[12..16] = 5-septet-LE float32 = RMS energy → dB = 10·log10(v), floor −40. The REAL,
   //     calibrated meters (matched the live readout to ~1 dB). 0x2E bytes 35/36 saturate → not used.
-  //   CPU — fn 0x01 sub 0x2E, byte 37 = block DSP load → CPU% ≈ CPU_BASE + byte37·CPU_SLOPE. That's a
-  //     590-byte frame, so we read it only once per round-robin cycle (meters are tiny 23-byte reads).
+  //   CPU — fn 0x01 sub 0x2E is the preset status + routing grid block; its declared payload carries
+  //     the DSP load as a float32 percentage. That's a ≥590-byte frame, so we read it only once per
+  //     round-robin cycle (meters are tiny 23-byte reads).
   // Runs while ≥1 SSE client is subscribed AND the active driver's telemetry capability allows it.
   #startMeters() {
     if (this.#metersTimer || this.#telemetryHolds > 0) return; // held by an exclusive operation (pauseTelemetry)
@@ -1176,11 +1176,14 @@ export class DeviceRegistry {
           }
         }
         this.#emit({ type: 'meters', out1L: this.#mDb[0]!, out1R: this.#mDb[1]!, out2L: this.#mDb[2]!, out2R: this.#mDb[3]! });
-        // CPU is a heavy 590-byte read → poll it only occasionally (every Nth tick), off the meter path.
+        // CPU is a heavy status-block read → poll it only occasionally (every Nth tick), off the meter path.
         if (step % cad.cpuEveryNTicks === 0) {
           const frames = await dev.request(buildCpuPoll(d.modelId), { timeoutMs: 400, quietMs: 25, routine: true, match: (fs) => fs.some((f) => isCpuResponse(f)) });
           const f = frames.find((x) => isCpuResponse(x));
-          if (f) this.#emit({ type: 'cpu', percent: cpuPercentFromRaw(parseCpuRawLoad(f)) });
+          if (f) {
+            const percent = parseCpuPercent(f);
+            if (percent != null) this.#emit({ type: 'cpu', percent });
+          }
         }
       });
       // The cheap scene/channel reflection watches run on BOTH link speeds — on a slow link each
